@@ -1,0 +1,1472 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any
+
+import dingtalk_stream
+
+from app.config import Settings, get_settings
+from app.db import AsyncSessionLocal, engine
+from app.llm.client import LLMClient
+from app.llm.extractor import DailyReportExtractor, LLMOutputError
+from app.progress.outbox import enqueue_daily_report_outbox_best_effort
+from app.repositories import (
+    create_webhook_event_once,
+    get_active_user_by_dingtalk_id,
+    list_active_user_habits,
+    mark_webhook_event_failed,
+    mark_webhook_event_processed,
+    maybe_create_report_interaction_event,
+)
+from app.services.dingtalk import DingTalkRobotClient, extract_voice_download_code, extract_voice_text
+from app.services.performance_service import (
+    NO_ACTIVE_PERFORMANCE_TASK_MESSAGE,
+    PERFORMANCE_PENDING_CONFIRMATION,
+    PerformanceTaskService,
+    is_performance_reply_candidate,
+    looks_like_performance_reply_template,
+    submission_metrics,
+)
+from app.services.report_service import DailyReportService
+from app.utils.time import now_in_timezone
+from app.agent2.assistant_tools import build_tool_assisted_reply
+from app.agent2.case_table_rag import DEFAULT_CASE_RAG_INDEX, CaseTableRagAdapter, find_case_location_hint
+from app.agent2.context_pack import Agent2ContextPack, build_agent2_context_pack
+from app.agent2.knowledge_resolver import (
+    KnowledgeQuery,
+    load_live_daily_history_adapter,
+    load_live_org_directory_adapter,
+    resolve_knowledge,
+)
+from app.agent2.personal_memory import build_personal_memory_profile
+from app.agent2.recent_context import load_recent_case_context_messages
+from app.agent2.daily_clarification import (
+    DailyCandidateClarification,
+    build_daily_candidate_clarification,
+    build_daily_candidate_clarification_reply,
+    build_pending_daily_candidate_focus_reply,
+)
+from app.agent2.daily_state import set_pending_daily_candidate
+from app.agent2.daily_execution import (
+    agent2_daily_enabled_for_user,
+    agent2_daily_should_fallback_to_legacy,
+    execute_agent2_daily_commands,
+)
+from app.agent2.daily_shadow import evaluate_daily_shadow
+from app.agent2.coordination_sandbox import CANDIDATE_CASE_PROGRESS, CANDIDATE_TRAVEL_COORDINATION
+from app.agent2.workflow_audit import create_agent2_workflow_audit_event
+from app.workflows.gate import GateDecision
+from app.workflows.daily_context import daily_active_task_from_report, load_live_daily_report
+from app.workflows.intake import (
+    ActiveWorkflowTask,
+    IncomingMessageEnvelope,
+    WORKFLOW_MONTHLY_REPORT,
+)
+
+logger = logging.getLogger("ai_review_stream")
+
+TEXT_TEXT_ONLY = "\u6ca1\u6709\u8bc6\u522b\u5230\u8bed\u97f3\u6587\u5b57\uff0c\u8bf7\u518d\u53d1\u4e00\u6b21\u6216\u6539\u53d1\u6587\u5b57\u3002"
+TEXT_QUEUE_FULL = "\u5f53\u524d\u590d\u76d8\u6d88\u606f\u8f83\u591a\uff0c\u7cfb\u7edf\u5df2\u6ee1\u8f7d\uff0c\u8bf7\u7a0d\u540e\u518d\u53d1\u4e00\u6b21\u3002"
+TEXT_UNKNOWN_USER = "\u672a\u8bc6\u522b\u5230\u4f60\u7684\u5458\u5de5\u4fe1\u606f\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u5148\u7ef4\u62a4 users \u8868\u3002"
+TEXT_LLM_FAILED = "\u590d\u76d8\u89e3\u6790\u5931\u8d25\uff0c\u7cfb\u7edf\u6ca1\u6709\u5165\u5e93\u3002\u8bf7\u7a0d\u540e\u91cd\u8bd5\u6216\u8054\u7cfb\u7ba1\u7406\u5458\u67e5\u770b LLM \u8f93\u51fa\u3002"
+TEXT_PROCESS_FAILED = "\u590d\u76d8\u5904\u7406\u5931\u8d25\uff0c\u7cfb\u7edf\u6ca1\u6709\u5165\u5e93\u3002\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002"
+
+
+@dataclass(frozen=True)
+class StreamJob:
+    message: dingtalk_stream.ChatbotMessage
+    text: str
+    payload: dict[str, Any]
+    received_at_monotonic: float = 0.0
+    queued_at_monotonic: float = 0.0
+    message_type: str = "text"
+    voice_download_seconds: float = 0.0
+    voice_transcribe_seconds: float = 0.0
+
+
+STREAM_TIMING_FIELDS = (
+    "queue_wait_seconds",
+    "voice_download_seconds",
+    "voice_transcribe_seconds",
+    "load_user_seconds",
+    "acquire_report_lock_seconds",
+    "llm_intent_seconds",
+    "llm_extract_seconds",
+    "report_merge_seconds",
+    "db_commit_seconds",
+    "dingtalk_send_seconds",
+    "total_seconds",
+)
+
+STREAM_LLM_META_FIELDS = (
+    "llm_intent_model",
+    "llm_extract_model",
+    "llm_summary_model",
+    "llm_intent_thinking",
+    "llm_extract_thinking",
+    "llm_intent_timeout",
+    "llm_extract_timeout",
+    "llm_fallback_to_pro",
+    "llm_fallback_reason",
+)
+
+STREAM_AGENT_META_FIELDS = (
+    "entered_report_agent",
+    "has_pending_before",
+    "pending_action_before",
+    "pending_section_before",
+    "state_resolver_decision",
+    "state_resolver_reason",
+    "report_agent_seconds",
+    "report_agent_model",
+    "report_agent_thinking",
+    "report_agent_timeout",
+    "report_agent_intent",
+    "report_agent_confidence",
+    "report_agent_should_write",
+    "report_agent_output_action",
+    "pending_created",
+    "pending_action_saved",
+    "pending_action_after",
+    "pending_cleared",
+    "pending_kept_after_failure",
+    "executor_action",
+    "executor_result",
+    "executor_error",
+    "reference_report_lookup_date",
+    "reference_report_found",
+    "reference_report_tomorrow_plan_count",
+    "reference_report_loaded",
+    "reference_report_source",
+    "rollover_completed_items",
+    "rollover_unfinished_items",
+    "deduped_items",
+    "post_action_preview",
+)
+
+
+def _elapsed_seconds(start: float) -> float:
+    return round(time.perf_counter() - start, 4)
+
+
+def _safe_seconds(value: Any) -> float:
+    try:
+        return round(float(value or 0.0), 4)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _add_timing(timings: dict[str, Any], key: str, value: float) -> None:
+    timings[key] = round(_safe_seconds(timings.get(key)) + _safe_seconds(value), 4)
+
+
+def _initial_stream_timings(job: StreamJob, started_at: float) -> dict[str, Any]:
+    timings = {field: 0.0 for field in STREAM_TIMING_FIELDS}
+    for field in STREAM_LLM_META_FIELDS:
+        timings[field] = False if field.endswith("_timeout") or field == "llm_fallback_to_pro" else None
+    for field in STREAM_AGENT_META_FIELDS:
+        timings[field] = None
+    if job.queued_at_monotonic:
+        timings["queue_wait_seconds"] = round(max(0.0, started_at - job.queued_at_monotonic), 4)
+    timings["voice_download_seconds"] = _safe_seconds(job.voice_download_seconds)
+    timings["voice_transcribe_seconds"] = _safe_seconds(job.voice_transcribe_seconds)
+    return timings
+
+
+def _apply_report_timings(timings: dict[str, Any], report_timings: dict[str, Any] | None) -> None:
+    report_timings = report_timings or {}
+    for key in (
+        "acquire_report_lock_seconds",
+        "llm_intent_seconds",
+        "llm_extract_seconds",
+        "report_merge_seconds",
+    ):
+        timings[key] = _safe_seconds(report_timings.get(key))
+    for key in STREAM_LLM_META_FIELDS:
+        if key in report_timings:
+            timings[key] = report_timings.get(key)
+    for key in STREAM_AGENT_META_FIELDS:
+        if key in report_timings:
+            timings[key] = report_timings.get(key)
+
+
+def _log_stream_timing(
+    *,
+    job: StreamJob,
+    dingtalk_user_id: str,
+    user_name: str | None,
+    timings: dict[str, Any],
+    status: str,
+    report_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    entered_report_agent = bool(timings.get("entered_report_agent") or timings.get("report_agent_seconds"))
+    entered_llm = bool(timings.get("llm_intent_seconds") or timings.get("llm_extract_seconds") or entered_report_agent)
+    record: dict[str, Any] = {
+        "message_id": job.message.message_id,
+        "user_id": dingtalk_user_id,
+        "user_name": user_name,
+        "message_type": job.message_type or ("voice" if job.message.message_type in ("audio", "voice") else "text"),
+        "status": status,
+        "text_len": len(job.text or ""),
+        "entered_llm": entered_llm,
+        "entered_report_agent": entered_report_agent,
+        "fast_path": not entered_llm,
+        "report_id": report_id,
+        "error": error,
+    }
+    for field in STREAM_TIMING_FIELDS:
+        record[field] = _safe_seconds(timings.get(field))
+    for field in STREAM_LLM_META_FIELDS:
+        record[field] = timings.get(field)
+    for field in STREAM_AGENT_META_FIELDS:
+        record[field] = timings.get(field)
+    logger.info("stream timing %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
+
+
+def _log_immediate_stream_timing(
+    *,
+    incoming: dingtalk_stream.ChatbotMessage,
+    user_id: str,
+    message_type: str,
+    text_len: int,
+    received_at_monotonic: float,
+    status: str,
+    voice_download_seconds: float = 0.0,
+    voice_transcribe_seconds: float = 0.0,
+    error: str | None = None,
+) -> None:
+    timings = {field: 0.0 for field in STREAM_TIMING_FIELDS}
+    timings["voice_download_seconds"] = _safe_seconds(voice_download_seconds)
+    timings["voice_transcribe_seconds"] = _safe_seconds(voice_transcribe_seconds)
+    timings["total_seconds"] = round(max(0.0, time.perf_counter() - received_at_monotonic), 4)
+    job = StreamJob(
+        message=incoming,
+        text="x" * max(0, text_len),
+        payload=incoming.to_dict(),
+        received_at_monotonic=received_at_monotonic,
+        message_type=message_type,
+        voice_download_seconds=voice_download_seconds,
+        voice_transcribe_seconds=voice_transcribe_seconds,
+    )
+    _log_stream_timing(
+        job=job,
+        dingtalk_user_id=user_id,
+        user_name=None,
+        timings=timings,
+        status=status,
+        error=error,
+    )
+
+
+async def _record_immediate_stream_failure(
+    *,
+    incoming: dingtalk_stream.ChatbotMessage,
+    user_id: str,
+    payload: dict[str, Any],
+    reply_text: str,
+    error_message: str,
+    settings: Settings,
+) -> None:
+    idempotency_key = _stream_idempotency_key(incoming, "")
+    response_payload = {"msgtype": "text", "text": {"content": reply_text}}
+    try:
+        async with AsyncSessionLocal() as session:
+            event, inserted = await create_webhook_event_once(
+                session,
+                idempotency_key=idempotency_key,
+                external_message_id=incoming.message_id,
+                dingtalk_user_id=user_id,
+                payload=payload,
+            )
+            if inserted or event.status == "processing":
+                await mark_webhook_event_failed(
+                    session,
+                    event,
+                    error_message=error_message,
+                    response_payload=response_payload,
+                    now=now_in_timezone(settings.timezone),
+                )
+                await session.commit()
+    except Exception:
+        logger.exception("failed to persist immediate stream failure")
+
+
+def _stream_idempotency_key(message: dingtalk_stream.ChatbotMessage, text: str) -> str:
+    if message.message_id:
+        return f"dingtalk-stream:{message.message_id}"
+    seed = "|".join(
+        [
+            message.sender_staff_id or message.sender_id or "",
+            message.conversation_id or "",
+            text,
+            str(message.create_at or ""),
+        ]
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return f"dingtalk-stream:sha256:{digest}"
+
+
+def _stream_user_id(message: dingtalk_stream.ChatbotMessage) -> str:
+    return message.sender_staff_id or message.sender_id or ""
+
+
+async def _send_stream_reply(
+    robot: DingTalkRobotClient,
+    message: dingtalk_stream.ChatbotMessage,
+    text: str,
+    timeout_seconds: float,
+) -> None:
+    user_id = _stream_user_id(message)
+    if message.session_webhook:
+        await asyncio.wait_for(
+            robot.send_session_webhook_text(session_webhook=message.session_webhook, text=text),
+            timeout=timeout_seconds,
+        )
+        return
+    if user_id:
+        await asyncio.wait_for(
+            robot.send_robot_direct_text(user_ids=[user_id], text=text),
+            timeout=timeout_seconds,
+        )
+
+
+class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
+    def __init__(self, queue: asyncio.Queue[StreamJob], robot: DingTalkRobotClient, settings: Settings):
+        super().__init__()
+        self.queue = queue
+        self.robot = robot
+        self.settings = settings
+
+    def _reply_soon(self, incoming: dingtalk_stream.ChatbotMessage, text: str) -> None:
+        async def _safe_reply() -> None:
+            try:
+                await _send_stream_reply(self.robot, incoming, text, self.settings.stream_reply_timeout_seconds)
+            except Exception:
+                logger.exception("stream immediate reply failed")
+
+        asyncio.create_task(_safe_reply())
+
+    async def process(self, callback_message: dingtalk_stream.CallbackMessage):
+        received_at_monotonic = time.perf_counter()
+        incoming = dingtalk_stream.ChatbotMessage.from_dict(callback_message.data)
+        user_id = _stream_user_id(incoming)
+        message_type = "voice" if incoming.message_type in ("audio", "voice") else "text"
+        voice_download_seconds = 0.0
+        voice_transcribe_seconds = 0.0
+
+        if incoming.message_type in ('audio', 'voice'):
+            payload = incoming.to_dict()
+            recognized = extract_voice_text(payload)
+            if recognized:
+                text = str(recognized).strip()
+                logger.info(
+                    "received stream voice message id=%s user=%s auto_recognition len=%s",
+                    incoming.message_id,
+                    user_id,
+                    len(text),
+                )
+            else:
+                download_code = extract_voice_download_code(payload)
+                if not download_code:
+                    logger.info(
+                        "received voice message without downloadCode user=%s",
+                        user_id,
+                    )
+                    await _record_immediate_stream_failure(
+                        incoming=incoming,
+                        user_id=user_id,
+                        payload=payload,
+                        reply_text=TEXT_TEXT_ONLY,
+                        error_message="voice_without_download_code",
+                        settings=self.settings,
+                    )
+                    self._reply_soon(incoming, TEXT_TEXT_ONLY)
+                    _log_immediate_stream_timing(
+                        incoming=incoming,
+                        user_id=user_id,
+                        message_type=message_type,
+                        text_len=0,
+                        received_at_monotonic=received_at_monotonic,
+                        status="voice_without_download_code",
+                    )
+                    return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+
+                transcribe_start = time.perf_counter()
+                try:
+                    recognized = await asyncio.wait_for(
+                        self.robot.recognize_audio(str(download_code)),
+                        timeout=self.settings.stream_reply_timeout_seconds,
+                    )
+                except Exception as exc:
+                    voice_transcribe_seconds = _elapsed_seconds(transcribe_start)
+                    logger.exception(
+                        "ASR recognition failed user=%s download_code=%s",
+                        user_id,
+                        str(download_code)[:16],
+                    )
+                    await _record_immediate_stream_failure(
+                        incoming=incoming,
+                        user_id=user_id,
+                        payload=payload,
+                        reply_text=TEXT_TEXT_ONLY,
+                        error_message=f"voice_transcribe_failed: {exc.__class__.__name__}: {exc}",
+                        settings=self.settings,
+                    )
+                    self._reply_soon(incoming, TEXT_TEXT_ONLY)
+                    _log_immediate_stream_timing(
+                        incoming=incoming,
+                        user_id=user_id,
+                        message_type=message_type,
+                        text_len=0,
+                        received_at_monotonic=received_at_monotonic,
+                        status="voice_transcribe_failed",
+                        voice_transcribe_seconds=voice_transcribe_seconds,
+                        error="asr_failed",
+                    )
+                    return dingtalk_stream.AckMessage.STATUS_OK, "asr failed"
+
+                voice_transcribe_seconds = _elapsed_seconds(transcribe_start)
+                text = recognized.strip()
+                logger.info(
+                    "received stream voice message id=%s user=%s asr len=%s",
+                    incoming.message_id,
+                    user_id,
+                    len(text),
+                )
+        else:
+            text_parts = self.extract_text_from_incoming_message(incoming) or []
+            text = "\n".join(str(part).strip() for part in text_parts if str(part).strip()).strip()
+            logger.info(
+                "received stream message id=%s user=%s type=%s conversation=%s text_len=%s",
+                incoming.message_id,
+                user_id,
+                incoming.message_type,
+                incoming.conversation_id,
+                len(text),
+            )
+
+        if not text:
+            self._reply_soon(incoming, TEXT_TEXT_ONLY)
+            _log_immediate_stream_timing(
+                incoming=incoming,
+                user_id=user_id,
+                message_type=message_type,
+                text_len=0,
+                received_at_monotonic=received_at_monotonic,
+                status="empty_text",
+                voice_download_seconds=voice_download_seconds,
+                voice_transcribe_seconds=voice_transcribe_seconds,
+            )
+            return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+
+        try:
+            queued_at_monotonic = time.perf_counter()
+            self.queue.put_nowait(
+                StreamJob(
+                    message=incoming,
+                    text=text,
+                    payload=incoming.to_dict(),
+                    received_at_monotonic=received_at_monotonic,
+                    queued_at_monotonic=queued_at_monotonic,
+                    message_type=message_type,
+                    voice_download_seconds=voice_download_seconds,
+                    voice_transcribe_seconds=voice_transcribe_seconds,
+                )
+            )
+        except asyncio.QueueFull:
+            self._reply_soon(incoming, TEXT_QUEUE_FULL)
+            _log_immediate_stream_timing(
+                incoming=incoming,
+                user_id=user_id,
+                message_type=message_type,
+                text_len=len(text),
+                received_at_monotonic=received_at_monotonic,
+                status="queue_full",
+                voice_download_seconds=voice_download_seconds,
+                voice_transcribe_seconds=voice_transcribe_seconds,
+            )
+            return dingtalk_stream.AckMessage.STATUS_OK, "queue full"
+
+        logger.info(
+            "queued stream message id=%s user=%s queue_size=%s",
+            incoming.message_id,
+            user_id,
+            self.queue.qsize(),
+        )
+        return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+
+
+async def _reply(
+    handler: DailyReviewStreamHandler,
+    robot: DingTalkRobotClient,
+    job: StreamJob,
+    text: str,
+) -> float:
+    send_start = time.perf_counter()
+    try:
+        await _send_stream_reply(robot, job.message, text, handler.settings.stream_reply_timeout_seconds)
+        send_seconds = _elapsed_seconds(send_start)
+        logger.info("stream final reply sent message=%s send_seconds=%s", job.message.message_id, send_seconds)
+        return send_seconds
+    except Exception as exc:
+        send_seconds = _elapsed_seconds(send_start)
+        logger.exception("stream final reply failed: %s", exc)
+        return send_seconds
+
+
+async def _evaluate_stream_legacy_daily_gate(
+    *,
+    session: Any,
+    user: Any,
+    job: StreamJob,
+    performance_service: PerformanceTaskService,
+    settings: Settings,
+) -> GateDecision:
+    _, shadow, _, _ = await _evaluate_stream_daily_shadow(
+        session=session,
+        user=user,
+        job=job,
+        performance_service=performance_service,
+        settings=settings,
+    )
+    return shadow.gate_decision
+
+
+async def _evaluate_stream_daily_shadow(
+    *,
+    session: Any,
+    user: Any,
+    job: StreamJob,
+    performance_service: PerformanceTaskService,
+    settings: Settings,
+    mode_override: str | None = None,
+):
+    active_tasks: list[ActiveWorkflowTask] = []
+    daily_report = None
+    try:
+        active_submission = await performance_service.get_active_submission(session, user.id)
+        if active_submission is not None:
+            metrics = submission_metrics(active_submission)
+            responses = list(active_submission.responses_json or [])
+            reply_candidate = is_performance_reply_candidate(
+                metrics=metrics,
+                responses=responses,
+                raw_input=job.text,
+                status=active_submission.status,
+            )
+            active_tasks.append(
+                ActiveWorkflowTask(
+                    workflow=WORKFLOW_MONTHLY_REPORT,
+                    task_id=str(active_submission.task_id),
+                    status=str(active_submission.status or ""),
+                    reply_candidate=reply_candidate,
+                    awaiting_confirmation=active_submission.status == PERFORMANCE_PENDING_CONFIRMATION,
+                    reason="performance submission is active",
+                    metadata={"submission_id": str(active_submission.id)},
+                )
+            )
+    except Exception as exc:
+        logger.info("stream workflow gate skipped performance task lookup: %s", exc)
+
+    try:
+        daily_report = await load_live_daily_report(session, user, settings)
+        daily_task = daily_active_task_from_report(daily_report)
+        if daily_task is not None:
+            active_tasks.append(daily_task)
+    except Exception as exc:
+        logger.info("stream workflow gate skipped daily task lookup: %s", exc)
+
+    timezone = getattr(user, "timezone", "") or getattr(settings, "timezone", "Asia/Shanghai")
+    envelope = IncomingMessageEnvelope(
+        sender_id=str(getattr(user, "id", "") or ""),
+        sender_name=str(getattr(user, "name", "") or ""),
+        dingtalk_user_id=_stream_user_id(job.message),
+        source="dingtalk_stream_text",
+        raw_text=job.text,
+        message_id=str(getattr(job.message, "message_id", "") or ""),
+        conversation_id=str(getattr(job.message, "conversation_id", "") or ""),
+        received_at=now_in_timezone(timezone),
+        active_tasks=tuple(active_tasks),
+    )
+    mode = mode_override or getattr(settings, "workflow_intake_mode", "observe_only")
+    shadow = evaluate_daily_shadow(envelope, mode=mode)
+    try:
+        user_habits = await list_active_user_habits(session, user.id)
+    except Exception as exc:
+        logger.info("stream workflow gate skipped personal memory habit lookup: %s", exc)
+        user_habits = []
+    context_pack = build_agent2_context_pack(
+        envelope,
+        daily_report=daily_report,
+        personal_memory=build_personal_memory_profile(user=user, user_habits=user_habits),
+        knowledge=await _resolve_stream_context_knowledge(
+            session=session,
+            user=user,
+            settings=settings,
+            envelope=envelope,
+            shadow=shadow,
+        ),
+    )
+    logger.info(
+        "stream workflow gate observation %s",
+        json.dumps(shadow.gate_observation(envelope), ensure_ascii=False, sort_keys=True),
+    )
+    await create_agent2_workflow_audit_event(
+        session=session,
+        user=user,
+        incoming=SimpleNamespace(dingtalk_user_id=_stream_user_id(job.message), text=job.text),
+        settings=settings,
+        envelope=envelope,
+        shadow=shadow,
+        mode=mode,
+        observe_only_log=False,
+    )
+    return envelope, shadow, context_pack, daily_report
+
+
+async def _resolve_stream_context_knowledge(
+    *,
+    session: Any,
+    user: Any,
+    settings: Settings,
+    envelope: IncomingMessageEnvelope,
+    shadow: Any,
+) -> tuple[Any, ...]:
+    adapters: list[Any] = []
+    try:
+        adapters.append(await load_live_org_directory_adapter(session))
+    except Exception as exc:
+        logger.info("stream context pack skipped org directory knowledge: %s", exc)
+    try:
+        timezone = getattr(user, "timezone", "") or getattr(settings, "timezone", "Asia/Shanghai")
+        adapters.append(
+            await load_live_daily_history_adapter(
+                session,
+                user,
+                settings,
+                current_date=now_in_timezone(timezone).date(),
+                include_current=False,
+            )
+        )
+    except Exception as exc:
+        logger.info("stream context pack skipped daily history knowledge: %s", exc)
+    if DEFAULT_CASE_RAG_INDEX.exists():
+        adapters.append(CaseTableRagAdapter(DEFAULT_CASE_RAG_INDEX))
+    if not adapters:
+        return ()
+
+    plan = getattr(shadow, "plan", None)
+    intent = str(getattr(plan, "primary_workflow", "") or "")
+    timezone = getattr(user, "timezone", "") or getattr(settings, "timezone", "Asia/Shanghai")
+    recent_case_messages = await load_recent_case_context_messages(
+        session=session,
+        dingtalk_user_id=str(envelope.dingtalk_user_id or ""),
+        current_message_id=str(envelope.message_id or ""),
+        current_text=str(envelope.raw_text or ""),
+    )
+    resolution = resolve_knowledge(
+        KnowledgeQuery(
+            text=str(envelope.raw_text or ""),
+            user_id=str(getattr(user, "id", "") or envelope.sender_id or ""),
+            dingtalk_user_id=str(envelope.dingtalk_user_id or ""),
+            intent=intent,
+            metadata={
+                "current_date": now_in_timezone(timezone).date().isoformat(),
+                "recent_case_messages": recent_case_messages,
+                "requester": _knowledge_requester_metadata(user),
+            },
+        ),
+        adapters,
+    )
+    if resolution.warnings and resolution.status != "available":
+        logger.info(
+            "stream context pack knowledge unavailable %s",
+            json.dumps({"warnings": list(resolution.warnings)}, ensure_ascii=False, sort_keys=True),
+        )
+    return tuple(resolution.evidence)
+
+
+def _knowledge_requester_metadata(user: Any) -> dict[str, str]:
+    team = getattr(user, "team", None)
+    return {
+        "user_id": str(getattr(user, "id", "") or ""),
+        "dingtalk_user_id": str(getattr(user, "dingtalk_user_id", "") or ""),
+        "name": str(getattr(user, "name", "") or ""),
+        "role": str(getattr(user, "role", "") or "member"),
+        "team_id": str(getattr(user, "team_id", "") or getattr(team, "id", "") or ""),
+        "team_name": str(getattr(team, "name", "") or ""),
+        "department_name": str(getattr(team, "department_name", "") or ""),
+    }
+
+
+async def _process_stream_agent2_daily_if_enabled(
+    *,
+    session: Any,
+    user: Any,
+    event: Any,
+    job: StreamJob,
+    handler: DailyReviewStreamHandler,
+    robot: DingTalkRobotClient,
+    llm_client: LLMClient,
+    settings: Settings,
+    performance_service: PerformanceTaskService,
+    timings: dict[str, Any],
+) -> str | None:
+    if not agent2_daily_enabled_for_user(settings, user):
+        return None
+
+    _, shadow, context_pack, daily_report = await _evaluate_stream_daily_shadow(
+        session=session,
+        user=user,
+        job=job,
+        performance_service=performance_service,
+        settings=settings,
+        mode_override="protective_gate",
+    )
+    gate_decision = shadow.gate_decision
+    if gate_decision.block_legacy_daily:
+        daily_candidate_clarification = build_daily_candidate_clarification(
+            raw_text=job.text,
+            context_pack=context_pack,
+        )
+        reply_text = await _agent2_blocked_reply_text(
+            shadow=shadow,
+            raw_text=job.text,
+            llm_client=llm_client,
+            context_pack=context_pack,
+            daily_candidate_clarification=daily_candidate_clarification,
+        )
+        if daily_candidate_clarification is not None:
+            _store_pending_daily_candidate(
+                daily_report,
+                daily_candidate_clarification,
+                settings=settings,
+            )
+        response_payload = {"msgtype": "text", "text": {"content": reply_text}}
+        await mark_webhook_event_processed(
+            session,
+            event,
+            report_id=None,
+            response_payload=response_payload,
+            now=now_in_timezone(settings.timezone),
+        )
+        commit_start = time.perf_counter()
+        await session.commit()
+        _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+        _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
+        return "agent2_daily_gate_blocked"
+
+    commands = list(shadow.commands)
+    if not commands:
+        return None
+
+    result = await asyncio.wait_for(
+        execute_agent2_daily_commands(
+            session,
+            user=user,
+            raw_input=job.text,
+            source="agent2_dingtalk_stream_text",
+            commands=commands,
+            settings=settings,
+        ),
+        timeout=settings.stream_processing_timeout_seconds,
+    )
+    if _agent2_daily_should_fallback_to_legacy(result.command_results):
+        logger.info("agent2 daily edit unresolved, falling back to legacy user_id=%s actions=%s", user.id, result.command_results)
+        return None
+    reply_message = result.message
+    side_reply_text = await _agent2_side_reply_text(
+        shadow=shadow,
+        raw_text=job.text,
+        llm_client=llm_client,
+        context_pack=context_pack,
+    )
+    if side_reply_text:
+        reply_message = f"{reply_message}\n\n{side_reply_text}"
+    candidate_feedback = _agent2_candidate_feedback_text(shadow, raw_text=job.text, context_pack=context_pack)
+    if candidate_feedback:
+        reply_message = f"{reply_message}\n\n{candidate_feedback}"
+    response_payload = {"msgtype": "text", "text": {"content": reply_message}}
+    await mark_webhook_event_processed(
+        session,
+        event,
+        report_id=uuid.UUID(result.report_id) if result.report_id else None,
+        response_payload=response_payload,
+        now=now_in_timezone(settings.timezone),
+    )
+    commit_start = time.perf_counter()
+    await session.commit()
+    _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+    _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_message))
+    logger.info(
+        "agent2 daily processed report_id=%s report_saved=%s read_only=%s commands=%s",
+        result.report_id,
+        result.report_saved,
+        result.read_only,
+        [command.operation for command in commands],
+    )
+    return "agent2_daily_processed"
+
+
+def _agent2_daily_should_fallback_to_legacy(actions: list[dict[str, Any]]) -> bool:
+    return agent2_daily_should_fallback_to_legacy(actions)
+
+
+def _store_pending_daily_candidate(
+    daily_report: Any | None,
+    clarification: DailyCandidateClarification,
+    *,
+    settings: Settings,
+) -> bool:
+    if daily_report is None:
+        return False
+    daily_report.section_status = set_pending_daily_candidate(
+        getattr(daily_report, "section_status", None),
+        dict(clarification.pending_payload),
+        created_at=now_in_timezone(settings.timezone).isoformat(),
+    )
+    return True
+
+
+async def _agent2_blocked_reply_text(
+    *,
+    shadow: Any,
+    raw_text: str,
+    llm_client: LLMClient,
+    context_pack: Agent2ContextPack | None = None,
+    daily_candidate_clarification: DailyCandidateClarification | None = None,
+) -> str:
+    candidate_feedback = _agent2_candidate_feedback_text(shadow, raw_text=raw_text, context_pack=context_pack)
+    daily_candidate_reply = (
+        daily_candidate_clarification.reply_text
+        if daily_candidate_clarification is not None
+        else build_daily_candidate_clarification_reply(
+            raw_text=raw_text,
+            context_pack=context_pack,
+        )
+    )
+    if daily_candidate_reply:
+        if candidate_feedback:
+            return f"{daily_candidate_reply}\n\n{candidate_feedback}"
+        return daily_candidate_reply
+    pending_candidate_focus_reply = build_pending_daily_candidate_focus_reply(
+        raw_text=raw_text,
+        context_pack=context_pack,
+    )
+    if pending_candidate_focus_reply:
+        if candidate_feedback:
+            return f"{pending_candidate_focus_reply}\n\n{candidate_feedback}"
+        return pending_candidate_focus_reply
+    assistant_reply = getattr(shadow, "assistant_reply", None)
+    if assistant_reply is not None and getattr(assistant_reply, "text", ""):
+        result = await build_tool_assisted_reply(
+            raw_text=raw_text,
+            assistant_reply=assistant_reply,
+            llm_client=llm_client,
+            context_pack=context_pack,
+        )
+        if result.fallback_used and result.error:
+            logger.info("agent2 assistant tool fallback source=%s error=%s", result.source, result.error)
+        if candidate_feedback:
+            return f"{result.text}\n\n{candidate_feedback}"
+        return result.text
+    if candidate_feedback:
+        return (
+            "\u8fd9\u53e5\u6211\u6ca1\u6709\u5199\u5165\u65e5\u62a5\u3002\n\n"
+            f"{candidate_feedback}"
+        )
+    gate_decision = getattr(shadow, "gate_decision", None)
+    reply_text = str(getattr(gate_decision, "reply_text", "") or "")
+    if reply_text:
+        return reply_text
+    return "\u8fd9\u53e5\u6211\u5148\u4e0d\u5199\u5165\u65e5\u62a5\uff0c\u8bf7\u8865\u5145\u8bf4\u660e\u3002"
+
+
+async def _agent2_side_reply_text(
+    *,
+    shadow: Any,
+    raw_text: str,
+    llm_client: LLMClient,
+    context_pack: Agent2ContextPack | None = None,
+) -> str:
+    assistant_reply = getattr(shadow, "assistant_reply", None)
+    reply_type = str(getattr(assistant_reply, "reply_type", "") or "")
+    if reply_type not in {"internal_qa", "legal_research"}:
+        return ""
+    result = await build_tool_assisted_reply(
+        raw_text=raw_text,
+        assistant_reply=assistant_reply,
+        llm_client=llm_client,
+        context_pack=context_pack,
+    )
+    if result.fallback_used and result.error:
+        logger.info("agent2 side assistant tool fallback source=%s error=%s", result.source, result.error)
+    return result.text
+
+
+def _agent2_candidate_feedback_text(
+    shadow: Any,
+    *,
+    raw_text: str = "",
+    context_pack: Agent2ContextPack | None = None,
+) -> str:
+    sandbox = getattr(shadow, "coordination_sandbox", None)
+    candidates = list(getattr(sandbox, "candidates", []) or [])
+    if not candidates:
+        return ""
+    lines: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        candidate_type = str(getattr(candidate, "candidate_type", "") or "")
+        if candidate_type == CANDIDATE_CASE_PROGRESS:
+            matter_hint = _candidate_target_value(candidate, "matter_hint") or "\u6848\u4ef6\u540d\u5f85\u786e\u8ba4"
+            key = (candidate_type, matter_hint)
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- \u3010\u6848\u4ef6\u8fdb\u5c55\u5019\u9009\u3011{matter_hint}")
+            location_line = _case_candidate_location_confirmation_line(
+                matter_hint=matter_hint,
+                raw_text=raw_text,
+                context_pack=context_pack,
+            )
+            if location_line:
+                lines.append(location_line)
+            continue
+        if candidate_type == CANDIDATE_TRAVEL_COORDINATION:
+            destination = _candidate_target_value(candidate, "destination") or "\u76ee\u7684\u5730\u5f85\u786e\u8ba4"
+            date_hint = _candidate_date_label(_candidate_target_value(candidate, "date_hint"))
+            status = _candidate_travel_status_label(_candidate_target_value(candidate, "status"))
+            key = (candidate_type, f"{destination}|{date_hint}|{status}")
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- \u3010\u51fa\u5dee\u534f\u540c\u5019\u9009\u3011{destination} | {date_hint} | {status}")
+    if not lines:
+        return ""
+    return (
+        "\u6211\u540c\u65f6\u8bc6\u522b\u5230\u4ee5\u4e0b\u534f\u540c\u5019\u9009"
+        "\uff08\u4ec5\u8bb0\u5f55\u5019\u9009\uff0c\u4e0d\u4f1a\u81ea\u52a8\u901a\u77e5\u6216\u5199\u5165\u6b63\u5f0f\u53f0\u8d26\uff09\uff1a\n"
+        + "\n".join(lines)
+    )
+
+
+def _candidate_target_value(candidate: Any, key: str) -> str:
+    target = getattr(candidate, "target", {}) or {}
+    if not isinstance(target, dict):
+        return ""
+    return str(target.get(key) or "").strip()
+
+
+def _case_candidate_location_confirmation_line(
+    *,
+    matter_hint: str,
+    raw_text: str,
+    context_pack: Agent2ContextPack | None = None,
+) -> str:
+    text = str(raw_text or "")
+    if not _looks_like_case_hearing_trip_probe(text):
+        return ""
+    hint = _case_location_hint_from_context(
+        matter_hint=matter_hint,
+        raw_text=text,
+        context_pack=context_pack,
+    )
+    if hint is None:
+        return ""
+    case_name = getattr(hint, "case_name", "") or matter_hint
+    assignee = getattr(hint, "assignee_name", "") or ""
+    owner_suffix = f"\uff0c\u627f\u529e/\u8d1f\u8d23\u4eba\uff1a{assignee}" if assignee else ""
+    location = getattr(hint, "court_or_location", "") or ""
+    if location:
+        return (
+            f"  \u5e95\u8868\u53ef\u80fd\u547d\u4e2d\u3010{case_name}\u3011{owner_suffix}\uff1b"
+            f"\u6cd5\u9662/\u5730\u70b9\u662f\u3010{location}\u3011\u3002"
+            f"\u4f60\u662f\u53bb\u3010{location}\u3011\u5f00\u5ead\u561b\uff1f\u786e\u8ba4\u540e\u6211\u518d\u7ed9\u4f60\u8bb0\u5f55\u51fa\u5dee\u5019\u9009\u3002"
+        )
+    return (
+        f"  \u5e95\u8868\u53ef\u80fd\u547d\u4e2d\u3010{case_name}\u3011{owner_suffix}\uff0c"
+        "\u4f46\u6ca1\u770b\u5230\u660e\u786e\u6cd5\u9662/\u5730\u70b9\uff1b\u6211\u5148\u4e0d\u8bb0\u5f55\u51fa\u5dee\uff0c\u4f60\u8865\u4e2a\u5730\u70b9\u6211\u518d\u5904\u7406\u3002"
+    )
+
+
+def _looks_like_case_hearing_trip_probe(text: str) -> bool:
+    value = str(text or "")
+    if not any(marker in value for marker in ("\u5f00\u5ead", "\u5ead\u5ba1", "\u51fa\u5ead")):
+        return False
+    if not any(marker in value for marker in ("\u53bb", "\u8d74", "\u5230", "\u524d\u5f80", "\u51fa\u5dee")):
+        return False
+    return any(marker in value for marker in ("\u6848", "\u6848\u4ef6", "\u6cd5\u9662"))
+
+
+def _case_location_hint_from_context(
+    *,
+    matter_hint: str,
+    raw_text: str,
+    context_pack: Agent2ContextPack | None,
+) -> Any | None:
+    hint = _case_location_hint_from_context_pack(matter_hint=matter_hint, context_pack=context_pack)
+    if hint is not None:
+        return hint
+    if not DEFAULT_CASE_RAG_INDEX.exists():
+        return None
+    return find_case_location_hint(
+        DEFAULT_CASE_RAG_INDEX,
+        matter_hint=matter_hint,
+        raw_text=raw_text,
+    )
+
+
+def _case_location_hint_from_context_pack(
+    *,
+    matter_hint: str,
+    context_pack: Agent2ContextPack | None,
+) -> Any | None:
+    if context_pack is None:
+        return None
+    term = _case_feedback_lookup_term(matter_hint)
+    if not term:
+        return None
+    for evidence in getattr(context_pack, "knowledge", ()) or ():
+        if str(getattr(evidence, "source_type", "") or "") != "case_table_rag":
+            continue
+        facts = getattr(evidence, "facts", None)
+        if not isinstance(facts, dict) or "case_count" in facts or facts.get("permission_denied"):
+            continue
+        case_name = str(facts.get("case_name") or getattr(evidence, "title", "") or "").strip()
+        summary = str(getattr(evidence, "summary", "") or "")
+        if term not in case_name and term not in summary:
+            continue
+        location = _location_from_case_facts(facts)
+        return SimpleNamespace(
+            case_name=case_name,
+            court_or_location=location,
+            department=str(facts.get("department") or ""),
+            assignee_name=str(facts.get("assignee_name") or ""),
+            source_id=str(getattr(evidence, "source_id", "") or ""),
+        )
+    return None
+
+
+def _case_feedback_lookup_term(matter_hint: str) -> str:
+    value = str(matter_hint or "").strip(" ：:，,。；;、")
+    value = value.replace("\u6848\u4ef6", "").replace("\u6848", "")
+    value = value.replace("\u5f00\u5ead", "").replace("\u5ead\u5ba1", "").replace("\u51fa\u5ead", "")
+    return value.strip(" ：:，,。；;、")
+
+
+def _location_from_case_facts(facts: dict[str, Any]) -> str:
+    for key in (
+        "\u627f\u529e\u6cd5\u9662",
+        "\u53d7\u7406\u6cd5\u9662",
+        "\u6267\u884c\u6cd5\u9662",
+        "\u4e00\u5ba1\u6cd5\u9662",
+        "\u4e8c\u5ba1\u6cd5\u9662",
+        "\u7ba1\u8f96\u6cd5\u9662",
+        "\u6cd5\u9662\u540d\u79f0",
+        "\u5f00\u5ead\u6cd5\u9662",
+        "\u5f00\u5ead\u5730\u70b9",
+        "\u5ead\u5ba1\u5730\u70b9",
+        "\u4ef2\u88c1\u59d4",
+        "\u4ef2\u88c1\u59d4\u5458\u4f1a",
+    ):
+        value = str(facts.get(key) or "").strip(" ：:，,。；;、")
+        if value and value not in {"/", "-", "\u65e0", "\u6682\u65e0", "\u5426", "\u662f", "0"}:
+            return value
+    return ""
+
+
+def _candidate_date_label(value: str) -> str:
+    return {
+        "today": "\u4eca\u5929",
+        "tomorrow": "\u660e\u5929",
+        "future_weekday": "\u672c\u5468\u672a\u6765\u65e5\u671f",
+        "next_week": "\u4e0b\u5468",
+        "past_weekday": "\u5df2\u8fc7\u65e5\u671f",
+    }.get(str(value or "").strip(), "\u65f6\u95f4\u5f85\u786e\u8ba4")
+
+
+def _candidate_travel_status_label(value: str) -> str:
+    return {
+        "planned": "\u8ba1\u5212\u51fa\u5dee",
+        "tentative": "\u53ef\u80fd\u51fa\u5dee",
+        "already_traveled": "\u5df2\u51fa\u5dee",
+    }.get(str(value or "").strip(), "\u72b6\u6001\u5f85\u786e\u8ba4")
+
+
+async def _handle_job(
+    *,
+    job: StreamJob,
+    handler: DailyReviewStreamHandler,
+    settings: Settings,
+    performance_service: PerformanceTaskService,
+    report_service: DailyReportService,
+    robot: DingTalkRobotClient,
+) -> None:
+    started_at = time.perf_counter()
+    timings = _initial_stream_timings(job, started_at)
+    idempotency_key = _stream_idempotency_key(job.message, job.text)
+    dingtalk_user_id = _stream_user_id(job.message)
+    status = "started"
+    user_name: str | None = None
+    report_id: str | None = None
+    error_message: str | None = None
+    logger.info(
+        "stream job start idempotency_key=%s user=%s message=%s",
+        idempotency_key,
+        dingtalk_user_id,
+        job.message.message_id,
+    )
+
+    async with AsyncSessionLocal() as session:
+        event = None
+        try:
+            logger.info("creating stream event key=%s", idempotency_key)
+            event, inserted = await create_webhook_event_once(
+                session,
+                idempotency_key=idempotency_key,
+                external_message_id=job.message.message_id,
+                dingtalk_user_id=dingtalk_user_id,
+                payload=job.payload,
+            )
+            commit_start = time.perf_counter()
+            await session.commit()
+            _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+            logger.info("stream event committed key=%s inserted=%s status=%s", idempotency_key, inserted, event.status)
+
+            if not inserted:
+                status = "duplicate"
+                response_payload = event.response_payload or {}
+                cached_text = (response_payload.get("text") or {}).get("content")
+                if cached_text:
+                    _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, cached_text))
+                return
+
+            if not dingtalk_user_id:
+                raise ValueError("DingTalk stream message missing senderStaffId.")
+
+            logger.info("loading stream user dingtalk_user_id=%s", dingtalk_user_id)
+            load_user_start = time.perf_counter()
+            user = await get_active_user_by_dingtalk_id(session, dingtalk_user_id)
+            timings["load_user_seconds"] = _elapsed_seconds(load_user_start)
+            if user is None:
+                status = "unknown_user"
+                reply_text = TEXT_UNKNOWN_USER
+                response_payload = {"msgtype": "text", "text": {"content": reply_text}}
+                await mark_webhook_event_failed(
+                    session,
+                    event,
+                    error_message=f"Unknown DingTalk user: {dingtalk_user_id}",
+                    response_payload=response_payload,
+                    now=now_in_timezone(settings.timezone),
+                )
+                commit_start = time.perf_counter()
+                await session.commit()
+                _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+                _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
+                return
+
+            user_name = user.name
+            logger.info("checking stream performance task user_id=%s", user.id)
+            performance_result = await asyncio.wait_for(
+                performance_service.submit_text(
+                    session,
+                    user=user,
+                    raw_input=job.text,
+                    source="dingtalk_stream_text",
+                    require_performance_signal=True,
+                ),
+                timeout=settings.stream_processing_timeout_seconds,
+            )
+            if performance_result is not None:
+                response_payload = {"msgtype": "text", "text": {"content": performance_result.message}}
+                await mark_webhook_event_processed(
+                    session,
+                    event,
+                    report_id=None,
+                    response_payload=response_payload,
+                    now=now_in_timezone(settings.timezone),
+                )
+                commit_start = time.perf_counter()
+                await session.commit()
+                _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+                logger.info(
+                    "stream performance submitted task_id=%s submission_id=%s status=%s",
+                    performance_result.task_id,
+                    performance_result.submission_id,
+                    performance_result.status,
+                )
+                _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, performance_result.message))
+                status = "performance_processed"
+                return
+
+            if looks_like_performance_reply_template(job.text):
+                response_payload = {"msgtype": "text", "text": {"content": NO_ACTIVE_PERFORMANCE_TASK_MESSAGE}}
+                await mark_webhook_event_processed(
+                    session,
+                    event,
+                    report_id=None,
+                    response_payload=response_payload,
+                    now=now_in_timezone(settings.timezone),
+                )
+                commit_start = time.perf_counter()
+                await session.commit()
+                _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+                _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, NO_ACTIVE_PERFORMANCE_TASK_MESSAGE))
+                status = "performance_no_active_task"
+                return
+
+            agent2_status = await _process_stream_agent2_daily_if_enabled(
+                session=session,
+                user=user,
+                event=event,
+                job=job,
+                handler=handler,
+                robot=robot,
+                llm_client=report_service.extractor.client,
+                settings=settings,
+                performance_service=performance_service,
+                timings=timings,
+            )
+            if agent2_status is not None:
+                status = agent2_status
+                return
+
+            _, shadow, context_pack, daily_report = await _evaluate_stream_daily_shadow(
+                session=session,
+                user=user,
+                job=job,
+                performance_service=performance_service,
+                settings=settings,
+            )
+            gate_decision = shadow.gate_decision
+            if gate_decision.block_legacy_daily:
+                daily_candidate_clarification = build_daily_candidate_clarification(
+                    raw_text=job.text,
+                    context_pack=context_pack,
+                )
+                reply_text = await _agent2_blocked_reply_text(
+                    shadow=shadow,
+                    raw_text=job.text,
+                    llm_client=report_service.extractor.client,
+                    context_pack=context_pack,
+                    daily_candidate_clarification=daily_candidate_clarification,
+                )
+                if daily_candidate_clarification is not None:
+                    _store_pending_daily_candidate(
+                        daily_report,
+                        daily_candidate_clarification,
+                        settings=settings,
+                    )
+                response_payload = {"msgtype": "text", "text": {"content": reply_text}}
+                await mark_webhook_event_processed(
+                    session,
+                    event,
+                    report_id=None,
+                    response_payload=response_payload,
+                    now=now_in_timezone(settings.timezone),
+                )
+                commit_start = time.perf_counter()
+                await session.commit()
+                _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+                _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
+                status = "workflow_gate_blocked"
+                return
+
+            logger.info("submitting stream report user_id=%s date_timezone=%s", user.id, user.timezone)
+            result = await asyncio.wait_for(
+                report_service.submit_text(
+                    session,
+                    user=user,
+                    raw_input=job.text,
+                    source="dingtalk_stream_text",
+                ),
+                timeout=settings.stream_processing_timeout_seconds,
+            )
+            _apply_report_timings(timings, result.timings)
+            report_id = result.report_id
+            if not result.report_saved:
+                await maybe_create_report_interaction_event(
+                    session,
+                    user=user,
+                    report=None,
+                    report_date=result.report_date,
+                    message_text=job.text,
+                    llm_decision_json={
+                        "reply_kind": result.reply_kind,
+                        "status": result.status,
+                        "report_saved": result.report_saved,
+                        "timings": result.timings,
+                    },
+                    backend_action=result.reply_kind,
+                    before_snapshot_json={},
+                    after_snapshot_json={
+                        "report_id": result.report_id or "",
+                        "status": result.status,
+                        "today_work_count": len(result.today_work or []),
+                        "problems_count": len(result.problems or []),
+                        "tomorrow_plan_count": len(result.tomorrow_plan or []),
+                        "today_work": list(result.today_work or [])[:20],
+                        "problems": list(result.problems or [])[:20],
+                        "tomorrow_plan": list(result.tomorrow_plan or [])[:20],
+                    },
+                    report_id_override=uuid.UUID(result.report_id) if result.report_id else None,
+                )
+            logger.info(
+                "stream report submitted report_id=%s status=%s score=%s",
+                result.report_id,
+                result.status,
+                result.completeness_score,
+            )
+            response_payload = {"msgtype": "text", "text": {"content": result.message}}
+            await mark_webhook_event_processed(
+                session,
+                event,
+                report_id=uuid.UUID(result.report_id) if result.report_id else None,
+                response_payload=response_payload,
+                now=now_in_timezone(settings.timezone),
+            )
+            commit_start = time.perf_counter()
+            await session.commit()
+            _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+            logger.info("stream report committed report_id=%s event_key=%s", result.report_id, idempotency_key)
+            _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, result.message))
+            await enqueue_daily_report_outbox_best_effort(
+                session_factory=AsyncSessionLocal,
+                settings=settings,
+                user=user,
+                result=result,
+                raw_text=job.text,
+                source="dingtalk_stream_text",
+                source_id=idempotency_key,
+            )
+            status = "processed"
+        except LLMOutputError as exc:
+            status = "llm_failed"
+            error_message = exc.__class__.__name__
+            await session.rollback()
+            reply_text = TEXT_LLM_FAILED
+            if event is not None:
+                commit_start = time.perf_counter()
+                async with session.begin():
+                    event = await session.merge(event)
+                    await mark_webhook_event_failed(
+                        session,
+                        event,
+                        error_message=str(exc),
+                        response_payload={"msgtype": "text", "text": {"content": reply_text}},
+                        now=now_in_timezone(settings.timezone),
+                    )
+                _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+            _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
+        except Exception as exc:
+            status = "failed"
+            error_message = exc.__class__.__name__
+            await session.rollback()
+            reply_text = TEXT_PROCESS_FAILED
+            logger.exception("stream job failed")
+            if event is not None:
+                commit_start = time.perf_counter()
+                async with session.begin():
+                    event = await session.merge(event)
+                    await mark_webhook_event_failed(
+                        session,
+                        event,
+                        error_message=str(exc),
+                        response_payload={"msgtype": "text", "text": {"content": reply_text}},
+                        now=now_in_timezone(settings.timezone),
+                    )
+                _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
+            _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
+        finally:
+            total_base = job.received_at_monotonic or started_at
+            timings["total_seconds"] = round(max(0.0, time.perf_counter() - total_base), 4)
+            _log_stream_timing(
+                job=job,
+                dingtalk_user_id=dingtalk_user_id,
+                user_name=user_name,
+                timings=timings,
+                status=status,
+                report_id=report_id,
+                error=error_message,
+            )
+            logger.info("stream job done key=%s", idempotency_key)
+
+
+async def _worker(
+    worker_id: int,
+    queue: asyncio.Queue[StreamJob],
+    handler: DailyReviewStreamHandler,
+    settings: Settings,
+    performance_service: PerformanceTaskService,
+    report_service: DailyReportService,
+    robot: DingTalkRobotClient,
+) -> None:
+    while True:
+        job = await queue.get()
+        try:
+            logger.info("worker=%s processing message=%s", worker_id, job.message.message_id)
+            await _handle_job(
+                job=job,
+                handler=handler,
+                settings=settings,
+                performance_service=performance_service,
+                report_service=report_service,
+                robot=robot,
+            )
+        finally:
+            queue.task_done()
+
+
+async def run_stream() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    settings = get_settings()
+    if not settings.dingtalk_app_key or not settings.dingtalk_app_secret:
+        raise RuntimeError("DingTalk app key/secret are required for stream mode.")
+
+    llm_client = LLMClient(settings)
+    robot = DingTalkRobotClient(settings)
+    performance_service = PerformanceTaskService(settings)
+    report_service = DailyReportService(settings, DailyReportExtractor(llm_client))
+    queue: asyncio.Queue[StreamJob] = asyncio.Queue(maxsize=settings.stream_queue_size)
+    handler = DailyReviewStreamHandler(queue, robot, settings)
+
+    credential = dingtalk_stream.Credential(settings.dingtalk_app_key, settings.dingtalk_app_secret)
+    client = dingtalk_stream.DingTalkStreamClient(credential)
+    client.register_callback_handler(dingtalk_stream.ChatbotMessage.TOPIC, handler)
+
+    workers = [
+        asyncio.create_task(_worker(i + 1, queue, handler, settings, performance_service, report_service, robot))
+        for i in range(settings.stream_worker_count)
+    ]
+
+    try:
+        logger.info(
+            "starting DingTalk stream workers=%s queue_size=%s",
+            settings.stream_worker_count,
+            settings.stream_queue_size,
+        )
+        await client.start()
+    finally:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        await robot.close()
+        await llm_client.close()
+        await engine.dispose()
+
+
+def main() -> None:
+    asyncio.run(run_stream())
+
+
+if __name__ == "__main__":
+    main()
