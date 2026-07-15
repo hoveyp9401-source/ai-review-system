@@ -578,6 +578,9 @@ async def live_case_detail_workspace(
                     "case_progress_collaboration_mode", ""
                 )
             ),
+            followup_enabled=settings.case_followup_enabled,
+            followup_send_enabled=settings.case_followup_send_enabled,
+            report_projection_enabled=settings.case_followup_report_projection_enabled,
         )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -1209,6 +1212,9 @@ async def _case_write_response(
                 or {}
             ).get("case_progress_collaboration_mode", "")
         ),
+        followup_enabled=settings.case_followup_enabled,
+        followup_send_enabled=settings.case_followup_send_enabled,
+        report_projection_enabled=settings.case_followup_report_projection_enabled,
     )
     return payload
 

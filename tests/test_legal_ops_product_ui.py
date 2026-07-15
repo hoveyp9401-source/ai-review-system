@@ -41,6 +41,18 @@ def test_product_shell_does_not_label_live_postgresql_as_fixture():
     assert "role_ids.includes(\"tenant_admin\")" in script
 
 
+def test_product_shell_uses_chinese_and_never_renders_raw_transport_identifiers():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "SANDBOX TENANT" not in page
+    assert "LEGAL OPERATIONS" not in page
+    assert 'sandbox_fixture: "演示数据"' in script
+    assert "external_message_id=" not in script
+    assert '["外部消息 ID", "external_message_id"]' not in script
+    assert "source_message_id" not in script
+
+
 def test_business_statuses_are_rendered_through_one_closed_chinese_dictionary():
     assert case_stage_label("plaintiff_case", "intended_filing") == "拟诉"
     assert case_stage_label("plaintiff_case", "litigation") == "诉讼中"
@@ -119,10 +131,11 @@ def test_case_workspace_is_paginated_chinese_and_hides_internal_identifiers():
     assert payload["items"][0]["node"] == "已立案"
     assert payload["items"][0]["next_plan"] == "下周联系法院"
     assert payload["items"][0]["followup_policy"] == "仅关键节点"
-    assert payload["items"][0]["hearing_date"] == "暂未记录"
-    assert payload["items"][0]["risk_level"] == "暂未评估"
-    assert payload["items"][0]["court"] == "暂未记录"
-    assert payload["items"][0]["cause"] == "暂未记录"
+    assert payload["items"][0]["business_facts"] == []
+    assert "hearing_date" not in payload["items"][0]
+    assert "risk_level" not in payload["items"][0]
+    assert "court" not in payload["items"][0]
+    assert "cause" not in payload["items"][0]
     assert "owner_user_id" not in payload["items"][0]
     assert "source_json" not in payload["items"][0]
     assert "version" not in payload["items"][0]
@@ -315,7 +328,12 @@ def test_team_center_uses_real_bindings_assignments_and_reports_without_user_ids
 
     payload = project_team_center(bindings, cases, daily, periodic, travel)
 
-    assert payload["team_name"] == "Agent2 灰测法务团队"
+    assert payload["team_name"] == "当前授权团队"
+    assert payload["identity_mapping"] == {
+        "source": "Agent2 身份绑定表",
+        "scope": "当前租户与当前团队",
+        "status": "服务器实时映射",
+    }
     assert payload["summary"] == {"members": 2, "cases": 3, "active_travel": 1}
     pang = next(item for item in payload["members"] if item["name"] == "庞浩")
     liu = next(item for item in payload["members"] if item["name"] == "刘聪")
@@ -498,6 +516,9 @@ def test_single_case_detail_builds_truthful_lifecycle_and_hides_receipt_fields()
         editable_actor_user_id="pang-id",
         writable_case_ids=("case-id",),
         permission_mode="explicit_shared_scope",
+        followup_enabled=True,
+        followup_send_enabled=False,
+        report_projection_enabled=False,
     )
 
     assert payload["case_type"] == "原告案件"
@@ -534,6 +555,12 @@ def test_single_case_detail_builds_truthful_lifecycle_and_hides_receipt_fields()
         }
     ]
     assert payload["can_manage_followup"] is False
+    assert payload["followup"]["capability"] == {
+        "task_generation": "已开启",
+        "message_delivery": "未开启",
+        "report_projection": "未开启",
+        "can_trigger_task": False,
+    }
     serialized = repr(payload)
     assert "secret-message-id" not in serialized
     assert "source_message_id" not in serialized
@@ -557,6 +584,14 @@ def test_single_case_detail_builds_truthful_lifecycle_and_hides_receipt_fields()
     assert collaborator_payload["assignment"] == "团队协作"
     assert collaborator_payload["can_add_progress"] is True
     assert collaborator_payload["progress"][0]["actions"]["can_edit"] is False
+
+
+def test_followup_ui_labels_shadow_task_creation_without_claiming_a_message_will_be_sent():
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "创建追问任务（暂不发送）" in script
+    assert "当前仅生成追问任务，钉钉发送未开启" in script
+    assert ">立即追问一次<" not in script
 
 
 def test_live_product_ui_wires_case_progress_and_report_mutations_to_workspace_endpoints():

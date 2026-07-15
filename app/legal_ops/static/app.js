@@ -236,7 +236,7 @@ function renderLiveCaseWorkspace(data) {
       <button class="primary-button compact-primary" type="submit">筛选</button>
     </form>
     <div class="case-summary-strip"><span>共 ${data.pagination.total} 件</span><span>本人负责 ${data.summary.assigned_to_me} 件</span><span>团队协作 ${data.summary.shared_with_me} 件</span><span>可登记进展 ${data.summary.writable} 件</span><span>有进展 ${data.summary.with_progress} 件</span></div>
-    <div class="product-case-grid">${data.items.map(item => `<article class="product-case-card"><div><span class="badge">${escapeHtml(item.case_type)}</span><span class="badge">${escapeHtml(item.stage)}</span><span class="badge">${escapeHtml(item.assignment)}</span></div><h3>${escapeHtml(item.case_name)}</h3><p>${escapeHtml(item.case_number)}</p><dl><div><dt>当前节点</dt><dd>${escapeHtml(item.node)}</dd></div><div><dt>负责人</dt><dd>${escapeHtml(item.owner_name)}</dd></div><div><dt>登记权限</dt><dd>${item.can_add_progress ? "可登记进展" : "仅查看"}</dd></div><div><dt>当事人</dt><dd>${escapeHtml(item.counterparties.join("、") || "暂未记录")}</dd></div><div><dt>案由</dt><dd>${escapeHtml(item.cause)}</dd></div><div><dt>法院 / 仲裁</dt><dd>${escapeHtml(item.court)}</dd></div><div><dt>开庭时间</dt><dd>${escapeHtml(item.hearing_date)}</dd></div><div><dt>风险等级</dt><dd>${escapeHtml(item.risk_level)}</dd></div><div><dt>追问策略</dt><dd>${escapeHtml(item.followup_policy)}</dd></div><div class="case-wide-field"><dt>最新进展</dt><dd>${escapeHtml(item.latest_progress)}</dd></div><div class="case-wide-field"><dt>下一步计划</dt><dd>${escapeHtml(item.next_plan)}</dd></div></dl><footer><span>${escapeHtml(item.source)} · 更新于 ${formatBusinessTime(item.updated_at)}</span><button class="text-button" data-phase2-case="${escapeHtml(item.case_ref)}">查看单案 →</button></footer></article>`).join("") || '<div class="empty-state">没有符合条件的案件</div>'}</div>
+    <div class="product-case-grid">${data.items.map(item => `<article class="product-case-card"><div><span class="badge">${escapeHtml(item.case_type)}</span><span class="badge">${escapeHtml(item.stage)}</span><span class="badge">${escapeHtml(item.assignment)}</span></div><h3>${escapeHtml(item.case_name)}</h3><p>${escapeHtml(item.case_number)}</p><dl><div><dt>当前节点</dt><dd>${escapeHtml(item.node)}</dd></div><div><dt>负责人</dt><dd>${escapeHtml(item.owner_name)}</dd></div><div><dt>登记权限</dt><dd>${item.can_add_progress ? "可登记进展" : "仅查看"}</dd></div><div><dt>当事人</dt><dd>${escapeHtml(item.counterparties.join("、") || "暂未记录")}</dd></div>${renderBusinessFacts(item.business_facts)}<div><dt>追问策略</dt><dd>${escapeHtml(item.followup_policy)}</dd></div><div class="case-wide-field"><dt>最新进展</dt><dd>${escapeHtml(item.latest_progress)}</dd></div><div class="case-wide-field"><dt>下一步计划</dt><dd>${escapeHtml(item.next_plan)}</dd></div></dl><footer><span>${escapeHtml(item.source)} · 更新于 ${formatBusinessTime(item.updated_at)}</span><button class="text-button" data-phase2-case="${escapeHtml(item.case_ref)}">查看单案 →</button></footer></article>`).join("") || '<div class="empty-state">没有符合条件的案件</div>'}</div>
     <div class="pagination"><button ${data.pagination.page <= 1 ? "disabled" : ""} data-live-case-page="${data.pagination.page - 1}">上一页</button><span>第 ${data.pagination.page} / ${data.pagination.pages} 页</span><button ${data.pagination.page >= data.pagination.pages ? "disabled" : ""} data-live-case-page="${data.pagination.page + 1}">下一页</button></div>`;
   document.querySelector("#live-case-filters")?.addEventListener("submit", event => { event.preventDefault(); loadLiveCases(1); });
 }
@@ -277,7 +277,7 @@ function renderReportActions(item) {
 }
 
 function renderLiveTeam(data) {
-  content.innerHTML = `${sectionHeading(data.team_name, "团队成员、案件分配、报告与出差均按真实数据库聚合，不展示内部用户编号")}
+  content.innerHTML = `${sectionHeading(data.team_name, `${escapeHtml(data.identity_mapping.source)} · ${escapeHtml(data.identity_mapping.status)} · ${escapeHtml(data.identity_mapping.scope)}`)}
     <div class="cards">${[["成员", data.summary.members], ["已分配案件", data.summary.cases], ["进行中出差", data.summary.active_travel]].map(([label, value]) => `<article class="metric-card"><span>${label}</span><strong>${value}<small> ${label === "成员" ? "人" : "条"}</small></strong></article>`).join("")}</div>
     <div class="team-grid product-team-grid">${data.members.map(item => `<article class="team-card"><h3>${escapeHtml(item.name)}</h3><div class="mini-stats"><div><strong>${item.assigned_cases}</strong><span>分配案件</span></div><div><strong>${item.plaintiff_cases}</strong><span>原告</span></div><div><strong>${item.defendant_cases}</strong><span>被告</span></div><div><strong>${item.active_travel}</strong><span>出差</span></div></div><div class="team-members"><p>最近日报：${escapeHtml(item.latest_daily_date)} · ${escapeHtml(item.latest_daily_status)}</p><p>周报/月报：${item.periodic_reports} 份</p></div></article>`).join("") || '<div class="empty-state">暂无团队成员</div>'}</div>`;
 }
@@ -286,7 +286,7 @@ function originLabel(value) {
   const labels = {
     real_user_message: "真实用户消息",
     server_acceptance_smoke: "服务器验收 Smoke",
-    sandbox_fixture: "Sandbox Fixture",
+    sandbox_fixture: "演示数据",
     system_generated: "系统生成",
     robot_followup: "机器人追踪",
     daily_report: "日报进展",
@@ -304,8 +304,8 @@ function renderLiveOverview(data) {
       ["出差登记", summary.travel_intents], ["协同候选", summary.collaboration_candidates],
       ["通知", summary.notifications], ["回执", summary.receipts], ["失败/阻断", summary.failures],
     ].map(([label, value]) => `<article class="metric-card"><span>${label}</span><strong>${value}<small> 条</small></strong></article>`).join("")}</div>
-    <div class="grid-2 live-overview-grid"><section class="panel"><h3 class="panel-title">最新案件进展 <span>PostgreSQL</span></h3>${data.case_progress.slice(0,6).map(item => `<article class="live-event"><strong>${escapeHtml(item.summary)}</strong><p>${escapeHtml(item.updated_at)} · v${item.version}</p>${originLabel(item.data_origin)}</article>`).join("") || '<div class="empty-state">暂无进展</div>'}</section>
-    <section class="panel"><h3 class="panel-title">通知传输状态 <span>不得把 pending 当作已发送</span></h3>${data.notifications.slice(0,6).map(item => `<article class="live-event"><strong>${escapeHtml(item.message_type)}</strong><p>${escapeHtml(item.recipient_user_id)} · ${escapeHtml(item.status)} · external_message_id=${escapeHtml(item.external_message_id || "无")}</p>${originLabel(item.data_origin)}</article>`).join("") || '<div class="empty-state">暂无通知</div>'}</section></div>`;
+    <div class="grid-2 live-overview-grid"><section class="panel"><h3 class="panel-title">最新案件进展 <span>服务器数据库</span></h3>${data.case_progress.slice(0,6).map(item => `<article class="live-event"><strong>${escapeHtml(item.summary)}</strong><p>${escapeHtml(item.updated_at)}</p>${originLabel(item.data_origin)}</article>`).join("") || '<div class="empty-state">暂无进展</div>'}</section>
+    <section class="panel"><h3 class="panel-title">通知传输状态 <span>排队、平台接受与确认送达分别展示</span></h3>${data.notifications.slice(0,6).map(item => `<article class="live-event"><strong>${escapeHtml(item.message_type)}</strong><p>${escapeHtml(item.status)}</p>${originLabel(item.data_origin)}</article>`).join("") || '<div class="empty-state">暂无通知</div>'}</section></div>`;
 }
 
 function renderLiveParties(data) {
@@ -365,9 +365,13 @@ function renderLiveTravel(data) {
 }
 
 function renderLiveAudit(data) {
-  content.innerHTML = `${sectionHeading("审计证据", "按 source message 串联 typed command、receipt、audit 和最终资源")}
-    <div class="table-wrap"><table><thead><tr><th>时间</th><th>命令</th><th>状态</th><th>资源</th><th>来源消息</th><th>写入</th></tr></thead><tbody>${data.receipts.map(item => `<tr><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(item.command_type)}</td><td>${businessBadge(item.status)}</td><td>${escapeHtml(item.resource_type)}:${escapeHtml(item.resource_id)}</td><td><code>${escapeHtml(item.source_message_id)}</code></td><td>${item.actual_write ? "是" : "否"}</td></tr>`).join("")}</tbody></table></div>
-    <section class="panel"><h3 class="panel-title">Audit events <span>${data.audits.length} 条</span></h3>${data.audits.slice(0,30).map(item => `<article class="live-event"><strong>${escapeHtml(item.command_type)} · ${escapeHtml(item.resource_type)}</strong><p>${escapeHtml(item.source_message_id)} · ${escapeHtml(item.created_at)}</p>${originLabel(item.data_origin)}</article>`).join("")}</section>`;
+  content.innerHTML = `${sectionHeading("审计证据", "展示业务操作、执行状态和写入结果；内部消息与数据库编号不在页面暴露")}
+    <div class="table-wrap"><table><thead><tr><th>时间</th><th>命令</th><th>状态</th><th>资源类型</th><th>写入</th></tr></thead><tbody>${data.receipts.map(item => `<tr><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(item.command_type)}</td><td>${businessBadge(item.status)}</td><td>${escapeHtml(item.resource_type)}</td><td>${item.actual_write ? "是" : "否"}</td></tr>`).join("")}</tbody></table></div>
+    <section class="panel"><h3 class="panel-title">操作审计 <span>${data.audits.length} 条</span></h3>${data.audits.slice(0,30).map(item => `<article class="live-event"><strong>${escapeHtml(item.command_type)} · ${escapeHtml(item.resource_type)}</strong><p>${escapeHtml(item.created_at)}</p>${originLabel(item.data_origin)}</article>`).join("")}</section>`;
+}
+
+function renderBusinessFacts(facts) {
+  return (facts || []).map(item => `<div><dt>${escapeHtml(item.label)}</dt><dd>${escapeHtml(item.value)}</dd></div>`).join("");
 }
 
 function sectionHeading(title, description, aside = "") {
@@ -660,15 +664,15 @@ function renderAgent2(data) {
     <div class="panel"><h3 class="panel-title">主体关系与案件线索 <span>人员、法院、回款、资产均保留案件和来源</span></h3>
       ${compactRows(data.party_case_clues, [["案件", "case_id"], ["主体", "party_id"], ["类型", "clue_type"], ["摘要", "summary"], ["金额", "amount"], ["来源", "source_type"]])}</div>
     <div class="panel"><h3 class="panel-title">出差协同与通知 <span>真实 transport receipt</span></h3>
-      ${compactRows(data.notifications, [["接收人", "recipient_user_id"], ["状态", "status"], ["重试", "retry_count"], ["外部消息 ID", "external_message_id"], ["错误", "error_message"]])}</div>
+      ${compactRows(data.notifications, [["状态", "status"], ["重试", "retry_count"], ["错误", "error_message"]])}</div>
     <div class="panel"><h3 class="panel-title">案件进展 <span>软删除、版本、来源</span></h3>
       ${compactRows(data.case_progress, [["案件", "case_id"], ["摘要", "summary"], ["来源", "content_origin"], ["版本", "version"], ["记录人", "reporter_id"]])}</div>
     <div class="panel"><h3 class="panel-title">周报 / 月报 <span>真实 PostgreSQL · 每次更新返回完整快照</span></h3>
       ${compactRows(data.periodic_reports, [["类型", "report_type"], ["周期", "period_key"], ["状态", "status"], ["版本", "version"], ["填报人", "owner_user_id"], ["来源", "data_origin"]])}</div>
     <div class="panel"><h3 class="panel-title">命令回执 <span>每个动作独立结果</span></h3>
-      ${compactRows(data.receipts, [["回执 ID", "receipt_id"], ["命令", "command_type"], ["状态", "status"], ["来源消息", "source_message_id"], ["资源", "resource_type"], ["实际写入", "actual_write"], ["失败/原因", "failed_stage"]])}</div>
+      ${compactRows(data.receipts, [["命令", "command_type"], ["状态", "status"], ["资源类型", "resource_type"], ["实际写入", "actual_write"], ["失败阶段", "failed_stage"]])}</div>
     <div class="panel"><h3 class="panel-title">审计记录 <span>操作人、来源消息与资源可追溯</span></h3>
-      ${compactRows(data.audits, [["审计 ID", "audit_id"], ["回执 ID", "receipt_id"], ["命令", "command_type"], ["操作人", "actor_user_id"], ["来源消息", "source_message_id"], ["资源", "resource_type"]])}</div>`;
+      ${compactRows(data.audits, [["命令", "command_type"], ["资源类型", "resource_type"], ["数据来源", "data_origin"], ["时间", "created_at"]])}</div>`;
 }
 
 async function showPhase2Case(caseId) {
@@ -695,7 +699,7 @@ function renderPhase2Case(data) {
       <button type="button" data-case-section-target="case-report-projection">日报投影</button>
       <button type="button" data-case-section-target="case-followup">主动追问</button>
     </nav>
-    <section class="panel" id="case-overview"><h3 class="panel-title">案件概览</h3><div class="followup-status-grid"><div><span>当前节点</span><strong>${escapeHtml(data.current_node)}</strong></div><div><span>当前状态</span><strong>${escapeHtml(data.current_status)}</strong></div><div><span>开庭准备</span><strong>${escapeHtml(data.hearing_readiness)}</strong></div><div><span>风险等级</span><strong>${escapeHtml(data.risk_level)}</strong></div><div><span>数据来源</span><strong>${escapeHtml(data.source)}</strong></div><div><span>下一步计划</span><strong>${escapeHtml(data.next_plan.join("；") || "暂未记录")}</strong></div></div></section>
+    <section class="panel" id="case-overview"><h3 class="panel-title">案件概览</h3><div class="followup-status-grid"><div><span>当前节点</span><strong>${escapeHtml(data.current_node)}</strong></div><div><span>当前状态</span><strong>${escapeHtml(data.current_status)}</strong></div><div><span>开庭准备</span><strong>${escapeHtml(data.hearing_readiness)}</strong></div><div><span>数据来源</span><strong>${escapeHtml(data.source)}</strong></div><div><span>下一步计划</span><strong>${escapeHtml(data.next_plan.join("；") || "暂未记录")}</strong></div>${renderBusinessFacts(data.business_facts)}</div></section>
     <section class="panel" id="case-lifecycle"><h3 class="panel-title">案件生命周期</h3><div class="product-lifecycle">${data.lifecycle.map(item => `<div class="${escapeHtml(item.state)}"><span></span><strong>${escapeHtml(item.label)}</strong><small>${item.state === "completed" ? "已到达" : item.state === "current" ? "当前阶段" : "尚未到达"}</small></div>`).join("")}</div></section>
     <section class="panel" id="case-progress"><h3 class="panel-title">案件进展</h3>${progressForm}${progress}</section>
     <section class="panel" id="case-parties"><h3 class="panel-title">当事人与案件线索</h3><div class="grid-2"><ul class="detail-list">${parties}</ul><ul class="detail-list">${clues}</ul></div></section>
@@ -719,8 +723,15 @@ function activateCaseSection(button) {
 function renderProductFollowupManagement(data) {
   if (!data.can_manage_followup || !data.management) return '<p class="muted">追问策略由管理员在权限范围内配置。</p>';
   const management = data.management;
+  const capability = data.followup?.capability || {};
   const options = [["daily", "每天一次"], ["weekly", "每周一次"], ["every_15_days", "每 15 天一次"], ["monthly", "每月一次"], ["event_only", "仅关键节点"], ["manual_only", "仅人工追问"], ["paused", "暂停"], ["disabled", "关闭"]];
-  return `<form class="followup-policy-form" data-case-id="${escapeHtml(management.case_ref)}" data-owner-id="${escapeHtml(management.owner_ref)}" data-version="${management.expected_version}"><label>追问频率<select name="cadence_type">${options.map(([value, label]) => `<option value="${value}" ${management.cadence_type === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label>自定义间隔（天）<input name="custom_interval_days" type="number" min="1" max="365" /></label><label class="followup-check"><input name="enabled" type="checkbox" ${management.enabled ? "checked" : ""} />启用主动追问</label><label class="followup-check"><input name="hearing_reminders_enabled" type="checkbox" ${management.hearing_reminders_enabled ? "checked" : ""} />开庭提醒</label><label class="followup-check"><input name="stage_transition_enabled" type="checkbox" ${management.stage_transition_enabled ? "checked" : ""} />阶段转换提醒</label><label class="followup-check"><input name="node_transition_enabled" type="checkbox" ${management.node_transition_enabled ? "checked" : ""} />关键节点提醒</label><button type="submit" class="primary-button">保存追问策略</button><button type="button" data-trigger-followup-now data-case-id="${escapeHtml(management.case_ref)}" data-owner-id="${escapeHtml(management.owner_ref)}">立即追问一次</button></form>`;
+  const sendNotice = capability.message_delivery === "已开启"
+    ? '<p class="muted">任务创建后会进入发送流程，最终状态以消息回执为准。</p>'
+    : '<p class="muted">当前仅生成追问任务，钉钉发送未开启。</p>';
+  const triggerButton = capability.can_trigger_task
+    ? `<button type="button" data-trigger-followup-now data-case-id="${escapeHtml(management.case_ref)}" data-owner-id="${escapeHtml(management.owner_ref)}">${capability.message_delivery === "已开启" ? "创建追问任务并进入发送流程" : "创建追问任务（暂不发送）"}</button>`
+    : '<button type="button" disabled>追问任务功能未开启</button>';
+  return `${sendNotice}<form class="followup-policy-form" data-case-id="${escapeHtml(management.case_ref)}" data-owner-id="${escapeHtml(management.owner_ref)}" data-version="${management.expected_version}"><label>追问频率<select name="cadence_type">${options.map(([value, label]) => `<option value="${value}" ${management.cadence_type === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label>自定义间隔（天）<input name="custom_interval_days" type="number" min="1" max="365" /></label><label class="followup-check"><input name="enabled" type="checkbox" ${management.enabled ? "checked" : ""} />启用追问策略</label><label class="followup-check"><input name="hearing_reminders_enabled" type="checkbox" ${management.hearing_reminders_enabled ? "checked" : ""} />开庭提醒</label><label class="followup-check"><input name="stage_transition_enabled" type="checkbox" ${management.stage_transition_enabled ? "checked" : ""} />阶段转换提醒</label><label class="followup-check"><input name="node_transition_enabled" type="checkbox" ${management.node_transition_enabled ? "checked" : ""} />关键节点提醒</label><button type="submit" class="primary-button">保存追问策略</button>${triggerButton}</form>`;
 }
 
 function renderCaseFollowupConfiguration(data) {
@@ -760,7 +771,7 @@ function renderCaseFollowupConfiguration(data) {
       <label class="followup-check"><input name="stage_transition_enabled" type="checkbox" ${policy.stage_transition_enabled !== false ? "checked" : ""} />阶段转换提醒</label>
       <label class="followup-check"><input name="node_transition_enabled" type="checkbox" ${policy.node_transition_enabled !== false ? "checked" : ""} />关键节点提醒</label>
       <button type="submit" class="primary-button">保存单案策略</button>
-      <button type="button" data-trigger-followup-now data-case-id="${escapeHtml(data.case.case_id)}" data-owner-id="${escapeHtml(data.case.owner_user_id)}">立即追问一次</button>
+      <button type="button" data-trigger-followup-now data-case-id="${escapeHtml(data.case.case_id)}" data-owner-id="${escapeHtml(data.case.owner_user_id)}">创建追问任务（发送状态以回执为准）</button>
     </form>
     <details class="followup-history"><summary>查看追问历史（${(data.history || []).length}）</summary>${history}</details>
   </section>`;

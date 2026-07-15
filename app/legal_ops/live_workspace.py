@@ -22,6 +22,28 @@ from app.legal_ops.business_labels import (
 )
 
 
+def _case_business_facts(case: dict[str, Any]) -> list[dict[str, str]]:
+    """Expose only business fields that are actually present in the source record."""
+    source = case.get("source_json")
+    if not isinstance(source, dict):
+        source = {}
+    field_candidates = (
+        ("案由", ("cause", "cause_of_action")),
+        ("法院 / 仲裁", ("court", "court_name", "tribunal")),
+        ("开庭时间", ("hearing_at", "hearing_date")),
+        ("风险等级", ("risk_level",)),
+    )
+    facts: list[dict[str, str]] = []
+    for label, keys in field_candidates:
+        value = next(
+            (str(source[key]).strip() for key in keys if source.get(key) not in (None, "")),
+            "",
+        )
+        if value:
+            facts.append({"label": label, "value": value})
+    return facts
+
+
 def project_case_workspace(
     read_model: dict[str, Any],
     *,
@@ -140,10 +162,7 @@ def project_case_workspace(
                 "next_plan": "；".join(
                     str(value) for value in lifecycle.get("next_actions_json") or []
                 ) or "暂未记录",
-                "hearing_date": "暂未记录",
-                "risk_level": "暂未评估",
-                "court": "暂未记录",
-                "cause": "暂未记录",
+                "business_facts": _case_business_facts(item),
                 "followup_policy": cadence_labels.get(
                     str(policy.get("cadence_type") or ""), "暂未配置"
                 ),
@@ -211,6 +230,9 @@ def project_case_detail(
     editable_actor_user_id: str = "",
     writable_case_ids: tuple[str, ...] | None = None,
     permission_mode: str = "",
+    followup_enabled: bool = False,
+    followup_send_enabled: bool = False,
+    report_projection_enabled: bool = False,
 ) -> dict[str, Any]:
     case = detail.get("case") or {}
     case_type = str(case.get("case_type") or "")
@@ -363,12 +385,12 @@ def project_case_detail(
         ),
         "can_add_progress": can_add_progress,
         "source": source_label(str(case.get("source_type") or "")),
+        "business_facts": _case_business_facts(case),
         "lifecycle": lifecycle,
         "current_node": str(lifecycle_state.get("node") or "暂未记录"),
         "current_status": str(lifecycle_state.get("current_status") or "暂未记录"),
         "next_plan": [str(item) for item in lifecycle_state.get("next_actions_json") or []],
         "hearing_readiness": str(lifecycle_state.get("hearing_readiness") or "暂未记录"),
-        "risk_level": "暂未评估",
         "parties": parties,
         "progress": progress,
         "audit": audit,
@@ -389,6 +411,12 @@ def project_case_detail(
             "last_message_status": travel_status_label(
                 str(latest_status.get("last_message_status") or "")
             ) if latest_status.get("last_message_status") else "暂无通知",
+            "capability": {
+                "task_generation": "已开启" if followup_enabled else "未开启",
+                "message_delivery": "已开启" if followup_send_enabled else "未开启",
+                "report_projection": "已开启" if report_projection_enabled else "未开启",
+                "can_trigger_task": bool(followup_enabled and can_manage_followup),
+            },
         },
         "can_manage_followup": can_manage_followup,
     }
@@ -588,7 +616,12 @@ def project_team_center(
             }
         )
     return {
-        "team_name": "Agent2 灰测法务团队",
+        "team_name": "当前授权团队",
+        "identity_mapping": {
+            "source": "Agent2 身份绑定表",
+            "scope": "当前租户与当前团队",
+            "status": "服务器实时映射",
+        },
         "summary": {
             "members": len(member_rows),
             "cases": len(cases),
@@ -887,6 +920,9 @@ async def load_case_detail_workspace(
     editable_actor_user_id: str = "",
     writable_case_ids: tuple[str, ...] | None = None,
     permission_mode: str = "",
+    followup_enabled: bool = False,
+    followup_send_enabled: bool = False,
+    report_projection_enabled: bool = False,
 ) -> dict[str, Any]:
     from app.legal_ops.phase2_read import (
         load_case_followup_configuration,
@@ -923,6 +959,9 @@ async def load_case_detail_workspace(
         editable_actor_user_id=editable_actor_user_id,
         writable_case_ids=writable_case_ids,
         permission_mode=permission_mode,
+        followup_enabled=followup_enabled,
+        followup_send_enabled=followup_send_enabled,
+        report_projection_enabled=report_projection_enabled,
     )
 
 
