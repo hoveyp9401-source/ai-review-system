@@ -51,6 +51,12 @@ def test_product_shell_uses_chinese_and_never_renders_raw_transport_identifiers(
     assert "external_message_id=" not in script
     assert '["外部消息 ID", "external_message_id"]' not in script
     assert "source_message_id" not in script
+    assert "<title>法务业务中台</title>" in page
+    assert "PARTY KNOWLEDGE" not in script
+    assert "LIVE READ MODEL" not in script
+    assert 'name="risk_level"' not in script
+    assert "auditCommandLabel(item.command_type)" in script
+    assert "auditResourceLabel(item.resource_type)" in script
 
 
 def test_business_statuses_are_rendered_through_one_closed_chinese_dictionary():
@@ -623,4 +629,4 @@ def test_live_product_ui_wires_case_progress_and_report_mutations_to_workspace_e
     assert "data-case-section-target" in script
     assert "activateCaseSection" in script
     assert '<span>概览</span>' not in script
-    assert "<title>Legal Ops 法务业务中台</title>" in page
+    assert "<title>法务业务中台</title>" in page

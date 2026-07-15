@@ -295,10 +295,51 @@ function originLabel(value) {
   return `<span class="origin-chip ${escapeHtml(value)}">${escapeHtml(labels[value] || value || "来源未标记")}</span>`;
 }
 
+function auditCommandLabel(value) {
+  const labels = {
+    CreateCaseProgress: "新增案件进展",
+    UpdateCaseProgress: "修改案件进展",
+    DeleteCaseProgress: "删除案件进展",
+    create_case_progress: "新增案件进展",
+    update_case_progress: "修改案件进展",
+    delete_case_progress: "删除案件进展",
+    CreateTravelIntent: "登记出差",
+    UpdateTravelIntent: "更新出差",
+    UpdateCaseFollowupPolicy: "修改追问策略",
+    TriggerCaseFollowupNow: "创建追问任务",
+  };
+  return labels[value] || "其他业务操作";
+}
+
+function auditResourceLabel(value) {
+  const labels = {
+    case_progress: "案件进展",
+    case: "案件",
+    travel_intent: "出差登记",
+    collaboration_candidate: "协同候选",
+    notification: "通知",
+    report: "报告",
+    case_followup_policy: "追问策略",
+    case_followup_task: "追问任务",
+  };
+  return labels[value] || "其他业务对象";
+}
+
+function auditStatusLabel(value) {
+  const labels = {
+    executed: "已执行",
+    duplicate: "重复请求（未重复写入）",
+    blocked: "已阻断",
+    failed: "失败",
+    pending: "待处理",
+  };
+  return labels[value] || "状态异常";
+}
+
 function renderLiveOverview(data) {
   const summary = data.summary;
-  content.innerHTML = `${sectionHeading("Sandbox Agent2 实时数据", "直接读取服务器 PostgreSQL；Smoke、Fixture 与真实用户消息分别标记")}
-    <div class="live-mode-banner"><strong>LIVE READ MODEL</strong><span>tenant=${escapeHtml(data.tenant_id)}</span>${businessBadge(data.route_control?.route_mode || "未配置路由")}</div>
+  content.innerHTML = `${sectionHeading("Agent2 灰测实时数据", "直接读取服务器数据库；验收数据、演示数据与真实用户消息分别标记")}
+    <div class="live-mode-banner"><strong>服务器实时读模型</strong>${businessBadge(data.route_control?.route_mode || "未配置路由")}</div>
     <div class="cards">${[
       ["主体", summary.parties], ["案件", summary.cases], ["案件进展", summary.case_progress],
       ["出差登记", summary.travel_intents], ["协同候选", summary.collaboration_candidates],
@@ -320,7 +361,7 @@ function renderLiveParties(data) {
 async function showLiveParty(partyId) {
   const data = await api(`phase2/parties/${encodeURIComponent(partyId)}`);
   const party = data.party;
-  openDrawer(`<div class="case-header"><p class="eyebrow">PARTY KNOWLEDGE</p><h2>${escapeHtml(party.canonical_name)}</h2><p>${escapeHtml(party.party_type)} · ${escapeHtml(party.data_quality)}</p>${originLabel(party.data_origin)}</div>
+  openDrawer(`<div class="case-header"><p class="eyebrow">主体知识库</p><h2>${escapeHtml(party.canonical_name)}</h2><p>${escapeHtml(party.party_type)} · ${escapeHtml(party.data_quality)}</p>${originLabel(party.data_origin)}</div>
     <div class="grid-2"><section class="panel"><h3 class="panel-title">别名</h3>${data.aliases.map(item => `<p>${escapeHtml(item.alias)} ${originLabel(item.data_origin)}</p>`).join("") || '<p>无</p>'}</section><section class="panel"><h3 class="panel-title">标识符</h3>${data.identifiers.map(item => `<p>${escapeHtml(item.identifier_type)}：<code>${escapeHtml(item.identifier_value)}</code></p>`).join("") || '<p>无</p>'}</section></div>
     <section class="panel"><h3 class="panel-title">案件角色</h3>${data.case_roles.map(item => `<button class="command-case" data-phase2-case="${escapeHtml(item.case.case_id)}"><strong>${escapeHtml(item.case.case_name)}</strong><span>${escapeHtml(item.role.role_type)} · ${escapeHtml(item.case.case_number)}</span><em>进入案件 →</em></button>`).join("") || '<p>无可见案件</p>'}</section>
     <section class="panel"><h3 class="panel-title">关系、合并候选与冲突</h3><p>主体关系 ${data.relations.length} 条 · 合并候选 ${data.merge_candidates.length} 条 · 冲突 ${data.conflicts.length} 条</p>${data.conflicts.map(item => `<p><strong>${escapeHtml(item.field_name)}</strong> · ${escapeHtml(item.status)}</p>`).join("")}</section>
@@ -346,7 +387,6 @@ function renderBulkFollowupPanel(data) {
       <label>案件角色<select name="case_type"><option value="">全部</option><option value="plaintiff">原告</option><option value="defendant">被告</option></select></label>
       <label>负责人<select name="assigned_user_id"><option value="">全部</option>${owners.map(([id, name]) => `<option value="${escapeHtml(id)}">${escapeHtml(name)}</option>`).join("")}</select></label>
       <label>一级阶段<input name="stage" placeholder="如：诉讼中、开庭" /></label>
-      <label>风险等级<select name="risk_level"><option value="">全部</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label>
       <label>目标频率<select name="cadence_type"><option value="daily">每天</option><option value="weekly" selected>每周</option><option value="every_15_days">每 15 天</option><option value="monthly">每月</option><option value="event_only">仅关键节点</option><option value="manual_only">仅人工追问</option><option value="paused">暂停</option><option value="disabled">关闭</option></select></label>
       <label class="followup-check"><input name="enabled" type="checkbox" checked />启用策略</label>
       <label class="followup-check"><input name="force_manual_override" type="checkbox" />强制覆盖单案人工例外</label>
@@ -366,8 +406,8 @@ function renderLiveTravel(data) {
 
 function renderLiveAudit(data) {
   content.innerHTML = `${sectionHeading("审计证据", "展示业务操作、执行状态和写入结果；内部消息与数据库编号不在页面暴露")}
-    <div class="table-wrap"><table><thead><tr><th>时间</th><th>命令</th><th>状态</th><th>资源类型</th><th>写入</th></tr></thead><tbody>${data.receipts.map(item => `<tr><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(item.command_type)}</td><td>${businessBadge(item.status)}</td><td>${escapeHtml(item.resource_type)}</td><td>${item.actual_write ? "是" : "否"}</td></tr>`).join("")}</tbody></table></div>
-    <section class="panel"><h3 class="panel-title">操作审计 <span>${data.audits.length} 条</span></h3>${data.audits.slice(0,30).map(item => `<article class="live-event"><strong>${escapeHtml(item.command_type)} · ${escapeHtml(item.resource_type)}</strong><p>${escapeHtml(item.created_at)}</p>${originLabel(item.data_origin)}</article>`).join("")}</section>`;
+    <div class="table-wrap"><table><thead><tr><th>时间</th><th>命令</th><th>状态</th><th>资源类型</th><th>写入</th></tr></thead><tbody>${data.receipts.map(item => `<tr><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(auditCommandLabel(item.command_type))}</td><td>${businessBadge(auditStatusLabel(item.status))}</td><td>${escapeHtml(auditResourceLabel(item.resource_type))}</td><td>${item.actual_write ? "是" : "否"}</td></tr>`).join("")}</tbody></table></div>
+    <section class="panel"><h3 class="panel-title">操作审计 <span>${data.audits.length} 条</span></h3>${data.audits.slice(0,30).map(item => `<article class="live-event"><strong>${escapeHtml(auditCommandLabel(item.command_type))} · ${escapeHtml(auditResourceLabel(item.resource_type))}</strong><p>${escapeHtml(item.created_at)}</p>${originLabel(item.data_origin)}</article>`).join("")}</section>`;
 }
 
 function renderBusinessFacts(facts) {
