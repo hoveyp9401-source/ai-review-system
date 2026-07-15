@@ -3676,6 +3676,8 @@ def _looks_like_direct_current_report_edit_instruction(raw_input: str, existing:
         return False
     if _looks_like_current_report_edit_entry_request(raw_input) or _looks_like_previous_report_edit_entry_request(raw_input):
         return False
+    if _looks_like_report_merge_instruction(compact):
+        return False
     if any(
         marker in compact
         for marker in ("\u53d1\u6211\u770b", "\u770b\u4e0b", "\u770b\u770b", "\u67e5\u8be2", "\u67e5\u4e0b", "\u786e\u8ba4\u63d0\u4ea4")
@@ -3685,6 +3687,26 @@ def _looks_like_direct_current_report_edit_instruction(raw_input: str, existing:
     replace_markers = ("\u6539\u6210", "\u6539\u4e3a", "\u6362\u6210", "\u66ff\u6362", "\u4fee\u6539\u4e3a", "\u66f4\u6b63\u4e3a")
     spelling_marker = "\u6539\u4e00\u4e0b" in compact and bool(re.search(r"\u662f.{1,12}\u7684.", raw_input))
     return any(marker in compact for marker in delete_markers) or any(marker in compact for marker in replace_markers) or spelling_marker
+
+
+def _looks_like_report_merge_instruction(compact: str) -> bool:
+    return any(
+        marker in compact
+        for marker in (
+            "合并",
+            "合到一起",
+            "合成一条",
+            "合成一个",
+            "并成一条",
+            "同一条",
+            "同一项",
+            "一回事",
+            "一件事",
+            "不要拆这么碎",
+            "别拆这么碎",
+            "拆得太碎",
+        )
+    )
 
 
 def _build_current_report_edit_pending(
@@ -4759,10 +4781,13 @@ def _is_previous_report_blocked_by_cutoff(raw_input: str, default_report_date: d
 
 def _default_report_date_for_received_at(received_at: datetime) -> date:
     current_date = received_at.date()
-    if _within_previous_report_cutoff(received_at):
+    # A normal weekday message always starts from the calendar day's report.
+    # The before-09:00 window only authorizes an *explicit* previous-day
+    # operation; it must not silently make yesterday the default.  Saturday is
+    # the sole defaulting exception because Friday is the last reporting day
+    # and Saturday itself has no required report.
+    if current_date.weekday() == 5 and _within_previous_report_cutoff(received_at):
         return _previous_reporting_date(current_date)
-    if _reporting_required_on(current_date):
-        return current_date
     return current_date
 
 
@@ -4814,8 +4839,6 @@ def _looks_like_current_report_content(raw_input: str) -> bool:
     compact = _compact_for_intent(raw_input)
     if not compact:
         return False
-    if _looks_like_previous_report_content_input(raw_input):
-        return False
     if _looks_like_current_report_lock_reply(raw_input):
         return True
     has_current_marker = any(marker in compact for marker in ("今天", "今日", "本日", "当前"))
@@ -4848,6 +4871,8 @@ def _looks_like_current_report_content(raw_input: str) -> bool:
     )
     if any(marker in compact for marker in content_markers):
         return True
+    if _looks_like_previous_report_content_input(raw_input):
+        return False
     return len(compact) > 120 and compact.startswith(("今天", "今日", "本日"))
 
 
@@ -10532,7 +10557,7 @@ def _direct_plan_slot_answer_plan(raw_input: str, existing: DailyReport | None) 
         return None
     if _looks_like_full_report_input(raw_input):
         return None
-    if _is_probable_noise_input(raw_input):
+    if _is_probable_noise_input(raw_input) or _is_non_report_phrase(raw_input):
         return None
     compact = _compact_for_intent(raw_input)
     if not compact:
@@ -10593,6 +10618,11 @@ def _direct_tomorrow_plan_phrase_plan(raw_input: str, existing: DailyReport | No
     if _looks_like_full_report_input(raw_input) or _is_probable_noise_input(raw_input):
         return None
     compact = _compact_for_intent(raw_input)
+    # A sentence that also carries an explicit current-day fact is a
+    # multi-section turn. Treating the whole sentence as one future plan loses
+    # today's work and can drag historical reference text into tomorrow_plan.
+    if any(marker in compact for marker in ("\u4eca\u5929", "\u4eca\u65e5", "\u672c\u65e5", "\u5f53\u524d")):
+        return None
     if not any(marker in compact for marker in ("明天", "明日", "明儿", "后天", "下周")):
         return None
     if any(marker in compact for marker in ("不是明天", "不用明天", "取消明天", "删除", "删掉", "清空", "改成", "修改")):

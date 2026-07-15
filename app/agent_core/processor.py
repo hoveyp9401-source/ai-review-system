@@ -107,6 +107,11 @@ def process_agent_turn(
     routing = (router or WorkflowRouter()).plan(envelope)
     coordination = compile_coordination_plan(envelope, routing_plan=routing)
     daily_commands = compile_daily_commands(routing, envelope, coordination_plan=coordination)
+    daily_commands = _preserve_direct_daily_fact_text(
+        envelope=envelope,
+        coordination=coordination,
+        commands=daily_commands,
+    )
     monthly_commands = _compile_monthly_commands(routing, envelope)
     authorization_policy = build_execution_policy(
         turn_id=_turn_id(envelope),
@@ -185,6 +190,46 @@ def process_agent_turn(
     records = build_persistable_operation_records(result)
     operation_ledger_store.upsert_many(records)
     return replace(result, persisted_operation_records=records)
+
+
+def _preserve_direct_daily_fact_text(
+    *,
+    envelope: IncomingMessageEnvelope,
+    coordination: CoordinationPlan,
+    commands: list[DailyCommand],
+) -> list[DailyCommand]:
+    """Keep a direct, whole-turn business fact byte-for-byte at the core boundary.
+
+    The shared daily compiler also serves conversational cleanup flows.  That
+    cleanup may remove date anchors such as ``today`` or ``tomorrow``.  Agent
+    Core operation records are replay/audit facts, so a whole-turn daily action
+    must retain the exact user-visible fact instead of inheriting presentation
+    cleanup.  Extracted fragments from multi-intent turns deliberately keep the
+    compiler result because their action payload is not the complete turn.
+    """
+
+    raw_text = str(envelope.raw_text or "").strip()
+    if not raw_text or len(commands) != 1:
+        return commands
+    daily_actions = [
+        action
+        for action in coordination.actions
+        if action.action_type == ACTION_DAILY_ENTRY
+    ]
+    if len(daily_actions) != 1:
+        return commands
+    action = daily_actions[0]
+    action_content = str(action.payload.get("content") or "").strip()
+    command = commands[0]
+    if (
+        command.operation != "fill"
+        or not command.should_write
+        or action_content != raw_text
+        or action.source_text_chars != len(raw_text)
+        or command.raw_text_hash != action.source_text_hash
+    ):
+        return commands
+    return [replace(command, content=[raw_text])]
 
 
 def _compile_monthly_commands(routing: RoutingPlan, envelope: IncomingMessageEnvelope) -> list[MonthlyCommand]:

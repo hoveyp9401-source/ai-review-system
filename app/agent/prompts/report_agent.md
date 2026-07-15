@@ -130,7 +130,7 @@ JSON schema:
   "should_write": true,
   "actions": [
     {
-      "type": "append_items | replace_field | replace_text | move_item | delete_item | clear_field | clear_all | submit_report | query_history | restore_snapshot | polish_items | ask_clarification | no_op | load_reference_report | complete_previous_plan_item | complete_all_previous_plan_items | rollover_previous_plan_items | update_historical_report",
+      "type": "append_items | replace_field | replace_text | move_item | delete_item | clear_field | clear_all | submit_report | unsubmit_report | query_history | restore_snapshot | polish_items | ask_clarification | no_op | load_reference_report | complete_previous_plan_item | complete_all_previous_plan_items | rollover_previous_plan_items | update_historical_report",
       "field": "today_work | problems | tomorrow_plan | meta_notes | none",
       "items": ["整理后的内容"],
       "source_field": "today_work | problems | tomorrow_plan | meta_notes | none",

@@ -2993,6 +2993,21 @@ def _actions_from_pending_confirmation(pending: PendingInteractionPlan) -> list[
     return []
 
 
+def _clean_indices(value: Any) -> list[int]:
+    """Normalize persisted pending indices without guessing missing targets."""
+
+    candidates = value if isinstance(value, list) else [value]
+    result: list[int] = []
+    for item in candidates:
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if number >= 0:
+            result.append(number)
+    return result
+
+
 def _fill_pending_action_target(action: AgentAction, pending: PendingInteractionPlan, context: dict[str, Any]) -> AgentAction:
     payload = action.model_dump()
     if action.type == "delete_item":
@@ -3105,7 +3120,18 @@ def _should_store_last_unwritten_candidate(plan: ActionPlan, raw_input: str) -> 
         return False
     if plan.intent not in {"fill_report", "edit_draft", "answer_current_slot", "supplement"}:
         return False
-    if any(action.type in {"query_history", "submit_report", "unsubmit_report"} for action in plan.actions):
+    if any(
+        action.type
+        in {
+            "query_history",
+            "submit_report",
+            "unsubmit_report",
+            "complete_previous_plan_item",
+            "complete_all_previous_plan_items",
+            "rollover_previous_plan_items",
+        }
+        for action in plan.actions
+    ):
         return False
     if _looks_like_control_only_reply(text) or _looks_like_current_report_query(text):
         return False

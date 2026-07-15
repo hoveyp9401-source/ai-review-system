@@ -457,11 +457,12 @@ def _looks_like_delete_request(raw_input: str) -> bool:
 
 
 def _can_use_pending_before_llm(branch: str) -> bool:
-    if branch.startswith("confirm_") or branch.startswith("cancel_"):
-        return True
-    if branch.startswith("pending_clarification_"):
-        return True
-    return branch in _PRE_LLM_PENDING_BRANCHES
+    # A StateResolution is already bound to the persisted pending object and
+    # produces a typed action plan.  Sending it back through the LLM can change
+    # the target, lose the pending lifecycle, or make a short confirmation
+    # non-deterministic.  Unknown pending *types* remain fail-closed inside the
+    # resolver by returning None; every concrete resolution is authoritative.
+    return bool(branch)
 
 
 def _can_use_error_fallback(plan: ActionPlan) -> bool:

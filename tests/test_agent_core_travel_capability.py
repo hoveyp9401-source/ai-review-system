@@ -59,7 +59,10 @@ def test_process_agent_turn_creates_daily_plan_and_travel_candidate():
         daily_snapshot=DailySnapshot(),
     )
 
-    assert result.daily_after.tomorrow_plan == ["去南京出差"]
+    # Agent Core operation/replay facts preserve the user's complete direct
+    # statement.  Presentation adapters may hide a redundant time prefix, but
+    # the auditable business snapshot must retain it.
+    assert result.daily_after.tomorrow_plan == ["明天去南京出差"]
     assert result.travel_capability is not None
     assert len(result.travel_capability.plans) == 1
     plan = result.travel_capability.plans[0]
