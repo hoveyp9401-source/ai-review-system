@@ -67,9 +67,9 @@ so `TWO_USER_UI_CANARY_VALIDATED` is not justified.
 | Full repository | 2412 passed, 59 failed, 2 skipped |
 
 The final full-suite JUnit is
-`artifacts/agent2-release-baseline/p4/full-suite-ui-truth-final-20260715.xml`
+`artifacts/agent2-release-baseline/p4/full-suite-ui-truth-reviewed-20260715.xml`
 with SHA-256
-`179b4f1302d0e2d876223483f723f75f1c124536de3b26fd67b8d05f04fa25c4`.
+`c8f4dc2b1f884d398ecd08d7e1a5ee2830c15107fed1e71b4300065e0cb8e995`.
 The 59 failure identities exactly equal the frozen P1/P3 set: zero added and
 zero removed. They remain the previously adjudicated report-protocol blockers.
 
@@ -77,15 +77,15 @@ zero removed. They remain the previously adjudicated report-protocol blockers.
 
 | Evidence | Value |
 |---|---|
-| Final Git commit | `1a2d8926c47bef4e5ce17b2ab27886ab414b0e71` |
+| Final Git commit | `0091e27b050ea52df2f2b44c555c409870d6b275` |
 | Core UI-truth commit | `89eb32a9e10f9267e5f6305c1da5730a516a7d16` |
 | Core package SHA-256 | `76d9d22f0cd2aa4f0b17d598a540e312b6b6a19aca33c1b47c98581c324b309d` |
-| Final localization package SHA-256 | `15fa2422ab482073c4ede9402caf27ca3159f1c2a44ba74450b300c76ac96d92` |
+| Final reviewed package SHA-256 | `59a0978282202d99c965dc0949e0066f94f522ddff46e2634cefb3d6782ed56a` |
 | Core deploy directory | `/home/ai_review_tunnel/deployments/agent2-p4-ui-truth-20260715T165825` |
-| Final deploy directory | `/home/ai_review_tunnel/deployments/agent2-p4-ui-truth-final-20260715T170704` |
+| Final deploy directory | `/home/ai_review_tunnel/deployments/agent2-p4-ui-truth-reviewed-20260715T171429` |
 | Core rollback archive SHA-256 | `5d3ff6ed5c337e3e400a6b59455e40737fc0db6cd24d6a67460ded76da2a2428` |
-| Final rollback archive SHA-256 | `ad15e35a51b23e98e80b461d4acce85dfb3605627d75ac9be285e2b66485c7ac` |
-| API / Stream / Scheduler PIDs | `3564906` / `3564902` / `3564907` |
+| Final rollback archive SHA-256 | `acdc58155de59ee38a4c88feade91b081504908cba62d1df110b1db99e2c795d` |
+| API / Stream / Scheduler PIDs | `3566788` / `3566786` / `3566789` |
 | Public page | `http://124.221.205.13:8000/legal-ops/` returned 200 |
 
 Current deployed file hashes:
@@ -94,12 +94,12 @@ Current deployed file hashes:
 |---|---|
 | `app/legal_ops/api.py` | `a13eb4879f1781748ca3bef005108f851108e6d461051409f2b31027ac57ede4` |
 | `app/legal_ops/live_workspace.py` | `002ebb0d8d271d8a3690e74f24b75c48dc534a92918c8fe6ae42276556011d9a` |
-| `app/legal_ops/static/app.js` | `1b6f81e644718fe247b4d08c1be5bfcc91e5b71b9f7eddd748f53b23f2df47b2` |
-| `app/legal_ops/static/index.html` | `1d379e9d972f874af909d98021fd4732ee2666d85bf4c6054a720fa27218dc95` |
+| `app/legal_ops/static/app.js` | `e825a01fb29baa1863c0bbf304519d45ab9a162ddfccdac68cb5e3a11d9dd41c` |
+| `app/legal_ops/static/index.html` | `7234285844a61240034d803eea89dc98acb859bd36f8950b00d8c9ebeceeddbb` |
 
-To roll back all P4 changes, restore the final rollback archive first and the
-core rollback archive second, then run the supervised production restart
-script. Both archives were created before their corresponding install.
+To roll back all P4 changes, restore each P4 rollback archive in reverse deploy
+order, ending with the core rollback archive, then run the supervised production
+restart script. Every archive was created before its corresponding install.
 
 ## Credential and permission smoke
 
@@ -124,4 +124,3 @@ returned 401.
   unavailable.
 - The P3 real-conversation and report-protocol blockers remain unchanged.
 - Follow-up real send and automatic report projection remain off.
-
