@@ -1,0 +1,52 @@
+{
+  "schema_version": "agent2_release_baseline_p4_ui_decision.v1",
+  "generated_at": "2026-07-15T17:12:00+08:00",
+  "decision": "READY_FOR_TWO_USER_UI_CANARY",
+  "overall_release_decision": "SHADOW_ONLY",
+  "two_user_ui_human_validated": false,
+  "git_commit": "1a2d8926c47bef4e5ce17b2ab27886ab414b0e71",
+  "runtime": {
+    "health": "ok",
+    "public_page_status": 200,
+    "api_instances": 1,
+    "stream_instances": 1,
+    "scheduler_instances": 1,
+    "case_followup_enabled": true,
+    "case_followup_send_enabled": false,
+    "case_followup_report_projection_enabled": false
+  },
+  "data": {
+    "visible_real_source_cases": 80,
+    "hidden_fixture_cases": 3,
+    "identity_bindings": 2,
+    "credential_principals": 3,
+    "case_owner_principals": 2,
+    "visible_travel_rows": 5,
+    "unsupported_case_fact_placeholders_removed": true,
+    "raw_identifiers_rendered": false
+  },
+  "tests": {
+    "legal_ops_focused_passed": 58,
+    "server_product_ui_passed": 15,
+    "full_passed": 2412,
+    "full_failed": 59,
+    "full_skipped": 2,
+    "failure_identity_delta_from_frozen_baseline": 0,
+    "junit_sha256": "179b4f1302d0e2d876223483f723f75f1c124536de3b26fd67b8d05f04fa25c4"
+  },
+  "deployment": {
+    "core_directory": "/home/ai_review_tunnel/deployments/agent2-p4-ui-truth-20260715T165825",
+    "final_directory": "/home/ai_review_tunnel/deployments/agent2-p4-ui-truth-final-20260715T170704",
+    "core_package_sha256": "76d9d22f0cd2aa4f0b17d598a540e312b6b6a19aca33c1b47c98581c324b309d",
+    "final_package_sha256": "15fa2422ab482073c4ede9402caf27ca3159f1c2a44ba74450b300c76ac96d92",
+    "core_rollback_sha256": "5d3ff6ed5c337e3e400a6b59455e40737fc0db6cd24d6a67460ded76da2a2428",
+    "final_rollback_sha256": "ad15e35a51b23e98e80b461d4acce85dfb3605627d75ac9be285e2b66485c7ac"
+  },
+  "blockers": [
+    "no post-deployment human browser closure for both users",
+    "overall P3 real-user acceptance remains SHADOW_ONLY",
+    "35 valid report-protocol blockers remain",
+    "proactive follow-up send is disabled",
+    "automatic report projection is disabled"
+  ]
+}
