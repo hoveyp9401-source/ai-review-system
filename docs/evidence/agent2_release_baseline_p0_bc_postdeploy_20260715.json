@@ -1,0 +1,66 @@
+{
+  "artifact_version": "agent2.release_baseline.p0_bc_postdeploy.v1",
+  "deployed_on": "2026-07-15",
+  "local_deployment_commit": "d10410fd39538a155df4ff3c3713de5b78614ee8",
+  "production_repository_head": "96cecec81c4ac9fe4e0500c08a52e661d094147d",
+  "deployment_model": "hash_verified_overlay_on_separate_production_history",
+  "database_migration": {
+    "status": "PASS",
+    "migration_sha256": "e92991500e848a5121567bfee2e67151273b36e8b4ccb1f1db24e7fce20db464",
+    "receipt_sha256": "440dbff71fad39548f110c3aee940839253d07a40fe6cb4a5e7bcbee9965b972",
+    "claim_rows": 2128,
+    "orphaned_claims": 0,
+    "unclaimed_webhook_events": 0
+  },
+  "postgres_gates": {
+    "isolated_migration_gate": {
+      "status": "PASS",
+      "artifact_sha256": "0f8ec7d69674386043d17d29afefd6e76471d88d04cb0d66940a3129d9e3911b"
+    },
+    "repository_rollback_smoke": {
+      "status": "PASS",
+      "artifact_sha256": "3cf824d22619cbab99430422a8c92c2149746bc93d0c4bcad37c0c8aaf5efd39",
+      "first_inserted": true,
+      "cross_transport_replay_inserted": false,
+      "same_event": true,
+      "committed_claims": 0,
+      "committed_events": 0,
+      "business_write_committed": false
+    }
+  },
+  "runtime": {
+    "api_active": true,
+    "stream_active": true,
+    "scheduler_active": true,
+    "api_main_pid": 3510966,
+    "stream_main_pid": 3510969,
+    "scheduler_main_pid": 3510970,
+    "health_status": "ok",
+    "legal_ops_http_status": 200,
+    "startup_warning_or_error_count": 0,
+    "deployed_runtime_hash_manifest_sha256": "3c1c945fdbf564b66394b869ec5e00accccc9567a722e49f6fb17db61b5516ea"
+  },
+  "postdeploy_read_only_audit": {
+    "artifact_sha256": "a64a3cd8bfb281c811dcb31ea696a996451faeff6c173f496a82b7a88e5bc8a5",
+    "webhook_events": 2128,
+    "business_actual_writes": 145,
+    "cross_transport_duplicate_groups": 0,
+    "repeated_business_write_groups": 0,
+    "route_control_audits": 104,
+    "scheduler_reminder_audit_rows": 0
+  },
+  "safety_switches": {
+    "semantic_admission_enabled": true,
+    "semantic_admission_enforced": false,
+    "semantic_admission_review_enabled": true,
+    "case_followup_enabled": true,
+    "case_followup_send_enabled": false,
+    "case_followup_report_projection_enabled": false,
+    "business_tenant_count": 1,
+    "semantic_user_count": 2,
+    "canary_user_count": 2
+  },
+  "verdict": "P0_BC_DEPLOYED_STRUCTURALLY_VALIDATED",
+  "real_user_acceptance": false,
+  "agent1_replacement": false
+}

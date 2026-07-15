@@ -372,6 +372,30 @@ async def collect_production_safety_snapshot() -> dict[str, Any]:
             "reminder_dry_run": bool(
                 getattr(settings, "reminder_dry_run", True)
             ),
+            "semantic_admission_enabled": bool(
+                getattr(settings, "agent2_semantic_admission_enabled", False)
+            ),
+            "semantic_admission_enforced": bool(
+                getattr(settings, "agent2_semantic_admission_enforce", False)
+            ),
+            "semantic_admission_review_enabled": bool(
+                getattr(settings, "agent2_semantic_admission_review_capture", False)
+            ),
+            "agent2_case_followup_enabled": bool(
+                getattr(settings, "agent2_case_followup_enabled", False)
+            ),
+            "agent2_case_followup_send_enabled": bool(
+                getattr(settings, "agent2_case_followup_send_enabled", False)
+            ),
+            "case_followup_enabled": bool(
+                getattr(settings, "case_followup_enabled", False)
+            ),
+            "case_followup_send_enabled": bool(
+                getattr(settings, "case_followup_send_enabled", False)
+            ),
+            "case_followup_report_projection_enabled": bool(
+                getattr(settings, "case_followup_report_projection_enabled", False)
+            ),
         },
         "tenants": tenant_rows,
     }
