@@ -204,26 +204,26 @@ async function loadLiveCases(page = 1) {
 function renderProductOverview(live, cases) {
   const summary = cases.summary;
   const overviewMetrics = [
-    ["权限内案件", summary.total, "cases"],
+    ["团队共享案件", summary.total, "cases"],
+    ["本人负责", summary.assigned_to_me, "cases"],
+    ["团队协作", summary.shared_with_me, "cases"],
     ["原告案件", summary.plaintiff, "cases:plaintiff_case"],
     ["被告案件", summary.defendant, "cases:defendant_case"],
-    ["暂无有效进展", summary.without_progress, "cases:missing_progress"],
     ["周报 / 月报", live.summary.periodic_reports, "reports"],
     ["出差登记", live.summary.travel_intents, "travel"],
-    ["协同候选", live.summary.collaboration_candidates, "travel"],
   ];
   if ((state.shell?.scope?.role_ids || []).some(role => ["tenant_admin", "system_admin"].includes(role))) overviewMetrics.push(["失败或阻断", live.summary.failures, "audit"]);
   content.innerHTML = `${sectionHeading("工作总览", "只展示当前登录人权限范围内的真实业务数据")}
     <div class="cards">${overviewMetrics.map(([label, value, route]) => `<article class="metric-card actionable-card"><span>${label}</span><strong>${value}<small> 条</small></strong><button data-overview-route="${route}">查看构成 →</button></article>`).join("")}</div>
     <div class="grid-2"><section class="panel"><h3 class="panel-title">案件阶段分布</h3>${Object.entries(summary.stage_distribution).map(([label, value]) => `<div class="bar-row"><span>${escapeHtml(label)}</span><div class="bar-track"><div class="bar" style="width:${Math.max(4, value / Math.max(summary.total, 1) * 100)}%"></div></div><strong>${value}</strong></div>`).join("") || '<div class="empty-state">暂无案件</div>'}</section>
-    <section class="panel"><h3 class="panel-title">数据说明</h3><p>案件、进展、报告、出差和通知均来自当前服务器 PostgreSQL。没有结构化字段的数据明确显示“暂未记录”或“暂未评估”。</p><button class="text-button" data-page="cases">查看案件工作台 →</button></section></div>`;
+    <section class="panel"><h3 class="panel-title">数据与权限说明</h3><p>案件、进展、报告、出差和通知均来自当前服务器 PostgreSQL。当前案件权限：${escapeHtml(summary.access_label)}；本人负责 ${summary.assigned_to_me} 件，团队协作 ${summary.shared_with_me} 件，可登记进展 ${summary.writable} 件。报告仍仅展示本人数据。</p><button class="text-button" data-page="cases">查看案件工作台 →</button></section></div>`;
 }
 
 function renderLiveCaseWorkspace(data) {
   const filters = data.filters || {};
   state.casePage = Number(data.pagination?.page || 1);
   state.caseFilters = { case_type: filters.case_type || "", stage: filters.stage || "", query: filters.query || "", progress_status: filters.progress_status || "" };
-  content.innerHTML = `${sectionHeading("案件工作台", "按原告/被告、阶段和关键词查看当前有权案件")}
+  content.innerHTML = `${sectionHeading("案件工作台", `当前为${escapeHtml(data.summary.access_label)}：负责人表示案件分配，团队协作案件也可按权限登记进展`)}
     <form id="live-case-filters" class="toolbar">
       <input name="query" value="${escapeHtml(filters.query || "")}" placeholder="案件名称、案号或当事人" />
       <select name="case_type"><option value="">全部案件</option><option value="plaintiff_case" ${filters.case_type === "plaintiff_case" ? "selected" : ""}>原告案件</option><option value="defendant_case" ${filters.case_type === "defendant_case" ? "selected" : ""}>被告案件</option></select>
@@ -235,8 +235,8 @@ function renderLiveCaseWorkspace(data) {
       <select name="progress_status"><option value="">全部进展状态</option><option value="active" ${filters.progress_status === "active" ? "selected" : ""}>已有有效进展</option><option value="missing" ${filters.progress_status === "missing" ? "selected" : ""}>暂无有效进展</option></select>
       <button class="primary-button compact-primary" type="submit">筛选</button>
     </form>
-    <div class="case-summary-strip"><span>共 ${data.pagination.total} 件</span><span>原告 ${data.summary.plaintiff} 件</span><span>被告 ${data.summary.defendant} 件</span><span>有进展 ${data.summary.with_progress} 件</span></div>
-    <div class="product-case-grid">${data.items.map(item => `<article class="product-case-card"><div><span class="badge">${escapeHtml(item.case_type)}</span><span class="badge">${escapeHtml(item.stage)}</span></div><h3>${escapeHtml(item.case_name)}</h3><p>${escapeHtml(item.case_number)}</p><dl><div><dt>当前节点</dt><dd>${escapeHtml(item.node)}</dd></div><div><dt>负责人</dt><dd>${escapeHtml(item.owner_name)}</dd></div><div><dt>当事人</dt><dd>${escapeHtml(item.counterparties.join("、") || "暂未记录")}</dd></div><div><dt>案由</dt><dd>${escapeHtml(item.cause)}</dd></div><div><dt>法院 / 仲裁</dt><dd>${escapeHtml(item.court)}</dd></div><div><dt>开庭时间</dt><dd>${escapeHtml(item.hearing_date)}</dd></div><div><dt>风险等级</dt><dd>${escapeHtml(item.risk_level)}</dd></div><div><dt>追问策略</dt><dd>${escapeHtml(item.followup_policy)}</dd></div><div class="case-wide-field"><dt>最新进展</dt><dd>${escapeHtml(item.latest_progress)}</dd></div><div class="case-wide-field"><dt>下一步计划</dt><dd>${escapeHtml(item.next_plan)}</dd></div></dl><footer><span>${escapeHtml(item.source)} · 更新于 ${formatBusinessTime(item.updated_at)}</span><button class="text-button" data-phase2-case="${escapeHtml(item.case_ref)}">查看单案 →</button></footer></article>`).join("") || '<div class="empty-state">没有符合条件的案件</div>'}</div>
+    <div class="case-summary-strip"><span>共 ${data.pagination.total} 件</span><span>本人负责 ${data.summary.assigned_to_me} 件</span><span>团队协作 ${data.summary.shared_with_me} 件</span><span>可登记进展 ${data.summary.writable} 件</span><span>有进展 ${data.summary.with_progress} 件</span></div>
+    <div class="product-case-grid">${data.items.map(item => `<article class="product-case-card"><div><span class="badge">${escapeHtml(item.case_type)}</span><span class="badge">${escapeHtml(item.stage)}</span><span class="badge">${escapeHtml(item.assignment)}</span></div><h3>${escapeHtml(item.case_name)}</h3><p>${escapeHtml(item.case_number)}</p><dl><div><dt>当前节点</dt><dd>${escapeHtml(item.node)}</dd></div><div><dt>负责人</dt><dd>${escapeHtml(item.owner_name)}</dd></div><div><dt>登记权限</dt><dd>${item.can_add_progress ? "可登记进展" : "仅查看"}</dd></div><div><dt>当事人</dt><dd>${escapeHtml(item.counterparties.join("、") || "暂未记录")}</dd></div><div><dt>案由</dt><dd>${escapeHtml(item.cause)}</dd></div><div><dt>法院 / 仲裁</dt><dd>${escapeHtml(item.court)}</dd></div><div><dt>开庭时间</dt><dd>${escapeHtml(item.hearing_date)}</dd></div><div><dt>风险等级</dt><dd>${escapeHtml(item.risk_level)}</dd></div><div><dt>追问策略</dt><dd>${escapeHtml(item.followup_policy)}</dd></div><div class="case-wide-field"><dt>最新进展</dt><dd>${escapeHtml(item.latest_progress)}</dd></div><div class="case-wide-field"><dt>下一步计划</dt><dd>${escapeHtml(item.next_plan)}</dd></div></dl><footer><span>${escapeHtml(item.source)} · 更新于 ${formatBusinessTime(item.updated_at)}</span><button class="text-button" data-phase2-case="${escapeHtml(item.case_ref)}">查看单案 →</button></footer></article>`).join("") || '<div class="empty-state">没有符合条件的案件</div>'}</div>
     <div class="pagination"><button ${data.pagination.page <= 1 ? "disabled" : ""} data-live-case-page="${data.pagination.page - 1}">上一页</button><span>第 ${data.pagination.page} / ${data.pagination.pages} 页</span><button ${data.pagination.page >= data.pagination.pages ? "disabled" : ""} data-live-case-page="${data.pagination.page + 1}">下一页</button></div>`;
   document.querySelector("#live-case-filters")?.addEventListener("submit", event => { event.preventDefault(); loadLiveCases(1); });
 }
@@ -682,7 +682,10 @@ function renderPhase2Case(data) {
   const reportProjection = (data.report_projection || []).map(item => `<article class="timeline-item"><strong>${escapeHtml(item.report_type)} · ${escapeHtml(item.section)}</strong><p>${escapeHtml(item.status)} · ${formatBusinessTime(item.created_at)}</p></article>`).join("") || '<div class="empty-state">当前案件暂无日报投影</div>';
   const parties = data.parties.map(item => `<li><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.role)}</span></li>`).join("") || '<li>暂未记录当事人</li>';
   const clues = data.clues.map(item => `<li><strong>${escapeHtml(item.type)}</strong><span>${escapeHtml(item.summary)}</span></li>`).join("") || '<li>暂无结构化案件线索</li>';
-  openDrawer(`<div class="case-header"><p class="eyebrow">单案工作台</p><h2>${escapeHtml(data.case_name)}</h2><p>${escapeHtml(data.case_number)}</p><div class="case-meta"><span class="badge">${escapeHtml(data.case_type)}</span><span class="badge">${escapeHtml(data.stage)}</span><span class="badge">负责人：${escapeHtml(data.owner_name)}</span></div></div>
+  const progressForm = data.can_add_progress
+    ? `<form class="case-progress-form" data-add-case-progress data-case-id="${escapeHtml(data.case_ref)}"><label>本次进展<textarea name="summary" maxlength="2000" required placeholder="按事实填写本次案件进展，不会由模型改写"></textarea></label><label>补充说明<textarea name="details" maxlength="10000" placeholder="可选"></textarea></label><label>下一步计划<input name="next_action" maxlength="2000" placeholder="可选，例如：下周联系法院确认查控结果" /></label><button class="primary-button" type="submit">记录案件进展</button></form>`
+    : '<p class="muted report-readonly">当前凭证对该案件仅有查看权限，不能登记案件进展。</p>';
+  openDrawer(`<div class="case-header"><p class="eyebrow">单案工作台</p><h2>${escapeHtml(data.case_name)}</h2><p>${escapeHtml(data.case_number)}</p><div class="case-meta"><span class="badge">${escapeHtml(data.case_type)}</span><span class="badge">${escapeHtml(data.stage)}</span><span class="badge">${escapeHtml(data.assignment)}</span><span class="badge">负责人：${escapeHtml(data.owner_name)}</span><span class="badge">${data.can_add_progress ? "可登记进展" : "仅查看"}</span></div></div>
     <nav class="case-detail-tabs" aria-label="案件详情区块">
       <button type="button" class="active" aria-current="true" data-case-section-target="case-overview">概览</button>
       <button type="button" data-case-section-target="case-lifecycle">生命周期</button>
@@ -694,7 +697,7 @@ function renderPhase2Case(data) {
     </nav>
     <section class="panel" id="case-overview"><h3 class="panel-title">案件概览</h3><div class="followup-status-grid"><div><span>当前节点</span><strong>${escapeHtml(data.current_node)}</strong></div><div><span>当前状态</span><strong>${escapeHtml(data.current_status)}</strong></div><div><span>开庭准备</span><strong>${escapeHtml(data.hearing_readiness)}</strong></div><div><span>风险等级</span><strong>${escapeHtml(data.risk_level)}</strong></div><div><span>数据来源</span><strong>${escapeHtml(data.source)}</strong></div><div><span>下一步计划</span><strong>${escapeHtml(data.next_plan.join("；") || "暂未记录")}</strong></div></div></section>
     <section class="panel" id="case-lifecycle"><h3 class="panel-title">案件生命周期</h3><div class="product-lifecycle">${data.lifecycle.map(item => `<div class="${escapeHtml(item.state)}"><span></span><strong>${escapeHtml(item.label)}</strong><small>${item.state === "completed" ? "已到达" : item.state === "current" ? "当前阶段" : "尚未到达"}</small></div>`).join("")}</div></section>
-    <section class="panel" id="case-progress"><h3 class="panel-title">案件进展</h3><form class="case-progress-form" data-add-case-progress data-case-id="${escapeHtml(data.case_ref)}"><label>本次进展<textarea name="summary" maxlength="2000" required placeholder="按事实填写本次案件进展，不会由模型改写"></textarea></label><label>补充说明<textarea name="details" maxlength="10000" placeholder="可选"></textarea></label><label>下一步计划<input name="next_action" maxlength="2000" placeholder="可选，例如：下周联系法院确认查控结果" /></label><button class="primary-button" type="submit">记录案件进展</button></form>${progress}</section>
+    <section class="panel" id="case-progress"><h3 class="panel-title">案件进展</h3>${progressForm}${progress}</section>
     <section class="panel" id="case-parties"><h3 class="panel-title">当事人与案件线索</h3><div class="grid-2"><ul class="detail-list">${parties}</ul><ul class="detail-list">${clues}</ul></div></section>
     <section class="panel" id="case-audit"><h3 class="panel-title">操作记录 <span>仅展示已写入的业务操作</span></h3>${audit}</section>
     <section class="panel" id="case-report-projection"><h3 class="panel-title">日报投影 <span>案件事实与报告条目分别保留</span></h3>${reportProjection}</section>

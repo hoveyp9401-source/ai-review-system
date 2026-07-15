@@ -491,6 +491,13 @@ async def live_case_workspace(
         stage=stage,
         query=query,
         progress_status=progress_status,
+        principal_user_id=(scope.user_id if scope.binding is not None else ""),
+        writable_case_ids=scope.writable_case_ids,
+        permission_mode=str(
+            ((scope.binding.permission_scope_json if scope.binding else {}) or {}).get(
+                "case_progress_collaboration_mode", ""
+            )
+        ),
     )
 
 
@@ -565,6 +572,12 @@ async def live_case_detail_workspace(
             allowed_case_ids=scope.allowed_case_ids,
             can_manage_followup=principal.has_role("tenant_admin", "system_admin"),
             editable_actor_user_id=(scope.user_id if scope.binding is not None else ""),
+            writable_case_ids=scope.writable_case_ids,
+            permission_mode=str(
+                ((scope.binding.permission_scope_json if scope.binding else {}) or {}).get(
+                    "case_progress_collaboration_mode", ""
+                )
+            ),
         )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -1189,6 +1202,13 @@ async def _case_write_response(
         allowed_case_ids=scope.allowed_case_ids,
         can_manage_followup=principal.has_role("tenant_admin", "system_admin"),
         editable_actor_user_id=(scope.user_id if scope.binding is not None else ""),
+        writable_case_ids=scope.writable_case_ids,
+        permission_mode=str(
+            (
+                (scope.binding.permission_scope_json if scope.binding is not None else {})
+                or {}
+            ).get("case_progress_collaboration_mode", "")
+        ),
     )
     return payload
 

@@ -132,6 +132,50 @@ def test_case_workspace_is_paginated_chinese_and_hides_internal_identifiers():
     assert missing["items"][0]["case_name"] == "乙公司买卖合同纠纷案"
 
 
+def test_shared_case_scope_distinguishes_assigned_and_collaboration_cases():
+    raw = {
+        "identity_bindings": [
+            {"user_id": "pang-id", "display_name": "庞浩"},
+            {"user_id": "liu-id", "display_name": "刘聪"},
+        ],
+        "cases": [
+            {
+                "case_id": "case-owned",
+                "case_name": "本人负责案件",
+                "case_type": "plaintiff_case",
+                "status": "litigation",
+                "owner_user_id": "pang-id",
+                "source_type": "real_case_workbook",
+            },
+            {
+                "case_id": "case-shared",
+                "case_name": "团队协作案件",
+                "case_type": "defendant_case",
+                "status": "hearing",
+                "owner_user_id": "liu-id",
+                "source_type": "real_case_workbook",
+            },
+        ],
+    }
+
+    payload = project_case_workspace(
+        raw,
+        principal_user_id="pang-id",
+        writable_case_ids=("case-owned", "case-shared"),
+        permission_mode="explicit_shared_scope",
+    )
+
+    assert payload["summary"]["assigned_to_me"] == 1
+    assert payload["summary"]["shared_with_me"] == 1
+    assert payload["summary"]["writable"] == 2
+    assert payload["summary"]["access_label"] == "团队共享协作"
+    assert {item["assignment"] for item in payload["items"]} == {
+        "本人负责",
+        "团队协作",
+    }
+    assert all(item["can_add_progress"] for item in payload["items"])
+
+
 def test_live_navigation_matches_the_simplified_product_information_architecture():
     script = (STATIC / "app.js").read_text(encoding="utf-8")
 
@@ -301,7 +345,15 @@ def test_travel_center_distinguishes_provider_acceptance_from_delivery_and_hides
                 "status": "planned",
                 "source_channel": "dingtalk_stream",
                 "source_message_id": "secret-message-id",
-            }
+            },
+            {
+                "travel_intent_id": "smoke-travel-id",
+                "user_id": "pang-id",
+                "destination_normalized": "测试城市",
+                "status": "planned",
+                "source_channel": "server_acceptance_smoke",
+                "data_origin": "server_acceptance_smoke",
+            },
         ],
         "collaboration_candidates": [
             {
@@ -312,7 +364,14 @@ def test_travel_center_distinguishes_provider_acceptance_from_delivery_and_hides
                 "responses_json": {"pang-id": "accept", "liu-id": "waiting_for_reply"},
                 "overlap_start": "2026-07-14T00:00:00+00:00",
                 "overlap_end": "2026-07-14T12:00:00+00:00",
-            }
+            },
+            {
+                "candidate_id": "smoke-candidate-id",
+                "destination": "测试城市",
+                "participant_ids": ["pang-id", "liu-id"],
+                "status": "pending",
+                "data_origin": "server_acceptance_smoke",
+            },
         ],
         "notifications": [
             {
@@ -321,7 +380,15 @@ def test_travel_center_distinguishes_provider_acceptance_from_delivery_and_hides
                 "status": "sent",
                 "external_message_id": "provider-secret-id",
                 "sent_at": "2026-07-13T08:00:00+00:00",
-            }
+                "message_type": "travel_collaboration_question",
+            },
+            {
+                "notification_id": "case-followup-notification-id",
+                "recipient_user_id": "pang-id",
+                "status": "sent",
+                "message_type": "case_progress_followup",
+                "data_origin": "robot_followup",
+            },
         ],
     }
 
@@ -334,9 +401,18 @@ def test_travel_center_distinguishes_provider_acceptance_from_delivery_and_hides
     assert payload["candidates"][0]["responses"][0]["status"] == "已接受"
     assert payload["notifications"][0]["status"] == "平台已接受发送请求"
     assert payload["notifications"][0]["delivery_claim"] == "未确认送达"
+    assert payload["summary"] == {
+        "travels": 1,
+        "candidates": 1,
+        "notifications": 1,
+        "waiting_for_reply": 1,
+    }
     serialized = repr(payload)
     assert "provider-secret-id" not in serialized
     assert "secret-message-id" not in serialized
+    assert "smoke-travel-id" not in serialized
+    assert "smoke-candidate-id" not in serialized
+    assert "case-followup-notification-id" not in serialized
 
 
 def test_single_case_detail_builds_truthful_lifecycle_and_hides_receipt_fields():
@@ -363,6 +439,7 @@ def test_single_case_detail_builds_truthful_lifecycle_and_hides_receipt_fields()
                     "occurred_at": "2026-07-13T09:00:00+00:00",
                     "content_origin": "human_record",
                     "source_message_id": "secret-message-id",
+                    "reporter_id": "pang-id",
                     "version": 3,
                     "deleted": False,
                 },
@@ -414,7 +491,13 @@ def test_single_case_detail_builds_truthful_lifecycle_and_hides_receipt_fields()
     }
 
     payload = project_case_detail(
-        detail, followup, identity_names={"pang-id": "庞浩"}, can_manage_followup=False
+        detail,
+        followup,
+        identity_names={"pang-id": "庞浩", "liu-id": "刘聪"},
+        can_manage_followup=False,
+        editable_actor_user_id="pang-id",
+        writable_case_ids=("case-id",),
+        permission_mode="explicit_shared_scope",
     )
 
     assert payload["case_type"] == "原告案件"
@@ -422,6 +505,8 @@ def test_single_case_detail_builds_truthful_lifecycle_and_hides_receipt_fields()
     assert [item["label"] for item in payload["lifecycle"]] == ["拟诉", "诉讼中", "执行中", "已结案"]
     assert [item["state"] for item in payload["lifecycle"]] == ["completed", "current", "future", "future"]
     assert payload["owner_name"] == "庞浩"
+    assert payload["assignment"] == "本人负责"
+    assert payload["can_add_progress"] is True
     assert payload["parties"] == [{"name": "南京甲公司", "role": "被告"}]
     assert payload["progress"][0]["content"] == "今天联系法院推进查控"
     assert len(payload["progress"]) == 1
@@ -460,12 +545,29 @@ def test_single_case_detail_builds_truthful_lifecycle_and_hides_receipt_fields()
     assert "report-secret-id" not in serialized
     assert "item-secret-id" not in serialized
 
+    collaborator_payload = project_case_detail(
+        detail,
+        followup,
+        identity_names={"pang-id": "庞浩", "liu-id": "刘聪"},
+        can_manage_followup=False,
+        editable_actor_user_id="liu-id",
+        writable_case_ids=("case-id",),
+        permission_mode="explicit_shared_scope",
+    )
+    assert collaborator_payload["assignment"] == "团队协作"
+    assert collaborator_payload["can_add_progress"] is True
+    assert collaborator_payload["progress"][0]["actions"]["can_edit"] is False
+
 
 def test_live_product_ui_wires_case_progress_and_report_mutations_to_workspace_endpoints():
     script = (STATIC / "app.js").read_text(encoding="utf-8")
     page = (STATIC / "index.html").read_text(encoding="utf-8")
 
     assert "data-add-case-progress" in script
+    assert "本人负责" in script
+    assert "团队协作" in script
+    assert "data.can_add_progress" in script
+    assert "当前凭证对该案件仅有查看权限" in script
     assert "data-start-case-progress-edit" in script
     assert "data-edit-case-progress-form" in script
     assert "data-delete-case-progress" in script

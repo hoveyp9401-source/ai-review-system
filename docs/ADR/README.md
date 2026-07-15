@@ -17,6 +17,7 @@
 | [0011](0011-blind-replay-and-sealed-scoring.md) | Accepted | Blind Runtime Replay 与 Sealed Scoring 物理隔离 |
 | [0012](0012-offline-production-shadow-candidate-adapter.md) | Accepted | 离线 Production Shadow Candidate 能力隔离边界 |
 | [0013](0013-legal-operations-phase0-sandbox-boundary.md) | Accepted | Legal Operations Phase 0 tenant-isolated Sandbox boundary |
+| [0022](0022-two-user-shared-case-progress-scope.md) | Accepted | 两用户灰测案件共享协作与进展写入边界 |
 
 所有 Phase 1 工程任务必须同时遵守以下不变量：
 

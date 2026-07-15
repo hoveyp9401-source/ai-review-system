@@ -31,6 +31,9 @@ def project_case_workspace(
     stage: str = "",
     query: str = "",
     progress_status: str = "",
+    principal_user_id: str = "",
+    writable_case_ids: tuple[str, ...] | None = None,
+    permission_mode: str = "",
 ) -> dict[str, Any]:
     safe_page = max(1, int(page))
     safe_page_size = max(1, min(100, int(page_size)))
@@ -65,6 +68,11 @@ def project_case_workspace(
         "manual_only": "仅人工追问", "paused": "已暂停", "disabled": "已关闭",
     }
     needle = str(query or "").strip().casefold()
+    writable_scope = (
+        {str(value) for value in writable_case_ids}
+        if writable_case_ids is not None
+        else None
+    )
     filtered: list[dict[str, Any]] = []
     all_cases = [item for item in read_model.get("cases", []) if isinstance(item, dict)]
     for item in all_cases:
@@ -109,6 +117,21 @@ def project_case_workspace(
                 "stage_code": raw_stage,
                 "node": str(lifecycle.get("node") or "暂未记录"),
                 "owner_name": identities.get(str(item.get("owner_user_id") or ""), "未识别负责人"),
+                "assignment": (
+                    "本人负责"
+                    if principal_user_id
+                    and str(item.get("owner_user_id") or "") == principal_user_id
+                    else "团队协作"
+                    if principal_user_id
+                    else "授权案件"
+                ),
+                "can_add_progress": bool(
+                    principal_user_id
+                    and (
+                        writable_scope is None
+                        or case_id in writable_scope
+                    )
+                ),
                 "counterparties": counterparties.get(case_id, []),
                 "latest_progress": (
                     str(progress[0].get("summary") or "") if progress else "暂无有效进展"
@@ -135,6 +158,11 @@ def project_case_workspace(
         case_stage_label(str(item.get("case_type") or ""), str(item.get("status") or ""))
         for item in all_cases
     )
+    assigned_to_me = sum(
+        bool(principal_user_id)
+        and str(item.get("owner_user_id") or "") == principal_user_id
+        for item in all_cases
+    )
     return {
         "summary": {
             "total": len(all_cases),
@@ -143,6 +171,20 @@ def project_case_workspace(
             "with_progress": len(progress_by_case),
             "without_progress": max(0, len(all_cases) - len(progress_by_case)),
             "stage_distribution": dict(stage_counts),
+            "assigned_to_me": assigned_to_me,
+            "shared_with_me": (
+                max(0, len(all_cases) - assigned_to_me) if principal_user_id else 0
+            ),
+            "writable": (
+                len(writable_scope.intersection({str(item.get("case_id") or "") for item in all_cases}))
+                if writable_scope is not None
+                else len(all_cases) if principal_user_id else 0
+            ),
+            "access_label": (
+                "团队共享协作"
+                if permission_mode == "explicit_shared_scope"
+                else "授权案件"
+            ),
         },
         "filters": {
             "case_type": case_type,
@@ -167,6 +209,8 @@ def project_case_detail(
     identity_names: dict[str, str],
     can_manage_followup: bool,
     editable_actor_user_id: str = "",
+    writable_case_ids: tuple[str, ...] | None = None,
+    permission_mode: str = "",
 ) -> dict[str, Any]:
     case = detail.get("case") or {}
     case_type = str(case.get("case_type") or "")
@@ -204,7 +248,14 @@ def project_case_detail(
         }
         for row in detail.get("parties", [])
     ]
-    actor_user_id = editable_actor_user_id or str(case.get("owner_user_id") or "")
+    case_id = str(case.get("case_id") or "")
+    can_add_progress = bool(
+        editable_actor_user_id
+        and (
+            writable_case_ids is None
+            or case_id in {str(value) for value in writable_case_ids}
+        )
+    )
     progress = [
         {
             "content": str(node.get("title") or ""),
@@ -217,10 +268,9 @@ def project_case_detail(
                 "can_edit": bool(
                     node.get("progress_id")
                     and not node.get("deleted")
-                    and (
-                        not node.get("reporter_id")
-                        or str(node.get("reporter_id")) == actor_user_id
-                    )
+                    and editable_actor_user_id
+                    and str(node.get("reporter_id") or "")
+                    == editable_actor_user_id
                 ),
             },
         }
@@ -297,12 +347,21 @@ def project_case_detail(
         "manual_only": "仅人工追问", "paused": "已暂停", "disabled": "已关闭",
     }
     payload: dict[str, Any] = {
-        "case_ref": str(case.get("case_id") or ""),
+        "case_ref": case_id,
         "case_name": str(case.get("case_name") or "未命名案件"),
         "case_number": str(case.get("case_number") or case.get("external_case_id") or "暂未记录"),
         "case_type": case_type_label(case_type),
         "stage": case_stage_label(case_type, current_stage),
         "owner_name": identity_names.get(str(case.get("owner_user_id") or ""), "未识别负责人"),
+        "assignment": (
+            "本人负责"
+            if editable_actor_user_id
+            and str(case.get("owner_user_id") or "") == editable_actor_user_id
+            else "团队协作"
+            if editable_actor_user_id and permission_mode == "explicit_shared_scope"
+            else "授权案件"
+        ),
+        "can_add_progress": can_add_progress,
         "source": source_label(str(case.get("source_type") or "")),
         "lifecycle": lifecycle,
         "current_node": str(lifecycle_state.get("node") or "暂未记录"),
@@ -547,6 +606,11 @@ def project_travel_center(read_model: dict[str, Any]) -> dict[str, Any]:
         str(item.get("user_id") or ""): str(item.get("display_name") or "未识别人员")
         for item in read_model.get("identity_bindings", [])
     }
+    business_travel_intents = [
+        item
+        for item in read_model.get("travel_intents", [])
+        if _is_default_business_record(item)
+    ]
     travels = [
         {
             "travel_ref": str(item.get("travel_intent_id") or ""),
@@ -558,10 +622,12 @@ def project_travel_center(read_model: dict[str, Any]) -> dict[str, Any]:
             "status": travel_status_label(str(item.get("status") or "")),
             "source": _travel_source_label(item),
         }
-        for item in read_model.get("travel_intents", [])
+        for item in business_travel_intents
     ]
     candidates: list[dict[str, Any]] = []
     for item in read_model.get("collaboration_candidates", []):
+        if not _is_default_business_record(item):
+            continue
         responses = item.get("responses_json") if isinstance(item.get("responses_json"), dict) else {}
         candidate_responses = []
         for user_id in item.get("participant_ids") or []:
@@ -587,6 +653,15 @@ def project_travel_center(read_model: dict[str, Any]) -> dict[str, Any]:
                 "status": travel_status_label(str(item.get("status") or "")),
             }
         )
+    travel_notifications = [
+        item
+        for item in read_model.get("notifications", [])
+        if _is_default_business_record(item)
+        and (
+            str(item.get("message_type") or "").startswith("travel_")
+            or bool(item.get("candidate_id"))
+        )
+    ]
     notifications = [
         {
             "recipient_name": identity_names.get(
@@ -602,7 +677,7 @@ def project_travel_center(read_model: dict[str, Any]) -> dict[str, Any]:
             "retry_count": int(item.get("retry_count") or 0),
             "error": str(item.get("error_message") or ""),
         }
-        for item in read_model.get("notifications", [])
+        for item in travel_notifications
     ]
     return {
         "summary": {
@@ -668,6 +743,21 @@ def _travel_source_label(item: dict[str, Any]) -> str:
     if "smoke" in channel:
         return "服务器验收记录"
     return "系统记录"
+
+
+def _is_default_business_record(item: dict[str, Any]) -> bool:
+    excluded_origins = {
+        "server_acceptance_smoke",
+        "sandbox_fixture",
+        "seed_fixture",
+        "frontend_static",
+        "mock_transport",
+    }
+    origin = str(item.get("data_origin") or "").strip().lower()
+    channel = str(item.get("source_channel") or "").strip().lower()
+    return origin not in excluded_origins and not any(
+        marker in channel for marker in ("acceptance_smoke", "fixture", "mock_transport")
+    )
 
 
 async def load_report_center(
@@ -795,6 +885,8 @@ async def load_case_detail_workspace(
     allowed_case_ids: tuple[str, ...] | None,
     can_manage_followup: bool,
     editable_actor_user_id: str = "",
+    writable_case_ids: tuple[str, ...] | None = None,
+    permission_mode: str = "",
 ) -> dict[str, Any]:
     from app.legal_ops.phase2_read import (
         load_case_followup_configuration,
@@ -829,6 +921,8 @@ async def load_case_detail_workspace(
         ),
         can_manage_followup=can_manage_followup,
         editable_actor_user_id=editable_actor_user_id,
+        writable_case_ids=writable_case_ids,
+        permission_mode=permission_mode,
     )
 
 
