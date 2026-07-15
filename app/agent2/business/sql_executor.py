@@ -9,6 +9,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import case as sql_case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent2.admission_store_sql import (
@@ -35,6 +36,8 @@ from app.agent2.business.contracts import (
     UpdateCaseProgress,
     UpdateTravelIntent,
     business_command_fingerprint,
+    travel_intent_fact_fingerprint,
+    travel_intent_fact_fingerprint_fields,
 )
 from app.agent2.business.admission import require_business_execution_admission
 from app.agent2.case_followup_commands import (
@@ -250,7 +253,10 @@ class SqlBusinessExecutor:
                         context,
                     )
                 outcome = await self._dispatch(command, context, key)
-                if ticket_lease is not None and outcome.status == "executed":
+                if ticket_lease is not None and outcome.status in {
+                    "executed",
+                    "duplicate",
+                }:
                     # Stage the successful receipt inside the same savepoint as
                     # the domain write before the authoritative Ticket may be
                     # consumed. The outer transaction remains the sole commit
@@ -324,7 +330,7 @@ class SqlBusinessExecutor:
         # tenant/actor/source scope and must be auditable without pretending a
         # domain write occurred.  Duplicate replays return the original
         # receipt above and therefore never create a second audit row.
-        if outcome.status in {"executed", "blocked", "failed"}:
+        if outcome.status in {"executed", "duplicate", "blocked", "failed"}:
             self.session.add(
                 BusinessAuditEvent(
                     audit_id=_stable_uuid("business-audit", str(receipt_id)),
@@ -654,6 +660,20 @@ class SqlBusinessExecutor:
             raise BusinessCommandError("travel_confidence_too_low", "domain_policy", "travel needs clarification")
         for case_id in command.related_case_ids:
             await self._assert_case_access(case_id, context)
+        existing = await self._find_existing_travel_intent(command, context)
+        if existing is not None:
+            return _Outcome.duplicate(
+                "travel_intent",
+                str(existing.travel_intent_id),
+                _model_json(existing),
+            )
+        travel_fact_key = ":".join(
+            (
+                "agent2-travel-fact-v1",
+                context.actor_user_id,
+                travel_intent_fact_fingerprint(command),
+            )
+        )
         travel_intent_id = _stable_uuid(
             "travel-intent",
             context.tenant_id,
@@ -693,14 +713,56 @@ class SqlBusinessExecutor:
             source_channel=context.source_channel,
             status="planned",
             confidence=Decimal(str(command.confidence)),
-            idempotency_key=key,
+            idempotency_key=travel_fact_key,
             version=1,
             created_at=context.occurred_at,
             updated_at=context.occurred_at,
         )
-        self.session.add(intent)
-        await self.session.flush()
+        try:
+            async with self.session.begin_nested():
+                self.session.add(intent)
+                await self.session.flush()
+        except IntegrityError:
+            # Two different provider messages can race after the read above.
+            # The existing tenant/idempotency unique constraint is the final
+            # arbiter; the losing message receives an auditable no-write receipt.
+            existing = await self.session.scalar(
+                select(TravelIntent).where(
+                    TravelIntent.tenant_id == context.tenant_id,
+                    TravelIntent.idempotency_key == travel_fact_key,
+                )
+            )
+            if existing is None:
+                raise
+            return _Outcome.duplicate(
+                "travel_intent",
+                str(existing.travel_intent_id),
+                _model_json(existing),
+            )
         return _Outcome.success("travel_intent", str(intent.travel_intent_id), {}, _model_json(intent))
+
+    async def _find_existing_travel_intent(
+        self,
+        command: CreateTravelIntent,
+        context: BusinessCommandContext,
+    ) -> TravelIntent | None:
+        """Find exact active facts, including rows written with legacy message keys."""
+
+        return await self.session.scalar(
+            select(TravelIntent)
+            .where(
+                TravelIntent.tenant_id == context.tenant_id,
+                TravelIntent.user_id == context.actor_user_id,
+                TravelIntent.city_code == command.city_code,
+                TravelIntent.start_at == command.start_at,
+                TravelIntent.end_at == command.end_at,
+                TravelIntent.time_precision == command.time_precision,
+                TravelIntent.purpose_summary == command.purpose_summary,
+                TravelIntent.status != "cancelled",
+            )
+            .order_by(TravelIntent.created_at.asc(), TravelIntent.travel_intent_id.asc())
+            .limit(1)
+        )
 
     async def _update_travel(
         self, command: UpdateTravelIntent, context: BusinessCommandContext
@@ -719,6 +781,12 @@ class SqlBusinessExecutor:
             raise BusinessCommandError("travel_intent_not_found", "authorization", "travel intent not found")
         if current.version != command.expected_version:
             raise BusinessCommandError("version_conflict", "optimistic_lock", "travel version conflict")
+        if current.status == "cancelled" and command.status != "cancelled":
+            raise BusinessCommandError(
+                "travel_intent_cancelled",
+                "domain_policy",
+                "cancelled travel intent cannot be reactivated",
+            )
         before = _model_json(current)
         current.start_at = command.start_at or current.start_at
         current.end_at = command.end_at or current.end_at
@@ -729,6 +797,32 @@ class SqlBusinessExecutor:
         current.updated_at = context.occurred_at
         if current.start_at > current.end_at:
             raise BusinessCommandError("travel_time_invalid", "domain_policy", "travel interval is invalid")
+        if current.status == "cancelled":
+            released_material = ":".join(
+                (
+                    context.tenant_id,
+                    str(current.travel_intent_id),
+                    str(current.version),
+                )
+            )
+            current.idempotency_key = (
+                "agent2-travel-released-v1:"
+                + hashlib.sha256(released_material.encode("utf-8")).hexdigest()
+            )
+        else:
+            current.idempotency_key = ":".join(
+                (
+                    "agent2-travel-fact-v1",
+                    context.actor_user_id,
+                    travel_intent_fact_fingerprint_fields(
+                        city_code=current.city_code,
+                        start_at=current.start_at,
+                        end_at=current.end_at,
+                        time_precision=current.time_precision,
+                        purpose_summary=current.purpose_summary,
+                    ),
+                )
+            )
         candidate_ids = select(TravelCollaborationCandidate.candidate_id).where(
             TravelCollaborationCandidate.tenant_id == context.tenant_id,
             TravelCollaborationCandidate.travel_intent_ids.contains([command.travel_intent_id]),
@@ -2057,6 +2151,21 @@ class _Outcome:
             before=before,
             after=after,
             actual_write=True,
+        )
+
+    @classmethod
+    def duplicate(
+        cls,
+        resource_type: str,
+        resource_id: str,
+        after: dict[str, Any],
+    ) -> "_Outcome":
+        return cls(
+            status="duplicate",
+            resource_type=resource_type,
+            resource_id=resource_id,
+            after=after,
+            actual_write=False,
         )
 
 

@@ -323,7 +323,7 @@ _DYNAMIC_ALLOWED_CHANGED_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
 }
 
 _SUCCESSFUL_RECEIPT_STATUSES = {
-    "business": frozenset({"executed"}),
+    "business": frozenset({"executed", "duplicate"}),
     "periodic_report": frozenset({"authorized"}),
     "daily_report": frozenset({"executed"}),
 }

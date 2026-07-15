@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
+import unicodedata
 from typing import Any, Literal, TypeAlias
 
 from app.agent2.case_followup_commands import TriggerCaseFollowupNow, UpdateCaseFollowupPolicy
@@ -257,6 +259,55 @@ def business_command_fingerprint(command: BusinessCommand) -> str:
         default=_fingerprint_json_default,
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def travel_intent_fact_fingerprint(command: CreateTravelIntent) -> str:
+    """Hash the conservative business identity of one travel intent.
+
+    Transport/message identifiers, model confidence and the raw location wording
+    are deliberately excluded.  The normalized city, exact travel window and
+    user-authored purpose remain material, so nearby but distinct trips are not
+    collapsed.  Tenant and actor fencing are added by the executor.
+    """
+
+    if not isinstance(command, CreateTravelIntent):
+        raise TypeError("CreateTravelIntent required")
+    return travel_intent_fact_fingerprint_fields(
+        city_code=command.city_code,
+        start_at=command.start_at,
+        end_at=command.end_at,
+        time_precision=command.time_precision,
+        purpose_summary=command.purpose_summary,
+    )
+
+
+def travel_intent_fact_fingerprint_fields(
+    *,
+    city_code: str,
+    start_at: datetime,
+    end_at: datetime,
+    time_precision: str,
+    purpose_summary: str,
+) -> str:
+    material = json.dumps(
+        {
+            "city_code": city_code.strip(),
+            "start_at": _fingerprint_json_default(start_at),
+            "end_at": _fingerprint_json_default(end_at),
+            "time_precision": time_precision.strip().lower(),
+            "purpose_summary": normalize_travel_fact_text(purpose_summary),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def normalize_travel_fact_text(value: str) -> str:
+    """Normalize representation only; never strengthen travel business facts."""
+
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value or "")).strip()
 
 
 def _fingerprint_json_default(value: Any) -> str:

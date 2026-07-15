@@ -737,6 +737,7 @@ class _BusinessWriteSession:
 
     async def scalar(self, statement):
         from sqlalchemy.sql.dml import Insert
+        from sqlalchemy.sql.selectable import Select
 
         if isinstance(statement, Insert):
             params = statement.compile(dialect=postgresql.dialect()).params
@@ -760,6 +761,9 @@ class _BusinessWriteSession:
                 updated_at=params["updated_at"],
             )
             return self.receipt.receipt_id
+        if isinstance(statement, Select):
+            # No pre-existing travel fact in the default write-session fixture.
+            return None
         raise AssertionError(type(statement))
 
     async def execute(self, statement):
@@ -793,6 +797,21 @@ class _BusinessWriteSession:
         return _Nested()
 
 
+class _ExistingTravelWriteSession(_BusinessWriteSession):
+    def __init__(self, existing):
+        super().__init__()
+        self.existing = existing
+
+    async def scalar(self, statement):
+        from sqlalchemy.sql.selectable import Select
+
+        if isinstance(statement, Select):
+            sql = str(statement.compile(dialect=postgresql.dialect()))
+            if "agent2_travel_intents" in sql:
+                return self.existing
+        return await super().scalar(statement)
+
+
 class _RecordingTicketStore:
     def __init__(self, session=None):
         self.session = session
@@ -806,8 +825,8 @@ class _RecordingTicketStore:
 
     async def consume(self, lease, *, receipt, consumed_at):
         if self.session is not None:
-            assert self.session.receipt.status == "executed"
-            assert self.session.receipt.actual_write is True
+            assert self.session.receipt.status == receipt.status
+            assert self.session.receipt.actual_write is receipt.actual_write
         self.consumed.append((lease, receipt, consumed_at))
 
     async def validate_consumed_business_replay(
@@ -917,6 +936,87 @@ async def test_sql_executor_consumes_ticket_with_successful_business_receipt():
     assert store.consumed[0][1].receipt_id == str(receipt.receipt_id)
     intent = next(item for item in session.added if isinstance(item, TravelIntent))
     assert str(intent.travel_intent_id) == dict(ticket["object_ref"])["stable_id"]
+    assert any(isinstance(item, BusinessAuditEvent) for item in session.added)
+
+
+@pytest.mark.asyncio
+async def test_new_ticket_for_existing_travel_fact_is_consumed_with_no_second_write():
+    ticket = _issued_travel_ticket()
+    existing = TravelIntent(
+        travel_intent_id=uuid4(),
+        tenant_id="tenant-test",
+        company_id="company-1",
+        department_id="department-1",
+        team_id="team-1",
+        user_id="u1",
+        destination_raw="\u5357\u4eac",
+        destination_normalized="\u5357\u4eac\u5e02",
+        city_code="320100",
+        province_code="320000",
+        start_at=datetime(2026, 7, 15, tzinfo=UTC),
+        end_at=datetime(2026, 7, 15, 23, 59, tzinfo=UTC),
+        time_precision="day",
+        purpose_summary="",
+        related_case_ids=[],
+        related_matter_ids=[],
+        source_message_id="older-provider-message",
+        source_channel="test",
+        status="planned",
+        confidence=1.0,
+        idempotency_key="legacy-message-scoped-key",
+        version=1,
+        created_at=NOW - timedelta(hours=1),
+        updated_at=NOW - timedelta(hours=1),
+    )
+    session = _ExistingTravelWriteSession(existing)
+    store = _RecordingTicketStore(session)
+    command = CreateTravelIntent(
+        command_id="travel-command-new-message",
+        destination_raw="\u5357\u4eac",
+        destination_normalized="\u5357\u4eac\u5e02",
+        city_code="320100",
+        province_code="320000",
+        start_at=datetime(2026, 7, 15, tzinfo=UTC),
+        end_at=datetime(2026, 7, 15, 23, 59, tzinfo=UTC),
+        time_precision="day",
+        purpose_summary="",
+        related_case_ids=(),
+        confidence=1.0,
+    )
+    context = BusinessCommandContext(
+        tenant_id="tenant-test",
+        company_id="company-1",
+        department_id="department-1",
+        team_id="team-1",
+        actor_user_id="u1",
+        actor_role_ids=(),
+        allowed_case_ids=(),
+        source_message_id="message-1",
+        source_channel="test",
+        occurred_at=NOW,
+        conversation_id="conversation-1",
+        execution_started_at=NOW + timedelta(seconds=1),
+        admission_ticket=ticket,
+        admission_required=True,
+        admission_action_id="travel-action-1",
+        admission_operation="record_travel_event",
+        conversation_state_version=4,
+    )
+
+    receipt = await SqlBusinessExecutor(
+        session,
+        admission_ticket_store=store,
+        execution_authority="semantic_ticket",
+    ).execute(command, context)
+
+    assert (receipt.status, receipt.actual_write) == ("duplicate", False), (
+        receipt.error_code,
+        receipt.failed_stage,
+    )
+    assert receipt.resource_id == str(existing.travel_intent_id)
+    assert store.locked == 1
+    assert len(store.consumed) == 1
+    assert not any(isinstance(item, TravelIntent) for item in session.added)
     assert any(isinstance(item, BusinessAuditEvent) for item in session.added)
 
 

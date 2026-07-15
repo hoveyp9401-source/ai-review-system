@@ -11,6 +11,7 @@ from app.agent2.business.contracts import (
     DeleteCaseProgress,
     RespondTravelCollaboration,
     UpdateCaseProgress,
+    UpdateTravelIntent,
 )
 from app.agent2.business.executor import InMemoryBusinessExecutor
 from app.agent2.business.party import (
@@ -161,6 +162,84 @@ def test_travel_match_requires_same_tenant_different_users_same_city_and_overlap
     assert len(candidates) == 1
     assert candidates[0].participant_ids == ("user-1", "user-2")
     assert candidates[0].overlap_start.date() == date(2026, 7, 13)
+
+
+def test_same_user_resending_same_travel_fact_does_not_create_second_intent():
+    executor = InMemoryBusinessExecutor()
+    first = CreateTravelIntent(
+        command_id="travel-resend-action-1",
+        destination_raw="南京",
+        destination_normalized="南京市",
+        city_code="320100",
+        province_code="320000",
+        start_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        end_at=datetime(2026, 7, 16, 23, 59, tzinfo=timezone.utc),
+        time_precision="day",
+        purpose_summary="沟通鑫瑞达回款事宜",
+        related_case_ids=("case-1",),
+        confidence=1.0,
+    )
+    resent = CreateTravelIntent(
+        **{
+            **first.__dict__,
+            "command_id": "travel-resend-action-2",
+        }
+    )
+
+    created = executor.execute(first, _context(message_id="provider-message-a"))
+    duplicate = executor.execute(
+        resent,
+        _context(message_id="provider-message-b"),
+    )
+
+    assert created.status == "executed"
+    assert duplicate.status == "duplicate"
+    assert duplicate.receipt_id != created.receipt_id
+    assert duplicate.resource_id == created.resource_id
+    assert duplicate.actual_write is False
+    assert len(executor.travel_intents) == 1
+
+
+def test_cancelled_travel_fact_can_be_registered_again_without_reactivating_old_row():
+    executor = InMemoryBusinessExecutor()
+    command = CreateTravelIntent(
+        command_id="travel-create-before-cancel",
+        destination_raw="Nanjing",
+        destination_normalized="Nanjing",
+        city_code="320100",
+        province_code="320000",
+        start_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        end_at=datetime(2026, 7, 16, 23, 59, tzinfo=timezone.utc),
+        time_precision="day",
+        purpose_summary="cancel and recreate regression",
+        related_case_ids=(),
+        confidence=1.0,
+    )
+    created = executor.execute(command, _context(message_id="travel-create-a"))
+    cancelled = executor.execute(
+        UpdateTravelIntent(
+            command_id="travel-cancel",
+            travel_intent_id=created.resource_id,
+            expected_version=1,
+            status="cancelled",
+        ),
+        _context(message_id="travel-cancel-b"),
+    )
+    recreated = executor.execute(
+        CreateTravelIntent(
+            **{
+                **command.__dict__,
+                "command_id": "travel-create-after-cancel",
+            }
+        ),
+        _context(message_id="travel-create-c"),
+    )
+
+    assert cancelled.status == "executed"
+    assert recreated.status == "executed"
+    assert recreated.resource_id != created.resource_id
+    assert len(executor.travel_intents) == 2
+    assert sum(item.status != "cancelled" for item in executor.travel_intents) == 1
 
 
 def test_three_people_same_city_and_window_produce_one_group_candidate_not_pairwise_storm():

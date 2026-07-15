@@ -29,6 +29,8 @@ from app.agent2.business.contracts import (
     UpdateCaseProgress,
     UpdateTravelIntent,
     business_command_fingerprint,
+    normalize_travel_fact_text,
+    travel_intent_fact_fingerprint,
 )
 from app.agent2.case_followup_commands import (
     TriggerCaseFollowupNow,
@@ -175,7 +177,7 @@ class InMemoryBusinessExecutor:
                         context.admission_ticket
                     ) as lease:
                         receipt = self._dispatch(command, context, key)
-                        if receipt.status == "executed":
+                        if receipt.status in {"executed", "duplicate"}:
                             lease.consume(receipt.receipt_id)
                         return receipt
                 return self._dispatch(command, context, key)
@@ -471,6 +473,31 @@ class InMemoryBusinessExecutor:
         if command.confidence < 0.85:
             raise BusinessCommandError("travel_confidence_too_low", "domain_policy", "travel needs clarification")
         self._assert_allowed_cases(command.related_case_ids, context)
+        existing = next(
+            (
+                item
+                for item in self.travel_intents_by_id.values()
+                if item.tenant_id == context.tenant_id
+                and item.user_id == context.actor_user_id
+                and item.status != "cancelled"
+                and item.city_code == command.city_code
+                and item.start_at == command.start_at
+                and item.end_at == command.end_at
+                and item.time_precision == command.time_precision
+                and normalize_travel_fact_text(item.purpose_summary)
+                == normalize_travel_fact_text(command.purpose_summary)
+            ),
+            None,
+        )
+        if existing is not None:
+            return self._duplicate(
+                command,
+                context,
+                key,
+                "travel_intent",
+                existing.travel_intent_id,
+                _mapping(existing),
+            )
         intent_id = _stable_id(
             "travel-intent",
             context.tenant_id,
@@ -829,6 +856,47 @@ class InMemoryBusinessExecutor:
                     occurred_at=context.occurred_at,
                 )
             )
+        return receipt
+
+    def _duplicate(
+        self,
+        command: BusinessCommand,
+        context: BusinessCommandContext,
+        key: str,
+        resource_type: str,
+        resource_id: str,
+        after: dict[str, Any],
+    ) -> BusinessReceipt:
+        receipt = self._receipt(
+            command=command,
+            context=context,
+            idempotency_key=key,
+            status="duplicate",
+            resource_type=resource_type,
+            resource_id=resource_id,
+            before={},
+            after=after,
+            error_code=None,
+            failed_stage=None,
+            actual_write=False,
+        )
+        self._receipts_by_key[key] = receipt
+        self.audit_log.append(
+            BusinessAuditEntry(
+                audit_id=_stable_id("business-audit", receipt.receipt_id),
+                receipt_id=receipt.receipt_id,
+                tenant_id=context.tenant_id,
+                actor_user_id=context.actor_user_id,
+                source_message_id=context.source_message_id,
+                source_channel=context.source_channel,
+                command_type=command.command_type,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                before={},
+                after=deepcopy(after),
+                occurred_at=context.occurred_at,
+            )
+        )
         return receipt
 
     def _receipt(
