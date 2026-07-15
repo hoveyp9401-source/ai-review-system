@@ -48,25 +48,147 @@ class ReplayDailyContext:
         )
 
 
+@dataclass(frozen=True)
+class LiveDailyContext:
+    report: Any | None
+    report_date: date
+    active_task: ActiveWorkflowTask | None
+    source: str
+
+
 async def load_live_daily_report(session: Any, user: Any, settings: Any) -> Any | None:
-    """Load the most recent active daily report that can own a follow-up message."""
+    """Load today's active daily report that can own an unqualified follow-up.
+
+    Historical collecting reports remain queryable through Daily history, but
+    they must never become the implicit write target for a later calendar day.
+    """
     from sqlalchemy import select
 
     from app.models import DailyReport
 
     now = now_in_timezone(getattr(user, "timezone", "") or getattr(settings, "timezone", "Asia/Shanghai"))
-    min_date = now.date() - timedelta(days=7)
     stmt = (
         select(DailyReport)
-        .where(DailyReport.user_id == user.id, DailyReport.report_date >= min_date)
+        .where(DailyReport.user_id == user.id, DailyReport.report_date == now.date())
         .order_by(DailyReport.updated_at.desc())
-        .limit(8)
+        .limit(1)
     )
     result = await session.execute(stmt)
     for report in result.scalars().all():
-        if daily_active_task_from_report(report) is not None:
+        if (
+            getattr(report, "report_date", None) == now.date()
+            and daily_active_task_from_report(report) is not None
+        ):
             return report
     return None
+
+
+async def load_live_daily_context(session: Any, user: Any, settings: Any) -> LiveDailyContext:
+    """Resolve the report date from persisted user/report interaction evidence.
+
+    A reminder is a report-scoped interaction even when no Daily row exists yet.
+    Persisting and reading that interaction keeps an early-morning reply attached
+    to the report date the robot actually asked about instead of silently using
+    the wall-clock date.
+    """
+
+    from sqlalchemy import select
+
+    from app.models import DailyReport, ReportInteractionEvent
+
+    timezone = getattr(user, "timezone", "") or getattr(settings, "timezone", "Asia/Shanghai")
+    now = now_in_timezone(timezone)
+    current_report = await _load_daily_report_for_date(
+        session,
+        user_id=user.id,
+        report_date=now.date(),
+    )
+    current_task = daily_active_task_from_report(current_report)
+    if current_task is not None:
+        return LiveDailyContext(
+            report=current_report,
+            report_date=now.date(),
+            active_task=current_task,
+            source="active_report",
+        )
+
+    reminder_statement = (
+        select(ReportInteractionEvent)
+        .where(
+            ReportInteractionEvent.user_id == user.id,
+            ReportInteractionEvent.backend_action == "daily_report_reminder_sent",
+            ReportInteractionEvent.report_date <= now.date(),
+            ReportInteractionEvent.created_at >= now - timedelta(hours=16),
+        )
+        .order_by(ReportInteractionEvent.created_at.desc())
+        .limit(1)
+    )
+    reminder_result = await session.execute(reminder_statement)
+    reminder = next(iter(reminder_result.scalars().all()), None)
+    if reminder is None:
+        return LiveDailyContext(
+            report=None,
+            report_date=now.date(),
+            active_task=None,
+            source="current_date_default",
+        )
+
+    target_date = reminder.report_date
+    target_report = await _load_daily_report_for_date(
+        session,
+        user_id=user.id,
+        report_date=target_date,
+    )
+    if target_report is not None and str(getattr(target_report, "status", "") or "") == STATUS_COMPLETED:
+        return LiveDailyContext(
+            report=None,
+            report_date=now.date(),
+            active_task=None,
+            source="completed_reminder_target_ignored",
+        )
+    active_task = daily_active_task_from_report(target_report)
+    if active_task is None:
+        active_task = ActiveWorkflowTask(
+            workflow=WORKFLOW_DAILY_REPORT,
+            task_id=f"reminder:{getattr(reminder, 'id', '')}",
+            status=STATUS_COLLECTING,
+            reply_candidate=True,
+            awaiting_confirmation=False,
+            reason="recent persisted daily reminder awaits a reply",
+            metadata={
+                "report_date": target_date.isoformat(),
+                "reminder_event_id": str(getattr(reminder, "id", "") or ""),
+            },
+        )
+    return LiveDailyContext(
+        report=target_report,
+        report_date=target_date,
+        active_task=active_task,
+        source="recent_reminder",
+    )
+
+
+async def _load_daily_report_for_date(
+    session: Any,
+    *,
+    user_id: Any,
+    report_date: date,
+) -> Any | None:
+    from sqlalchemy import select
+
+    from app.models import DailyReport
+
+    statement = (
+        select(DailyReport)
+        .where(
+            DailyReport.user_id == user_id,
+            DailyReport.report_date == report_date,
+        )
+        .order_by(DailyReport.updated_at.desc())
+        .limit(1)
+    )
+    result = await session.execute(statement)
+    return next(iter(result.scalars().all()), None)
 
 
 async def build_live_daily_active_task(session: Any, user: Any, settings: Any) -> ActiveWorkflowTask | None:

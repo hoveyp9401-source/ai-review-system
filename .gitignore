@@ -25,6 +25,11 @@ htmlcov/
 *.zip
 
 .tmp*
+.codex_tmp/
+.codex_upload_tmp*/
+__codex_tmp_sync__/
+backups/
+tmp/
 tmp_*
 tmp-*
 tmp_server_scripts/
@@ -32,6 +37,7 @@ remote_current/
 remote_edit/
 server_patch/
 outputs/
+artifacts/
 dist/
 data/
 !data/.gitkeep

@@ -1,0 +1,51 @@
+{
+  "schema_version": "agent2.corpus_search_evidence.v1",
+  "recorded_at": "2026-07-10T21:20:00+08:00",
+  "exact_842_dialogue_5562_turn_bundle_found": false,
+  "searches": [
+    {
+      "scope": "workspace source, docs, fixtures, scripts, replay outputs, and ignored files",
+      "command": "rg -uu -l -P --glob '!venv/**' --glob '!.git/**' '(?<!\\d)842(?!\\d)|(?<!\\d)5562(?!\\d)' .",
+      "result": "References and other corpora were found, including the Phase 1 design/ADR and local server-history exports; no exact raw bundle plus selection manifest was present. Structured JSONL counts are recorded in corpus_manifest.json entries."
+    },
+    {
+      "scope": "workspace ZIP archives, including ignored output archives",
+      "command": "Get-ChildItem . -Recurse -File -Filter *.zip; inspect every ZIP member ending in .jsonl",
+      "result": "7 non-venv ZIP files inspected. Dialogue members were 5/26, 60/320, 5/26, 60/320, and 60/320 dialogues/turns; one RAG JSONL was not dialogue-shaped. No 842/5562 member was found."
+    },
+    {
+      "scope": "reachable git history",
+      "command": "git log --all -G'(^|[^0-9])(842|5562)([^0-9]|$)' --format='%H %s' -- .",
+      "result": "No commit matched the exact-number history search. A broader -S842 hit was inspected and contained only unrelated substrings such as Chinese text/code and CSS colors."
+    },
+    {
+      "scope": "git refs, tags, branches, and stash",
+      "command": "git branch --all; git tag; git stash list",
+      "result": "Only the current main branch was present; no tag, additional historical branch, or stash contained a recoverable corpus."
+    },
+    {
+      "scope": "project-related user archives and temporary directories",
+      "command": "Search project-named directories, temp roots, outputs, data, evals, fixtures, logs, and archive extensions under the current user profile",
+      "result": "No second ai-review-system workspace or 842/5562 candidate bundle was found. Pytest temp data contained only small test fixtures."
+    },
+    {
+      "scope": "documented absolute path E:\\桌面\\测试反馈",
+      "command": "Get-ChildItem -LiteralPath 'E:\\桌面\\测试反馈' -Recurse -File | filter .json/.jsonl/archive extensions; parse dialogue-shaped JSONL counts",
+      "result": "5 JSONL candidates: 5000_test_cases.jsonl has 5000 flat {text} rows; 5000条异常明细.jsonl has 567 flat anomaly rows; dialogue-shaped sets contain 36/36, 400/670, and 150/261 dialogues/turns. No archive candidate and no 842/5562 dialogue bundle."
+    }
+  ],
+  "known_local_representative_sets": [
+    {"dialogues": 687, "turns": 1407, "role": "current Phase 1 selection"},
+    {"dialogues": 747, "turns": 1727, "role": "local combined source set"},
+    {"dialogues": 915, "turns": 3102, "role": "local replay/result set"},
+    {"dialogues": 168, "turns": 1375, "role": "server-history-derived set"}
+  ],
+  "missing_delta_analysis": {
+    "dialogues": 155,
+    "turns": 4155,
+    "average_turns_per_missing_dialogue": 26.8065,
+    "inference": "The unusually long average and absence from flat GLM files indicate a likely server-only historical conversation selection, not the 5000 flat text generator.",
+    "inference_status": "not_proven_requires_server_export_manifest"
+  },
+  "limitation": "This is a search ledger, not the missing corpus. It does not make any representative set equivalent to the required 842/5562 selection."
+}

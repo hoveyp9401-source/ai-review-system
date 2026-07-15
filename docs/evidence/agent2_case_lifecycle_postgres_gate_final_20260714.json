@@ -1,0 +1,21 @@
+{
+  "artifact_version": "agent2.case_lifecycle.postgres_gate.v1",
+  "checks": {
+    "idempotent_reapply": true,
+    "legacy_outcome_upgrade": true,
+    "public_schema_unchanged": true,
+    "transaction_rollback": true
+  },
+  "cleanup": {
+    "confirmed": true,
+    "passed": true
+  },
+  "database_target": "remote_configured_postgresql_redacted",
+  "execution_transport": "ssh",
+  "finished_at": "2026-07-14T00:58:04+00:00",
+  "migration_sha256": "19b19a8653fdb4ba96bc2e300c886086b90a45982bb7d05b5cc7919718bdf34c",
+  "started_at": "2026-07-14T00:58:03+00:00",
+  "status": "PASS",
+  "temporary_schema": "agent2_admission_gate_20260714case",
+  "verifier_sha256": "be2928a9fd227189d1b86cfedcb66ddce65bf0859e80e56a1f8cefd9fb51f80f"
+}

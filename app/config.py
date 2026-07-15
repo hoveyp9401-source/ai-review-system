@@ -52,6 +52,16 @@ class Settings(BaseSettings):
     llm_intent_fallback_confidence: float = Field(default=0.45, ge=0.0, le=1.0)
     admin_enabled: bool = False
     admin_token: str = ""
+    legal_ops_sandbox_enabled: bool = False
+    legal_ops_sandbox_data_path: str = "data/legal_ops_sandbox.json"
+    legal_ops_sandbox_seed_manifest: str = "app/legal_ops/fixtures/phase0_manifest.json"
+    legal_ops_sandbox_default_tenant: str = ""
+    legal_ops_sandbox_token: str = ""
+    legal_ops_sandbox_principals_json: str = ""
+    legal_ops_live_enabled: bool = False
+    legal_ops_live_tenant_id: str = ""
+    legal_ops_live_token: str = ""
+    legal_ops_live_principals_json: str = ""
     shadow_memory_enabled: bool = False
     progress_enabled: bool = False
     progress_outbox_enabled: bool = False
@@ -66,6 +76,45 @@ class Settings(BaseSettings):
     workflow_intake_mode: str = "observe_only"
     agent2_daily_enabled: bool = False
     agent2_daily_enabled_user_ids: str = ""
+    agent2_cognitive_core_v3_enabled: bool = False
+    agent2_cognitive_core_v3_model: str = "deepseek-v4-pro"
+    agent2_cognitive_core_v3_thinking: bool = True
+    agent2_semantic_admission_enabled: bool = False
+    agent2_semantic_admission_enforce: bool = False
+    agent2_semantic_admission_review_capture: bool = False
+    agent2_semantic_admission_deferred_capture: bool = False
+    agent2_semantic_admission_shadow_replay: bool = False
+    agent2_semantic_admission_tenant_allowlist: str = ""
+    agent2_semantic_admission_user_allowlist: str = ""
+    agent2_business_phase2_enabled: bool = False
+    agent2_business_tenant_ids: str = ""
+    agent2_business_party_query_enabled: bool = False
+    agent2_business_case_progress_enabled: bool = False
+    agent2_business_case_progress_write_enabled: bool = False
+    agent2_business_travel_enabled: bool = False
+    agent2_business_travel_write_enabled: bool = False
+    agent2_travel_notification_worker_enabled: bool = False
+    agent2_travel_notification_worker_interval_seconds: int = Field(default=15, ge=5, le=3600)
+    agent2_travel_notification_batch_size: int = Field(default=50, ge=1, le=500)
+    agent2_travel_notification_max_attempts: int = Field(default=5, ge=1, le=20)
+    agent2_travel_notification_retry_base_seconds: int = Field(default=30, ge=1, le=3600)
+    agent2_travel_notification_stale_lock_minutes: int = Field(default=10, ge=1, le=1440)
+    agent2_case_followup_enabled: bool = False
+    agent2_case_followup_send_enabled: bool = False
+    agent2_case_followup_tenant_ids: str = ""
+    agent2_case_followup_user_ids: str = ""
+    case_followup_enabled: bool = False
+    case_followup_send_enabled: bool = False
+    case_followup_report_projection_enabled: bool = False
+    case_followup_user_allowlist: str = ""
+    case_followup_tenant_allowlist: str = ""
+    case_followup_trigger_allowlist: str = ""
+    case_followup_conversation_map_json: str = ""
+    case_followup_daily_limit: int = Field(default=3, ge=1, le=50)
+    case_followup_case_daily_limit: int = Field(default=1, ge=1, le=10)
+    case_followup_merge_window_minutes: int = Field(default=30, ge=1, le=1440)
+    case_followup_reminder_interval_hours: int = Field(default=48, ge=1, le=720)
+    case_followup_max_reminders: int = Field(default=1, ge=0, le=10)
 
     dingtalk_incoming_token: str = ""
     dingtalk_callback_token: str = ""

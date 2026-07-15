@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -43,6 +43,83 @@ class User(Base):
 
     team: Mapped[Team] = relationship(back_populates="users")
     daily_reports: Mapped[list["DailyReport"]] = relationship(back_populates="user")
+
+
+class Agent2ConversationState(Base):
+    __tablename__ = "agent2_conversation_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_key",
+            "conversation_id",
+            name="agent2_conversation_states_user_conversation_key",
+        ),
+        CheckConstraint("version >= 0", name="agent2_conversation_states_version_nonnegative"),
+        Index("agent2_conversation_states_updated_idx", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    state_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    last_message_id: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class Agent2DailyCommandReceipt(Base):
+    __tablename__ = "agent2_daily_command_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="agent2_daily_receipts_tenant_idempotency_key",
+        ),
+        CheckConstraint(
+            "status IN ('executed', 'duplicate', 'blocked')",
+            name="agent2_daily_receipts_status_check",
+        ),
+        Index("agent2_daily_receipts_tenant_created_idx", "tenant_id", "created_at"),
+        Index("agent2_daily_receipts_user_date_idx", "user_id", "report_date"),
+    )
+
+    receipt_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    report_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("daily_reports.id", ondelete="SET NULL"),
+    )
+    report_date: Mapped[date] = mapped_column(Date, nullable=False)
+    message_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    command_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    decision_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    sub_decision_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    command_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    validation_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    actual_write: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    resource_type: Mapped[str] = mapped_column(String(64), nullable=False, default="daily_report")
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    before_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    after_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    audit_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 
 class DailyReport(Base):

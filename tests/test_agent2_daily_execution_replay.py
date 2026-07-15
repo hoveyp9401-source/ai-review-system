@@ -237,3 +237,204 @@ def test_execution_replay_treats_polished_daily_wording_as_semantically_equal(tm
     results = replay_daily_execution_cases(cases)
 
     assert results[0]["passed"] is True
+
+
+def test_execution_replay_blocks_actionless_context_instruction_instead_of_writing_it(tmp_path: Path):
+    cases = _load_one(
+        tmp_path,
+        {
+            "dialogue_id": "actionless-context-instruction",
+            "turns": [
+                {
+                    "turn_id": "daily",
+                    "text": "\u4eca\u5929\u5b8c\u6210\u5408\u540c\u5ba1\u6838",
+                    "expected": {"agent2_direct_write": True},
+                },
+                {
+                    "turn_id": "vague-editorial-request",
+                    "text": "\u5e2e\u6211\u6574\u5408\u4f18\u5316",
+                    "expected": {
+                        "agent2_direct_write": False,
+                        "blocked_by_gate": True,
+                        "forbidden_today_work_contains": ["\u5e2e\u6211\u6574\u5408\u4f18\u5316"],
+                    },
+                },
+            ],
+        },
+    )
+
+    results = replay_daily_execution_cases(cases)
+    blocked_turn = results[0]["turns"][1]
+
+    assert results[0]["passed"] is True
+    assert blocked_turn["cognitive_decision"]["allow_write"] is False
+    assert [action["action_type"] for action in blocked_turn["cognitive_decision"]["actions"]] == [
+        "disambiguation_required"
+    ]
+    assert blocked_turn["cognitive_decision"]["actions"][0]["safety_flags"] == [
+        "ambiguous_daily_edit_target"
+    ]
+    assert blocked_turn["gate"]["reply_type"] == "clarify"
+    assert blocked_turn["contract_invariant_violations"] == []
+
+
+def test_execution_replay_authorizes_concrete_contextual_personnel_work_before_writing(tmp_path: Path):
+    personnel_work = "\u554a\uff0c\u5904\u7406\u4e86\u5173\u4e8e\u79bb\u804c\u4eba\u5458\u7684\u624b\u7eed\u5bf9\u63a5\u5de5\u4f5c"
+    cases = _load_one(
+        tmp_path,
+        {
+            "dialogue_id": "authorized-contextual-personnel-work",
+            "turns": [
+                {
+                    "turn_id": "daily",
+                    "text": "\u4eca\u5929\u5b8c\u6210\u5408\u540c\u5ba1\u6838",
+                    "expected": {"agent2_direct_write": True},
+                },
+                {
+                    "turn_id": "personnel-work",
+                    "text": personnel_work,
+                    "expected": {
+                        "agent2_direct_write": True,
+                        "fallback_to_legacy": False,
+                    },
+                },
+            ],
+        },
+    )
+
+    results = replay_daily_execution_cases(cases)
+    written_turn = results[0]["turns"][1]
+
+    assert results[0]["passed"] is True
+    assert written_turn["cognitive_decision"]["allow_write"] is True
+    assert [action["action_type"] for action in written_turn["cognitive_decision"]["actions"]] == ["daily_write"]
+    assert written_turn["contract_invariant_violations"] == []
+    assert "\u5904\u7406\u5173\u4e8e\u79bb\u804c\u4eba\u5458\u7684\u624b\u7eed\u5bf9\u63a5\u5de5\u4f5c" in written_turn["report_after"]["today_work"]
+
+
+def test_execution_replay_keeps_personnel_and_project_questions_read_only_in_active_daily(tmp_path: Path):
+    personnel_question = "\u79bb\u804c\u624b\u7eed\u600e\u4e48\u5904\u7406\uff1f"
+    project_question = "\u63a8\u52a8\u9879\u76ee\u662f\u4ec0\u4e48\u610f\u601d\uff1f"
+    project_negation = "\u6ca1\u6709\u63a8\u52a8\u9879\u76ee"
+    personnel_meta = "\u5165\u804c\u6750\u6599\u6a21\u677f"
+    cases = _load_one(
+        tmp_path,
+        {
+            "dialogue_id": "business-object-questions-stay-read-only",
+            "turns": [
+                {
+                    "turn_id": "daily",
+                    "text": "\u4eca\u5929\u5b8c\u6210\u5408\u540c\u5ba1\u6838",
+                    "expected": {"agent2_direct_write": True},
+                },
+                {
+                    "turn_id": "personnel-question",
+                    "text": personnel_question,
+                    "expected": {
+                        "agent2_direct_write": False,
+                        "forbidden_today_work_contains": [personnel_question],
+                    },
+                },
+                {
+                    "turn_id": "project-question",
+                    "text": project_question,
+                    "expected": {
+                        "agent2_direct_write": False,
+                        "forbidden_today_work_contains": [project_question],
+                    },
+                },
+                {
+                    "turn_id": "project-negation",
+                    "text": project_negation,
+                    "expected": {
+                        "agent2_direct_write": False,
+                        "forbidden_today_work_contains": [project_negation],
+                    },
+                },
+                {
+                    "turn_id": "personnel-meta",
+                    "text": personnel_meta,
+                    "expected": {
+                        "agent2_direct_write": False,
+                        "forbidden_today_work_contains": [personnel_meta],
+                    },
+                },
+            ],
+        },
+    )
+
+    results = replay_daily_execution_cases(cases)
+    summary = summarize_daily_execution_results(results)
+
+    assert results[0]["passed"] is True
+    assert summary["gray_ready"] is True
+    assert all(turn["contract_invariant_violations"] == [] for turn in results[0]["turns"])
+
+
+def test_execution_replay_blocks_bare_contextual_correction_without_item_focus(tmp_path: Path):
+    correction = "\u662f\u65e5\u5e38\u8fd0\u8425\u5ba1\u6838"
+    cases = _load_one(
+        tmp_path,
+        {
+            "dialogue_id": "contextual-correction-without-item-focus",
+            "turns": [
+                {
+                    "turn_id": "daily",
+                    "text": "\u4eca\u5929\u505a\u4e86\u65e5\u5e38\u7528\u8bed\u5ba1\u6838",
+                    "expected": {"agent2_direct_write": True},
+                },
+                {
+                    "turn_id": "bare-correction",
+                    "text": correction,
+                    "expected": {
+                        "agent2_direct_write": False,
+                        "blocked_by_gate": True,
+                        "forbidden_today_work_contains": [correction],
+                    },
+                },
+            ],
+        },
+    )
+
+    results = replay_daily_execution_cases(cases)
+    correction_turn = results[0]["turns"][1]
+
+    assert results[0]["passed"] is True
+    assert correction_turn["gate"]["reply_type"] == "clarify"
+    assert correction_turn["contract_invariant_violations"] == []
+
+
+def test_execution_replay_explicit_do_not_write_overrides_contextual_system_failure(tmp_path: Path):
+    instruction = (
+        "\u4eca\u5929\u8bd5\u4e86\u62a5\u9500\u7cfb\u7edf\uff0c\u8fd8\u662f\u4e0d\u884c\uff0c"
+        "\u4e0d\u8981\u5199\u65e5\u62a5\uff0c\u53ea\u5e2e\u6211\u770b\u770b"
+    )
+    cases = _load_one(
+        tmp_path,
+        {
+            "dialogue_id": "system-failure-explicit-no-write",
+            "turns": [
+                {
+                    "turn_id": "daily",
+                    "text": "\u4eca\u5929\u5b8c\u6210\u5408\u540c\u5ba1\u6838",
+                    "expected": {"agent2_direct_write": True},
+                },
+                {
+                    "turn_id": "system-question",
+                    "text": instruction,
+                    "expected": {
+                        "agent2_direct_write": False,
+                        "forbidden_problems_contains": ["\u62a5\u9500\u7cfb\u7edf"],
+                        "forbidden_today_work_contains": [instruction],
+                    },
+                },
+            ],
+        },
+    )
+
+    results = replay_daily_execution_cases(cases)
+    question_turn = results[0]["turns"][1]
+
+    assert results[0]["passed"] is True
+    assert question_turn["cognitive_decision"]["allow_write"] is False
+    assert question_turn["contract_invariant_violations"] == []

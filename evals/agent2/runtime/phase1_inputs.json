@@ -1,0 +1,26 @@
+{
+  "schema_version": "agent2.runtime_replay_inputs.v1",
+  "expected_dialogues": 687,
+  "expected_turns": 1407,
+  "inputs": [
+    "evals/agent2/dialogues/assistant_cross_workflow_20260703.jsonl",
+    "evals/agent2/dialogues/assistant_long_context_edit_20260703.jsonl",
+    "evals/agent2/dialogues/assistant_reply_20260703.jsonl",
+    "evals/agent2/dialogues/assistant_side_reply_20260703.jsonl",
+    "evals/agent2/dialogues/core.jsonl",
+    "evals/agent2/dialogues/court_routing_regression_20260709.jsonl",
+    "evals/agent2/dialogues/daily_commands_expanded_20260702.jsonl",
+    "evals/agent2/dialogues/daily_execution_grey_gate_20260702.jsonl",
+    "evals/agent2/dialogues/legal_daily_500_20260709.jsonl",
+    "evals/agent2/dialogues/legal_daily_realistic_20260709.jsonl",
+    "evals/agent2/dialogues/random_generated_20260703_item_ids.jsonl",
+    "evals/agent2/dialogues/self_generated_multiturn_20260703.jsonl"
+  ],
+  "excluded": [
+    {
+      "path": "evals/agent2/dialogues/random_generated_20260703.jsonl",
+      "reason": "Superseded by random_generated_20260703_item_ids.jsonl for this curated run. The two files reuse 60 dialogue IDs but are not byte- or turn-equivalent; retaining both would violate unique dialogue identity, so this is an explicit version choice rather than a claim of identical duplication."
+    }
+  ],
+  "known_evidence_gap": "The claimed 842-dialogue/5562-turn server corpus is not present in this workspace."
+}

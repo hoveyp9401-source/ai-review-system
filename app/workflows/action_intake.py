@@ -138,6 +138,11 @@ def plan_user_actions(envelope: Any) -> UserActionPlan:
     active_tasks = tuple(getattr(envelope, "active_tasks", ()) or ())
     active_daily = _has_active_task(active_tasks, WORKFLOW_DAILY_REPORT)
     active_monthly = _has_active_task(active_tasks, WORKFLOW_MONTHLY_REPORT)
+    pending_confirmation_tasks = [task for task in active_tasks if bool(getattr(task, "awaiting_confirmation", False))]
+    daily_confirmation_pending = (
+        len(pending_confirmation_tasks) == 1
+        and str(getattr(pending_confirmation_tasks[0], "workflow", "") or "") == WORKFLOW_DAILY_REPORT
+    )
     received_at = getattr(envelope, "received_at", None)
     action_context = resolve_action_context(raw_text, received_at=received_at, active_tasks=active_tasks)
 
@@ -149,6 +154,7 @@ def plan_user_actions(envelope: Any) -> UserActionPlan:
                 index=index,
                 active_daily=active_daily,
                 active_monthly=active_monthly,
+                daily_confirmation_pending=daily_confirmation_pending,
                 whole_text=raw_text,
                 received_at=received_at,
                 inherited_field=frame.inherited_field,
@@ -156,6 +162,16 @@ def plan_user_actions(envelope: Any) -> UserActionPlan:
         )
 
     actions = _suppress_resolved_daily_ambiguity(_dedupe_actions(actions))
+    if _looks_like_do_not_write_daily(raw_text):
+        actions = [
+            action
+            for action in actions
+            if not (
+                action.workflow == WORKFLOW_DAILY_REPORT
+                and action.write_policy == POLICY_WRITE
+                and action.action_type == ACTION_DAILY_WRITE
+            )
+        ]
     return UserActionPlan(
         actions=actions,
         commit_policy=_commit_policy(actions),
@@ -172,6 +188,7 @@ def _actions_for_segment(
     index: int,
     active_daily: bool,
     active_monthly: bool,
+    daily_confirmation_pending: bool,
     whole_text: str,
     received_at: Any = None,
     inherited_field: str = "",
@@ -179,6 +196,67 @@ def _actions_for_segment(
     segment = str(segment or "").strip()
     if not segment:
         return []
+    if active_daily and _looks_like_contextual_system_failure_followup(whole_text):
+        if index != 1:
+            return []
+        content = _contextual_system_failure_content(whole_text)
+        return [
+            _action(
+                ACTION_DAILY_WRITE,
+                WORKFLOW_DAILY_REPORT,
+                "fill",
+                content,
+                index,
+                target_field="problems",
+                write_policy=POLICY_WRITE,
+                payload={"content": content},
+                confidence=0.86,
+                reason="active daily context reports a concrete system failure",
+            ),
+            _action(
+                ACTION_INTERNAL_QA,
+                WORKFLOW_INTERNAL_QA,
+                "answer_question",
+                whole_text,
+                index,
+                write_policy=POLICY_READ_ONLY,
+                confidence=0.76,
+                safety_flags=["side_reply_only"],
+                reason="user also asks the assistant to inspect the reported failure",
+            ),
+        ]
+    if _looks_like_current_daily_status_query(whole_text) and not _looks_like_daily_history_query(whole_text):
+        if index != 1:
+            return []
+        return [
+            _action(
+                ACTION_DAILY_READ_CURRENT,
+                WORKFLOW_DAILY_REPORT,
+                "query_current",
+                whole_text,
+                index,
+                write_policy=POLICY_READ_ONLY,
+                confidence=0.9,
+                reason="user asks for the current daily-report status",
+            )
+        ]
+    if active_daily and _looks_like_ambiguous_daily_editorial_request(whole_text):
+        if index != 1:
+            return []
+        return [
+            _action(
+                ACTION_DISAMBIGUATION_REQUIRED,
+                WORKFLOW_DAILY_REPORT,
+                "clarify_target",
+                whole_text,
+                index,
+                target_field="unknown",
+                write_policy=POLICY_PENDING,
+                confidence=0.84,
+                safety_flags=["ambiguous_daily_edit_target"],
+                reason="daily editorial request does not identify the item or field to change",
+            )
+        ]
     if _looks_like_historical_daily_destructive_request(whole_text):
         if index != 1:
             return []
@@ -230,6 +308,21 @@ def _actions_for_segment(
                 reason="active daily context receives a contextual retract/revoke instruction",
             )
         ]
+    if active_daily and index == 1 and _compact(whole_text) == "\u64a4\u56de":
+        return [
+            _action(
+                ACTION_DAILY_EDIT,
+                WORKFLOW_DAILY_REPORT,
+                "edit",
+                whole_text,
+                index,
+                target_field="all",
+                write_policy=POLICY_WRITE,
+                confidence=0.84,
+                safety_flags=["destructive_or_overwrite", "requires_bound_typed_validation"],
+                reason="user asks to revoke the active daily report; typed validation must bind report state",
+            )
+        ]
     if _looks_like_emotional_customer_phone_only(whole_text):
         if index == 1:
             return [
@@ -262,22 +355,45 @@ def _actions_for_segment(
                 )
             ]
         return []
-    if _looks_like_lifestyle_question_turn(whole_text) and not _has_current_reportable_work_piece(whole_text):
-        if index == 1:
+    if (
+        _looks_like_lifestyle_question_turn(whole_text)
+        and not _has_current_reportable_work_piece(whole_text)
+    ):
+        independent_daily_segment = (
+            _has_daily_time_anchor(segment)
+            and _has_reportable_work_piece(segment)
+            and not _looks_like_lifestyle_question_turn(segment)
+        )
+        if not independent_daily_segment and index != 1:
+            return []
+        if not independent_daily_segment:
             return [
                 _action(
                     ACTION_SMALL_TALK,
                     WORKFLOW_CHAT,
                     "small_talk",
-                    segment,
+                    whole_text,
                     index,
                     write_policy=POLICY_NO_WRITE,
                     confidence=0.84,
                     safety_flags=["blocks_context_write", "lifestyle_question"],
-                    reason="whole turn is a lifestyle question with incidental work context, not a daily update",
+                    reason="whole turn is a lifestyle question without an independent daily update",
                 )
             ]
-        return []
+    if _looks_like_lifestyle_question_turn(segment) and not _has_current_reportable_work_piece(segment):
+        return [
+            _action(
+                ACTION_SMALL_TALK,
+                WORKFLOW_CHAT,
+                "small_talk",
+                segment,
+                index,
+                write_policy=POLICY_NO_WRITE,
+                confidence=0.84,
+                safety_flags=["blocks_context_write", "lifestyle_question"],
+                reason="segment is a lifestyle question with incidental work context, not a daily update",
+            )
+        ]
     if _looks_like_today_task_question(whole_text):
         if index == 1:
             return [
@@ -1307,7 +1423,11 @@ def _actions_for_segment(
                 reason="user asks to view the current daily draft",
             )
         ]
-    if _looks_like_daily_confirm_request(segment, active_daily=active_daily):
+    if _looks_like_daily_confirm_request(
+        segment,
+        active_daily=active_daily,
+        daily_confirmation_pending=daily_confirmation_pending,
+    ):
         return [
             _action(
                 ACTION_DAILY_CONFIRM,
@@ -1493,7 +1613,15 @@ def _actions_for_segment(
                 reason="segment is not a daily-report work item",
             )
         ]
-    if _looks_like_monthly_meta_request(segment) or _looks_like_daily_bot_feedback(whole_text):
+    monthly_meta_is_active_daily_work = (
+        active_daily
+        and _looks_like_monthly_meta_request(segment)
+        and _has_current_reportable_work_piece(segment)
+    )
+    if (
+        _looks_like_monthly_meta_request(segment)
+        and not monthly_meta_is_active_daily_work
+    ) or _looks_like_daily_bot_feedback(whole_text):
         return [
             _action(
                 ACTION_SMALL_TALK,
@@ -1630,7 +1758,9 @@ def _actions_for_segment(
                 reason="user explicitly asks to write or start a daily report",
             )
         ]
-    if _looks_like_internal_qa(segment) and not (active_daily and _has_reportable_work_piece(segment)):
+    if _looks_like_internal_qa(segment) and not (
+        active_daily and (_has_reportable_work_piece(segment) or _daily_edit_allowed(segment, active_daily=True))
+    ):
         return [
             _action(
                 ACTION_INTERNAL_QA,
@@ -1741,6 +1871,8 @@ def _actions_for_segment(
             received_at=received_at,
             reason_prefix="case/travel follow-up detail is collected as a sidecar candidate, not direct daily content",
         )
+    if _looks_like_future_travel_schedule_continuation(segment, whole_text=whole_text):
+        return []
     if _looks_like_future_case_schedule_update(segment, whole_text=whole_text, received_at=received_at):
         return _sidecar_candidate_actions(
             segment,
@@ -2031,6 +2163,7 @@ def _actions_for_segment(
                 target_field=daily_field,
                 write_policy=POLICY_WRITE,
                 confidence=0.84,
+                safety_flags=["active_daily_explicit_work"] if monthly_meta_is_active_daily_work else [],
                 reason="segment contains daily-report work, problem, or plan content",
             )
         )
@@ -2580,7 +2713,18 @@ def _daily_field_for_segment(
         return ""
     if _looks_like_personal_state_only(segment) or _looks_like_calendar_or_offday_chatter(segment):
         return ""
-    if _looks_like_monthly_meta_request(segment) or _looks_like_monthly_meta_request(whole_text) or _looks_like_daily_bot_feedback(whole_text):
+    monthly_meta_is_active_daily_work = (
+        active_daily
+        and _looks_like_monthly_meta_request(segment)
+        and _has_current_reportable_work_piece(segment)
+    )
+    if (
+        _looks_like_monthly_meta_request(segment)
+        and not monthly_meta_is_active_daily_work
+    ) or (
+        _looks_like_monthly_meta_request(whole_text)
+        and not monthly_meta_is_active_daily_work
+    ) or _looks_like_daily_bot_feedback(whole_text):
         return ""
     if _looks_like_process_help_reason_fragment(segment):
         return ""
@@ -3087,22 +3231,32 @@ def _clear_target_field(segment: str) -> str:
     return "all"
 
 
-def _looks_like_daily_confirm_request(segment: str, *, active_daily: bool) -> bool:
+def _looks_like_daily_confirm_request(
+    segment: str,
+    *,
+    active_daily: bool,
+    daily_confirmation_pending: bool,
+) -> bool:
     if not active_daily:
         return False
     compact = _compact(segment)
     if _contains_any(compact, ("\u65e5\u62a5\u5c31\u8fd9\u6837", "\u65e5\u62a5\u5c31\u8fd9\u6837\u5427", "\u65e5\u62a5\u8fd9\u6837\u5427")):
         return True
-    return compact in {
-        "\u786e\u8ba4",
-        "\u786e\u5b9a",
+    if compact in {
         "\u63d0\u4ea4",
+        "\u63d0\u4ea4\u65e5\u62a5",
+        "\u65e5\u62a5\u63d0\u4ea4",
         "\u786e\u8ba4\u63d0\u4ea4",
         "\u53ef\u4ee5\u63d0\u4ea4",
         "\u5e2e\u6211\u63d0\u4ea4",
         "\u4ea4",
         "\u4ea4\u5427",
         "\u4ea4\u4e86",
+    }:
+        return True
+    return daily_confirmation_pending and compact in {
+        "\u786e\u8ba4",
+        "\u786e\u5b9a",
         "\u5c31\u8fd9\u6837",
         "\u662f",
         "\u662f\u7684",
@@ -3267,6 +3421,16 @@ def _looks_like_daily_editorial_edit_request(segment: str, *, active_daily: bool
     if _contains_any(text, ("\u8868\u8ff0", "\u9519\u522b\u5b57", "\u4e0d\u592a\u81ea\u7136", "\u5199\u5dee\u4e86", "\u4f18\u9009", "\u4f18\u5316\u4e0b")):
         return active_daily or _contains_any(text, ("\u95ee\u9898", "\u98ce\u9669", "\u4eca\u5929\u7684\u5de5\u4f5c", "\u4eca\u65e5\u5de5\u4f5c", "\u660e\u65e5\u8ba1\u5212", "\u65e5\u62a5", "\u5185\u5bb9"))
     return False
+
+
+def _looks_like_ambiguous_daily_editorial_request(segment: str) -> bool:
+    compact = _compact(segment)
+    return compact in {
+        "\u5e2e\u6211\u6574\u5408\u4f18\u5316",
+        "\u5e2e\u6211\u6574\u5408\u4e00\u4e0b",
+        "\u6574\u5408\u4f18\u5316",
+        "\u6574\u4f53\u4f18\u5316\u4e00\u4e0b",
+    }
 
 
 def _looks_like_daily_problem_reply(segment: str, *, active_daily: bool) -> bool:
@@ -4125,6 +4289,11 @@ def _has_business_work_object(segment: str) -> bool:
     text = str(segment or "")
     if re.search(r"\u5f00\u4e86?[0-9\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]*\u4e2a?\u4f1a", text):
         return True
+    if _contains_any(text, ("\u79bb\u804c", "\u5165\u804c")) and _contains_any(
+        text,
+        ("\u624b\u7eed", "\u6750\u6599", "\u4ea4\u63a5", "\u5bf9\u63a5"),
+    ):
+        return True
     return _contains_any(
         text,
         (
@@ -4211,6 +4380,8 @@ def _has_business_work_object(segment: str) -> bool:
             "\u90ae\u4ef6",
             "\u673a\u5668\u4eba",
             "\u4f1a\u8bae",
+            "\u8bae\u7a0b",
+            "\u901a\u77e5",
             "\u57f9\u8bad",
             "\u8bc4\u5ba1\u4f1a",
             "\u4f8b\u4f1a",
@@ -5413,6 +5584,28 @@ def _looks_like_system_failure_problem(segment: str) -> bool:
     return _contains_any(compact, ("\u7cfb\u7edf\u5d29", "\u7cfb\u7edf\u53c8\u5d29", "\u7cfb\u7edf\u6545\u969c", "\u7cfb\u7edfbug", "\u7cfb\u7edf\u767b\u5f55\u8001\u8d85\u65f6", "\u7cfb\u7edf\u767b\u5f55\u8d85\u65f6", "\u767b\u5f55\u8001\u8d85\u65f6", "\u767b\u5f55\u8d85\u65f6", "\u670d\u52a1\u5668\u7a81\u7136\u91cd\u542f", "\u7cfb\u7edf\u7a81\u7136\u91cd\u542f", "\u5ba2\u6237\u53cd\u9988\u6162", "\u5ba2\u6237\u53cd\u9988\u5361", "bug\u53c8\u591a", "\u6ca1\u4fdd\u5b58", "\u4fdd\u5b58\u5931\u8d25", "\u5dee\u70b9\u6ca1\u4fdd\u5b58"))
 
 
+def _looks_like_contextual_system_failure_followup(segment: str) -> bool:
+    compact = _compact(segment)
+    if not compact or "\u7cfb\u7edf" not in compact:
+        return False
+    return _contains_any(compact, ("\u8fd8\u662f\u4e0d\u884c", "\u4ecd\u7136\u4e0d\u884c", "\u4f9d\u7136\u4e0d\u884c")) and _contains_any(
+        compact,
+        ("\u4eca\u5929\u8bd5", "\u4eca\u65e5\u8bd5", "\u8bd5\u4e86", "\u5c1d\u8bd5\u4e86"),
+    )
+
+
+def _contextual_system_failure_content(segment: str) -> str:
+    text = str(segment or "").strip()
+    match = re.search(
+        r"([^\uff0c,\u3002]{2,40}\u7cfb\u7edf)[\uff0c,]([^\uff0c,\u3002]*(?:\u8fd8\u662f|\u4ecd\u7136|\u4f9d\u7136)\u4e0d\u884c)",
+        text,
+    )
+    if not match:
+        return text
+    system = re.sub(r"^.*?(?:\u90a3\u4e2a|\u8fd9\u4e2a)", "", match.group(1)).strip()
+    return f"{system}\uff0c{match.group(2).strip()}"
+
+
 def _looks_like_system_rant_only(segment: str) -> bool:
     compact = _compact(segment)
     if not compact or not _looks_like_system_failure_problem(segment):
@@ -6016,9 +6209,24 @@ def _looks_like_active_daily_add_instruction(segment: str) -> bool:
     compact = _compact(text)
     if not compact or _looks_like_question(text):
         return False
+    if _contains_any(compact, ("\u5220\u6389", "\u5220\u9664", "\u53bb\u6389", "\u5220\u4e86")):
+        return False
     if _looks_like_referential_write_reminder(text) and not _has_concrete_problem_detail(text):
         return False
-    if not _contains_any(compact, ("\u5199\u8fdb\u53bb", "\u5199\u8fdb", "\u5199\u4e0a", "\u8bb0\u4e0a", "\u8bb0\u8fdb\u53bb", "\u8bb0\u8fdb", "\u8865\u4e0a")):
+    if not _contains_any(
+        compact,
+        (
+            "\u5199\u8fdb\u53bb",
+            "\u5199\u8fdb",
+            "\u5199\u4e0a",
+            "\u8bb0\u4e0a",
+            "\u8bb0\u8fdb\u53bb",
+            "\u8bb0\u8fdb",
+            "\u8865\u4e0a",
+            "\u52a0\u4e0a",
+            "\u52a0\u4e00\u4e2a",
+        ),
+    ):
         return False
     content = _active_daily_add_content(text)
     if not content or _looks_like_question(content):
@@ -6033,11 +6241,19 @@ def _looks_like_active_daily_add_instruction(segment: str) -> bool:
 
 def _active_daily_add_content(segment: str) -> str:
     text = str(segment or "").strip()
+    quoted = re.search(r"[\u2018\u201c\u300e\"'](.+?)[\u2019\u201d\u300f\"']", text)
+    if quoted:
+        return quoted.group(1).strip()
     if "\uff1a" in text or ":" in text:
         text = re.split(r"[:\uff1a]", text, maxsplit=1)[-1].strip()
     text = re.sub(r"^(?:\u628a)?", "", text).strip()
+    text = re.sub(
+        r"^(?:\u521a\u624d\u8bf4\u7684\u90a3\u4e9b)?(?:\u518d)?(?:\u52a0\u4e0a|\u52a0\u4e00\u4e2a)(?:\u4e00\u4e2a)?",
+        "",
+        text,
+    ).strip()
     text = re.sub(r"(?:\u5199\u8fdb\u53bb|\u5199\u8fdb|\u5199\u4e0a|\u8bb0\u4e0a|\u8bb0\u8fdb\u53bb|\u8bb0\u8fdb|\u8865\u4e0a)$", "", text).strip()
-    return text.strip(" \t\r\n\u3000\uff0c,\u3002.:\uff1a")
+    return text.strip(" \t\r\n\u3000\uff0c,\u3002.:\uff1a\u300e\u300f\u2018\u2019\u201c\u201d\"'")
 
 
 def _looks_like_active_daily_concrete_reminder(segment: str) -> bool:
@@ -6065,6 +6281,11 @@ def _looks_like_contextual_business_detail(segment: str) -> bool:
         return False
     if _looks_like_non_substantive_daily_request(text) or _looks_like_vague_repeat_or_workload_statement(text):
         return False
+    if _has_business_work_object(text) and re.search(
+        r"(?:\u4e0a\u5348|\u4e0b\u5348|\u4e2d\u5348|\u665a\u4e0a|\u65e9\u4e0a)?\d{1,2}(?:\u70b9|\u70b9\u534a|:\d{2})",
+        text,
+    ):
+        return True
     if _contains_any(compact, ("\u7ade\u54c1\u5206\u6790", "\u5408\u89c4\u5ba1\u67e5", "\u521d\u7a3f", "\u5bf9\u6bd4")):
         return True
     if _contains_any(compact, ("\u90a3\u4e2a\u6848\u5b50", "\u90a3\u4e2a\u6848", "\u8fd9\u4e2a\u6848\u5b50", "\u8fd9\u4e2a\u6848")) and _contains_any(
@@ -6272,6 +6493,32 @@ def _looks_like_future_daily_makeup_notice(segment: str) -> bool:
     if not compact:
         return False
     return _contains_any(compact, ("\u65e5\u62a5", "\u65e5\u5fd7")) and _contains_any(compact, ("\u5468\u4e94\u4e00\u8d77\u8865", "\u56de\u6765\u4e00\u8d77\u8865", "\u5230\u65f6\u5019\u4e00\u8d77\u8865", "\u4e00\u8d77\u8865"))
+
+
+def _looks_like_future_travel_schedule_continuation(
+    segment: str, *, whole_text: str
+) -> bool:
+    compact = _compact(segment)
+    whole = _compact(whole_text)
+    if not (
+        _looks_like_future_daily_makeup_notice(whole_text)
+        and _looks_like_travel_event(whole_text)
+    ):
+        return False
+    has_range = bool(
+        re.search(r"(?:周|星期)[一二三四五六日天].{0,5}(?:到|至|-)(?:周|星期)?[一二三四五六日天]", compact)
+    )
+    location_continuation = _contains_any(
+        compact, ("都在那边", "都在那里", "一直在那边", "在当地", "在南京")
+    )
+    business_action = _contains_any(
+        compact,
+        (
+            "联系", "沟通", "提交", "审核", "整理", "推进", "开庭", "调查",
+            "完成", "处理", "起草", "修改", "查控", "执行申请",
+        ),
+    )
+    return has_range and location_continuation and not business_action and compact in whole
 
 
 def _looks_like_moyu_self_deprecation(segment: str) -> bool:
@@ -6605,6 +6852,8 @@ def _looks_like_question(segment: str) -> bool:
             "\u600e\u6837",
             "\u600e\u4e48\u6837",
             "\u4e3a\u4ec0\u4e48",
+            "\u4ec0\u4e48\u65f6\u5019",
+            "\u8c01\u8fd8\u6ca1",
             "\u662f\u4e0d\u662f",
             "\u662f\u5565",
             "\u6709\u6ca1\u6709",

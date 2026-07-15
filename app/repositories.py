@@ -154,8 +154,16 @@ async def mark_webhook_event_processed(
     response_payload: dict[str, Any],
     now: datetime,
 ) -> None:
+    legacy_report_id = None
+    if report_id is not None:
+        # WebhookEvent.report_id is a legacy FK to daily_reports. Unified
+        # Report-domain snapshots use their own stable IDs and must not be
+        # written into this legacy relationship unless that row actually exists.
+        legacy_report = await session.get(DailyReport, report_id)
+        if legacy_report is not None:
+            legacy_report_id = report_id
     event.status = "processed"
-    event.report_id = report_id
+    event.report_id = legacy_report_id
     event.response_payload = response_payload
     event.processed_at = now
     event.error_message = None
@@ -372,6 +380,7 @@ async def upsert_daily_report(
     pending_confirmation_at: datetime | None,
     auto_submit_at: datetime | None,
     replace_sections: bool = False,
+    report_id_override: uuid.UUID | None = None,
 ) -> DailyReport:
     user_id = user.id
     team_id = user.team_id
@@ -387,6 +396,7 @@ async def upsert_daily_report(
     reloaded_after_insert_conflict = False
     if existing is None:
         report = DailyReport(
+            id=report_id_override or uuid.uuid4(),
             user_id=user_id,
             team_id=team_id,
             report_date=report_date,

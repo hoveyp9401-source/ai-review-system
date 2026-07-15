@@ -931,7 +931,7 @@ def test_apply_edit_recent_reference_move_uses_last_modified_as_source_not_desti
     assert result.actions[0]["target_field"] == "problems"
 
 
-def test_apply_edit_recent_reference_without_saved_memory_targets_last_item_in_field():
+def test_apply_edit_recent_reference_without_saved_memory_is_ambiguous():
     result = apply_commands_to_snapshot(
         today_work=["合同审核", "函件起草"],
         problems=[],
@@ -940,10 +940,9 @@ def test_apply_edit_recent_reference_without_saved_memory_targets_last_item_in_f
         commands=[DailyCommand(operation="edit", target_field="today_work", content=["删除刚才那条"], should_write=True)],
     )
 
-    assert result.changed is True
-    assert result.today_work == ["合同审核"]
-    assert result.actions[0]["edit_action"] == "delete_item"
-    assert result.actions[0]["item_indices"] == [2]
+    assert result.changed is False
+    assert result.today_work == ["合同审核", "函件起草"]
+    assert result.actions[0]["reason"] == "ambiguous_target"
 
 
 def _pending_candidate_section_status() -> dict:
@@ -1215,3 +1214,18 @@ def test_apply_short_delete_reply_deletes_last_modified_item_only():
     assert result.problems == ["\u6682\u65e0"]
     assert result.tomorrow_plan == ["\u7ee7\u7eed\u8ddf\u8fdb\u6848\u4ef6"]
     assert result.actions[0]["edit_action"] == "delete_item"
+
+
+def test_apply_deictic_delete_without_focus_is_ambiguous_and_does_not_change():
+    result = apply_commands_to_snapshot(
+        today_work=["完成合同审核", "跟进保利案件"],
+        problems=[],
+        tomorrow_plan=[],
+        status="collecting",
+        commands=[DailyCommand(operation="edit", target_field="today_work", content=["那条删掉"], should_write=True)],
+        section_status={},
+    )
+
+    assert result.changed is False
+    assert result.today_work == ["完成合同审核", "跟进保利案件"]
+    assert result.actions[0]["reason"] == "ambiguous_target"

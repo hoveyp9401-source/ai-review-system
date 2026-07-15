@@ -1,0 +1,557 @@
+{
+  "acceptance_eligible": false,
+  "actual_artifact_hash": "b54efbef0708ab61781324104016a6beb0b045aaa60821934adcb039a0f39c8f",
+  "evidence_classification": "machine_candidate",
+  "human_review_state": "pending_human_review",
+  "independent_metrics_available": false,
+  "input_pack_digest": "d79f06f4febc8a836aada5f9663c95f08349bb2a8f655e864472c77330a1746d",
+  "input_pack_id": "agent2-semantic-admission-adversarial-20260714-v1",
+  "label_count": 26,
+  "matched_case_count": 8,
+  "mismatch_count": 30,
+  "results": [
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-01-old_date_daily",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "report",
+              "operation": "capture_daily_event",
+              "status": "blocked"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "report",
+              "operation": "capture_daily_event",
+              "reason_code": "active_daily_report_authorized",
+              "status": "admitted"
+            }
+          ]
+        },
+        {
+          "actual": 1,
+          "expected": 0,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-02-no_other_risk",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [],
+          "unexpected_actual": [
+            {
+              "domain": "case",
+              "operation": "answer_case_query",
+              "reason_code": "case_query_permission_scope_verified",
+              "status": "admitted"
+            }
+          ]
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-03-weekly_entry_not_chat",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "report",
+              "operation": "query_periodic_report",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": []
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-04-weekly_context_hijack",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "report",
+              "operation": "query_periodic_report",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": []
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-05-weekly_append",
+      "matched": true,
+      "mismatches": [],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-06-generic_case_material",
+      "matched": true,
+      "mismatches": [],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-07-unique_case_alias",
+      "matched": true,
+      "mismatches": [],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-08-unique_case_number",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "reason_code": "case_reference_not_grounded_in_segment",
+              "status": "blocked"
+            }
+          ]
+        },
+        {
+          "actual": 0,
+          "expected": 1,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-09-ambiguous_case_alias",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "reason_code": "case_reference_ambiguous",
+              "status": "blocked"
+            }
+          ],
+          "unexpected_actual": []
+        },
+        {
+          "actual": 0,
+          "expected": 1,
+          "field": "selection_request_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-10-travel_asserted",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "reason_code": "travel_evidence_not_grounded",
+              "status": "blocked"
+            }
+          ]
+        },
+        {
+          "actual": 0,
+          "expected": 1,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-11-travel_missing_time",
+      "matched": true,
+      "mismatches": [],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-12-travel_missing_destination",
+      "matched": true,
+      "mismatches": [],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-13-travel_negated",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [],
+          "unexpected_actual": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "reason_code": "personal_travel_grounded_and_parseable",
+              "status": "admitted"
+            }
+          ]
+        },
+        {
+          "actual": 1,
+          "expected": 0,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-14-travel_hypothetical",
+      "matched": true,
+      "mismatches": [],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-15-travel_quotation",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [],
+          "unexpected_actual": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "reason_code": "travel_statement_not_asserted",
+              "status": "blocked"
+            }
+          ]
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-16-case_negated",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [],
+          "unexpected_actual": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "reason_code": "case_reference_uniquely_authorized",
+              "status": "admitted"
+            }
+          ]
+        },
+        {
+          "actual": 1,
+          "expected": 0,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-17-case_hypothetical",
+      "matched": true,
+      "mismatches": [],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-18-case_quotation",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [],
+          "unexpected_actual": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "reason_code": "case_statement_not_asserted",
+              "status": "blocked"
+            }
+          ]
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-19-daily_and_travel",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "reason_code": "travel_evidence_not_grounded",
+              "status": "blocked"
+            }
+          ]
+        },
+        {
+          "actual": 1,
+          "expected": 2,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-20-daily_and_unique_case",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "reason_code": "case_reference_not_grounded_in_segment",
+              "status": "blocked"
+            }
+          ]
+        },
+        {
+          "actual": 1,
+          "expected": 2,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-21-case_and_travel",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "reason_code": "travel_evidence_not_grounded",
+              "status": "blocked"
+            }
+          ]
+        },
+        {
+          "actual": 1,
+          "expected": 2,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-22-three_domain_siblings",
+      "matched": true,
+      "mismatches": [],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-23-ambiguous_sibling_isolated",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "reason_code": "case_reference_ambiguous",
+              "status": "blocked"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "reason_code": "case_reference_not_grounded_in_segment",
+              "status": "blocked"
+            }
+          ]
+        },
+        {
+          "actual": 0,
+          "expected": 1,
+          "field": "selection_request_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-24-risk_noop_plus_travel",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "case",
+              "operation": "answer_case_query",
+              "reason_code": "case_query_scope_or_evidence_missing",
+              "status": "blocked"
+            },
+            {
+              "domain": "travel",
+              "operation": "record_travel_event",
+              "reason_code": "travel_evidence_not_grounded",
+              "status": "blocked"
+            }
+          ]
+        },
+        {
+          "actual": 0,
+          "expected": 1,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-25-old_date_and_current_daily",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "report",
+              "operation": "capture_daily_event",
+              "status": "blocked"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "report",
+              "operation": "edit_daily_item",
+              "reason_code": "daily_item_target_not_uniquely_authorized",
+              "status": "blocked"
+            }
+          ]
+        }
+      ],
+      "review_status": "pending_human_review"
+    },
+    {
+      "annotation_class": "machine_candidate",
+      "case_id": "sa-blind-26-weekly_case_interruption",
+      "matched": false,
+      "mismatches": [
+        {
+          "field": "decision_signatures",
+          "missing_expected": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "status": "admitted"
+            }
+          ],
+          "unexpected_actual": [
+            {
+              "domain": "case",
+              "operation": "record_case_progress",
+              "reason_code": "case_reference_not_grounded_in_segment",
+              "status": "blocked"
+            }
+          ]
+        },
+        {
+          "actual": 1,
+          "expected": 2,
+          "field": "ticket_count"
+        }
+      ],
+      "review_status": "pending_human_review"
+    }
+  ],
+  "schema_version": "agent2.semantic_admission_blind_score.v1",
+  "sealed_label_hash": "bae9a38c05ed2df4dcee5ffbeef7218890815765c54ca74adee68350ff939fbb"
+}

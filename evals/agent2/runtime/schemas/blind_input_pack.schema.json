@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent2.runtime_blind_input.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "pack_id", "cases"],
+  "properties": {
+    "schema_version": {"const": "agent2.runtime_blind_input.v1"},
+    "pack_id": {"type": "string", "minLength": 1},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["case_id", "actor_id", "conversation_id", "initial_state", "initial_daily_snapshot", "runtime_config", "turns"],
+        "properties": {
+          "case_id": {"type": "string", "minLength": 1},
+          "actor_id": {"type": "string", "format": "uuid"},
+          "conversation_id": {"type": "string", "minLength": 1},
+          "initial_state": {"type": ["object", "null"]},
+          "initial_daily_snapshot": {"type": "object"},
+          "runtime_config": {"type": "object"},
+          "turns": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["turn_id", "raw_text", "occurred_at", "channel", "request_metadata"],
+              "properties": {
+                "turn_id": {"type": "string", "minLength": 1},
+                "raw_text": {"type": "string", "minLength": 1},
+                "occurred_at": {"type": "string", "format": "date-time"},
+                "channel": {"type": "string", "minLength": 1},
+                "request_metadata": {"type": "object"}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

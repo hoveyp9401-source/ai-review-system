@@ -210,10 +210,14 @@ def _command_from_effect(
     operation = _operation_from_effect(effect, raw_text)
     target_field = _target_field(effect, operation, raw_text)
     payload_safety_flags = list(effect.payload.get("safety_flags") or [])
-    is_prevalidated_daily_supplement = bool(
-        {"conditional_daily_supplement", "active_daily_concrete_reminder"}.intersection(payload_safety_flags)
+    is_prevalidated_daily_content = bool(
+        {
+            "conditional_daily_supplement",
+            "active_daily_concrete_reminder",
+            "active_daily_explicit_work",
+        }.intersection(payload_safety_flags)
     )
-    if effect.effect_type == EFFECT_LEGACY_DAILY_CONTEXT_ACTION and not is_prevalidated_daily_supplement and not _legacy_daily_context_command_eligible(
+    if effect.effect_type == EFFECT_LEGACY_DAILY_CONTEXT_ACTION and not is_prevalidated_daily_content and not _legacy_daily_context_command_eligible(
         operation,
         target_field,
         raw_text,
@@ -241,7 +245,12 @@ def _command_from_effect(
         content = _eligible_daily_content(content, target_field)
     elif operation == "fill" and target_field in {"today_work", "problems", "tomorrow_plan"}:
         payload_safety_flags = list(effect.payload.get("safety_flags") or [])
-        if "conditional_daily_supplement" not in payload_safety_flags:
+        bypass_content_filter = bool(
+            {"conditional_daily_supplement", "active_daily_explicit_work"}.intersection(
+                payload_safety_flags
+            )
+        )
+        if not bypass_content_filter:
             content = _eligible_daily_content(content, target_field)
         if not content:
             operation = "no_write"
@@ -3316,6 +3325,7 @@ _BUSINESS_ACTION_MARKERS = (
     "\u4fee\u6539",
     "\u8bbe\u8ba1",
     "\u8ddf\u8fdb",
+    "\u63a8\u52a8",
     "\u66f4\u65b0",
     "\u62df",
     "\u62df\u5b9a",

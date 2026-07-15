@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 from typing import Any
+from dataclasses import replace
 import json
 import uuid
 
@@ -9,7 +12,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.db import get_session
+from app.db import AsyncSessionLocal, get_session
 from app.llm.extractor import LLMOutputError
 from app.repositories import (
     create_webhook_event_once,
@@ -35,17 +38,105 @@ from app.services.performance_service import (
 )
 from app.services.report_service import DailyReportService
 from app.utils.time import now_in_timezone
+from app.agent2.cognitive_runtime_v3 import (
+    admission_block_reply,
+    cognitive_core_v3_enabled,
+    execute_selection_pending_turn,
+    finalize_cognitive_core_v3_execution,
+    information_pending_reply,
+    selection_request_reply,
+    semantic_admission_mode,
+)
+from app.agent2.turn_runtime import (
+    InformationContinuationBlocked,
+    SelectionContinuationBlocked,
+    VerifiedTurnRejected,
+    VerifiedTurnRequest,
+    production_agent2_turn_runtime,
+    verified_turn_rejection_reply,
+)
+from app.agent2.cognitive_reply_v3 import build_cognitive_side_reply_v3
+from app.agent2.case_report_projection_runtime import (
+    project_committed_case_followup_facts,
+)
+from app.agent2.report_projection_confirmation_runtime import (
+    execute_report_projection_confirmation_turn,
+)
+from app.agent2.report_projection_correction_runtime import (
+    execute_report_projection_correction_turn,
+)
+from app.agent2.business.composition import Phase2BusinessComposer
+from app.agent2.business.entrypoint import build_business_command_context, resolve_agent2_entrypoint
+from app.agent2.business.repositories import CaseFollowupPolicySqlRepository, CaseProgressSqlRepository, CaseSqlRepository, PartySqlRepository
+from app.agent2.business.sql_executor import SqlBusinessExecutor
+from app.agent2.business.policy import BusinessEffectPolicy
 from app.agent2.daily_shadow import evaluate_daily_shadow
+from app.agent2.daily_execution import (
+    Agent2DailyExecutionResult,
+    agent2_daily_enabled_for_user,
+    agent2_daily_report_version,
+    execute_agent2_daily_commands,
+)
+from app.agent2.typed_daily_executor import execute_typed_agent2_daily_commands
+from app.agent2.report_sql_executor import (
+    execute_periodic_report_commands,
+)
 from app.agent2.workflow_audit import create_agent2_workflow_audit_event
+from app.agent2.operation_outcomes import OutcomeReplyComposer
+from app.agent2.operation_outcome_store import persist_operation_outcomes
+from app.agent2.outcome_adapters import (
+    business_composition_outcomes,
+    daily_execution_outcomes,
+    periodic_execution_outcomes,
+    text_outcome,
+)
 from app.workflows.intake import (
     ActiveWorkflowTask,
     IncomingMessageEnvelope,
     WORKFLOW_MONTHLY_REPORT,
 )
 from app.workflows.gate import GateDecision
-from app.workflows.daily_context import build_live_daily_active_task
+from app.workflows.daily_context import (
+    build_live_daily_active_task,
+    daily_active_task_from_report,
+    load_live_daily_context,
+    load_live_daily_report,
+)
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+logger = logging.getLogger(__name__)
+
+
+def _log_callback_metadata(
+    event: str,
+    params: dict[str, Any] | None = None,
+    *,
+    payload: str | bytes | None = None,
+) -> None:
+    """Log only bounded callback metadata; never credentials or message text."""
+
+    params = params or {}
+    payload_bytes = (
+        payload
+        if isinstance(payload, bytes)
+        else str(payload or "").encode("utf-8")
+    )
+    logger.info(
+        "%s parameter_count=%d signature_present=%s nonce_present=%s "
+        "timestamp_present=%s token_present=%s payload_chars=%d payload_sha256=%s",
+        event,
+        len(params),
+        bool(params.get("msg_signature") or params.get("signature")),
+        bool(params.get("nonce")),
+        bool(params.get("timestamp")),
+        bool(params.get("token")),
+        len(payload_bytes),
+        hashlib.sha256(payload_bytes).hexdigest(),
+    )
+
+
+def _log_runtime_failure(event: str, error: BaseException) -> None:
+    logger.warning("%s error_type=%s", event, type(error).__name__)
 
 
 def _get_crypto(settings: Settings) -> DingTalkCallbackCrypto:
@@ -80,7 +171,7 @@ def _encrypted_success(crypto: DingTalkCallbackCrypto) -> JSONResponse:
 
 async def _handle_dingtalk_event_subscription(request: Request, settings: Settings):
     params = dict(request.query_params)
-    print(f"DingTalk event subscription params: {params}", flush=True)
+    _log_callback_metadata("dingtalk_event_subscription_request", params)
 
     if request.method == "GET":
         sig = params.get("msg_signature") or params.get("signature") or ""
@@ -106,7 +197,11 @@ async def _handle_dingtalk_event_subscription(request: Request, settings: Settin
         raise HTTPException(status_code=403, detail="Invalid callback signature")
 
     raw = crypto.decrypt(body["encrypt"])
-    print(f"DingTalk event subscription payload: {raw[:1000]}", flush=True)
+    _log_callback_metadata(
+        "dingtalk_event_subscription_payload",
+        params,
+        payload=raw,
+    )
     return _encrypted_success(crypto)
 
 
@@ -120,7 +215,7 @@ async def dingtalk_webhook_get(
     echostr: str = Query(default=""),
     settings: Settings = Depends(get_settings),
 ):
-    print(f"DingTalk GET params: {dict(request.query_params)}", flush=True)
+    _log_callback_metadata("dingtalk_webhook_get", dict(request.query_params))
     sig = msg_signature or signature
     if sig and timestamp and nonce and echostr:
         crypto = _get_crypto(settings)
@@ -156,7 +251,7 @@ async def dingtalk_webhook(
 ) -> Any:
     params = dict(request.query_params)
     body = await request.json()
-    print(f"DingTalk POST params: {params}", flush=True)
+    _log_callback_metadata("dingtalk_webhook_post", params)
 
     msg_signature = params.get("msg_signature", "")
     timestamp = params.get("timestamp", "")
@@ -172,8 +267,7 @@ async def dingtalk_webhook(
             raise HTTPException(status_code=403, detail="Invalid callback signature")
 
         raw = crypto.decrypt(body["encrypt"])
-
-        print(f"DingTalk decrypted payload: {raw[:1000]}", flush=True)
+        _log_callback_metadata("dingtalk_webhook_decrypted", params, payload=raw)
 
         if raw == "success" or '"EventType":"check_url"' in raw:
             return _encrypted_success(crypto)
@@ -203,8 +297,12 @@ async def dingtalk_webhook(
                     recognized = await robot.recognize_audio(str(download_code))
                     from dataclasses import replace
                     incoming = replace(incoming, text=str(recognized).strip())
-                except Exception:
-                    print(f"DingTalk ASR failed for downloadCode={str(download_code)[:16]}", flush=True)
+                except Exception as exc:
+                    logger.warning(
+                        "dingtalk_asr_failed download_code_sha256=%s error_type=%s",
+                        hashlib.sha256(str(download_code).encode("utf-8")).hexdigest(),
+                        type(exc).__name__,
+                    )
 
     idempotency_key = build_idempotency_key(payload, incoming)
     event, inserted = await create_webhook_event_once(
@@ -270,7 +368,9 @@ async def dingtalk_webhook(
                         else:
                             await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=performance_result.message)
                     except Exception as send_exc:
-                        print(f"DingTalk async performance reply failed: {send_exc}", flush=True)
+                        _log_runtime_failure(
+                            "dingtalk_async_performance_reply_failed", send_exc
+                        )
                     return _encrypted_success(crypto)
                 return response_payload
 
@@ -292,9 +392,45 @@ async def dingtalk_webhook(
                         else:
                             await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=NO_ACTIVE_PERFORMANCE_TASK_MESSAGE)
                     except Exception as send_exc:
-                        print(f"DingTalk async performance no-task reply failed: {send_exc}", flush=True)
+                        _log_runtime_failure(
+                            "dingtalk_async_performance_no_task_reply_failed",
+                            send_exc,
+                        )
                     return _encrypted_success(crypto)
                 return response_payload
+
+        agent2_result = await _submit_webhook_agent2_if_enabled(
+            session=session,
+            user=user,
+            incoming=incoming,
+            settings=settings,
+            message_id=idempotency_key,
+            llm_client=(
+                getattr(request.app.state, "llm_client", None)
+                or getattr(getattr(getattr(request.app.state, "report_service", None), "extractor", None), "client", None)
+            ),
+        )
+        if agent2_result is not None:
+            response_payload = dingtalk_text_response(agent2_result.message)
+            await mark_webhook_event_processed(
+                session,
+                event,
+                report_id=uuid.UUID(agent2_result.report_id) if agent2_result.report_id else None,
+                response_payload=response_payload,
+                now=now_in_timezone(settings.timezone),
+            )
+            await session.commit()
+            if is_encrypted and crypto:
+                robot = request.app.state.dingtalk_robot
+                try:
+                    if incoming.session_webhook:
+                        await robot.send_session_webhook_text(session_webhook=incoming.session_webhook, text=agent2_result.message)
+                    else:
+                        await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=agent2_result.message)
+                except Exception as send_exc:
+                    _log_runtime_failure("dingtalk_async_agent2_reply_failed", send_exc)
+                return _encrypted_success(crypto)
+            return response_payload
 
         gate_decision = await _evaluate_legacy_daily_gate(
             session=session,
@@ -321,7 +457,7 @@ async def dingtalk_webhook(
                     else:
                         await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=response_payload["text"]["content"])
                 except Exception as send_exc:
-                    print(f"DingTalk async gate reply failed: {send_exc}", flush=True)
+                    _log_runtime_failure("dingtalk_async_gate_reply_failed", send_exc)
                 return _encrypted_success(crypto)
             return response_payload
 
@@ -343,7 +479,7 @@ async def dingtalk_webhook(
                 else:
                     await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=result.message)
             except Exception as send_exc:
-                print(f"DingTalk async reply failed: {send_exc}", flush=True)
+                _log_runtime_failure("dingtalk_async_reply_failed", send_exc)
             return _encrypted_success(crypto)
         return response_payload
     except LLMOutputError as exc:
@@ -370,6 +506,520 @@ async def dingtalk_webhook(
         if is_encrypted and crypto:
             return _encrypt_response(crypto, response_payload)
         return response_payload
+
+
+async def _submit_webhook_agent2_if_enabled(
+    *,
+    session: AsyncSession,
+    user: Any,
+    incoming: Any,
+    settings: Settings,
+    message_id: str,
+    llm_client: Any | None = None,
+):
+    entrypoint = await resolve_agent2_entrypoint(
+        session,
+        settings=settings,
+        dingtalk_user_id=str(getattr(incoming, "dingtalk_user_id", "") or ""),
+        source_message_id=message_id,
+    )
+    phase2_primary = entrypoint.decision.route == "agent2_primary"
+    phase2_business_context = (
+        build_business_command_context(
+            entrypoint.binding,
+            source_message_id=message_id,
+            source_channel=str(getattr(incoming, "source", "") or "dingtalk_webhook"),
+            occurred_at=now_in_timezone(settings.timezone),
+            conversation_id=str(getattr(incoming, "conversation_id", "") or ""),
+        )
+        if phase2_primary and entrypoint.binding is not None
+        else None
+    )
+    if entrypoint.decision.route == "blocked":
+        current_date = now_in_timezone(settings.timezone).date()
+        return Agent2DailyExecutionResult(
+            report_id=None,
+            report_date=current_date,
+            status="collecting",
+            message="Agent2 身份或租户路由不唯一，本次已阻断，未回退 Agent1，也未写入业务数据。",
+            report_saved=False,
+            read_only=True,
+            command_results=[],
+        )
+    if entrypoint.decision.route == "agent2_shadow":
+        return None
+    if not phase2_primary and not agent2_daily_enabled_for_user(settings, user):
+        return None
+    daily_context = await load_live_daily_context(session, user, settings)
+    daily_report = daily_context.report
+    report_date = daily_context.report_date
+    daily_task = daily_context.active_task
+    active_tasks = (daily_task,) if daily_task is not None else ()
+    envelope = IncomingMessageEnvelope(
+        sender_id=str(getattr(user, "id", "") or ""),
+        sender_name=str(getattr(user, "name", "") or ""),
+        dingtalk_user_id=str(getattr(incoming, "dingtalk_user_id", "") or ""),
+        source=str(getattr(incoming, "source", "") or "dingtalk_webhook"),
+        raw_text=str(getattr(incoming, "text", "") or ""),
+        message_id=message_id,
+        conversation_id=str(getattr(incoming, "conversation_id", "") or ""),
+        active_tasks=active_tasks,
+    )
+    pre_runtime_admission_mode = (
+        semantic_admission_mode(
+            settings,
+            tenant_id=phase2_business_context.tenant_id,
+            user_id=phase2_business_context.actor_user_id,
+        )
+        if phase2_primary and phase2_business_context is not None
+        else "disabled"
+    )
+    if (
+        phase2_primary
+        and phase2_business_context is not None
+        and pre_runtime_admission_mode != "enforced"
+    ):
+        projection_turn = await execute_report_projection_confirmation_turn(
+            session_factory=AsyncSessionLocal,
+            envelope=envelope,
+            business_context=phase2_business_context,
+            settings=settings,
+        )
+        if projection_turn is not None and projection_turn.handled:
+            return Agent2DailyExecutionResult(
+                report_id=str(getattr(daily_report, "id", "") or "") or None,
+                report_date=(
+                    report_date
+                ),
+                status=str(getattr(daily_report, "status", "") or "collecting"),
+                message=projection_turn.reply,
+                report_saved=any(item.actual_write for item in projection_turn.outcomes),
+                read_only=not any(item.actual_write for item in projection_turn.outcomes),
+                today_work=list(getattr(daily_report, "today_work", []) or []),
+                problems=list(getattr(daily_report, "problems", []) or []),
+                tomorrow_plan=list(getattr(daily_report, "tomorrow_plan", []) or []),
+                command_results=[item.as_dict() for item in projection_turn.outcomes],
+            )
+        correction_turn = await execute_report_projection_correction_turn(
+            session_factory=AsyncSessionLocal,
+            envelope=envelope,
+            business_context=phase2_business_context,
+            settings=settings,
+        )
+        if correction_turn is not None and correction_turn.handled:
+            return Agent2DailyExecutionResult(
+                report_id=str(getattr(daily_report, "id", "") or "") or None,
+                report_date=(
+                    report_date
+                ),
+                status=str(getattr(daily_report, "status", "") or "collecting"),
+                message=correction_turn.reply,
+                report_saved=any(item.actual_write for item in correction_turn.outcomes),
+                read_only=not any(item.actual_write for item in correction_turn.outcomes),
+                today_work=list(getattr(daily_report, "today_work", []) or []),
+                problems=list(getattr(daily_report, "problems", []) or []),
+                tomorrow_plan=list(getattr(daily_report, "tomorrow_plan", []) or []),
+                command_results=[item.as_dict() for item in correction_turn.outcomes],
+            )
+        selection_turn = await execute_selection_pending_turn(
+            session=session,
+            user=user,
+            envelope=envelope,
+            business_context=phase2_business_context,
+            settings=settings,
+        )
+        if selection_turn is not None and selection_turn.handled:
+            return Agent2DailyExecutionResult(
+                report_id=str(getattr(daily_report, "id", "") or "") or None,
+                report_date=(
+                    report_date
+                ),
+                status=str(getattr(daily_report, "status", "") or "collecting"),
+                message=selection_turn.reply,
+                report_saved=False,
+                read_only=not selection_turn.actual_write,
+                today_work=list(getattr(daily_report, "today_work", []) or []),
+                problems=list(getattr(daily_report, "problems", []) or []),
+                tomorrow_plan=list(getattr(daily_report, "tomorrow_plan", []) or []),
+                command_results=(
+                    [selection_turn.outcome.as_dict()]
+                    if selection_turn.outcome is not None
+                    else []
+                ),
+            )
+    shadow = None if phase2_primary else evaluate_daily_shadow(envelope, mode="protective_gate")
+    if phase2_primary and not cognitive_core_v3_enabled(settings):
+        return Agent2DailyExecutionResult(
+            report_id=str(getattr(daily_report, "id", "") or "") or None,
+            report_date=report_date,
+            status=str(getattr(daily_report, "status", "") or "collecting"),
+            message="Agent2 业务主路已启用，但 Cognitive Core 未启用。本次已阻断，未回退 Agent1，也未写入业务数据。",
+            report_saved=False,
+            read_only=True,
+            today_work=list(getattr(daily_report, "today_work", []) or []),
+            problems=list(getattr(daily_report, "problems", []) or []),
+            tomorrow_plan=list(getattr(daily_report, "tomorrow_plan", []) or []),
+            command_results=[],
+        )
+    if cognitive_core_v3_enabled(settings):
+        try:
+            if llm_client is None:
+                raise RuntimeError("cognitive core v3 requires an LLM client")
+            turn_runtime_result = await production_agent2_turn_runtime().handle(
+                VerifiedTurnRequest(
+                    session=session,
+                    user=user,
+                    envelope=envelope,
+                    llm_client=llm_client,
+                    daily_report=daily_report,
+                    report_date=report_date,
+                    settings=settings,
+                    business_context=phase2_business_context,
+                )
+            )
+            cognitive_v3 = turn_runtime_result.orchestration
+        except (
+            InformationContinuationBlocked,
+            SelectionContinuationBlocked,
+            VerifiedTurnRejected,
+        ) as exc:
+            safe_reply = verified_turn_rejection_reply(exc)
+            logger.info(
+                "webhook_cognitive_v3_blocked reply_kind=%s",
+                safe_reply.reply_kind,
+            )
+            return Agent2DailyExecutionResult(
+                report_id=str(getattr(daily_report, "id", "") or "") or None,
+                report_date=report_date,
+                status=str(getattr(daily_report, "status", "") or "collecting"),
+                message=safe_reply.message,
+                report_saved=False,
+                read_only=True,
+                today_work=list(getattr(daily_report, "today_work", []) or []),
+                problems=list(getattr(daily_report, "problems", []) or []),
+                tomorrow_plan=list(getattr(daily_report, "tomorrow_plan", []) or []),
+                command_results=[],
+            )
+        except Exception as exc:
+            _log_runtime_failure("webhook_cognitive_v3_fail_closed", exc)
+            return Agent2DailyExecutionResult(
+                report_id=str(getattr(daily_report, "id", "") or "") or None,
+                report_date=report_date,
+                status=str(getattr(daily_report, "status", "") or "collecting"),
+                message="这条消息暂时无法完成处理，本次没有写入任何业务内容，请稍后重试。",
+                report_saved=False,
+                read_only=True,
+                today_work=list(getattr(daily_report, "today_work", []) or []),
+                problems=list(getattr(daily_report, "problems", []) or []),
+                tomorrow_plan=list(getattr(daily_report, "tomorrow_plan", []) or []),
+                command_results=[],
+            )
+        else:
+            phase2_business_result = None
+            periodic_report_results = []
+            verified_execution_context = (
+                turn_runtime_result.business_execution_context
+            )
+            if cognitive_v3.command_plan.report_commands:
+                if phase2_business_context is None:
+                    raise RuntimeError("periodic Report commands require a verified Agent2 identity")
+                periodic_report_results = await execute_periodic_report_commands(
+                    session,
+                    commands=cognitive_v3.command_plan.report_commands,
+                    context=verified_execution_context,
+                    timezone_name=settings.timezone,
+                    execution_authority=(
+                        turn_runtime_result.mutation_execution_authority
+                    ),
+                )
+            if phase2_primary and cognitive_v3.command_plan.business_commands:
+                binding = entrypoint.binding
+                if binding is None:
+                    raise RuntimeError("Agent2 primary route requires a verified identity binding")
+                business_context = verified_execution_context
+                if business_context is None:
+                    raise RuntimeError("Agent2 primary route requires business command context")
+                executable_candidates = tuple(
+                    command
+                    for command in cognitive_v3.command_plan.business_commands
+                    if command.command_type
+                    in {
+                        "record_travel_candidate",
+                        "respond_travel_collaboration_candidate",
+                        "record_case_progress_candidate",
+                        "update_case_progress_candidate",
+                        "delete_case_progress_candidate",
+                        "query_case_progress_candidate",
+                        "link_case_progress_candidate",
+                        "list_assigned_cases",
+                        "query_operation_status",
+                        "query_case_risk",
+                        "update_case_followup_policy_candidate",
+                        "trigger_case_followup_now_candidate",
+                    }
+                )
+                if executable_candidates:
+                    # Admission issuance and its domain effect must remain in one
+                    # transaction.  A second session cannot see an uncommitted
+                    # authoritative Ticket and would either fail spuriously or
+                    # tempt the caller to weaken the authority check.
+                    phase2_business_result = await Phase2BusinessComposer(
+                        case_repository=CaseSqlRepository(session),
+                        party_repository=PartySqlRepository(session),
+                        progress_repository=CaseProgressSqlRepository(session),
+                        followup_policy_repository=CaseFollowupPolicySqlRepository(session),
+                        executor=SqlBusinessExecutor(
+                            session,
+                            effect_policy=BusinessEffectPolicy.from_settings(settings),
+                            execution_authority=(
+                                turn_runtime_result.mutation_execution_authority
+                            ),
+                        ),
+                    ).execute(executable_candidates, business_context)
+            if cognitive_v3.command_plan.daily_commands:
+                daily_result = await execute_typed_agent2_daily_commands(
+                    session,
+                    user=user,
+                    commands=cognitive_v3.command_plan.daily_commands,
+                    execution_context=turn_runtime_result.daily_execution_context(),
+                    settings=settings,
+                    execution_authority=(
+                        turn_runtime_result.mutation_execution_authority
+                    ),
+                )
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=daily_result.command_results,
+                    business_result=phase2_business_result,
+                    report_results=[item.as_dict() for item in periodic_report_results],
+                    business_context=verified_execution_context,
+                    selection_continuation=(
+                        turn_runtime_result.selection_continuation
+                    ),
+                )
+                outcomes = daily_execution_outcomes(
+                    daily_result, source_turn_id=message_id
+                )
+                if phase2_business_result is not None:
+                    outcomes += business_composition_outcomes(phase2_business_result)
+                    if verified_execution_context is not None:
+                        outcomes += await project_committed_case_followup_facts(
+                            business_result=phase2_business_result,
+                            business_context=verified_execution_context,
+                            source_session=session,
+                            session_factory=AsyncSessionLocal,
+                            settings=settings,
+                            report_date=report_date,
+                        )
+                outcomes += periodic_execution_outcomes(
+                    periodic_report_results, source_turn_id=message_id
+                )
+                if phase2_primary:
+                    side_reply = await build_cognitive_side_reply_v3(
+                        decision=cognitive_v3.decision,
+                        llm_client=llm_client,
+                    )
+                    if side_reply:
+                        outcomes += (
+                            text_outcome(side_reply, source_turn_id=message_id),
+                        )
+                if verified_execution_context is not None:
+                    await persist_operation_outcomes(
+                        session, outcomes,
+                        tenant_id=verified_execution_context.tenant_id,
+                        user_id=verified_execution_context.actor_user_id,
+                        conversation_id=verified_execution_context.conversation_id,
+                        source_turn_id=message_id,
+                        now=verified_execution_context.occurred_at,
+                    )
+                daily_result = replace(
+                    daily_result,
+                    message=OutcomeReplyComposer().compose(outcomes),
+                )
+                return daily_result
+            if phase2_business_result is not None:
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=phase2_business_result,
+                    report_results=[item.as_dict() for item in periodic_report_results],
+                    business_context=verified_execution_context,
+                    selection_continuation=(
+                        turn_runtime_result.selection_continuation
+                    ),
+                )
+                outcomes = business_composition_outcomes(phase2_business_result)
+                if verified_execution_context is not None:
+                    outcomes += await project_committed_case_followup_facts(
+                        business_result=phase2_business_result,
+                        business_context=verified_execution_context,
+                        source_session=session,
+                        session_factory=AsyncSessionLocal,
+                        settings=settings,
+                        report_date=report_date,
+                    )
+                outcomes += periodic_execution_outcomes(
+                    periodic_report_results, source_turn_id=message_id
+                )
+                side_reply = await build_cognitive_side_reply_v3(
+                    decision=cognitive_v3.decision,
+                    llm_client=llm_client,
+                )
+                if side_reply:
+                    outcomes += (text_outcome(side_reply, source_turn_id=message_id),)
+                if verified_execution_context is not None:
+                    await persist_operation_outcomes(
+                        session, outcomes,
+                        tenant_id=verified_execution_context.tenant_id,
+                        user_id=verified_execution_context.actor_user_id,
+                        conversation_id=verified_execution_context.conversation_id,
+                        source_turn_id=message_id,
+                        now=verified_execution_context.occurred_at,
+                    )
+                business_message = OutcomeReplyComposer().compose(outcomes)
+                return Agent2DailyExecutionResult(
+                    report_id=str(getattr(daily_report, "id", "") or "") or None,
+                    report_date=report_date,
+                    status=str(getattr(daily_report, "status", "") or "collecting"),
+                    message=business_message,
+                    report_saved=False,
+                    read_only=not any(
+                        action.receipt is not None and action.receipt.actual_write
+                        for action in phase2_business_result.actions
+                    ),
+                    today_work=list(getattr(daily_report, "today_work", []) or []),
+                    problems=list(getattr(daily_report, "problems", []) or []),
+                    tomorrow_plan=list(getattr(daily_report, "tomorrow_plan", []) or []),
+                    command_results=[
+                        {
+                            "semantic_command_id": action.semantic_command_id,
+                            "semantic_command_type": action.semantic_command_type,
+                            "compiled_command_type": action.compiled_command_type,
+                            "status": action.status,
+                            "receipt_id": action.receipt.receipt_id if action.receipt else "",
+                            "block_reason": action.block.reason_code if action.block else "",
+                        }
+                        for action in phase2_business_result.actions
+                    ] + [item.as_dict() for item in periodic_report_results],
+                )
+            if periodic_report_results:
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[item.as_dict() for item in periodic_report_results],
+                    business_context=verified_execution_context,
+                    selection_continuation=(
+                        turn_runtime_result.selection_continuation
+                    ),
+                )
+                latest = periodic_report_results[-1]
+                outcomes = periodic_execution_outcomes(
+                    periodic_report_results,
+                    source_turn_id=message_id,
+                )
+                if verified_execution_context is not None:
+                    await persist_operation_outcomes(
+                        session,
+                        outcomes,
+                        tenant_id=verified_execution_context.tenant_id,
+                        user_id=verified_execution_context.actor_user_id,
+                        conversation_id=verified_execution_context.conversation_id,
+                        source_turn_id=message_id,
+                        now=verified_execution_context.occurred_at,
+                    )
+                return Agent2DailyExecutionResult(
+                    report_id=str(latest.execution.after.report_id),
+                    report_date=report_date,
+                    status=latest.execution.after.status,
+                    message=OutcomeReplyComposer().compose(outcomes),
+                    report_saved=any(item.actual_write for item in periodic_report_results),
+                    read_only=not any(item.actual_write for item in periodic_report_results),
+                    command_results=[item.as_dict() for item in periodic_report_results],
+                )
+            selection_message = selection_request_reply(cognitive_v3.decision)
+            information_message = information_pending_reply(cognitive_v3.decision)
+            admission_message = admission_block_reply(cognitive_v3.decision)
+            if selection_message:
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[],
+                    business_context=verified_execution_context,
+                )
+                message = selection_message
+            elif information_message or admission_message:
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[],
+                    business_context=verified_execution_context,
+                )
+                message = information_message or admission_message
+            elif cognitive_v3.decision.clarification_need is not None:
+                message = cognitive_v3.decision.clarification_need.question
+            elif phase2_primary and (
+                message := await build_cognitive_side_reply_v3(
+                    decision=cognitive_v3.decision,
+                    llm_client=llm_client,
+                )
+            ):
+                pass
+            elif phase2_primary:
+                message = "这条消息未形成可执行的 Agent2 typed command，本次未写入，也未回退 Agent1。"
+            else:
+                message = (
+                    getattr(getattr(shadow, "assistant_reply", None), "text", "")
+                    or shadow.gate_decision.reply_text
+                    or "这条消息已按业务对话处理，没有写入日报。"
+                )
+            if phase2_primary:
+                if verified_execution_context is None:
+                    raise RuntimeError(
+                        "Agent2 read-only outcome requires verified execution context"
+                    )
+                outcomes = (text_outcome(message, source_turn_id=message_id),)
+                await persist_operation_outcomes(
+                    session,
+                    outcomes,
+                    tenant_id=verified_execution_context.tenant_id,
+                    user_id=verified_execution_context.actor_user_id,
+                    conversation_id=verified_execution_context.conversation_id,
+                    source_turn_id=message_id,
+                    now=verified_execution_context.occurred_at,
+                )
+                message = OutcomeReplyComposer().compose(outcomes)
+            return Agent2DailyExecutionResult(
+                report_id=str(getattr(daily_report, "id", "") or "") or None,
+                report_date=report_date,
+                status=str(getattr(daily_report, "status", "") or "collecting"),
+                message=message,
+                report_saved=False,
+                read_only=True,
+                today_work=list(getattr(daily_report, "today_work", []) or []),
+                problems=list(getattr(daily_report, "problems", []) or []),
+                tomorrow_plan=list(getattr(daily_report, "tomorrow_plan", []) or []),
+                command_results=[],
+            )
+    if shadow is None or shadow.gate_decision.block_legacy_daily or not shadow.commands:
+        return None
+    return await execute_agent2_daily_commands(
+        session,
+        user=user,
+        raw_input=envelope.raw_text,
+        source="agent2_dingtalk_webhook_text",
+        commands=list(shadow.commands),
+        settings=settings,
+        message_id=message_id,
+        expected_report_version=agent2_daily_report_version(daily_report),
+    )
 
 
 async def _observe_workflow_route(
@@ -424,14 +1074,16 @@ async def _evaluate_legacy_daily_gate(
                     )
                 )
         except Exception as exc:
-            print(f"Workflow route observation skipped performance task lookup: {exc}", flush=True)
+            _log_runtime_failure(
+                "workflow_route_performance_task_lookup_skipped", exc
+            )
 
     try:
         daily_task = await build_live_daily_active_task(session, user, settings)
         if daily_task is not None:
             active_tasks.append(daily_task)
     except Exception as exc:
-        print(f"Workflow route observation skipped daily task lookup: {exc}", flush=True)
+        _log_runtime_failure("workflow_route_daily_task_lookup_skipped", exc)
 
     envelope = IncomingMessageEnvelope(
         sender_id=str(getattr(user, "id", "") or ""),
@@ -446,15 +1098,16 @@ async def _evaluate_legacy_daily_gate(
     mode = "observe_only" if observe_only_log else getattr(settings, "workflow_intake_mode", "observe_only")
     shadow = evaluate_daily_shadow(envelope, mode=mode)
     gate_decision = shadow.gate_decision
-    print(
-        "Workflow route observation: "
-        + json.dumps(shadow.route_observation(envelope), ensure_ascii=False, sort_keys=True),
-        flush=True,
-    )
-    print(
-        "Workflow gate observation: "
-        + json.dumps(shadow.gate_observation(envelope), ensure_ascii=False, sort_keys=True),
-        flush=True,
+    observation = envelope.observation_base()
+    summary = shadow.summary()
+    logger.info(
+        "workflow_shadow_observation source_message_hash=%s selected_workflow=%s "
+        "command_count=%d adapter_result_count=%d block_legacy_daily=%s",
+        str(observation.get("raw_text_hash") or ""),
+        str(getattr(shadow.route, "workflow", "") or ""),
+        int(summary.get("command_count") or 0),
+        int(summary.get("adapter_result_count") or 0),
+        bool(gate_decision.block_legacy_daily),
     )
     await create_agent2_workflow_audit_event(
         session=session,

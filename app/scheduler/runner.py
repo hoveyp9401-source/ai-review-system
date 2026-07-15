@@ -1,13 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import select
 
+from app.agent2.business.models import Agent2IdentityBinding
+from app.models import Agent2ConversationState
+from app.agent2.business.notifications import (
+    dispatch_notification_batch,
+    reconcile_sent_notification_outcomes,
+    recover_stale_notification_claims,
+)
+from app.agent2.business.travel_pipeline import evaluate_travel_collaboration_candidates
+from app.agent2.case_followup_outbox import (
+    enqueue_due_case_followup_reminders,
+    enqueue_due_case_followups,
+    reconcile_case_followup_provider_acceptances,
+)
+from app.agent2.case_followup_invalidation import expire_due_case_followups
+from app.agent2.case_followup_scheduler import plan_due_case_followups
+from app.agent2.case_followup_service import CaseFollowupTaskCreator, FollowupCreationContext
+from app.agent2.case_followup_sql_store import SqlCaseFollowupTaskStore
 from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.llm.client import LLMClient
@@ -18,6 +39,38 @@ from app.services.summary_service import SummaryService
 from app.utils.time import today_in_timezone
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_followup_conversation_id(
+    configured: dict[str, str],
+    *,
+    tenant_id: str,
+    user_id: str,
+    observed_conversation_ids: tuple[str, ...],
+) -> str:
+    explicit = str(configured.get(f"{tenant_id}:{user_id}") or "").strip()
+    if explicit:
+        return explicit
+    observed = tuple(dict.fromkeys(
+        value.strip() for value in observed_conversation_ids if value.strip()
+    ))
+    return observed[0] if len(observed) == 1 else ""
+
+
+def _configured_followup_conversation_map(raw: str) -> dict[str, str]:
+    if not str(raw or "").strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key).strip(): str(item).strip()
+        for key, item in value.items()
+        if str(key).strip() and str(item).strip()
+    }
 
 
 async def run_scheduler() -> None:
@@ -110,6 +163,261 @@ async def run_scheduler() -> None:
                 logger.exception("daily summary generation failed after briefing send")
             await session.commit()
 
+    async def agent2_notification_job() -> None:
+        tenant_ids = _configured_agent2_business_tenant_ids(settings)
+        if not settings.agent2_business_phase2_enabled or not tenant_ids:
+            logger.warning("Agent2 notification dispatch skipped: no enabled test-tenant allowlist")
+            return
+        travel_enabled = bool(
+            settings.agent2_travel_notification_worker_enabled
+            and settings.agent2_business_travel_enabled
+            and settings.agent2_business_travel_write_enabled
+        )
+        configured_followup_tenants = set(
+            _configured_csv_values(settings.agent2_case_followup_tenant_ids)
+        )
+        followup_tenant_ids = tuple(
+            value for value in tenant_ids if value in configured_followup_tenants
+        )
+        followup_user_ids = _configured_csv_values(settings.agent2_case_followup_user_ids)
+        followup_enabled = bool(
+            settings.agent2_case_followup_enabled
+            and settings.agent2_case_followup_send_enabled
+            and settings.agent2_business_case_progress_enabled
+            and settings.agent2_business_case_progress_write_enabled
+            and followup_tenant_ids
+            and followup_user_ids
+        )
+        lifecycle_tenant_ids = tuple(
+            value for value in tenant_ids
+            if value in set(_configured_csv_values(settings.case_followup_tenant_allowlist))
+        )
+        lifecycle_user_ids = _configured_csv_values(settings.case_followup_user_allowlist)
+        lifecycle_evaluation_enabled = bool(
+            settings.case_followup_enabled
+            and lifecycle_tenant_ids
+            and lifecycle_user_ids
+        )
+        lifecycle_send_enabled = bool(
+            lifecycle_evaluation_enabled and settings.case_followup_send_enabled
+        )
+        allowed_message_types = tuple(
+            message_type
+            for message_type, enabled in (
+                ("travel_collaboration_question", travel_enabled),
+                ("case_progress_followup", followup_enabled),
+                ("case_lifecycle_followup", lifecycle_send_enabled),
+            )
+            if enabled
+        )
+        if not allowed_message_types and not lifecycle_evaluation_enabled:
+            logger.warning("Agent2 notification dispatch skipped: all domain/effect switches are closed")
+            return
+
+        now = datetime.now(ZoneInfo(settings.timezone))
+        scanned_intents = matched_groups = created_candidates = notification_rows = 0
+        lifecycle_notification_rows = 0
+        notification_outcomes_reconciled = 0
+        assigned_case_ids: tuple[str, ...] = ()
+        lifecycle_plans = ()
+        lifecycle_conversations: dict[tuple[str, str], str] = {}
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                if travel_enabled:
+                    evaluation = await evaluate_travel_collaboration_candidates(
+                        session,
+                        now=now,
+                        allowed_tenant_ids=tenant_ids,
+                    )
+                    scanned_intents = evaluation.scanned_intents
+                    matched_groups = evaluation.matched_groups
+                    created_candidates = evaluation.created_candidates
+                    notification_rows = evaluation.notification_rows
+                if lifecycle_evaluation_enabled:
+                    bindings = (
+                        await session.scalars(
+                            select(Agent2IdentityBinding).where(
+                                Agent2IdentityBinding.tenant_id.in_(lifecycle_tenant_ids),
+                                Agent2IdentityBinding.user_id.in_(lifecycle_user_ids),
+                                Agent2IdentityBinding.active.is_(True),
+                            )
+                        )
+                    ).all()
+                    assigned_case_ids = tuple(
+                        dict.fromkeys(
+                            str(case_id)
+                            for binding in bindings
+                            for case_id in (
+                                (binding.permission_scope_json or {}).get(
+                                    "allowed_case_ids", []
+                                )
+                            )
+                            if case_id
+                        )
+                    )
+                    lifecycle_plans = await plan_due_case_followups(
+                        session, now=now,
+                        allowed_tenant_ids=lifecycle_tenant_ids,
+                        allowed_user_ids=lifecycle_user_ids,
+                        allowed_case_ids=assigned_case_ids,
+                        allowed_trigger_types=_configured_csv_values(
+                            settings.case_followup_trigger_allowlist
+                        ),
+                    )
+                    state_user_keys = tuple(
+                        f"{tenant_id}:{user_id}"
+                        for tenant_id in lifecycle_tenant_ids
+                        for user_id in lifecycle_user_ids
+                    )
+                    state_rows = tuple((await session.scalars(
+                        select(Agent2ConversationState).where(
+                            Agent2ConversationState.user_key.in_(state_user_keys)
+                        )
+                    )).all()) if state_user_keys else ()
+                    observed: dict[str, list[str]] = {}
+                    for row in state_rows:
+                        observed.setdefault(row.user_key, []).append(row.conversation_id)
+                    configured_conversations = _configured_followup_conversation_map(
+                        settings.case_followup_conversation_map_json
+                    )
+                    for plan in lifecycle_plans:
+                        key = (plan.tenant_id, plan.assigned_user_id)
+                        lifecycle_conversations[key] = resolve_followup_conversation_id(
+                            configured_conversations,
+                            tenant_id=plan.tenant_id,
+                            user_id=plan.assigned_user_id,
+                            observed_conversation_ids=tuple(
+                                observed.get(
+                                    f"{plan.tenant_id}:{plan.assigned_user_id}", []
+                                )
+                            ),
+                        )
+        if lifecycle_plans:
+            creator = CaseFollowupTaskCreator(SqlCaseFollowupTaskStore(AsyncSessionLocal))
+            for plan in lifecycle_plans:
+                conversation_id = lifecycle_conversations.get(
+                    (plan.tenant_id, plan.assigned_user_id), ""
+                )
+                if not conversation_id:
+                    logger.warning(
+                        "Agent2 lifecycle plan blocked: conversation scope is not unique "
+                        "tenant=%s user=%s followup=%s",
+                        plan.tenant_id, plan.assigned_user_id, plan.followup_id,
+                    )
+                    continue
+                await creator.create(
+                    plan,
+                    FollowupCreationContext(
+                        tenant_id=plan.tenant_id,
+                        user_id=plan.assigned_user_id,
+                        conversation_id=conversation_id,
+                        source_turn_id=f"scheduler:{plan.followup_id}",
+                        now=now,
+                    ),
+                )
+        if not allowed_message_types:
+            logger.info(
+                "Agent2 lifecycle shadow planned=%s; message effect switch is closed",
+                len(lifecycle_plans),
+            )
+            return
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                notification_outcomes_reconciled = (
+                    await reconcile_sent_notification_outcomes(
+                        session,
+                        now=now,
+                        allowed_tenant_ids=tenant_ids,
+                        allowed_message_types=allowed_message_types,
+                        limit=settings.agent2_travel_notification_batch_size,
+                    )
+                )
+                if lifecycle_send_enabled:
+                    await reconcile_case_followup_provider_acceptances(
+                        session, now=now,
+                        allowed_tenant_ids=lifecycle_tenant_ids,
+                        allowed_user_ids=lifecycle_user_ids,
+                        limit=settings.agent2_travel_notification_batch_size,
+                    )
+                    await expire_due_case_followups(
+                        session, now=now,
+                        allowed_tenant_ids=lifecycle_tenant_ids,
+                        allowed_user_ids=lifecycle_user_ids,
+                        allowed_case_ids=assigned_case_ids,
+                    )
+                    lifecycle_events = await enqueue_due_case_followups(
+                        session, now=now,
+                        allowed_tenant_ids=lifecycle_tenant_ids,
+                        allowed_user_ids=lifecycle_user_ids,
+                        allowed_case_ids=assigned_case_ids,
+                        send_enabled=True,
+                        limit=settings.agent2_travel_notification_batch_size,
+                        user_daily_limit=settings.case_followup_daily_limit,
+                        case_daily_limit=settings.case_followup_case_daily_limit,
+                    )
+                    reminder_events = await enqueue_due_case_followup_reminders(
+                        session, now=now,
+                        allowed_tenant_ids=lifecycle_tenant_ids,
+                        allowed_user_ids=lifecycle_user_ids,
+                        allowed_case_ids=assigned_case_ids,
+                        send_enabled=True,
+                        reminder_interval_hours=(
+                            settings.case_followup_reminder_interval_hours
+                        ),
+                        max_reminders=settings.case_followup_max_reminders,
+                        user_daily_limit=settings.case_followup_daily_limit,
+                        case_daily_limit=settings.case_followup_case_daily_limit,
+                        limit=settings.agent2_travel_notification_batch_size,
+                    )
+                    lifecycle_notification_rows = len(lifecycle_events) + len(reminder_events)
+                recovered = await recover_stale_notification_claims(
+                    session, now=now,
+                    stale_before=now - timedelta(
+                        minutes=settings.agent2_travel_notification_stale_lock_minutes
+                    ),
+                    allowed_tenant_ids=tenant_ids,
+                    allowed_message_types=allowed_message_types,
+                )
+            summary = await dispatch_notification_batch(
+                session,
+                robot,
+                worker_id="agent2-notification-scheduler",
+                now=now,
+                limit=settings.agent2_travel_notification_batch_size,
+                max_attempts=settings.agent2_travel_notification_max_attempts,
+                retry_base_seconds=settings.agent2_travel_notification_retry_base_seconds,
+                allowed_tenant_ids=tenant_ids,
+                allowed_message_types=allowed_message_types,
+                case_followup_tenant_ids=tuple(
+                    dict.fromkeys((*followup_tenant_ids, *lifecycle_tenant_ids))
+                ),
+                case_followup_user_ids=tuple(
+                    dict.fromkeys((*followup_user_ids, *lifecycle_user_ids))
+                ),
+                case_followup_trigger_types=_configured_csv_values(
+                    settings.case_followup_trigger_allowlist
+                ),
+            )
+        if scanned_intents or recovered or summary.claimed or notification_outcomes_reconciled:
+            logger.info(
+                "Agent2 notifications scanned=%s matches=%s new_candidates=%s "
+                "notification_rows=%s lifecycle_notification_rows=%s recovered=%s claimed=%s sent=%s failed=%s "
+                "dead_letter=%s cancelled=%s outcomes_reconciled=%s message_types=%s",
+                scanned_intents,
+                matched_groups,
+                created_candidates,
+                notification_rows,
+                lifecycle_notification_rows,
+                len(recovered),
+                summary.claimed,
+                summary.sent,
+                summary.failed,
+                summary.dead_letter,
+                summary.cancelled,
+                notification_outcomes_reconciled,
+                allowed_message_types,
+            )
+
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
     scheduler.add_job(
         reminder_job,
@@ -147,6 +455,20 @@ async def run_scheduler() -> None:
         replace_existing=True,
         max_instances=1,
     )
+    if settings.agent2_travel_notification_worker_enabled or (
+        settings.agent2_case_followup_enabled and settings.agent2_case_followup_send_enabled
+    ):
+        scheduler.add_job(
+            agent2_notification_job,
+            IntervalTrigger(
+                seconds=settings.agent2_travel_notification_worker_interval_seconds,
+                timezone=settings.timezone,
+            ),
+            id="agent2_travel_notification_dispatch",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -214,6 +536,23 @@ def _scheduler_pause_dates(settings) -> set[date]:
         except ValueError:
             logger.warning("ignoring invalid scheduler pause date value=%s", value)
     return dates
+
+
+def _configured_agent2_business_tenant_ids(settings) -> tuple[str, ...]:
+    return _configured_csv_values(getattr(settings, "agent2_business_tenant_ids", ""))
+
+
+def _configured_csv_values(raw) -> tuple[str, ...]:
+    raw = raw or ""
+    if not isinstance(raw, str):
+        raw = ",".join(str(value) for value in raw)
+    return tuple(
+        dict.fromkeys(
+            value.strip()
+            for value in raw.replace("\n", ",").replace(";", ",").split(",")
+            if value.strip()
+        )
+    )
 
 
 if __name__ == "__main__":

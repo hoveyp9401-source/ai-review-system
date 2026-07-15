@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import DailyReport, User
+from app.models import DailyReport, ReportInteractionEvent, User
 from app.repositories import list_missing_users
 from app.services.dingtalk import DingTalkRobotClient
 from app.services.state_machine import (
@@ -128,6 +128,35 @@ async def remind_missing_reports(
 
     if not effective_dry_run and sent_user_ids:
         now = now_in_timezone(settings.timezone)
+        sent_user_id_set = set(sent_user_ids)
+        for user in target_users:
+            if user.id not in sent_user_id_set:
+                continue
+            report = reports_by_user.get(user.id)
+            session.add(
+                ReportInteractionEvent(
+                    user_id=user.id,
+                    report_id=getattr(report, "id", None),
+                    dingtalk_user_id=str(getattr(user, "dingtalk_user_id", "") or ""),
+                    report_date=report_date,
+                    message_text=build_report_reminder_text(
+                        report_date,
+                        user,
+                        report,
+                        reminder_kind=reminder_kind,
+                    ),
+                    llm_decision_json={
+                        "interaction_type": "daily_report_reminder",
+                        "reminder_kind": reminder_kind,
+                        "target_report_date": report_date.isoformat(),
+                        "business_write": False,
+                        "provider_message_id_available": False,
+                    },
+                    backend_action="daily_report_reminder_sent",
+                    before_snapshot_json={},
+                    after_snapshot_json={},
+                )
+            )
         result = await session.execute(
             select(DailyReport).where(
                 DailyReport.report_date == report_date,

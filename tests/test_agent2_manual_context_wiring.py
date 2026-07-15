@@ -40,7 +40,7 @@ def test_agent2_manual_blocked_reply_uses_tool_assisted_context_pack():
     )
 
 
-def test_manual_endpoint_uses_agent2_only_for_explicit_source_or_gray_user():
+def test_manual_endpoint_ignores_request_source_and_uses_trusted_gray_gate():
     source = REPORTS_API.read_text(encoding="utf-8")
     tree = ast.parse(source)
     function = next(
@@ -49,9 +49,23 @@ def test_manual_endpoint_uses_agent2_only_for_explicit_source_or_gray_user():
         if isinstance(node, ast.FunctionDef) and node.name == "_manual_should_use_agent2"
     )
 
-    assert "legacy" in ast.unparse(function)
-    assert "disable_agent2" in ast.unparse(function)
     function_source = ast.unparse(function)
-    assert "agent2" in function_source
-    assert "source_text" in function_source
+    assert "source_text" not in function_source
+    assert "'agent2' in" not in function_source
+    assert "'legacy'" not in function_source
+    assert "'agent1'" not in function_source
+    assert "'disable_agent2'" not in function_source
     assert "agent2_daily_enabled_for_user" in function_source
+
+
+def test_manual_cognitive_v3_path_executes_only_typed_daily_commands():
+    source = REPORTS_API.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calls = _calls_named(tree, "execute_typed_agent2_daily_commands")
+
+    assert calls, "manual Agent2 v3 path must call the typed executor"
+    for call in calls:
+        keyword_names = {keyword.arg for keyword in call.keywords}
+        assert {"commands", "execution_context"} <= keyword_names
+        assert "raw_input" not in keyword_names
+        assert "actions" not in keyword_names

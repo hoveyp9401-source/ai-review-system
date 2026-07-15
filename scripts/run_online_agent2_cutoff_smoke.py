@@ -15,7 +15,7 @@ import httpx
 from sqlalchemy import delete, select
 
 from app.db import AsyncSessionLocal
-from app.models import DailyReport, ReportInteractionEvent, Team, User, UserHabit, WebhookEvent
+from app.models import Agent2ConversationState, DailyReport, ReportInteractionEvent, Team, User, UserHabit, WebhookEvent
 
 
 TEAM_CODE = "__agent2_cutoff_smoke_team__"
@@ -78,6 +78,16 @@ async def cleanup_all_smoke_data() -> None:
             await session.execute(delete(DailyReport).where(DailyReport.user_id.in_(user_ids)))
             await session.execute(delete(ReportInteractionEvent).where(ReportInteractionEvent.user_id.in_(user_ids)))
             await session.execute(delete(UserHabit).where(UserHabit.user_id.in_(user_ids)))
+            await session.execute(
+                delete(Agent2ConversationState).where(
+                    Agent2ConversationState.user_key.in_([str(user_id) for user_id in user_ids])
+                )
+            )
+        await session.execute(
+            delete(Agent2ConversationState).where(
+                Agent2ConversationState.last_message_id.like("agent2-cutoff-%")
+            )
+        )
         await session.execute(delete(WebhookEvent).where(WebhookEvent.dingtalk_user_id.like(f"{USER_PREFIX}%")))
         for user in users:
             await session.delete(user)
@@ -178,21 +188,32 @@ async def smoke_today_write_ignores_historical_context(client: httpx.AsyncClient
     yesterday_report = await get_report(user, yesterday)
     assert_true(response.get("report_date") == DEFAULT_REPORT_DATE.isoformat(), "today write response did not target today")
     assert_true(today_report is not None, "today write did not create today's report")
-    assert_true("今天完成线上截止规则验证" in list(today_report.today_work or []), "today write missing from today's report")
+    assert_true(
+        any("完成线上截止规则验证" in item for item in list(today_report.today_work or [])),
+        "today write missing from today's report",
+    )
     assert_true(yesterday_report is not None and list(yesterday_report.today_work or []) == ["昨天历史上下文"], "today write changed yesterday")
 
 
-async def smoke_bare_clear_targets_today_not_historical_context(client: httpx.AsyncClient) -> None:
+async def smoke_bare_clear_is_blocked_without_bound_confirmation(client: httpx.AsyncClient) -> None:
     user = await ensure_user("bare-clear")
     yesterday = DEFAULT_REPORT_DATE - timedelta(days=1)
-    await seed_report(user, DEFAULT_REPORT_DATE, today_work=["今天应被清空"], problems=["今天问题"], tomorrow_plan=["今天计划"])
+    await seed_report(user, DEFAULT_REPORT_DATE, today_work=["今天不得误清空"], problems=["今天问题"], tomorrow_plan=["今天计划"])
     await asyncio.sleep(0.05)
     await seed_report(user, yesterday, today_work=["昨天不应被清空"], problems=["昨天问题"], tomorrow_plan=["昨天计划"])
     response = await post_manual(client, user, "清空日报", case_name="bare-clear")
+    print("CUTOFF_V3_RESPONSE bare-clear " + json.dumps(response, ensure_ascii=False), flush=True)
     today_report = await get_report(user, DEFAULT_REPORT_DATE)
     yesterday_report = await get_report(user, yesterday)
     assert_true(response.get("report_date") == DEFAULT_REPORT_DATE.isoformat(), "bare clear response did not target today")
-    assert_true(today_report is not None and list(today_report.today_work or []) == [], "bare clear did not clear today's report")
+    assert_true(today_report is not None and list(today_report.today_work or []) == ["今天不得误清空"], "bare clear changed today's report without bound confirmation")
+    message = str(response.get("message") or "")
+    assert_true(
+        "没改动日报" in message
+        or "没有改动日报" in message
+        or ("确认" in message and "清空" in message),
+        "bare clear did not return a blocked or bound-confirmation reply",
+    )
     assert_true(yesterday_report is not None and list(yesterday_report.today_work or []) == ["昨天不应被清空"], "bare clear changed yesterday")
 
 
@@ -201,14 +222,20 @@ async def smoke_explicit_yesterday_edit_is_blocked_after_cutoff(client: httpx.As
     yesterday = DEFAULT_REPORT_DATE - timedelta(days=1)
     await seed_report(user, yesterday, today_work=["昨天第一条"], problems=["暂无"], tomorrow_plan=["继续"])
     response = await post_manual(client, user, "昨天第一条删掉", case_name="explicit-yesterday-edit")
+    print("CUTOFF_V3_RESPONSE historical-edit " + json.dumps(response, ensure_ascii=False), flush=True)
     yesterday_report = await get_report(user, yesterday)
-    assert_true("9点后" in str(response.get("message") or ""), "explicit historical edit did not explain cutoff")
+    message = str(response.get("message") or "")
+    assert_true(
+        "9点后" in message or ("09:00" in message and any(word in message for word in ("超过", "已过"))),
+        "explicit historical edit did not explain cutoff",
+    )
     assert_true(yesterday_report is not None and list(yesterday_report.today_work or []) == ["昨天第一条"], "explicit historical edit changed yesterday")
 
 
 async def smoke_daily_meta_status_is_no_write(client: httpx.AsyncClient) -> None:
     user = await ensure_user("daily-meta-status")
     response = await post_manual(client, user, "写日报了", case_name="daily-meta-status")
+    print("CUTOFF_V3_RESPONSE daily-meta-status " + json.dumps(response, ensure_ascii=False), flush=True)
     today_report = await get_report(user, DEFAULT_REPORT_DATE)
     assert_true(today_report is None or "写日报了" not in list(today_report.today_work or []), "daily meta status was written as daily work")
     assert_true("不写入日报" in str(response.get("message") or ""), "daily meta status did not return no-write reply")
@@ -224,6 +251,7 @@ async def smoke_chatter_does_not_match_daily_candidate(client: httpx.AsyncClient
         tomorrow_plan=["明天出差三亚沟通海花岛案件"],
     )
     response = await post_manual(client, user, "明天吃屎", case_name="chatter-candidate")
+    print("CUTOFF_V3_RESPONSE chatter " + json.dumps(response, ensure_ascii=False), flush=True)
     report = await get_report(user, DEFAULT_REPORT_DATE)
     message = str(response.get("message") or "")
     assert_true("不写入日报" in message, "chatter did not return no-write reply")
@@ -234,7 +262,7 @@ async def smoke_chatter_does_not_match_daily_candidate(client: httpx.AsyncClient
 async def run(base_url: str, output: Path) -> int:
     cases = [
         ("today_write_ignores_historical_context", smoke_today_write_ignores_historical_context),
-        ("bare_clear_targets_today_not_historical_context", smoke_bare_clear_targets_today_not_historical_context),
+        ("bare_clear_is_blocked_without_bound_confirmation", smoke_bare_clear_is_blocked_without_bound_confirmation),
         ("explicit_yesterday_edit_is_blocked_after_cutoff", smoke_explicit_yesterday_edit_is_blocked_after_cutoff),
         ("daily_meta_status_is_no_write", smoke_daily_meta_status_is_no_write),
         ("chatter_does_not_match_daily_candidate", smoke_chatter_does_not_match_daily_candidate),

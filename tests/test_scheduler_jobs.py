@@ -493,6 +493,9 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
         return {}
 
     class Session:
+        def __init__(self):
+            self.added = []
+
         async def execute(self, query):
             class Result:
                 def scalars(self):
@@ -502,6 +505,9 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
                     return []
 
             return Result()
+
+        def add(self, value):
+            self.added.append(value)
 
     class Robot:
         def __init__(self):
@@ -520,8 +526,9 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
     monkeypatch.setattr(jobs, "list_missing_users", fake_list_missing_users)
     monkeypatch.setattr(jobs, "_load_reports_by_user", fake_load_reports_by_user)
 
+    session = Session()
     result = await remind_missing_reports(
-        Session(),
+        session,
         SimpleNamespace(
             timezone="Asia/Shanghai",
             dingtalk_default_robot_webhook="https://example.invalid",
@@ -541,6 +548,13 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
     assert result["would_send"] == 0
     assert result["real_sent"] == 1
     assert result["skipped_real_users"] == 1
+    assert len(session.added) == 1
+    reminder_event = session.added[0]
+    assert reminder_event.backend_action == "daily_report_reminder_sent"
+    assert reminder_event.user_id == test_user.id
+    assert reminder_event.report_date == date(2026, 6, 15)
+    assert reminder_event.report_id is None
+    assert reminder_event.llm_decision_json["reminder_kind"] == "daily"
 
 
 @pytest.mark.asyncio

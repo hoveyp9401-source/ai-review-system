@@ -5,10 +5,12 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import re
+import uuid
 from zoneinfo import ZoneInfo
 from typing import Any, TYPE_CHECKING
 
 from app.agent2.daily_commands import DailyCommand
+from app.agent2.daily_command_compiler import TypedDailyBatchResult, apply_legacy_daily_commands_as_typed
 from app.agent2.daily_edit_intent import looks_like_parenthetical_delete, looks_like_spoken_correction
 from app.agent2.daily_state import (
     DRAFT_ITEM_IDS_KEY,
@@ -18,6 +20,12 @@ from app.agent2.daily_state import (
     focus_item,
     pending_daily_candidate,
 )
+from app.agent2.typed_daily_commands import DailyReportMutationSnapshot
+
+
+TYPED_REPORT_VERSION_KEY = "_agent2_report_version"
+TYPED_COMMAND_KEYS_KEY = "_agent2_typed_command_keys"
+TYPED_AUDIT_KEY = "_agent2_typed_audit"
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,6 +73,10 @@ def agent2_daily_enabled_for_user(settings: Any, user: User) -> bool:
     return any(candidate and candidate in configured for candidate in candidates)
 
 
+def agent2_daily_report_version(report: "DailyReport | None") -> int:
+    return _typed_report_version(getattr(report, "section_status", None))
+
+
 async def execute_agent2_daily_commands(
     session: "AsyncSession",
     *,
@@ -74,6 +86,8 @@ async def execute_agent2_daily_commands(
     commands: list[DailyCommand],
     settings: Any,
     report_date: date | None = None,
+    message_id: str = "",
+    expected_report_version: int | None = None,
 ) -> Agent2DailyExecutionResult:
     from app.repositories import acquire_daily_report_advisory_lock, build_report_interaction_snapshot, get_report, upsert_daily_report
 
@@ -110,15 +124,27 @@ async def execute_agent2_daily_commands(
     before_snapshot = build_report_interaction_snapshot(existing)
     previous_report = await _previous_report_for_copy(session, user=user, report_date=target_report_date, commands=commands)
 
-    application = apply_commands_to_snapshot(
-        today_work=list(getattr(existing, "today_work", []) or []),
-        problems=list(getattr(existing, "problems", []) or []),
-        tomorrow_plan=list(getattr(existing, "tomorrow_plan", []) or []),
-        status=str(getattr(existing, "status", "") or "collecting"),
+    typed_batch = _apply_typed_command_adapter(
         commands=commands,
+        message_id=message_id,
+        user=user,
+        report_date=target_report_date,
+        existing=existing,
         previous_report=previous_report,
-        section_status=getattr(existing, "section_status", None),
+        expected_report_version=expected_report_version,
     )
+    if typed_batch is not None and typed_batch.status != "unsupported":
+        application = _daily_application_from_typed_batch(typed_batch, commands)
+    else:
+        application = apply_commands_to_snapshot(
+            today_work=list(getattr(existing, "today_work", []) or []),
+            problems=list(getattr(existing, "problems", []) or []),
+            tomorrow_plan=list(getattr(existing, "tomorrow_plan", []) or []),
+            status=str(getattr(existing, "status", "") or "collecting"),
+            commands=commands,
+            previous_report=previous_report,
+            section_status=getattr(existing, "section_status", None),
+        )
 
     if application.read_only:
         return Agent2DailyExecutionResult(
@@ -152,6 +178,14 @@ async def execute_agent2_daily_commands(
         **(getattr(existing, "section_status", None) or {}),
         "agent2_last_commands": [command.as_dict() for command in commands],
     }
+    if typed_batch is not None and typed_batch.status == "executed":
+        section_status[TYPED_REPORT_VERSION_KEY] = typed_batch.after.version
+        existing_keys = _typed_command_keys(getattr(existing, "section_status", None))
+        new_keys = [execution.command.idempotency_key for execution in typed_batch.executions]
+        section_status[TYPED_COMMAND_KEYS_KEY] = [*existing_keys, *new_keys][-100:]
+        existing_audits = _typed_audit_records(getattr(existing, "section_status", None))
+        new_audits = [execution.audit.as_dict() for execution in typed_batch.executions]
+        section_status[TYPED_AUDIT_KEY] = [*existing_audits, *new_audits][-100:]
     _attach_agent2_item_ids(
         section_status,
         existing=existing,
@@ -180,6 +214,8 @@ async def execute_agent2_daily_commands(
             "agent2": True,
             "commands": [command.as_dict() for command in commands],
             "command_results": application.actions,
+            "typed_commands": [execution.command.as_dict() for execution in typed_batch.executions] if typed_batch is not None else [],
+            "typed_audit": [execution.audit.as_dict() for execution in typed_batch.executions] if typed_batch is not None else [],
         },
         received_at=received_at,
         confirmation_type="user_confirmed" if _has_confirm_submit(commands, application.status) else "none",
@@ -190,6 +226,7 @@ async def execute_agent2_daily_commands(
         pending_confirmation_at=None,
         auto_submit_at=None,
         replace_sections=True,
+        report_id_override=typed_batch.after.report_id if typed_batch is not None and existing is None else None,
     )
     after_snapshot = build_report_interaction_snapshot(report)
     if not bool(getattr(settings, "shadow_memory_enabled", False)):
@@ -216,6 +253,195 @@ async def execute_agent2_daily_commands(
         tomorrow_plan=list(report.tomorrow_plan or []),
         command_results=application.actions,
     )
+
+
+def _apply_typed_command_adapter(
+    *,
+    commands: list[DailyCommand],
+    message_id: str,
+    user: "User",
+    report_date: date,
+    existing: "DailyReport | None",
+    previous_report: "DailyReport | None",
+    expected_report_version: int | None,
+) -> TypedDailyBatchResult | None:
+    if not str(message_id or "").strip():
+        return None
+    snapshot = _typed_snapshot(user=user, report_date=report_date, report=existing)
+    return apply_legacy_daily_commands_as_typed(
+        commands,
+        message_id=message_id,
+        snapshot=snapshot,
+        actor_user_id=user.id,
+        expected_report_version=(
+            expected_report_version
+            if expected_report_version is not None
+            else snapshot.version
+        ),
+        executed_idempotency_keys=_typed_command_keys(getattr(existing, "section_status", None)),
+        previous_snapshot=(
+            _typed_snapshot(
+                user=user,
+                report_date=getattr(previous_report, "report_date", report_date),
+                report=previous_report,
+            )
+            if previous_report is not None
+            else None
+        ),
+    )
+
+
+def _typed_snapshot(
+    *,
+    user: "User",
+    report_date: date,
+    report: "DailyReport | None",
+) -> DailyReportMutationSnapshot:
+    today_work = list(getattr(report, "today_work", []) or [])
+    problems = list(getattr(report, "problems", []) or [])
+    tomorrow_plan = list(getattr(report, "tomorrow_plan", []) or [])
+    item_ids = _item_ids_from_section_status(
+        getattr(report, "section_status", None),
+        today_work=today_work,
+        problems=problems,
+        tomorrow_plan=tomorrow_plan,
+    )
+    report_id = getattr(report, "id", None) or uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"agent2-daily-report:{user.id}:{report_date.isoformat()}",
+    )
+    return DailyReportMutationSnapshot(
+        report_id=report_id,
+        owner_user_id=user.id,
+        version=_typed_report_version(getattr(report, "section_status", None)),
+        status=str(getattr(report, "status", "") or "collecting"),
+        today_work=tuple(today_work),
+        problems=tuple(problems),
+        tomorrow_plan=tuple(tomorrow_plan),
+        item_ids={field: tuple(item_ids.get(field, [])) for field in REPORT_FIELD_ORDER},
+    )
+
+
+def _typed_report_version(section_status: dict[str, Any] | None) -> int:
+    try:
+        return max(0, int((section_status or {}).get(TYPED_REPORT_VERSION_KEY, 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _typed_command_keys(section_status: dict[str, Any] | None) -> list[str]:
+    values = (section_status or {}).get(TYPED_COMMAND_KEYS_KEY, [])
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values if str(value).strip()]
+
+
+def _typed_audit_records(section_status: dict[str, Any] | None) -> list[dict[str, Any]]:
+    values = (section_status or {}).get(TYPED_AUDIT_KEY, [])
+    if not isinstance(values, list):
+        return []
+    return [dict(value) for value in values if isinstance(value, dict)]
+
+
+def _daily_application_from_typed_batch(
+    batch: TypedDailyBatchResult,
+    legacy_commands: list[DailyCommand],
+) -> DailyCommandApplication:
+    if batch.status != "executed":
+        action: dict[str, Any] = {
+            "operation": legacy_commands[0].operation if legacy_commands else "unknown",
+            "changed": False,
+            "reason": batch.reason_code,
+            "validation_status": "blocked",
+        }
+        if batch.compilations:
+            action["expected_reply_type"] = batch.compilations[-1].expected_reply_type
+        if batch.executions:
+            action["typed_command"] = batch.executions[-1].command.as_dict()
+            action["audit"] = batch.executions[-1].audit.as_dict()
+        return DailyCommandApplication(
+            today_work=list(batch.before.today_work),
+            problems=list(batch.before.problems),
+            tomorrow_plan=list(batch.before.tomorrow_plan),
+            status=batch.before.status,
+            changed=False,
+            read_only=False,
+            actions=[action],
+            item_ids={field: list(batch.before.item_ids.get(field, ())) for field in REPORT_FIELD_ORDER},
+        )
+
+    actions = [
+        _typed_execution_action(
+            execution,
+            legacy_commands[batch.execution_command_indices[index]]
+            if index < len(batch.execution_command_indices) and batch.execution_command_indices[index] < len(legacy_commands)
+            else None,
+        )
+        for index, execution in enumerate(batch.executions)
+    ]
+    return DailyCommandApplication(
+        today_work=list(batch.after.today_work),
+        problems=list(batch.after.problems),
+        tomorrow_plan=list(batch.after.tomorrow_plan),
+        status=batch.after.status,
+        changed=batch.after != batch.before,
+        read_only=bool(batch.executions) and all(
+            execution.command.command_type == "query_report"
+            for execution in batch.executions
+        ),
+        actions=actions,
+        item_ids={field: list(batch.after.item_ids.get(field, ())) for field in REPORT_FIELD_ORDER},
+    )
+
+
+def _typed_execution_action(execution: Any, legacy_command: DailyCommand | None) -> dict[str, Any]:
+    command = execution.command
+    action: dict[str, Any] = {
+        "operation": getattr(legacy_command, "operation", "") or command.command_type,
+        "typed_command_type": command.command_type,
+        "typed_command": command.as_dict(),
+        "validation_status": execution.validation.status,
+        "reason": execution.validation.reason_code,
+        "audit": execution.audit.as_dict(),
+        "changed": execution.changed,
+        "read_only": command.command_type == "query_report",
+    }
+    if command.command_type == "append_item":
+        field_name = str(command.patch.get("field") or "")
+        before_ids = set(execution.before.item_ids.get(field_name, ()))
+        action.update(
+            {
+                "target_field": field_name,
+                "edit_action": "append_item",
+                "item_ids": [item_id for item_id in execution.after.item_ids.get(field_name, ()) if item_id not in before_ids],
+            }
+        )
+    elif command.command_type in {"edit_item", "delete_item", "merge_items"}:
+        field_name = _field_for_typed_target(execution.before, command.target_item_ids[0])
+        edit_action = {
+            "edit_item": "replace_item",
+            "delete_item": "delete_item",
+            "merge_items": "merge_items",
+        }[command.command_type]
+        action.update(
+            {
+                "target_field": field_name,
+                "edit_action": edit_action,
+                "item_ids": list(command.target_item_ids),
+            }
+        )
+        if command.command_type == "delete_item":
+            action["removed_item_ids"] = list(command.target_item_ids)
+        if command.command_type == "merge_items":
+            action["merged_item_ids"] = list(command.target_item_ids)
+    return action
+
+
+def _field_for_typed_target(snapshot: DailyReportMutationSnapshot, target_item_id: str) -> str:
+    for field_name in REPORT_FIELD_ORDER:
+        if target_item_id in snapshot.item_ids.get(field_name, ()):
+            return field_name
+    return ""
 
 
 def apply_commands_to_snapshot(
@@ -616,6 +842,9 @@ def _apply_edit_command(
                     },
                 )
         return _unsupported_edit_result(today_work, problems, tomorrow_plan, "merge_indices_unresolved", item_ids=field_item_ids)
+
+    if _has_delete_item_intent(text) and not indices and _has_deictic_item_reference(text):
+        return _unsupported_edit_result(today_work, problems, tomorrow_plan, "ambiguous_target", item_ids=field_item_ids)
 
     if _has_delete_item_intent(text) and not indices and _looks_like_field_clear(text, preferred_field):
         removed_ids = list(field_item_ids[preferred_field])
@@ -1504,7 +1733,7 @@ def _recent_item_target_from_text(
         field, index = status_target
         if field in REPORT_FIELDS and 1 <= index <= len(field_values.get(field, [])):
             return field, index
-    if _is_bare_short_delete_reference(text):
+    if _is_bare_short_delete_reference(text) or _has_deictic_item_reference(text):
         return None
     if preferred_field in REPORT_FIELDS and field_values.get(preferred_field):
         return preferred_field, len(field_values[preferred_field])
@@ -1515,6 +1744,11 @@ def _recent_item_target_from_text(
     if field_values.get("today_work"):
         return "today_work", len(field_values["today_work"])
     return None
+
+
+def _has_deictic_item_reference(text: str) -> bool:
+    compact = _compact(text)
+    return any(token in compact for token in ("刚才那条", "刚才那个", "刚刚那条", "刚刚那个", "这条", "那条", "这个", "那个", "上一条", "上条", "它"))
 
 
 def _has_recent_item_reference(text: str) -> bool:
@@ -2614,6 +2848,16 @@ def _no_change_message(actions: list[dict[str, Any]]) -> str:
         return "当前日报还没填完整，暂不能提交。"
     if any(action.get("reason") == "completed_report_locked" for action in actions):
         return "当前日报已提交，请先撤回后再修改。"
+    if "ambiguous_target" in reasons:
+        return "我没有改动日报。请明确要操作哪一条，例如回复“删除第 2 条”或“合并第 1、2 条”。"
+    if "target_not_found" in reasons:
+        return "我没有找到你指定的条目，日报未改动。请先查看当前草稿并重新指定栏目和编号。"
+    if "version_conflict" in reasons:
+        return "日报刚刚已被其他操作更新，这次没有覆盖新内容。请查看最新草稿后再操作。"
+    if "duplicate_message" in reasons:
+        return "这条请求已经处理过了，没有重复写入日报。"
+    if "forbidden_payload" in reasons:
+        return "这段内容更像操作指令、问答或闲聊，我没有把它写进日报正文。"
     if reasons & {"merge_indices_unresolved", "delete_indices_unresolved", "replace_indices_unresolved"}:
         return "没有找到对应编号，请先查看当前日报草稿后再修改。"
     if "replace_text_unresolved" in reasons:

@@ -242,8 +242,53 @@ def test_agent2_plan_routes_active_daily_confirmation_to_daily_context():
     assert [effect.effect_type for effect in plan.effects] == [EFFECT_CONFIRM_DAILY_REPORT]
 
 
-def test_agent2_plan_routes_active_daily_collecting_short_submit_replies_to_daily_context():
-    for text in ("交", "交了", "确认", "是", "确定"):
+def test_agent2_plan_blocks_bare_affirmation_when_active_daily_has_no_pending_confirmation():
+    plan = WorkflowRouter().plan(
+        _envelope(
+            "是的",
+            ActiveWorkflowTask(
+                workflow=WORKFLOW_DAILY_REPORT,
+                task_id="daily-collecting",
+                status="collecting",
+                reply_candidate=True,
+                awaiting_confirmation=False,
+            ),
+        )
+    )
+
+    assert plan.primary_workflow == WORKFLOW_UNKNOWN_OR_HELP
+    assert plan.effects == []
+    assert plan.safety_decision.commit_policy == "blocked"
+    assert "orphan_confirmation" in plan.safety_decision.flags
+
+
+def test_agent2_plan_blocks_bare_affirmation_when_multiple_workflows_are_pending():
+    plan = WorkflowRouter().plan(
+        _envelope(
+            "对",
+            ActiveWorkflowTask(
+                workflow=WORKFLOW_DAILY_REPORT,
+                task_id="daily-pending",
+                status="pending_confirmation",
+                awaiting_confirmation=True,
+            ),
+            ActiveWorkflowTask(
+                workflow=WORKFLOW_MONTHLY_REPORT,
+                task_id="monthly-pending",
+                status="pending_confirmation",
+                awaiting_confirmation=True,
+            ),
+        )
+    )
+
+    assert plan.primary_workflow == WORKFLOW_UNKNOWN_OR_HELP
+    assert plan.effects == []
+    assert plan.safety_decision.commit_policy == "blocked"
+    assert "ambiguous_confirmation" in plan.safety_decision.flags
+
+
+def test_agent2_plan_routes_active_daily_collecting_explicit_submit_requests_to_daily_context():
+    for text in ("交", "交了", "提交", "确认提交"):
         plan = WorkflowRouter().plan(
             _envelope(
                 text,
@@ -260,6 +305,67 @@ def test_agent2_plan_routes_active_daily_collecting_short_submit_replies_to_dail
         assert plan.task_id == "daily-collecting"
         assert [effect.effect_type for effect in plan.effects] == [EFFECT_CONFIRM_DAILY_REPORT]
         assert plan.safety_decision.commit_policy == "partial_allowed"
+
+
+def test_agent2_plan_submits_the_only_active_daily_draft_on_explicit_request():
+    plan = WorkflowRouter().plan(
+        _envelope(
+            "提交日报",
+            ActiveWorkflowTask(
+                workflow=WORKFLOW_DAILY_REPORT,
+                task_id="daily-collecting",
+                status="collecting",
+                reply_candidate=True,
+            ),
+        )
+    )
+
+    assert plan.primary_workflow == WORKFLOW_DAILY_REPORT
+    assert [effect.effect_type for effect in plan.effects] == [EFFECT_CONFIRM_DAILY_REPORT]
+    assert plan.safety_decision.commit_policy == "partial_allowed"
+
+
+def test_agent2_explicit_daily_submit_wins_over_unrelated_monthly_pending():
+    plan = WorkflowRouter().plan(
+        _envelope(
+            "\u63d0\u4ea4\u65e5\u62a5",
+            ActiveWorkflowTask(
+                workflow=WORKFLOW_MONTHLY_REPORT,
+                task_id="monthly-pending",
+                status="collecting",
+                reply_candidate=True,
+                awaiting_confirmation=True,
+            ),
+            ActiveWorkflowTask(
+                workflow=WORKFLOW_DAILY_REPORT,
+                task_id="daily-draft",
+                status="collecting",
+                reply_candidate=True,
+            ),
+        )
+    )
+
+    assert plan.primary_workflow == WORKFLOW_DAILY_REPORT
+    assert plan.task_id == "daily-draft"
+    assert [effect.effect_type for effect in plan.effects] == [EFFECT_CONFIRM_DAILY_REPORT]
+
+
+def test_agent2_plan_keeps_ambiguous_multi_item_merge_in_daily_for_target_clarification():
+    plan = WorkflowRouter().plan(
+        _envelope(
+            "这几条合并一下",
+            ActiveWorkflowTask(
+                workflow=WORKFLOW_DAILY_REPORT,
+                task_id="daily-collecting",
+                status="collecting",
+                reply_candidate=True,
+            ),
+        )
+    )
+
+    assert plan.primary_workflow == WORKFLOW_DAILY_REPORT
+    assert plan.safety_decision.commit_policy == "partial_allowed"
+    assert [effect.effect_type for effect in plan.effects] == [EFFECT_LEGACY_DAILY_CONTEXT_ACTION]
 
 
 def test_agent2_plan_pending_candidate_focus_confirmation_does_not_submit_daily_report():

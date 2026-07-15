@@ -263,6 +263,25 @@ class WorkflowRouter:
                 reason="message changes future bot behavior and must not be written to a daily report",
             ), envelope)
 
+        if daily_task and _daily_task_has_pending_candidate(daily_task) and _looks_like_candidate_focus_confirmation(envelope.raw_text):
+            return _with_segments(_blocked_plan(
+                primary_workflow=WORKFLOW_UNKNOWN_OR_HELP,
+                matched_workflows=[],
+                signals=signals,
+                task_id=daily_task.task_id,
+                flags=["pending_daily_candidate_confirmation"],
+                reason="user confirmed a focused daily draft candidate but did not provide an edit action",
+            ), envelope)
+
+        if _ambiguous_confirmation(envelope):
+            return _with_segments(_blocked_plan(
+                primary_workflow=WORKFLOW_UNKNOWN_OR_HELP,
+                matched_workflows=[],
+                signals=signals,
+                flags=["ambiguous_confirmation"],
+                reason="confirmation-like message matches more than one pending workflow",
+            ), envelope)
+
         if _orphan_confirmation(envelope):
             return _with_segments(_blocked_plan(
                 primary_workflow=WORKFLOW_UNKNOWN_OR_HELP,
@@ -271,6 +290,37 @@ class WorkflowRouter:
                 flags=["orphan_confirmation"],
                 reason="confirmation-like message has no active confirmation context",
             ), envelope)
+
+        if daily_task and daily_task.reply_candidate and _looks_like_explicit_daily_submit(envelope.raw_text):
+            effects = [
+                WorkflowEffect(
+                    effect_type=EFFECT_CONFIRM_DAILY_REPORT,
+                    target_system=WORKFLOW_DAILY_REPORT,
+                    target={
+                        "task_id": daily_task.task_id,
+                        "report_date": _active_task_report_date(daily_task),
+                        "operation": "confirm",
+                        "action_type": "daily_confirm",
+                        "write_policy": "write",
+                    },
+                    links={"source_message_id": envelope.message_id},
+                    risk_level="low",
+                    reason="explicit daily submit targets the active daily draft",
+                )
+            ]
+            return _with_segments(
+                RoutingPlan(
+                    primary_workflow=WORKFLOW_DAILY_REPORT,
+                    matched_workflows=[WORKFLOW_DAILY_REPORT],
+                    effects=effects,
+                    safety_decision=_safety_for_effects(effects, [WORKFLOW_DAILY_REPORT]),
+                    confidence=max(0.9, daily_context_signal),
+                    reason="explicit daily submit targets the active daily draft",
+                    task_id=daily_task.task_id,
+                    signals=signals,
+                ),
+                envelope,
+            )
 
         if monthly_task and monthly_task.reply_candidate:
             effects = [
@@ -402,32 +452,23 @@ class WorkflowRouter:
             and qa_signal < 0.55
             and legal_research_signal < 0.75
         ):
-            effects = [
-                WorkflowEffect(
-                    effect_type=EFFECT_LEGACY_DAILY_CONTEXT_ACTION,
-                    target_system=WORKFLOW_DAILY_REPORT,
-                    target={
-                        "task_id": daily_task.task_id,
-                        "field": _daily_field_hint(envelope.raw_text),
-                        "status": daily_task.status,
-                    },
-                    payload={"content": envelope.raw_text},
-                    links={"source_message_id": envelope.message_id},
-                    risk_level="low",
-                    reason=daily_task.reason or "active daily-report context accepted follow-up text",
-                )
-            ]
-            return _with_segments(RoutingPlan(
-                primary_workflow=WORKFLOW_DAILY_REPORT,
-                matched_workflows=[WORKFLOW_DAILY_REPORT],
-                effects=effects,
-                safety_decision=_safety_for_effects(effects, [WORKFLOW_DAILY_REPORT]),
-                confidence=max(0.78, daily_context_signal, daily_signal),
-                reason=daily_task.reason or "active daily-report context accepted follow-up text",
-                task_id=daily_task.task_id,
-                signals=signals,
-                entities=_entity_hints(envelope.raw_text),
-            ), envelope)
+            return _with_segments(
+                _with_action_entities(
+                    _blocked_plan(
+                        primary_workflow=WORKFLOW_UNKNOWN_OR_HELP,
+                        matched_workflows=[],
+                        signals=signals,
+                        task_id=daily_task.task_id,
+                        flags=["active_daily_requires_user_action"],
+                        reason=(
+                            "active daily context cannot create a write effect when the "
+                            "action-first parser found no authorized user action"
+                        ),
+                    ),
+                    user_action_plan,
+                ),
+                envelope,
+            )
 
         if monthly_task and daily_signal < 0.7 and daily_context_signal < 0.5 and help_signal < 0.7 and qa_signal < 0.7:
             return _with_segments(_blocked_plan(
@@ -876,6 +917,8 @@ def _action_first_guard_plan(
     daily_write_action_types = {ACTION_DAILY_WRITE, ACTION_DAILY_EDIT}
     read_only_side_action_types = {
         ACTION_ASSISTANT_FEEDBACK,
+        ACTION_DAILY_READ_CURRENT,
+        ACTION_DAILY_READ_HISTORY,
         ACTION_INTERNAL_QA,
         ACTION_LEGAL_RESEARCH,
         ACTION_SMALL_TALK,
@@ -1471,12 +1514,20 @@ def _dedupe_workflows(workflows: list[str]) -> list[str]:
 def _orphan_confirmation(envelope: IncomingMessageEnvelope) -> bool:
     if not _looks_like_confirmation(envelope.raw_text):
         return False
+    if _looks_like_bare_affirmation(envelope.raw_text):
+        return sum(1 for task in envelope.active_tasks if task.awaiting_confirmation) != 1
     if any(task.awaiting_confirmation for task in envelope.active_tasks):
         return False
     return not any(
         task.workflow == WORKFLOW_DAILY_REPORT and task.reply_candidate
         for task in envelope.active_tasks
     )
+
+
+def _ambiguous_confirmation(envelope: IncomingMessageEnvelope) -> bool:
+    return _looks_like_bare_affirmation(envelope.raw_text) and sum(
+        1 for task in envelope.active_tasks if task.awaiting_confirmation
+    ) > 1
 
 
 def _matched_workflows(
@@ -2885,6 +2936,8 @@ def _looks_like_confirmation(raw_text: str) -> bool:
         "确认",
         "确认提交",
         "提交",
+        "提交日报",
+        "日报提交",
         "提交了",
         "可以提交",
         "没问题",
@@ -2906,6 +2959,26 @@ def _looks_like_confirmation(raw_text: str) -> bool:
         "\u597d\u4e86\u63d0\u4ea4",
         "\u597d\u63d0\u4ea4",
         "\u63d0\u4ea4\u5427",
+        "ok",
+    }
+
+
+def _looks_like_bare_affirmation(raw_text: str) -> bool:
+    compact = _compact(raw_text)
+    return compact in {
+        "确认",
+        "没问题",
+        "就这样",
+        "对",
+        "对的",
+        "确定",
+        "可以",
+        "好",
+        "好的",
+        "嗯",
+        "恩",
+        "是",
+        "是的",
         "ok",
     }
 
@@ -2941,6 +3014,8 @@ def _looks_like_daily_submit_reply(raw_text: str) -> bool:
         "确认",
         "确认提交",
         "提交",
+        "提交日报",
+        "日报提交",
         "提交了",
         "可以提交",
         "确定",
@@ -2952,6 +3027,18 @@ def _looks_like_daily_submit_reply(raw_text: str) -> bool:
         "交了",
         "交吧",
         "ok",
+    }
+
+
+def _looks_like_explicit_daily_submit(raw_text: str) -> bool:
+    compact = _compact(raw_text)
+    return compact in {
+        "\u63d0\u4ea4\u65e5\u62a5",
+        "\u65e5\u62a5\u63d0\u4ea4",
+        "\u786e\u8ba4\u63d0\u4ea4\u65e5\u62a5",
+        "\u8bf7\u63d0\u4ea4\u65e5\u62a5",
+        "\u5e2e\u6211\u63d0\u4ea4\u65e5\u62a5",
+        "\u53ef\u4ee5\u63d0\u4ea4\u65e5\u62a5",
     }
 
 

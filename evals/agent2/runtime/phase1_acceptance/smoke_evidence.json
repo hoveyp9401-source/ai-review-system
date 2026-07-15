@@ -1,0 +1,110 @@
+{
+  "schema_version": "agent2.runtime_phase1_smoke.v1",
+  "executed_at": "2026-07-10T20:24:57.3983033+08:00",
+  "safety_policy": {
+    "production_shadow_enabled": false,
+    "production_state_modified": false,
+    "production_database_write_performed": false,
+    "notes": "Only SSH read-only health, systemd, Git/hash, OpenAPI, and database metadata queries were executed."
+  },
+  "executor_contract_smoke": {
+    "status": "passed",
+    "command": ".\\venv\\Scripts\\python.exe -m pytest tests\\test_agent2_typed_daily_commands.py tests\\test_agent2_typed_daily_executor_v3.py tests\\test_agent2_runtime_architecture.py tests\\test_agent2_runtime_harness.py tests\\test_agent2_runtime_replay.py -q",
+    "result": "55 passed in 0.95s",
+    "covered": {
+      "runtime_dry_run_actual_write_zero": true,
+      "typed_command_validation": true,
+      "idempotency": true,
+      "optimistic_version": true,
+      "owner_rejection": true,
+      "raw_text_executor_input_rejected_by_interface": true,
+      "unknown_schema_fail_closed": true,
+      "command_receipt_alignment": true,
+      "runtime_failure_has_no_legacy_fallback": true,
+      "runtime_lifecycle_exception_is_failed_closed": true,
+      "audit_failure_has_stable_error_code_and_no_false_recorded_claim": true,
+      "trusted_composition_rejects_non_simulator_executor": true
+    },
+    "limitation": "This is isolated executor/Runtime evidence, not a real database transaction smoke."
+  },
+  "database_discovery": {
+    "status": "blocked_no_isolated_target",
+    "dialect": "postgresql",
+    "database_name": "ai_review",
+    "server_read_only": false,
+    "test_or_smoke_schema_count": 0,
+    "environment_file_discovered": true,
+    "environment_values_recorded": false,
+    "write_tests_skipped": [
+      "controlled typed-command transaction",
+      "transaction rollback",
+      "database idempotency",
+      "database optimistic-lock conflict",
+      "receipt versus actual database effect"
+    ],
+    "blocker": "Only the writable production database was discoverable; destructive or rollback-based acceptance tests were prohibited."
+  },
+  "online_read_only_smoke": {
+    "status": "failed_runtime_not_deployed",
+    "api_health": {
+      "passed": true,
+      "response": {"status": "ok"}
+    },
+    "services": {
+      "ai-review-api.service": "active",
+      "ai-review-stream.service": "active",
+      "ai-review-scheduler.service": "active"
+    },
+    "openapi_entries": {
+      "/health": ["get"],
+      "/reports/manual": ["post"],
+      "/webhooks/dingtalk": ["get", "post"],
+      "/webhooks/dingtalk/events": ["get", "post"]
+    },
+    "stream_entry": "systemd service active; no HTTP stream route expected",
+    "entrypoint_hash_match_local": {
+      "app/api/reports.py": true,
+      "app/api/webhook.py": true,
+      "app/stream_runner.py": true
+    },
+    "runtime_files_deployed": {
+      "app/agent2/runtime/harness.py": false,
+      "app/agent2/runtime/replay.py": false
+    },
+    "core_planner_hash_match_local": {
+      "app/agent2/cognitive_core_v3.py": false,
+      "app/agent2/command_planner_v3.py": false
+    },
+    "git": {
+      "local_head": "36c2199a",
+      "remote_head": "96cecec81c4ac9fe4e0500c08a52e661d094147d",
+      "remote_worktree_dirty": true
+    },
+    "same_runtime_chain_across_entries": false,
+    "shadow_conversation_state_non_persistence_confirmed_online": false,
+    "shadow_business_write_zero_confirmed_online": false,
+    "shadow_live_physical_isolation_confirmed_online": false,
+    "runtime_kill_switch_confirmed_online": false,
+    "runtime_log_locator_confirmed_online": false,
+    "available_log_locator": "journalctl -u ai-review-api.service -u ai-review-stream.service -u ai-review-scheduler.service",
+    "blocker": "The Phase 1 Runtime Harness is not deployed or wired online, so the production Shadow operational gate cannot pass."
+  },
+  "reproduction": {
+    "target_variable": "Set AGENT2_RUNTIME_SMOKE_TARGET to the approved SSH alias/host; no credential is stored in this artifact.",
+    "commands": [
+      ".\\venv\\Scripts\\python.exe -m pytest tests\\test_agent2_typed_daily_commands.py tests\\test_agent2_typed_daily_executor_v3.py tests\\test_agent2_runtime_architecture.py tests\\test_agent2_runtime_harness.py tests\\test_agent2_runtime_replay.py -q",
+      "ssh $env:AGENT2_RUNTIME_SMOKE_TARGET \"curl -fsS http://127.0.0.1:8000/health\"",
+      "ssh $env:AGENT2_RUNTIME_SMOKE_TARGET \"systemctl is-active ai-review-api.service ai-review-stream.service ai-review-scheduler.service\"",
+      "ssh $env:AGENT2_RUNTIME_SMOKE_TARGET \"curl -fsS http://127.0.0.1:8000/openapi.json\"",
+      "$remoteWorkdir = ssh $env:AGENT2_RUNTIME_SMOKE_TARGET \"systemctl show ai-review-api.service -p WorkingDirectory --value\"",
+      "ssh $env:AGENT2_RUNTIME_SMOKE_TARGET \"cd '$remoteWorkdir' && git rev-parse HEAD && git status --short && test -f app/agent2/runtime/harness.py && test -f app/agent2/runtime/replay.py\"",
+      "Get-FileHash app/api/reports.py,app/api/webhook.py,app/stream_runner.py,app/agent2/cognitive_core_v3.py,app/agent2/command_planner_v3.py -Algorithm SHA256",
+      "ssh $env:AGENT2_RUNTIME_SMOKE_TARGET \"cd '$remoteWorkdir' && sha256sum app/api/reports.py app/api/webhook.py app/stream_runner.py app/agent2/cognitive_core_v3.py app/agent2/command_planner_v3.py\"",
+      "ssh $env:AGENT2_RUNTIME_SMOKE_TARGET \"systemctl show ai-review-api.service -p EnvironmentFiles --value\"",
+      "On the approved host, load the service EnvironmentFile without printing values, then run psql read-only metadata queries: SELECT current_database(); SHOW transaction_read_only; SELECT count(*) FROM information_schema.schemata WHERE schema_name ~ '(test|smoke)'."
+    ],
+    "write_commands_executed": false,
+    "http_methods_used_online": ["GET"],
+    "limitation": "Raw SSH transcripts and secrets are intentionally not embedded. The commands above reproduce the read-only checks; DB mutation/rollback checks remain prohibited on the discovered production target."
+  }
+}

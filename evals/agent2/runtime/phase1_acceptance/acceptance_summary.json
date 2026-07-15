@@ -1,0 +1,145 @@
+{
+  "after_replay": {
+    "acceptance_eligible": false,
+    "acceptance_ineligibility_reason": "The recorded baseline compiles the semantic decision and is also the comparison oracle; diagnostic counts cannot prove semantic Safety or Parity.",
+    "candidate_actual_write_count": 0,
+    "cognitive_semantic_independence": false,
+    "diagnostic_execution_invariants_passed": true,
+    "dialogue_count": 687,
+    "evaluation_scope": "baseline_derived_planner_executor_replay",
+    "legacy_fallback_count": 0,
+    "mismatch_count": 582,
+    "missing_expected_write_count": 7,
+    "safety_ready": false,
+    "turn_count": 1407,
+    "typed_executor_bypass_count": 0,
+    "unexpected_write_intent_count": 0
+  },
+  "before_replay": {
+    "acceptance_eligible": false,
+    "acceptance_ineligibility_reason": "The recorded baseline compiles the semantic decision and is also the comparison oracle; diagnostic counts cannot prove semantic Safety or Parity.",
+    "candidate_actual_write_count": 0,
+    "cognitive_semantic_independence": false,
+    "diagnostic_execution_invariants_passed": false,
+    "dialogue_count": 687,
+    "evaluation_scope": "baseline_derived_planner_executor_replay",
+    "legacy_fallback_count": 0,
+    "mismatch_count": 876,
+    "missing_expected_write_count": 29,
+    "safety_ready": false,
+    "turn_count": 1407,
+    "typed_executor_bypass_count": 0,
+    "unexpected_write_intent_count": 42
+  },
+  "blockers": [
+    "The 42/29 anomaly replay is oracle-assisted: baseline expectations compile the candidate semantic decision, so no closure count is acceptance-valid.",
+    "The diagnostic replay still exposes 7 copy_previous misses because the Phase 1 typed daily contract has no copy command.",
+    "Independent human review of the semantic tape is not complete; semantic metrics are unavailable.",
+    "The exact 842-dialogue/5562-turn server corpus and manifest are missing locally.",
+    "DB integration smoke is blocked because only the writable production database was discoverable.",
+    "Online read-only smoke found that the Phase 1 Runtime Harness is not deployed or wired."
+  ],
+  "corpus_complete": false,
+  "gates": {
+    "operational": {
+      "db_smoke": "blocked_no_isolated_target",
+      "evidence_path": "evals/agent2/runtime/phase1_acceptance/smoke_evidence.json",
+      "online_smoke": "failed_runtime_not_deployed",
+      "passed": false
+    },
+    "parity": {
+      "agent2_and_first_layer_passed": true,
+      "baseline_derived_mismatch_count": 582,
+      "complete_corpus_executed": false,
+      "legacy_daily_execution_baseline_mismatch_count": 0,
+      "passed": false
+    },
+    "safety": {
+      "contract_evidence_path": "evals/agent2/runtime/phase1_acceptance/smoke_evidence.json",
+      "isolated_contract_test_coverage": {
+        "audit_failure_has_stable_error_code_and_no_false_recorded_claim": true,
+        "command_receipt_alignment": true,
+        "idempotency": true,
+        "optimistic_version": true,
+        "owner_rejection": true,
+        "raw_text_executor_input_rejected_by_interface": true,
+        "runtime_dry_run_actual_write_zero": true,
+        "runtime_failure_has_no_legacy_fallback": true,
+        "runtime_lifecycle_exception_is_failed_closed": true,
+        "trusted_composition_rejects_non_simulator_executor": true,
+        "typed_command_validation": true,
+        "unknown_schema_fail_closed": true
+      },
+      "isolated_contract_test_status": "passed",
+      "oracle_assisted_diagnostic_counts": {
+        "legacy_fallback": 0,
+        "simulator_actual_write_receipt": 0,
+        "typed_executor_bypass": 0,
+        "unexpected_high_risk_write_intent": 0
+      },
+      "passed": false,
+      "production_db_write_measurement": "not_run_production_db_write_prohibited",
+      "replay_acceptance_eligible": false,
+      "replay_ineligibility_reason": "The recorded baseline compiles the semantic decision and is also the comparison oracle; diagnostic counts cannot prove semantic Safety or Parity."
+    },
+    "semantic": {
+      "historical_anomaly_closure_verified": false,
+      "human_reviewed_gold_set": false,
+      "metrics_available": false,
+      "oracle_assisted_diagnostic_expected_write_misses": 7,
+      "oracle_assisted_diagnostic_unexpected_write_count": 0,
+      "passed": false
+    }
+  },
+  "ledger": {
+    "case_count": 73,
+    "closure_claim_allowed": false,
+    "evidence_validity": "oracle_assisted_diagnostic_only",
+    "historical_anomaly_count": 71,
+    "newly_surfaced_after_fix_count": 2,
+    "resolution_counts": {
+      "oracle_assisted_open_contract_gap": 7,
+      "oracle_assisted_unverified": 66
+    },
+    "root_cause_counts": {
+      "case_progress_misinterpreted_as_daily_write": 31,
+      "cross_domain_travel_misinterpreted_as_daily_write": 11,
+      "replay_delta_compiler_missing_merge": 24,
+      "typed_contract_copy_previous_unsupported": 7
+    }
+  },
+  "live_allowed": false,
+  "production_shadow_allowed": false,
+  "schema_version": "agent2.runtime_phase1_acceptance.v2",
+  "semantic_tape": {
+    "annotation_source": "machine_proposed_from_raw_text_and_phase1_contract",
+    "gold_set_ready": false,
+    "human_approved_count": 0,
+    "independent_from_runtime_core_outputs": true,
+    "metrics_available": false,
+    "missing_reason": "All candidate annotations require independent human review before scoring.",
+    "record_count": 14,
+    "review_status_counts": {
+      "pending_human_review": 14
+    },
+    "schema_version": "agent2.semantic_tape_manifest.v1",
+    "sha256": "7758bc954306cca60617d71566ab1368f9300228b39663dfe7e96585f0df0965",
+    "source_path": "evals/agent2/runtime/phase1_semantic_tape_review_queue.jsonl",
+    "unavailable_metrics": [
+      "semantic_accuracy",
+      "write_intent_precision",
+      "write_intent_recall",
+      "executable_action_precision",
+      "clarification_precision",
+      "domain_ownership_accuracy",
+      "segmentation_accuracy",
+      "high_risk_false_positives"
+    ]
+  },
+  "tests": {
+    "agent2_and_first_layer": "870 passed in 27.28s",
+    "evidence_path": "evals/agent2/runtime/phase1_acceptance/test_evidence.json",
+    "full_repository": "1156 passed, 142 failed in 31.91s"
+  },
+  "verdict": "NO_GO"
+}

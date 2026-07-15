@@ -1,0 +1,25 @@
+{
+  "annotation_source": "machine_proposed_from_raw_text_and_phase1_contract",
+  "gold_set_ready": false,
+  "human_approved_count": 0,
+  "independent_from_runtime_core_outputs": true,
+  "metrics_available": false,
+  "missing_reason": "All candidate annotations require independent human review before scoring.",
+  "record_count": 14,
+  "review_status_counts": {
+    "pending_human_review": 14
+  },
+  "schema_version": "agent2.semantic_tape_manifest.v1",
+  "sha256": "7758bc954306cca60617d71566ab1368f9300228b39663dfe7e96585f0df0965",
+  "source_path": "evals/agent2/runtime/phase1_semantic_tape_review_queue.jsonl",
+  "unavailable_metrics": [
+    "semantic_accuracy",
+    "write_intent_precision",
+    "write_intent_recall",
+    "executable_action_precision",
+    "clarification_precision",
+    "domain_ownership_accuracy",
+    "segmentation_accuracy",
+    "high_risk_false_positives"
+  ]
+}

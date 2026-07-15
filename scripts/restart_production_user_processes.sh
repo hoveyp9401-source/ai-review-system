@@ -81,6 +81,75 @@ require_single() {
   printf '%s: running pid %s\n' "$label" "${pids[0]}"
 }
 
+systemd_units_loaded() {
+  local unit
+  for unit in ai-review-api.service ai-review-stream.service ai-review-scheduler.service; do
+    if [[ "$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)" != "loaded" ]]; then
+      return 1
+    fi
+  done
+}
+
+restart_systemd_supervised_processes() {
+  local units=(ai-review-scheduler.service ai-review-stream.service ai-review-api.service)
+  local unit pid new_pid ready restarted=0
+  declare -A old_pids=()
+  printf 'systemd supervision detected; restarting service main processes without creating parallel nohup workers\n'
+  for unit in "${units[@]}"; do
+    pid="$(systemctl show -p MainPID --value "$unit")"
+    if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+      printf 'ERROR: %s has no active MainPID\n' "$unit" >&2
+      return 1
+    fi
+    old_pids["$unit"]="$pid"
+    printf '%s: stopping supervised pid %s\n' "$unit" "$pid"
+    if (( DRY_RUN == 0 )); then
+      kill "$pid"
+    fi
+  done
+  if (( DRY_RUN == 1 )); then
+    printf 'dry-run complete; no process was changed\n'
+    return 0
+  fi
+  for _ in {1..30}; do
+    sleep 1
+    ready=1
+    for unit in "${units[@]}"; do
+      new_pid="$(systemctl show -p MainPID --value "$unit")"
+      if [[ ! "$new_pid" =~ ^[1-9][0-9]*$ ]] \
+        || [[ "$new_pid" == "${old_pids[$unit]}" ]] \
+        || ! kill -0 "$new_pid" 2>/dev/null; then
+        ready=0
+        break
+      fi
+    done
+    if (( ready == 1 )) && systemctl is-active --quiet "${units[@]}"; then
+      restarted=1
+      break
+    fi
+  done
+  if (( restarted == 0 )); then
+    printf 'ERROR: one or more systemd services failed to recover\n' >&2
+    systemctl --no-pager --full status "${units[@]}" || true
+    return 1
+  fi
+  require_single "api" "$API_NEEDLE"
+  require_single "stream" "$STREAM_NEEDLE"
+  require_single "scheduler" "$SCHEDULER_NEEDLE"
+  for _ in {1..30}; do
+    if curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null; then
+      printf '\n'
+      break
+    fi
+    sleep 1
+  done
+  if ! curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null; then
+    printf 'ERROR: API process restarted but health endpoint did not become ready\n' >&2
+    return 1
+  fi
+  printf '\nsystemd-supervised restart complete\n'
+}
+
 main() {
   if [[ ! -d "$ROOT" ]]; then
     printf 'ERROR: ROOT does not exist: %s\n' "$ROOT" >&2
@@ -92,6 +161,11 @@ main() {
   fi
   cd "$ROOT"
   mkdir -p "$LOG_DIR"
+
+  if systemd_units_loaded; then
+    restart_systemd_supervised_processes
+    return
+  fi
 
   printf 'ROOT=%s\nPORT=%s\nDRY_RUN=%s\n' "$ROOT" "$PORT" "$DRY_RUN"
   show_matches "api-before" "$API_NEEDLE"

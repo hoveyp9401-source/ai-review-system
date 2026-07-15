@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Legal Ops 法务业务中台</title>
+    <link rel="stylesheet" href="/legal-ops/assets/styles.css?v=12" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">LO</div>
+          <div>
+            <strong>法务作战中心</strong>
+            <span id="environment-subtitle">运营决策 · 正在识别环境</span>
+          </div>
+        </div>
+        <nav id="navigation" aria-label="主导航"></nav>
+        <div class="sandbox-card">
+          <span class="pulse"></span>
+          <div><strong id="environment-title">安全数据环境</strong><small id="environment-detail">正在校验登录身份</small></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="tenant-eyebrow">SANDBOX TENANT</p>
+            <h1 id="page-title">作战指挥中心</h1>
+          </div>
+          <div class="top-actions">
+            <label class="compact-field">团队
+              <select id="team-filter"><option value="">全部团队</option></select>
+            </label>
+            <button class="icon-button" id="refresh-button" aria-label="刷新">↻</button>
+            <button class="avatar" id="identity-button" aria-label="当前身份">S</button>
+          </div>
+        </header>
+        <div class="fixture-banner" id="fixture-banner">
+          <strong id="data-mode-title">数据来源</strong>
+          <span>正在读取服务端数据来源说明。</span>
+        </div>
+        <section id="content" class="content" aria-live="polite">
+          <div class="loading-card">正在加载安全读模型…</div>
+        </section>
+      </main>
+    </div>
+
+    <div class="modal-backdrop" id="login-modal">
+      <form class="login-card" id="login-form">
+        <div class="brand-mark large">LO</div>
+        <p class="eyebrow">LEGAL OPERATIONS</p>
+        <h2>登录法务中台</h2>
+        <p>请输入管理员分配的登录凭证。系统会按你的身份展示有权查看的团队、报告和案件。</p>
+        <label>登录凭证
+          <input id="token-input" type="password" autocomplete="current-password" placeholder="请输入登录凭证" required />
+        </label>
+        <button class="primary-button" type="submit">验证并进入</button>
+        <button class="demo-login-button hidden" id="demo-login-button" type="button">进入本地演示数据</button>
+        <p class="form-error" id="login-error"></p>
+      </form>
+    </div>
+
+    <div class="drawer-backdrop" id="drawer-backdrop"></div>
+    <aside class="drawer" id="drawer" aria-label="明细抽屉">
+      <button class="drawer-close" id="drawer-close" aria-label="关闭">×</button>
+      <div id="drawer-content"></div>
+    </aside>
+    <div class="toast" id="toast"></div>
+    <script src="/legal-ops/assets/app.js?v=19" defer></script>
+  </body>
+</html>

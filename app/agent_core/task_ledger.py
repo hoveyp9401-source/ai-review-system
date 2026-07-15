@@ -91,6 +91,126 @@ class InMemoryTaskLedger:
         )
 
 
+@dataclass(frozen=True)
+class FormalTaskLedgerTask:
+    task_id: str
+    tenant_id: str
+    user_id: str
+    conversation_id: str
+    domain: str
+    operation: str
+    object_ref: dict[str, Any]
+    status: str
+    focus_state: str
+    version: int
+    resume_policy: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FormalTaskLedgerState:
+    focused_task: FormalTaskLedgerTask | None
+    active_tasks: tuple[FormalTaskLedgerTask, ...]
+    suspended_tasks: tuple[FormalTaskLedgerTask, ...]
+
+
+@dataclass(frozen=True)
+class FormalTaskLedgerTransition:
+    status: str
+    reason_code: str
+    state: FormalTaskLedgerState
+
+
+class FormalTaskLedger:
+    """Receipt-driven reducer for focused, active, and suspended tasks."""
+
+    def focus_case_followup(
+        self,
+        state: FormalTaskLedgerState,
+        *,
+        followup_task_id: str,
+        receipt_succeeded: bool,
+    ) -> FormalTaskLedgerTransition:
+        if not receipt_succeeded:
+            return FormalTaskLedgerTransition("blocked", "receipt_not_succeeded", state)
+        followup = next(
+            (item for item in state.active_tasks if item.task_id == followup_task_id), None
+        )
+        if followup is None or followup.domain != "case_followup":
+            return FormalTaskLedgerTransition("blocked", "followup_task_not_found", state)
+        suspended = list(state.suspended_tasks)
+        updates: dict[str, FormalTaskLedgerTask] = {}
+        if state.focused_task is not None and state.focused_task.task_id != followup_task_id:
+            previous = replace(
+                state.focused_task,
+                status="suspended",
+                focus_state="suspended",
+                version=state.focused_task.version + 1,
+            )
+            suspended.append(previous)
+            updates[previous.task_id] = previous
+        focused = replace(
+            followup,
+            focus_state="focused",
+            version=followup.version + 1,
+        )
+        updates[focused.task_id] = focused
+        active = tuple(updates.get(item.task_id, item) for item in state.active_tasks)
+        return FormalTaskLedgerTransition(
+            "transitioned",
+            "followup_focused",
+            FormalTaskLedgerState(focused, active, tuple(suspended)),
+        )
+
+    def complete_case_followup(
+        self,
+        state: FormalTaskLedgerState,
+        *,
+        followup_task_id: str,
+        receipt_succeeded: bool,
+    ) -> FormalTaskLedgerTransition:
+        if not receipt_succeeded:
+            return FormalTaskLedgerTransition("blocked", "receipt_not_succeeded", state)
+        if state.focused_task is None or state.focused_task.task_id != followup_task_id:
+            return FormalTaskLedgerTransition("blocked", "followup_not_focused", state)
+        resumable = tuple(
+            item for item in state.suspended_tasks
+            if item.domain == "report"
+            and item.status == "suspended"
+            and str(item.resume_policy.get("report_status") or "") == "collecting"
+        )
+        if len(resumable) > 1:
+            return FormalTaskLedgerTransition("clarification_required", "multiple_resumable_tasks", state)
+        completed = replace(
+            state.focused_task,
+            status="completed",
+            focus_state="active",
+            version=state.focused_task.version + 1,
+        )
+        restored = (
+            replace(
+                resumable[0],
+                status="active",
+                focus_state="focused",
+                version=resumable[0].version + 1,
+            )
+            if resumable
+            else None
+        )
+        updates = {completed.task_id: completed}
+        if restored is not None:
+            updates[restored.task_id] = restored
+        active = tuple(updates.get(item.task_id, item) for item in state.active_tasks)
+        remaining = tuple(
+            item for item in state.suspended_tasks
+            if restored is None or item.task_id != restored.task_id
+        )
+        return FormalTaskLedgerTransition(
+            "transitioned",
+            "previous_task_restored" if restored is not None else "followup_completed",
+            FormalTaskLedgerState(restored, active, remaining),
+        )
+
+
 def apply_task_ledger_context(
     envelope: IncomingMessageEnvelope,
     task_ledger: Any | None,

@@ -9,6 +9,8 @@ from app.api import admin, debug, performance, reports, tasks, webhook
 from app.config import get_settings
 from app.llm.client import LLMClient
 from app.llm.extractor import DailyReportExtractor, TeamSummaryGenerator
+from app.legal_ops.api import build_runtime as build_legal_ops_runtime
+from app.legal_ops.api import router as legal_ops_router
 from app.services.dingtalk import DingTalkRobotClient
 from app.services.performance_service import PerformanceTaskService
 from app.services.report_service import DailyReportService
@@ -25,6 +27,7 @@ async def lifespan(app: FastAPI):
     app.state.report_service = DailyReportService(settings, DailyReportExtractor(llm_client))
     app.state.performance_service = PerformanceTaskService(settings)
     app.state.summary_service = SummaryService(settings, TeamSummaryGenerator(llm_client))
+    app.state.legal_ops_runtime = build_legal_ops_runtime(settings)
     yield
     await robot.close()
     await llm_client.close()
@@ -54,6 +57,7 @@ def create_app() -> FastAPI:
     app.include_router(reports.router)
     app.include_router(tasks.router)
     app.include_router(debug.router)
+    app.include_router(legal_ops_router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent2-operation-outcome.v1",
+  "title": "Agent2 Operation Outcome",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outcome_id", "tenant_id", "user_id", "conversation_id",
+    "domain", "operation", "object_ref", "business_status", "message_status",
+    "changed_fields", "user_visible_snapshot", "blocking_reason", "receipt_refs",
+    "state_transition", "actual_write", "would_write", "source_turn_id", "metadata",
+    "audit_refs", "idempotency_key", "created_at"
+  ],
+  "properties": {
+    "outcome_id": {"type": "string"},
+    "tenant_id": {"type": "string"},
+    "user_id": {"type": "string"},
+    "conversation_id": {"type": "string"},
+    "domain": {"type": "string", "minLength": 1},
+    "operation": {"type": "string", "minLength": 1},
+    "object_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object_type", "stable_id", "label", "version"],
+      "properties": {
+        "object_type": {"type": "string", "minLength": 1},
+        "stable_id": {"type": "string"},
+        "label": {"type": "string", "minLength": 1},
+        "version": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "business_status": {
+      "enum": ["succeeded", "duplicate", "unchanged", "blocked", "failed", "conflict", "not_found", "partial", "registered", "matched", "queued", "sending", "accepted_by_provider", "delivery_confirmed", "waiting_for_reply", "accepted_by_one_party", "accepted_by_both", "declined", "cancelled", "expired"]
+    },
+    "message_status": {
+      "enum": ["not_applicable", "not_requested", "scheduled", "queued", "sending", "accepted_by_provider", "delivery_confirmed", "waiting_for_reply", "failed", "cancelled"]
+    },
+    "changed_fields": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "user_visible_snapshot": {"type": "object"},
+    "blocking_reason": {"type": "string"},
+    "receipt_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["receipt_id", "receipt_type", "status", "actual_write", "external_message_id", "reliable_delivery_evidence"],
+        "properties": {
+          "receipt_id": {"type": "string", "minLength": 1},
+          "receipt_type": {"type": "string", "minLength": 1},
+          "status": {"type": "string", "minLength": 1},
+          "actual_write": {"type": "boolean"},
+          "external_message_id": {"type": "string"},
+          "reliable_delivery_evidence": {"type": "boolean"}
+        }
+      }
+    },
+    "state_transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to"],
+      "properties": {"from": {"type": "string"}, "to": {"type": "string"}}
+    },
+    "actual_write": {"type": "boolean"},
+    "would_write": {"type": "boolean"},
+    "source_turn_id": {"type": "string"},
+    "metadata": {"type": "object"},
+    "audit_refs": {"type": "array", "items": {"type": "string"}},
+    "idempotency_key": {"type": "string"},
+    "created_at": {"type": "string"}
+  }
+}

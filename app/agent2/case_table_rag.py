@@ -241,6 +241,89 @@ def find_case_location_hint(
     )
 
 
+def find_case_location_hint_by_identity(
+    index_path: str | Path,
+    *,
+    case_number: str = "",
+    case_name: str = "",
+    source_id: str = "",
+) -> CaseLocationHint | None:
+    """Read a court/location only from the already-resolved Case row.
+
+    Unlike :func:`find_case_location_hint`, this function never performs a
+    fuzzy matter search.  A document must match the Case number, exact name,
+    or exact source workbook coordinate before any location is returned.
+    """
+
+    target = Path(index_path)
+    if not target.exists():
+        return None
+    normalized_number = str(case_number or "").strip()
+    normalized_name = str(case_name or "").strip()
+    source_file, source_sheet, source_row = _source_coordinate(source_id)
+    if not any((normalized_number, normalized_name, source_row is not None)):
+        return None
+
+    with sqlite3.connect(target) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM documents ORDER BY row_number").fetchall()
+    matched: list[CaseTableDocument] = []
+    for row in rows:
+        document = _document_from_row(row)
+        facts = dict(document.facts or {})
+        number_matches = bool(
+            normalized_number
+            and str(facts.get("案件编号") or "").strip() == normalized_number
+        )
+        name_matches = bool(
+            normalized_name
+            and (
+                document.case_name.strip() == normalized_name
+                or str(facts.get("案件名称") or "").strip() == normalized_name
+            )
+        )
+        source_matches = bool(
+            source_row is not None
+            and document.row_number == source_row
+            and (not source_sheet or document.sheet_name.strip() == source_sheet)
+            and (
+                not source_file
+                or Path(document.source_file).name.casefold() == source_file.casefold()
+            )
+        )
+        if source_matches or number_matches or name_matches:
+            matched.append(document)
+    if not matched:
+        return None
+
+    # Prefer the workbook coordinate, then a Case-number match, then exact
+    # name.  Every path remains bound to the resolved Case identity.
+    matched.sort(
+        key=lambda document: (
+            0
+            if source_row is not None
+            and document.row_number == source_row
+            and (not source_sheet or document.sheet_name.strip() == source_sheet)
+            else 1,
+            0
+            if normalized_number
+            and str(document.facts.get("案件编号") or "").strip()
+            == normalized_number
+            else 1,
+            0 if normalized_name and document.case_name.strip() == normalized_name else 1,
+        )
+    )
+    document = matched[0]
+    location = _case_document_court_or_location(document)
+    return CaseLocationHint(
+        case_name=document.case_name,
+        court_or_location=location,
+        department=document.department,
+        assignee_name=document.assignee_name,
+        source_id=document.doc_id,
+    )
+
+
 def _permission_checked_evidence(
     evidence: KnowledgeEvidenceFrame,
     *,
@@ -624,6 +707,8 @@ def _case_document_court_or_location(document: CaseTableDocument) -> str:
         "庭审地点",
         "仲裁委",
         "仲裁委员会",
+        "受理_机构名称",
+        "受理机构名称",
     )
     for key in key_priority:
         value = _clean_court_or_location_value(facts.get(key))
@@ -672,6 +757,19 @@ def _extract_location_from_document_text(text: str) -> str:
         if location:
             return location
     return ""
+
+
+def _source_coordinate(source_id: str) -> tuple[str, str, int | None]:
+    value = str(source_id or "").strip()
+    if "#" not in value or "!" not in value:
+        return "", "", None
+    source_file, coordinate = value.rsplit("#", 1)
+    sheet, row_text = coordinate.rsplit("!", 1)
+    try:
+        row_number = int(row_text.strip())
+    except (TypeError, ValueError):
+        return Path(source_file.strip()).name, sheet.strip(), None
+    return Path(source_file.strip()).name, sheet.strip(), row_number
 
 
 def _case_document(value: CaseTableDocument | dict[str, Any]) -> CaseTableDocument:
