@@ -1,0 +1,73 @@
+{
+  "schema_version": "agent2_release_baseline_final_decision.v1",
+  "generated_at": "2026-07-15T17:22:00+08:00",
+  "decision": "SHADOW_ONLY",
+  "agent1_replacement": "NO_GO",
+  "canary_scope_expansion": "NO_GO",
+  "legal_ops_ui": "READY_FOR_TWO_USER_UI_CANARY",
+  "current_scope": {
+    "tenant_count": 1,
+    "canary_user_count": 2,
+    "visible_case_count": 80,
+    "case_owner_credentials": 2
+  },
+  "runtime": {
+    "deployed_code_commit": "0091e27b050ea52df2f2b44c555c409870d6b275",
+    "health": "ok",
+    "api_instances": 1,
+    "stream_instances": 1,
+    "scheduler_instances": 1,
+    "api_pid": 3566788,
+    "stream_pid": 3566786,
+    "scheduler_pid": 3566789
+  },
+  "switches": {
+    "semantic_admission_enabled": true,
+    "semantic_admission_enforced": false,
+    "case_progress_write_enabled": true,
+    "travel_write_enabled": true,
+    "followup_policy_enabled": true,
+    "followup_send_enabled": false,
+    "automatic_report_projection_enabled": false
+  },
+  "tests": {
+    "passed": 2412,
+    "failed": 59,
+    "skipped": 2,
+    "failure_identity_delta": 0,
+    "valid_report_protocol_blockers": 35,
+    "junit_sha256": "c8f4dc2b1f884d398ecd08d7e1a5ee2830c15107fed1e71b4300065e0cb8e995"
+  },
+  "gates": {
+    "baseline_frozen": true,
+    "rollback_proven": true,
+    "single_runtime_owner": true,
+    "route_isolated": true,
+    "no_new_regression": true,
+    "report_behavior_contract": false,
+    "two_user_current_runtime_human_closure": false,
+    "two_user_ui_human_closure": false,
+    "followup_real_send": false,
+    "automatic_report_projection": false
+  },
+  "allowed": [
+    "continue the existing two-user inbound canary",
+    "run Legal Ops as a controlled two-user UI canary",
+    "generate and review follow-up tasks in shadow",
+    "keep case-progress and travel writes inside the current authority boundary"
+  ],
+  "prohibited": [
+    "expand the canary user or tenant scope",
+    "replace Agent1",
+    "enable proactive follow-up sending",
+    "enable automatic report projection",
+    "claim a send, delivery, write or user acceptance without evidence"
+  ],
+  "blockers": [
+    "35 valid report-protocol failures remain",
+    "both users lack current-final-runtime organic closure",
+    "both users lack post-deploy human browser validation",
+    "proactive follow-up send lacks real delivery and reply evidence",
+    "automatic report projection lacks production acceptance evidence"
+  ]
+}
