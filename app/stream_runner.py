@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import time
@@ -16,6 +15,7 @@ from app.config import Settings, get_settings
 from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
 from app.llm.extractor import DailyReportExtractor, LLMOutputError
+from app.message_identity import canonical_dingtalk_idempotency_key
 from app.progress.outbox import enqueue_daily_report_outbox_best_effort
 from app.repositories import (
     create_webhook_event_once,
@@ -74,7 +74,12 @@ from app.agent2.business.composition import (
     BusinessCompositionResult,
     Phase2BusinessComposer,
 )
-from app.agent2.business.entrypoint import build_business_command_context, resolve_agent2_entrypoint
+from app.agent2.business.entrypoint import (
+    build_business_command_context,
+    decide_runtime_owner,
+    persist_runtime_owner_claim,
+    resolve_agent2_entrypoint,
+)
 from app.agent2.business.repositories import CaseFollowupPolicySqlRepository, CaseProgressSqlRepository, CaseSqlRepository, PartySqlRepository
 from app.agent2.business.sql_executor import SqlBusinessExecutor
 from app.agent2.business.policy import BusinessEffectPolicy
@@ -354,18 +359,25 @@ async def _record_immediate_stream_failure(
 
 
 def _stream_idempotency_key(message: dingtalk_stream.ChatbotMessage, text: str) -> str:
-    if message.message_id:
-        return f"dingtalk-stream:{message.message_id}"
-    seed = "|".join(
-        [
-            message.sender_staff_id or message.sender_id or "",
-            message.conversation_id or "",
-            text,
-            str(message.create_at or ""),
-        ]
+    return canonical_dingtalk_idempotency_key(
+        message_id=getattr(message, "message_id", ""),
+        user_id=(
+            getattr(message, "sender_staff_id", "")
+            or getattr(message, "sender_id", "")
+        ),
+        conversation_id=getattr(message, "conversation_id", ""),
+        text=text,
+        created_at=getattr(message, "create_at", ""),
     )
-    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    return f"dingtalk-stream:sha256:{digest}"
+
+
+def _stream_source_message_id(
+    event: Any,
+    message: dingtalk_stream.ChatbotMessage,
+    text: str,
+) -> str:
+    persisted_key = str(getattr(event, "idempotency_key", "") or "").strip()
+    return persisted_key or _stream_idempotency_key(message, text)
 
 
 def _stream_user_id(message: dingtalk_stream.ChatbotMessage) -> str:
@@ -852,18 +864,22 @@ async def _process_stream_agent2_daily_if_enabled(
     performance_service: PerformanceTaskService,
     timings: dict[str, Any],
 ) -> str | None:
-    source_message_id = str(
-        getattr(job.message, "message_id", "")
-        or getattr(event, "external_message_id", "")
-        or getattr(event, "id", "")
-    )
+    source_message_id = _stream_source_message_id(event, job.message, job.text)
     entrypoint = await resolve_agent2_entrypoint(
         session,
         settings=settings,
         dingtalk_user_id=str(getattr(user, "dingtalk_user_id", "") or ""),
         source_message_id=source_message_id,
     )
-    phase2_primary = entrypoint.decision.route == "agent2_primary"
+    await persist_runtime_owner_claim(session, entrypoint)
+    runtime_owner = decide_runtime_owner(
+        entrypoint.decision,
+        phase2_control_plane_enabled=bool(
+            getattr(settings, "agent2_business_phase2_enabled", False)
+        ),
+        legacy_agent2_daily_enabled=agent2_daily_enabled_for_user(settings, user),
+    )
+    phase2_primary = runtime_owner == "agent2_primary"
     phase2_business_context = (
         build_business_command_context(
             entrypoint.binding,
@@ -878,7 +894,7 @@ async def _process_stream_agent2_daily_if_enabled(
         if phase2_primary and entrypoint.binding is not None
         else None
     )
-    if entrypoint.decision.route == "blocked":
+    if runtime_owner == "blocked":
         reply_text = "Agent2 身份或租户路由不唯一，本次已阻断，未回退 Agent1，也未写入业务数据。"
         response_payload = {"msgtype": "text", "text": {"content": reply_text}}
         await mark_webhook_event_processed(
@@ -901,7 +917,7 @@ async def _process_stream_agent2_daily_if_enabled(
             mode_override="protective_gate",
         )
         return None
-    if not phase2_primary and not agent2_daily_enabled_for_user(settings, user):
+    if runtime_owner == "agent1":
         return None
     if phase2_primary and not cognitive_core_v3_enabled(settings):
         reply_text = "Agent2 业务主路已启用，但 Cognitive Core 未启用。本次已阻断，未回退 Agent1，也未写入业务数据。"

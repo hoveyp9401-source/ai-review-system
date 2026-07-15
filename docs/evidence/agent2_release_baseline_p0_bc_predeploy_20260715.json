@@ -1,0 +1,60 @@
+{
+  "artifact_version": "agent2.release_baseline.p0_bc_predeploy.v1",
+  "generated_on": "2026-07-15",
+  "baseline_commit": "279b701ce47cd4369b58de3ea1ff156052bb3c5b",
+  "branch": "codex/agent2-release-baseline-20260715",
+  "production_scope": {
+    "tenant_count": 1,
+    "canary_user_count": 2,
+    "active_identity_binding_count": 2,
+    "allowed_case_count_per_binding": 80,
+    "writable_case_count_per_binding": 80,
+    "agent1_rollback_enabled": false,
+    "followup_send_enabled": false,
+    "report_projection_enabled": false,
+    "semantic_admission_enforced": false
+  },
+  "read_only_production_audit": {
+    "artifact_sha256": "0820c2d14526ad7175e6e8f6dc670c72667e31e81cc5a0de08624a3bfaa776c9",
+    "webhook_events": 2128,
+    "processing_events": 0,
+    "cross_transport_duplicate_groups": 0,
+    "repeated_business_write_groups": 0,
+    "business_receipts": 163,
+    "business_actual_writes": 145,
+    "route_control_audits": 104,
+    "scheduler_reminder_audit_rows": 0,
+    "scheduler_reminder_provider_evidence_rows": 0
+  },
+  "implemented_contracts": {
+    "canonical_cross_transport_message_identity": true,
+    "postgres_ingress_claim_ledger": true,
+    "phase2_route_is_authoritative": true,
+    "legacy_agent2_daily_only_when_phase2_disabled": true,
+    "route_owner_claim_committed_before_runtime": true,
+    "reminder_provider_reference_required": true,
+    "provider_acceptance_not_delivery_confirmation": true
+  },
+  "postgres_migration_gate": {
+    "status": "PASS",
+    "migration_sha256": "e92991500e848a5121567bfee2e67151273b36e8b4ccb1f1db24e7fce20db464",
+    "artifact_sha256": "0f8ec7d69674386043d17d29afefd6e76471d88d04cb0d66940a3129d9e3911b",
+    "historical_backfill_rows": 2,
+    "orphaned_claims": 0,
+    "duplicate_conflict_sqlstate": "23505",
+    "idempotent_replay": true,
+    "temporary_schema_cleaned": true
+  },
+  "tests": {
+    "focused_passed": 55,
+    "full_passed": 2317,
+    "full_failed": 142,
+    "full_skipped": 1,
+    "failure_set_added": 0,
+    "failure_set_removed": 0,
+    "baseline_junit_sha256": "858cf9fabbabbb3a8c12c765dcb9f4e17be2ab1bf42243e0e59ca8656bf98458",
+    "predeploy_junit_sha256": "09d93e7f23dc9adc18b2b03cad644ba84a467108fedef168cd1718d53a6d1f55"
+  },
+  "deployment_status": "NOT_DEPLOYED",
+  "gate": "PASS_FOR_LIMITED_DEPLOYMENT_VALIDATION"
+}

@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
-from app.models import DailyReport, ProgressOutboxEvent, ReportInteractionEvent, Team, TeamSummary, User, UserHabit, WebhookEvent
+from app.models import DailyReport, MessageIngressClaim, ProgressOutboxEvent, ReportInteractionEvent, Team, TeamSummary, User, UserHabit, WebhookEvent
 
 
 logger = logging.getLogger(__name__)
@@ -120,29 +120,63 @@ async def create_webhook_event_once(
     external_message_id: str | None,
     dingtalk_user_id: str | None,
     payload: dict[str, Any],
+    platform: str = "dingtalk",
 ) -> tuple[WebhookEvent, bool]:
-    stmt = (
-        insert(WebhookEvent)
+    external_message_id = str(external_message_id or "").strip() or None
+    platform = str(platform or "").strip() or "dingtalk"
+    candidate_event_id = uuid.uuid4()
+    claim_stmt = (
+        insert(MessageIngressClaim)
         .values(
             idempotency_key=idempotency_key,
+            platform=platform,
             external_message_id=external_message_id,
-            dingtalk_user_id=dingtalk_user_id,
-            payload=payload,
-            status="processing",
+            webhook_event_id=candidate_event_id,
         )
-        .on_conflict_do_nothing(index_elements=[WebhookEvent.idempotency_key])
-        .returning(WebhookEvent.id)
+        .on_conflict_do_nothing()
+        .returning(MessageIngressClaim.idempotency_key)
     )
-    result = await session.execute(stmt)
-    inserted_id = result.scalar_one_or_none()
-    if inserted_id is not None:
-        event = await session.get(WebhookEvent, inserted_id)
+    claim_result = await session.execute(claim_stmt)
+    inserted_claim_key = claim_result.scalar_one_or_none()
+    if inserted_claim_key is not None:
+        event_stmt = (
+            insert(WebhookEvent)
+            .values(
+                id=candidate_event_id,
+                idempotency_key=idempotency_key,
+                platform=platform,
+                external_message_id=external_message_id,
+                dingtalk_user_id=dingtalk_user_id,
+                payload=payload,
+                status="processing",
+            )
+            .on_conflict_do_nothing()
+            .returning(WebhookEvent.id)
+        )
+        event_result = await session.execute(event_stmt)
+        inserted_event_id = event_result.scalar_one_or_none()
+        if inserted_event_id != candidate_event_id:
+            raise RuntimeError("message ingress claim could not create its webhook event")
+        event = await session.get(WebhookEvent, candidate_event_id)
         if event is None:
             raise RuntimeError("Inserted webhook event cannot be loaded.")
         return event, True
 
-    existing = await session.execute(select(WebhookEvent).where(WebhookEvent.idempotency_key == idempotency_key))
-    event = existing.scalar_one()
+    identities = [MessageIngressClaim.idempotency_key == idempotency_key]
+    if external_message_id is not None:
+        identities.append(
+            (MessageIngressClaim.platform == platform)
+            & (MessageIngressClaim.external_message_id == external_message_id)
+        )
+    existing = await session.execute(
+        select(MessageIngressClaim).where(or_(*identities)).limit(2)
+    )
+    claims = list(existing.scalars().all())
+    if len(claims) != 1:
+        raise RuntimeError("incomplete or ambiguous message ingress claim")
+    event = await session.get(WebhookEvent, claims[0].webhook_event_id)
+    if event is None:
+        raise RuntimeError("incomplete or ambiguous message ingress claim")
     return event, False
 
 

@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.message_identity import canonical_dingtalk_idempotency_key
 
 
 @dataclass(frozen=True)
@@ -154,18 +155,13 @@ def parse_incoming_message(payload: dict[str, Any]) -> DingTalkIncomingMessage:
 
 
 def build_idempotency_key(payload: dict[str, Any], message: DingTalkIncomingMessage) -> str:
-    if message.message_id:
-        return f"dingtalk:{message.message_id}"
-    seed = "|".join(
-        [
-            message.dingtalk_user_id,
-            message.conversation_id or "",
-            message.text,
-            str(payload.get("createAt") or payload.get("timestamp") or ""),
-        ]
+    return canonical_dingtalk_idempotency_key(
+        message_id=message.message_id,
+        user_id=message.dingtalk_user_id,
+        conversation_id=message.conversation_id,
+        text=message.text,
+        created_at=payload.get("createAt") or payload.get("timestamp"),
     )
-    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    return f"dingtalk:sha256:{digest}"
 
 
 class DingTalkRobotClient:
@@ -210,10 +206,10 @@ class DingTalkRobotClient:
         self._access_token_expires_at = now + int(data.get("expireIn") or data.get("expiresIn") or 7200)
         return self._access_token
 
-    async def send_work_notification(self, *, user_ids: list[str], text: str) -> None:
+    async def send_work_notification(self, *, user_ids: list[str], text: str) -> dict[str, Any]:
         user_ids = [user_id for user_id in user_ids if user_id]
         if not user_ids:
-            return
+            return {}
         if not self.settings.dingtalk_agent_id:
             raise ValueError("DingTalk agent id is not configured.")
 
@@ -237,6 +233,7 @@ class DingTalkRobotClient:
         data = response.json()
         if data.get("errcode") not in (0, None):
             raise RuntimeError(data.get("errmsg") or "DingTalk work notification failed.")
+        return data
 
     async def send_robot_direct_text(self, *, user_ids: list[str], text: str) -> dict[str, Any]:
         user_ids = [user_id for user_id in user_ids if user_id]

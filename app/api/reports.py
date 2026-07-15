@@ -107,6 +107,7 @@ async def submit_manual_report(
             external_message_id=body.idempotency_key,
             dingtalk_user_id=body.dingtalk_user_id,
             payload=body.model_dump(mode="json"),
+            platform="manual_api",
         )
         await session.commit()
         if not inserted and event.status == "processed":

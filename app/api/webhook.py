@@ -66,7 +66,12 @@ from app.agent2.report_projection_correction_runtime import (
     execute_report_projection_correction_turn,
 )
 from app.agent2.business.composition import Phase2BusinessComposer
-from app.agent2.business.entrypoint import build_business_command_context, resolve_agent2_entrypoint
+from app.agent2.business.entrypoint import (
+    build_business_command_context,
+    decide_runtime_owner,
+    persist_runtime_owner_claim,
+    resolve_agent2_entrypoint,
+)
 from app.agent2.business.repositories import CaseFollowupPolicySqlRepository, CaseProgressSqlRepository, CaseSqlRepository, PartySqlRepository
 from app.agent2.business.sql_executor import SqlBusinessExecutor
 from app.agent2.business.policy import BusinessEffectPolicy
@@ -523,7 +528,15 @@ async def _submit_webhook_agent2_if_enabled(
         dingtalk_user_id=str(getattr(incoming, "dingtalk_user_id", "") or ""),
         source_message_id=message_id,
     )
-    phase2_primary = entrypoint.decision.route == "agent2_primary"
+    await persist_runtime_owner_claim(session, entrypoint)
+    runtime_owner = decide_runtime_owner(
+        entrypoint.decision,
+        phase2_control_plane_enabled=bool(
+            getattr(settings, "agent2_business_phase2_enabled", False)
+        ),
+        legacy_agent2_daily_enabled=agent2_daily_enabled_for_user(settings, user),
+    )
+    phase2_primary = runtime_owner == "agent2_primary"
     phase2_business_context = (
         build_business_command_context(
             entrypoint.binding,
@@ -535,7 +548,7 @@ async def _submit_webhook_agent2_if_enabled(
         if phase2_primary and entrypoint.binding is not None
         else None
     )
-    if entrypoint.decision.route == "blocked":
+    if runtime_owner == "blocked":
         current_date = now_in_timezone(settings.timezone).date()
         return Agent2DailyExecutionResult(
             report_id=None,
@@ -546,9 +559,7 @@ async def _submit_webhook_agent2_if_enabled(
             read_only=True,
             command_results=[],
         )
-    if entrypoint.decision.route == "agent2_shadow":
-        return None
-    if not phase2_primary and not agent2_daily_enabled_for_user(settings, user):
+    if runtime_owner == "agent1":
         return None
     daily_context = await load_live_daily_context(session, user, settings)
     daily_report = daily_context.report

@@ -521,6 +521,7 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
 
         async def send_robot_direct_text(self, **kwargs):
             self.direct_user_ids.extend(kwargs["user_ids"])
+            return {"processQueryKey": "provider-query-1"}
 
     robot = Robot()
     monkeypatch.setattr(jobs, "list_missing_users", fake_list_missing_users)
@@ -555,6 +556,11 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
     assert reminder_event.report_date == date(2026, 6, 15)
     assert reminder_event.report_id is None
     assert reminder_event.llm_decision_json["reminder_kind"] == "daily"
+    assert reminder_event.llm_decision_json["message_status"] == "accepted_by_provider"
+    assert reminder_event.llm_decision_json["provider_reference"] == "provider-query-1"
+    assert reminder_event.llm_decision_json["provider_reference_available"] is True
+    assert reminder_event.llm_decision_json["provider_message_id_available"] is False
+    assert reminder_event.llm_decision_json["transport"] == "direct_robot"
 
 
 @pytest.mark.asyncio
@@ -570,14 +576,30 @@ async def test_send_user_message_falls_back_to_work_notification():
 
         async def send_work_notification(self, **kwargs):
             self.work_notification_user_ids.extend(kwargs["user_ids"])
+            return {"task_id": "work-task-1"}
 
     robot = Robot()
 
-    channel = await send_user_message(robot, ["user-1"], "hello")
+    evidence = await send_user_message(robot, ["user-1"], "hello")
 
-    assert channel == "work_notification"
+    assert evidence.channel == "work_notification"
+    assert evidence.provider_reference == "work-task-1"
+    assert evidence.message_status == "accepted_by_provider"
     assert robot.direct_called is True
     assert robot.work_notification_user_ids == ["user-1"]
+
+
+@pytest.mark.asyncio
+async def test_send_user_message_fails_closed_without_provider_reference():
+    class Robot:
+        async def send_robot_direct_text(self, **kwargs):
+            return {}
+
+        async def send_work_notification(self, **kwargs):
+            return {}
+
+    with pytest.raises(RuntimeError, match="provider reference"):
+        await send_user_message(Robot(), ["user-1"], "hello")
 
 
 @pytest.mark.asyncio
@@ -626,6 +648,7 @@ async def test_send_daily_briefings_targets_team_leader_recipients():
 
         async def send_robot_direct_text(self, **kwargs):
             self.sent.append((kwargs["user_ids"], kwargs["text"]))
+            return {"processQueryKey": "briefing-query-1"}
 
     robot = Robot()
     briefings = {

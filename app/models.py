@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -257,6 +257,33 @@ class WebhookEvent(Base):
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class MessageIngressClaim(Base):
+    """Database-authoritative ownership claim for one inbound provider event."""
+
+    __tablename__ = "message_ingress_claims"
+    __table_args__ = (
+        Index(
+            "message_ingress_claims_platform_external_message_id_key",
+            "platform",
+            "external_message_id",
+            unique=True,
+            postgresql_where=text(
+                "external_message_id IS NOT NULL AND external_message_id <> ''"
+            ),
+        ),
+    )
+
+    idempotency_key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_message_id: Mapped[str | None] = mapped_column(String(256))
+    webhook_event_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), unique=True, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class ProgressOutboxEvent(Base):

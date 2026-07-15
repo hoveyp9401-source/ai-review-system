@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,34 @@ from app.agent2.business.route_control import RouteControlRepository, RouteDecis
 class Agent2EntrypointResolution:
     decision: RouteDecision
     binding: Agent2IdentityBinding | None
+    route_audit_pending: bool = False
+
+
+RuntimeOwner = Literal[
+    "agent1",
+    "agent2_primary",
+    "legacy_agent2_daily",
+    "blocked",
+]
+
+
+def decide_runtime_owner(
+    decision: RouteDecision,
+    *,
+    phase2_control_plane_enabled: bool,
+    legacy_agent2_daily_enabled: bool,
+) -> RuntimeOwner:
+    """Choose exactly one message owner across old and new control planes."""
+
+    if decision.route == "blocked":
+        return "blocked"
+    if decision.route == "agent2_primary":
+        return "agent2_primary"
+    if phase2_control_plane_enabled:
+        return "agent1"
+    if legacy_agent2_daily_enabled:
+        return "legacy_agent2_daily"
+    return "agent1"
 
 
 async def resolve_agent2_entrypoint(
@@ -65,26 +94,54 @@ async def resolve_agent2_entrypoint(
         tenant_id=binding.tenant_id,
         user_id=binding.user_id,
     )
-    if control is not None:
-        session.add(
-            RouteControlAudit(
-                tenant_id=binding.tenant_id,
-                actor_user_id=binding.user_id,
-                source_message_id=source_message_id,
-                before_json={
+    session.add(
+        RouteControlAudit(
+            tenant_id=binding.tenant_id,
+            actor_user_id=binding.user_id,
+            source_message_id=source_message_id,
+            before_json=(
+                {
                     "route_mode": control.route_mode,
                     "agent1_rollback_enabled": control.agent1_rollback_enabled,
                     "version": control.version,
-                },
-                after_json={
-                    "resolved_route": decision.route,
-                    "user_id": binding.user_id,
-                },
-                reason=f"route_decision:{decision.reason}",
-            )
+                }
+                if control is not None
+                else {
+                    "route_mode": "missing",
+                    "agent1_rollback_enabled": False,
+                    "version": 0,
+                }
+            ),
+            after_json={
+                "resolved_route": decision.route,
+                "user_id": binding.user_id,
+            },
+            reason=f"route_decision:{decision.reason}",
         )
-        await session.flush()
-    return Agent2EntrypointResolution(decision, binding)
+    )
+    await session.flush()
+    return Agent2EntrypointResolution(
+        decision,
+        binding,
+        route_audit_pending=True,
+    )
+
+
+async def persist_runtime_owner_claim(
+    session: AsyncSession,
+    resolution: Agent2EntrypointResolution,
+) -> bool:
+    """Durably record the selected runtime before any business execution.
+
+    The route audit is intentionally committed at the orchestration boundary:
+    a later LLM, repository, or reply failure must not erase the evidence of
+    which runtime owned the provider message.
+    """
+
+    if not bool(getattr(resolution, "route_audit_pending", False)):
+        return False
+    await session.commit()
+    return True
 
 
 def build_business_command_context(

@@ -103,6 +103,24 @@ def test_webhook_periodic_only_branch_persists_operation_outcome() -> None:
     assert _calls(branch, "persist_operation_outcomes")
 
 
+def test_both_dingtalk_transports_persist_route_claim_before_runtime() -> None:
+    webhook_function = _async_function(
+        "app/api/webhook.py",
+        "_submit_webhook_agent2_if_enabled",
+    )
+    stream_function = _async_function(
+        "app/stream_runner.py",
+        "_process_stream_agent2_daily_if_enabled",
+    )
+
+    for function in (webhook_function, stream_function):
+        source = ast.unparse(function)
+        resolve_at = source.index("await resolve_agent2_entrypoint(")
+        persist_at = source.index("await persist_runtime_owner_claim(")
+        owner_at = source.index("decide_runtime_owner(")
+        assert resolve_at < persist_at < owner_at
+
+
 @pytest.mark.asyncio
 async def test_stream_periodic_only_command_executes_and_commits_outcome(
     monkeypatch: pytest.MonkeyPatch,

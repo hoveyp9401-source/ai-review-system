@@ -7,9 +7,12 @@ import pytest
 
 from app.agent2.business.entrypoint import (
     build_business_command_context,
+    decide_runtime_owner,
     parse_tenant_allowlist,
+    persist_runtime_owner_claim,
     resolve_agent2_entrypoint,
 )
+from app.agent2.business.route_control import RouteDecision
 from app.agent2.business.models import Agent2IdentityBinding, RouteControlAudit, TenantRouteControl
 
 
@@ -22,6 +25,7 @@ class _Session:
         self.values = list(scalar_values)
         self.added = []
         self.scalar_calls = 0
+        self.commits = 0
 
     async def scalar(self, statement):
         self.scalar_calls += 1
@@ -36,6 +40,9 @@ class _Session:
 
     async def flush(self):
         return None
+
+    async def commit(self):
+        self.commits += 1
 
 
 def _binding() -> Agent2IdentityBinding:
@@ -114,6 +121,56 @@ async def test_test_tenant_primary_route_is_resolved_and_audited():
     assert len(audits) == 1
     assert audits[0].source_message_id == "message-1"
     assert audits[0].after_json["resolved_route"] == "agent2_primary"
+    assert result.route_audit_pending is True
+
+    persisted = await persist_runtime_owner_claim(session, result)  # type: ignore[arg-type]
+
+    assert persisted is True
+    assert session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_claim_does_not_commit_when_no_route_audit_exists():
+    session = _Session()
+    settings = SimpleNamespace(
+        agent2_business_phase2_enabled=False,
+        agent2_business_tenant_ids="tenant-test",
+    )
+    result = await resolve_agent2_entrypoint(
+        session,  # type: ignore[arg-type]
+        settings=settings,
+        dingtalk_user_id="ding-user-1",
+        source_message_id="message-1",
+    )
+
+    persisted = await persist_runtime_owner_claim(session, result)  # type: ignore[arg-type]
+
+    assert persisted is False
+    assert session.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_tenant_route_control_is_blocked_audited_and_committed():
+    session = _Session((_binding(),), (None,))
+    settings = SimpleNamespace(
+        agent2_business_phase2_enabled=True,
+        agent2_business_tenant_ids="tenant-test",
+    )
+
+    result = await resolve_agent2_entrypoint(
+        session,  # type: ignore[arg-type]
+        settings=settings,
+        dingtalk_user_id="ding-user-1",
+        source_message_id="message-missing-control",
+    )
+
+    assert result.decision.route == "agent1"
+    audits = [item for item in session.added if isinstance(item, RouteControlAudit)]
+    assert len(audits) == 1
+    assert audits[0].before_json["route_mode"] == "missing"
+    assert audits[0].after_json["resolved_route"] == "agent1"
+    assert await persist_runtime_owner_claim(session, result) is True  # type: ignore[arg-type]
+    assert session.commits == 1
 
 
 @pytest.mark.asyncio
@@ -188,3 +245,33 @@ def test_tenant_allowlist_parser_is_deterministic_and_deduplicated():
         "tenant-b",
         "tenant-c",
     )
+
+
+def test_phase2_route_control_is_authoritative_over_legacy_agent2_daily_flag():
+    owner = decide_runtime_owner(
+        RouteDecision("tenant-test", "agent1", "outside_canary"),
+        phase2_control_plane_enabled=True,
+        legacy_agent2_daily_enabled=True,
+    )
+
+    assert owner == "agent1"
+
+
+def test_legacy_agent2_daily_is_available_only_when_phase2_control_plane_is_off():
+    owner = decide_runtime_owner(
+        RouteDecision("", "agent1", "agent2_business_phase2_disabled"),
+        phase2_control_plane_enabled=False,
+        legacy_agent2_daily_enabled=True,
+    )
+
+    assert owner == "legacy_agent2_daily"
+
+
+def test_phase2_primary_claims_the_message_even_if_legacy_daily_flag_is_off():
+    owner = decide_runtime_owner(
+        RouteDecision("tenant-test", "agent2_primary", "canary_user"),
+        phase2_control_plane_enabled=True,
+        legacy_agent2_daily_enabled=False,
+    )
+
+    assert owner == "agent2_primary"

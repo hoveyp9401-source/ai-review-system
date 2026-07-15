@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
@@ -28,6 +29,17 @@ CONFIRMATION_REMINDED_ON_KEY = "_confirmation_reminded_on"
 CONFIRMATION_REMINDED_AT_KEY = "_confirmation_reminded_at"
 UNRESOLVED_DRAFT_EDIT_KEY = "_unresolved_draft_edit"
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ReminderDispatchEvidence:
+    channel: str
+    provider_reference: str
+    message_status: str = "accepted_by_provider"
+
+
+class MissingProviderEvidenceError(RuntimeError):
+    """The provider call returned but supplied no auditable reference."""
 
 
 async def remind_missing_reports(
@@ -62,6 +74,7 @@ async def remind_missing_reports(
     sent_by_work_notification = 0
     dry_run_messages: list[dict[str, Any]] = []
     sent_user_ids = []
+    sent_evidence_by_user: dict[Any, ReminderDispatchEvidence] = {}
     reports_by_user = await _load_reports_by_user(session, report_date, [user.id for user in target_users])
     target_users = _filter_reminder_users(target_users, reports_by_user, report_date)
 
@@ -80,13 +93,14 @@ async def remind_missing_reports(
                     would_send += len(grouped_users)
                     dry_run_messages.append(_dry_run_message("direct_robot", team, grouped_users, text))
                     continue
-                channel = await send_user_message(robot, [user.dingtalk_user_id for user in grouped_users], text)
+                evidence = await send_user_message(robot, [user.dingtalk_user_id for user in grouped_users], text)
                 sent += len(grouped_users)
-                if channel == "work_notification":
+                if evidence.channel == "work_notification":
                     sent_by_work_notification += len(grouped_users)
                 else:
                     sent_by_direct_robot += len(grouped_users)
                 sent_user_ids.extend(user.id for user in grouped_users)
+                sent_evidence_by_user.update({user.id: evidence for user in grouped_users})
         elif test_user_ids:
             for text, grouped_users in grouped_messages.items():
                 dry_run_messages.append(_dry_run_message("skipped_test_requires_direct_robot", team, grouped_users, text))
@@ -113,13 +127,14 @@ async def remind_missing_reports(
                     would_send += len(grouped_users)
                     dry_run_messages.append(_dry_run_message("direct_robot", team, grouped_users, text))
                     continue
-                channel = await send_user_message(robot, [user.dingtalk_user_id for user in grouped_users], text)
+                evidence = await send_user_message(robot, [user.dingtalk_user_id for user in grouped_users], text)
                 sent += len(grouped_users)
-                if channel == "work_notification":
+                if evidence.channel == "work_notification":
                     sent_by_work_notification += len(grouped_users)
                 else:
                     sent_by_direct_robot += len(grouped_users)
                 sent_user_ids.extend(user.id for user in grouped_users)
+                sent_evidence_by_user.update({user.id: evidence for user in grouped_users})
         else:
             for text, grouped_users in grouped_messages.items():
                 dry_run_messages.append(_dry_run_message("skipped_no_channel", team, grouped_users, text))
@@ -132,6 +147,7 @@ async def remind_missing_reports(
         for user in target_users:
             if user.id not in sent_user_id_set:
                 continue
+            dispatch_evidence = sent_evidence_by_user[user.id]
             report = reports_by_user.get(user.id)
             session.add(
                 ReportInteractionEvent(
@@ -150,7 +166,11 @@ async def remind_missing_reports(
                         "reminder_kind": reminder_kind,
                         "target_report_date": report_date.isoformat(),
                         "business_write": False,
+                        "message_status": dispatch_evidence.message_status,
+                        "provider_reference": dispatch_evidence.provider_reference,
+                        "provider_reference_available": True,
                         "provider_message_id_available": False,
+                        "transport": dispatch_evidence.channel,
                     },
                     backend_action="daily_report_reminder_sent",
                     before_snapshot_json={},
@@ -195,24 +215,54 @@ async def remind_missing_reports(
     }
 
 
-async def send_user_message(robot: DingTalkRobotClient, user_ids: list[str], text: str, *, markdown: bool = False, title: str = "日报通知") -> str:
+async def send_user_message(robot: DingTalkRobotClient, user_ids: list[str], text: str, *, markdown: bool = False, title: str = "日报通知") -> ReminderDispatchEvidence:
     user_ids = [user_id for user_id in user_ids if user_id]
     if not user_ids:
-        return "none"
+        raise ValueError("at least one DingTalk user id is required")
     try:
         if markdown and hasattr(robot, "send_robot_direct_markdown"):
-            await robot.send_robot_direct_markdown(user_ids=user_ids, title=title, text=text)
-            return "direct_robot_markdown"
+            result = await robot.send_robot_direct_markdown(user_ids=user_ids, title=title, text=text)
+            return _dispatch_evidence("direct_robot_markdown", result)
         if hasattr(robot, "send_robot_direct_text"):
-            await robot.send_robot_direct_text(user_ids=user_ids, text=text)
-            return "direct_robot"
+            result = await robot.send_robot_direct_text(user_ids=user_ids, text=text)
+            return _dispatch_evidence("direct_robot", result)
         raise AttributeError("robot has no direct send method")
+    except MissingProviderEvidenceError:
+        # The first provider call may already have accepted the message. Do not
+        # fall back to a second channel and risk a duplicate notification.
+        raise
     except Exception as exc:
         logger.warning("direct robot message failed, falling back to work notification: %s", exc)
         if not hasattr(robot, "send_work_notification"):
             raise
-        await robot.send_work_notification(user_ids=user_ids, text=text)
-        return "work_notification"
+        result = await robot.send_work_notification(user_ids=user_ids, text=text)
+        return _dispatch_evidence("work_notification", result)
+
+
+def _dispatch_evidence(channel: str, result: Any) -> ReminderDispatchEvidence:
+    payload = result if isinstance(result, dict) else {}
+    provider_reference = next(
+        (
+            str(payload.get(key) or "").strip()
+            for key in (
+                "processQueryKey",
+                "task_id",
+                "taskId",
+                "request_id",
+                "requestId",
+            )
+            if str(payload.get(key) or "").strip()
+        ),
+        "",
+    )
+    if not provider_reference:
+        raise MissingProviderEvidenceError(
+            f"DingTalk {channel} response is missing a provider reference"
+        )
+    return ReminderDispatchEvidence(
+        channel=channel,
+        provider_reference=provider_reference,
+    )
 
 
 def _configured_test_user_ids(settings: Settings) -> set[str]:
