@@ -1,0 +1,78 @@
+{
+  "artifact_version": "agent2.release_baseline.p2_postdeploy.v1",
+  "generated_for_date": "2026-07-15",
+  "verdict": "P2_API_AND_UI_PROJECTION_PASSED",
+  "local_commit": "0319de1f",
+  "server_deployment": {
+    "archive_sha256": "baf3127cccca5af86b2d3801369956fd4ed8d8a27e89fee2f1ce507398397f88",
+    "runtime_manifest_sha256": "f49397532b09dfdef4052b66339e8c23bc4244e0b167604f20b325365981c840",
+    "rollback_archive_sha256": "737ed5223f0c03e0120f2d31fecc97d1ac954e64b3685a0ea2010c9226a8ab60",
+    "api_pid": 3536329,
+    "stream_pid": 3536331,
+    "scheduler_pid": 3536330,
+    "health": "ok",
+    "server_focused_tests": {
+      "passed": 35,
+      "failed": 0
+    }
+  },
+  "tests": {
+    "legal_ops_focused": {
+      "passed": 78,
+      "failed": 0
+    },
+    "full_repository": {
+      "passed": 2407,
+      "failed": 59,
+      "skipped": 1,
+      "new_failure_count": 0,
+      "unresolved_inherited_valid_regressions": 35
+    }
+  },
+  "authentication": {
+    "missing_credential_http_status": 401,
+    "invalid_credential_http_status": 401
+  },
+  "users": {
+    "pang_hao": {
+      "cases_total": 80,
+      "assigned_to_me": 40,
+      "shared_with_me": 40,
+      "writable": 80,
+      "reports_total": 27,
+      "travels_default": 4,
+      "travel_candidates": 1,
+      "travel_notifications": 1,
+      "travel_sources": ["real_user_message"]
+    },
+    "liu_cong": {
+      "cases_total": 80,
+      "assigned_to_me": 40,
+      "shared_with_me": 40,
+      "writable": 80,
+      "reports_total": 17,
+      "travels_default": 1,
+      "travel_candidates": 1,
+      "travel_notifications": 1,
+      "travel_sources": ["real_user_message"]
+    }
+  },
+  "safety_switches": {
+    "semantic_admission_enabled": true,
+    "semantic_admission_enforced": false,
+    "case_followup_enabled": true,
+    "case_followup_send_enabled": false,
+    "case_followup_report_projection_enabled": false
+  },
+  "browser_visual_check": {
+    "completed": false,
+    "reason": "desktop in-app browser connection timed out and reset during post-deploy navigation",
+    "substitute_evidence": [
+      "public index references app.js?v=20",
+      "public app.js contains assigned, shared and read-only permission projections",
+      "both authenticated production APIs passed read-only projection assertions"
+    ]
+  },
+  "scope_expanded": false,
+  "real_user_acceptance_completed": false
+}
