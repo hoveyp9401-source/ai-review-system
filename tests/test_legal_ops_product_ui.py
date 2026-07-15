@@ -57,6 +57,8 @@ def test_product_shell_uses_chinese_and_never_renders_raw_transport_identifiers(
     assert 'name="risk_level"' not in script
     assert "auditCommandLabel(item.command_type)" in script
     assert "auditResourceLabel(item.resource_type)" in script
+    assert 'labels[value] || "来源状态异常"' in script
+    assert 'labels[value] || value || "来源未标记"' not in script
 
 
 def test_business_statuses_are_rendered_through_one_closed_chinese_dictionary():

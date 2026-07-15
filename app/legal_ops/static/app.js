@@ -292,7 +292,7 @@ function originLabel(value) {
     daily_report: "日报进展",
     human_record: "人工记录",
   };
-  return `<span class="origin-chip ${escapeHtml(value)}">${escapeHtml(labels[value] || value || "来源未标记")}</span>`;
+  return `<span class="origin-chip ${escapeHtml(value)}">${escapeHtml(labels[value] || "来源状态异常")}</span>`;
 }
 
 function auditCommandLabel(value) {
