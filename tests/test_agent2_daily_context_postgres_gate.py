@@ -9,6 +9,7 @@ from scripts.verify_agent2_daily_context_postgres import (
     _safe_failure_symbol,
     build_isolation_plan,
     evaluate_gate_checks,
+    isolated_search_path,
     validate_public_artifact,
 )
 
@@ -77,6 +78,18 @@ def test_isolation_plan_clones_only_required_tables_into_allowlisted_schema() ->
     )
     assert "public" not in plan.drop_statement.lower()
     assert plan.drop_statement == f'DROP SCHEMA "{config.schema}" CASCADE'
+
+
+def test_gate_search_path_cannot_fall_through_to_public() -> None:
+    config = GateConfig.create(
+        run_id="release_20260722_a1b2c3d4",
+        confirmation="RUN_ISOLATED_AGENT2_DAILY_POSTGRES_GATE",
+    )
+
+    assert isolated_search_path(config) == (
+        "agent2_daily_gate_release_20260722_a1b2c3d4,pg_catalog"
+    )
+    assert "public" not in isolated_search_path(config).split(",")
 
 
 def test_gate_decision_fails_closed_when_any_hard_check_is_false() -> None:

@@ -153,6 +153,12 @@ def build_isolation_plan(config: GateConfig) -> IsolationPlan:
     )
 
 
+def isolated_search_path(config: GateConfig) -> str:
+    """Resolve application SQL only inside the gate schema and pg_catalog."""
+
+    return f"{config.schema},pg_catalog"
+
+
 def evaluate_gate_checks(checks: dict[str, Any]) -> dict[str, Any]:
     failed = [name for name in REQUIRED_TRUE_CHECKS if checks.get(name) is not True]
     failed.extend(name for name in REQUIRED_ZERO_CHECKS if checks.get(name) != 0)
@@ -685,7 +691,7 @@ async def run_postgres_gate(
             connect_args={
                 "server_settings": {
                     "application_name": "agent2_daily_context_release_gate",
-                    "search_path": f"{config.schema},public",
+                    "search_path": isolated_search_path(config),
                 }
             },
         )
