@@ -14,6 +14,7 @@ from app.agent2.typed_daily_commands import (
     DailyReportMutationSnapshot,
     REPORT_FIELDS,
     TypedDailyCommand,
+    execute_typed_daily_command,
 )
 from app.agent2.report_domain import (
     PeriodicReportSnapshot,
@@ -255,6 +256,26 @@ class CognitiveCommandPlanner:
                 if block is not None:
                     blocked.append(block)
                 continue
+            if action.action_type == "replace_daily_section":
+                command, block = self._plan_daily_section_replace(
+                    decision_id=decision_id,
+                    action=action,
+                    entities=action_entities,
+                    context=working_context,
+                )
+                if command is not None:
+                    daily_commands.append(
+                        _bind_report_admission(
+                            command,
+                            action=action,
+                            admission_ticket=admission_ticket_payload,
+                            admission_required=admission_required,
+                        )
+                    )
+                    working_context = _advance_daily_context(working_context, command)
+                if block is not None:
+                    blocked.append(block)
+                continue
             if action.action_type == "submit_daily_report":
                 command, block = self._plan_daily_submit(
                     decision_id=decision_id,
@@ -289,13 +310,21 @@ class CognitiveCommandPlanner:
                 if block is not None:
                     blocked.append(block)
                 continue
-            if action.action_type in {"edit_daily_item", "merge_daily_items"}:
+            if action.action_type in {
+                "edit_daily_item",
+                "merge_daily_items",
+                "move_daily_items",
+            }:
                 command, block = self._plan_daily_item_mutation(
                     decision_id=decision_id,
                     action=action,
                     entities=action_entities,
                     context=working_context,
-                    command_type=("edit_item" if action.action_type == "edit_daily_item" else "merge_items"),
+                    command_type={
+                        "edit_daily_item": "edit_item",
+                        "merge_daily_items": "merge_items",
+                        "move_daily_items": "move_items",
+                    }[action.action_type],
                 )
                 if command is not None:
                     daily_commands.append(_bind_report_admission(
@@ -303,7 +332,7 @@ class CognitiveCommandPlanner:
                         admission_ticket=admission_ticket_payload,
                         admission_required=admission_required,
                     ))
-                    working_context = _advance_daily_context(working_context)
+                    working_context = _advance_daily_context(working_context, command)
                 if block is not None:
                     blocked.append(block)
                 continue
@@ -700,6 +729,62 @@ class CognitiveCommandPlanner:
             None,
         )
 
+    def _plan_daily_section_replace(
+        self,
+        *,
+        decision_id: UUID,
+        action: RequiredAction,
+        entities: tuple[ConversationEntity, ...],
+        context: CommandPlanningContext,
+    ) -> tuple[TypedDailyCommand | None, PlanningBlock | None]:
+        if context.user_constraints.read_only or context.user_constraints.no_daily_write:
+            return None, PlanningBlock(action.action_id, "user_constraint_blocks_daily_write")
+        snapshot = context.daily_snapshot
+        if snapshot is None:
+            return None, PlanningBlock(action.action_id, "daily_snapshot_required")
+        if _historical_write_blocked(context, snapshot):
+            return None, PlanningBlock(action.action_id, "historical_daily_mutation_blocked_after_cutoff")
+        if len(entities) != 1 or entities[0].entity_type != "daily_report":
+            return None, PlanningBlock(action.action_id, "daily_report_entity_required")
+        attributes = entities[0].attributes
+        field_name = str(attributes.get("field") or "").strip()
+        raw_items = attributes.get("items")
+        items = [str(value).strip() for value in raw_items] if isinstance(raw_items, (list, tuple)) else []
+        if field_name not in REPORT_FIELDS or not items or any(not value for value in items):
+            return None, PlanningBlock(action.action_id, "daily_section_values_required")
+        report_id = str(attributes.get("report_id") or "").strip()
+        raw_version = attributes.get("version")
+        if report_id and report_id != str(snapshot.report_id):
+            return None, PlanningBlock(action.action_id, "target_not_found")
+        if raw_version is not None and raw_version > snapshot.version:
+            return None, PlanningBlock(action.action_id, "version_conflict")
+        patch = {"field": field_name, "items": items}
+        sub_decision_id = _sub_decision_id(decision_id, action.action_id)
+        command_id = uuid5(
+            NAMESPACE_URL,
+            f"agent2-command-v3:{sub_decision_id}:replace_section",
+        )
+        return (
+            TypedDailyCommand(
+                command_id=command_id,
+                decision_id=decision_id,
+                sub_decision_id=sub_decision_id,
+                command_type="replace_section",
+                report_id=snapshot.report_id,
+                report_version=snapshot.version,
+                target_item_ids=(),
+                patch=patch,
+                idempotency_key=_daily_idempotency_key(
+                    context.message_id,
+                    "replace_section",
+                    snapshot.report_id,
+                    (),
+                    patch,
+                ),
+            ),
+            None,
+        )
+
     def _plan_daily_item_mutation(
         self,
         *,
@@ -707,7 +792,7 @@ class CognitiveCommandPlanner:
         action: RequiredAction,
         entities: tuple[ConversationEntity, ...],
         context: CommandPlanningContext,
-        command_type: Literal["edit_item", "delete_item", "merge_items"],
+        command_type: Literal["edit_item", "delete_item", "merge_items", "move_items"],
     ) -> tuple[TypedDailyCommand | None, PlanningBlock | None]:
         if context.user_constraints.read_only or context.user_constraints.no_daily_write:
             return None, PlanningBlock(action.action_id, "user_constraint_blocks_daily_write")
@@ -737,7 +822,12 @@ class CognitiveCommandPlanner:
         if any(item_id not in known_item_ids for item_id in target_ids):
             return None, PlanningBlock(action.action_id, "target_not_found")
         patch: dict[str, Any] = {}
-        if command_type in {"edit_item", "merge_items"}:
+        if command_type == "move_items":
+            target_field = str(entities[0].attributes.get("target_field") or "").strip()
+            if target_field not in REPORT_FIELDS:
+                return None, PlanningBlock(action.action_id, "daily_field_required")
+            patch["target_field"] = target_field
+        elif command_type in {"edit_item", "merge_items"}:
             replacement = str(entities[0].attributes.get("replacement") or "").strip()
             if command_type == "edit_item" and not replacement:
                 return None, PlanningBlock(action.action_id, "replacement_required")
@@ -1346,8 +1436,24 @@ def _daily_idempotency_key(
     return f"{message_id}:daily:{digest}"
 
 
-def _advance_daily_context(context: CommandPlanningContext) -> CommandPlanningContext:
+def _advance_daily_context(
+    context: CommandPlanningContext,
+    command: TypedDailyCommand | None = None,
+) -> CommandPlanningContext:
     snapshot = context.daily_snapshot
     if snapshot is None:
         return context
+    if command is not None:
+        simulated = execute_typed_daily_command(
+            replace(
+                command,
+                admission_ticket={},
+                admission_required=False,
+                admission_action_id="",
+                admission_operation="",
+            ),
+            snapshot=snapshot,
+            actor_user_id=context.actor_user_id,
+        )
+        return replace(context, daily_snapshot=simulated.after)
     return replace(context, daily_snapshot=replace(snapshot, version=snapshot.version + 1))

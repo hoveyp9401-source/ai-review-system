@@ -554,7 +554,7 @@ async def _submit_webhook_agent2_if_enabled(
             report_id=None,
             report_date=current_date,
             status="collecting",
-            message="Agent2 身份或租户路由不唯一，本次已阻断，未回退 Agent1，也未写入业务数据。",
+            message="当前账号或所属组织信息无法唯一确认，本次没有执行任何业务操作。",
             report_saved=False,
             read_only=True,
             command_results=[],
@@ -664,7 +664,7 @@ async def _submit_webhook_agent2_if_enabled(
             report_id=str(getattr(daily_report, "id", "") or "") or None,
             report_date=report_date,
             status=str(getattr(daily_report, "status", "") or "collecting"),
-            message="Agent2 业务主路已启用，但 Cognitive Core 未启用。本次已阻断，未回退 Agent1，也未写入业务数据。",
+            message="当前服务暂时无法处理这条消息，本次没有执行任何业务操作。",
             report_saved=False,
             read_only=True,
             today_work=list(getattr(daily_report, "today_work", []) or []),
@@ -984,7 +984,7 @@ async def _submit_webhook_agent2_if_enabled(
             ):
                 pass
             elif phase2_primary:
-                message = "这条消息未形成可执行的 Agent2 typed command，本次未写入，也未回退 Agent1。"
+                message = "这条消息暂时无法形成明确可执行的操作，本次没有写入任何内容。"
             else:
                 message = (
                     getattr(getattr(shadow, "assistant_reply", None), "text", "")

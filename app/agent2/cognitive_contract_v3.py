@@ -8,7 +8,13 @@ from app.agent2.cognitive_core_v3 import SemanticInterpretation
 ENTITY_ATTRIBUTE_KEYS = {
     "daily_event": frozenset({"field", "context_reference"}),
     "daily_item_target": frozenset(
-        {"target_item_ids", "replacement", "context_reference"}
+        {
+            "target_item_ids",
+            "replacement",
+            "source_field",
+            "target_field",
+            "context_reference",
+        }
     ),
     "case_query": frozenset({"matter_hint", "question", "context_reference"}),
     "operation_status_query": frozenset({"domain"}),
@@ -25,7 +31,7 @@ ENTITY_ATTRIBUTE_KEYS = {
     ),
     "travel_collaboration_ref": frozenset({"candidate_id", "response", "context_reference"}),
     "daily_report": frozenset(
-        {"report_id", "version", "report_date", "field", "context_reference"}
+        {"report_id", "version", "report_date", "field", "items", "context_reference"}
     ),
     "case_ref": frozenset(
         {
@@ -74,6 +80,8 @@ ACTION_PARAMETER_KEYS = {
     "edit_daily_item": frozenset({"confirmed_pending_id"}),
     "delete_daily_item": frozenset({"confirmed_pending_id"}),
     "merge_daily_items": frozenset({"confirmed_pending_id"}),
+    "replace_daily_section": frozenset({"confirmed_pending_id"}),
+    "move_daily_items": frozenset({"confirmed_pending_id"}),
     "query_daily_report": frozenset({"confirmed_pending_id"}),
     "copy_previous_daily_report": frozenset({"confirmed_pending_id"}),
     "clear_daily_section": frozenset({"confirmed_pending_id"}),
@@ -105,7 +113,7 @@ CONTEXT_REFERENCE_KEYS = frozenset(
 )
 STRING_ENTITY_ATTRIBUTES = {
     "daily_event": frozenset({"field"}),
-    "daily_item_target": frozenset({"replacement"}),
+    "daily_item_target": frozenset({"replacement", "source_field", "target_field"}),
     "case_query": frozenset({"matter_hint", "question"}),
     "operation_status_query": frozenset({"domain"}),
     "travel_event": frozenset(
@@ -177,6 +185,19 @@ def validate_semantic_interpretation_contract(
             if not isinstance(version, int) or isinstance(version, bool) or version < 0:
                 violations.append(
                     f"entities.{entity.entity_id}.attributes.version.value_type"
+                )
+        if entity.entity_type == "daily_report" and "items" in entity.attributes:
+            replacement_items = entity.attributes.get("items")
+            if (
+                not isinstance(replacement_items, (list, tuple))
+                or not replacement_items
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in replacement_items
+                )
+            ):
+                violations.append(
+                    f"entities.{entity.entity_id}.attributes.items.value_type"
                 )
         if entity.entity_type == "case_progress_ref" and "expected_version" in entity.attributes:
             version = entity.attributes.get("expected_version")

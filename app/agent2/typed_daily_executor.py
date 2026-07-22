@@ -413,6 +413,48 @@ async def execute_typed_agent2_daily_commands(
             ],
         )
 
+    if not any(execution.should_write_db for execution in executions):
+        await _persist_execution_receipts(
+            session,
+            user=user,
+            report_date=report_date,
+            report_id=getattr(existing, "id", None),
+            executions=tuple(executions),
+            context=execution_context,
+        )
+        if ticket_leases:
+            await session.flush()
+            for execution, ticket_lease in ticket_leases:
+                await ticket_store.consume(
+                    ticket_lease,
+                    receipt=AdmissionReceiptReference(
+                        receipt_kind="daily_report",
+                        receipt_id=_daily_receipt_id(
+                            execution.command.idempotency_key,
+                            tenant_id=execution_context.tenant_id,
+                        ),
+                        status=_receipt_status(execution),
+                        actual_write=False,
+                    ),
+                    consumed_at=_daily_execution_time(execution_context),
+                )
+        return Agent2DailyExecutionResult(
+            report_id=str(getattr(existing, "id", "") or working.report_id),
+            report_date=report_date,
+            status=working.status,
+            message="日报内容已在对应栏目中，本次没有修改。\n\n"
+            + _query_result_message(report_date, working),
+            report_saved=False,
+            read_only=False,
+            today_work=list(working.today_work),
+            problems=list(working.problems),
+            tomorrow_plan=list(working.tomorrow_plan),
+            command_results=[
+                _execution_result(item, tenant_id=execution_context.tenant_id)
+                for item in executions
+            ],
+        )
+
     received_at = datetime.now(
         ZoneInfo(getattr(user, "timezone", None) or getattr(settings, "timezone", "Asia/Shanghai"))
     )

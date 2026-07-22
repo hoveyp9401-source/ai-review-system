@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="9" skipped="0" tests="12" time="1.347" timestamp="2026-07-22T09:08:44.714225+08:00" hostname="AMIN-2208-0002"><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_explicit_daily_entry_keeps_plain_work_content_out_of_internal_qa" time="0.005"><failure message="AssertionError: assert None is not None&#10; +  where None = ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())).current_goal&#10; +    where ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())) = RuntimeFailureOutcome(run_id='4269ac65-2931-5aa0-8d03-fd8847196241', mode='replay', status='failed_closed', reply=Runt...audit_recorded', detail=mappingproxy({'run_id': '4269ac65-2931-5aa0-8d03-fd8847196241'}))), legacy_fallback_used=False).state">def test_explicit_daily_entry_keeps_plain_work_content_out_of_internal_qa():
+        client = AdversarialInternalQaClient()
+        actor_id, daily, interpreter, runtime = _runtime(client)
+        opener = _fixture_turn("historical-explicit-daily-entry", "b-03")
+        content = _fixture_turn("historical-explicit-daily-entry", "b-04")
+    
+        opener_outcome = asyncio.run(
+            runtime.handle(_request(actor_id, "b-03", str(opener["text"])))
+        )
+        content_outcome = asyncio.run(
+            runtime.handle(_request(actor_id, "b-04", str(content["text"])))
+        )
+    
+&gt;       assert opener_outcome.state.current_goal is not None
+E       AssertionError: assert None is not None
+E        +  where None = ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())).current_goal
+E        +    where ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())) = RuntimeFailureOutcome(run_id='4269ac65-2931-5aa0-8d03-fd8847196241', mode='replay', status='failed_closed', reply=Runt...audit_recorded', detail=mappingproxy({'run_id': '4269ac65-2931-5aa0-8d03-fd8847196241'}))), legacy_fallback_used=False).state
+
+tests\test_agent2_historical_daily_context_acceptance.py:156: AssertionError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_report_entry_variants_enter_daily_context_without_writing[\u6211\u5199\u4eca\u5929\u65e5\u62a5]" time="0.002"><failure message="AssertionError: assert None is not None&#10; +  where None = ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())).current_goal&#10; +    where ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())) = RuntimeFailureOutcome(run_id='da002b1c-fb19-5acb-8e20-a6ca0bf487bd', mode='replay', status='failed_closed', reply=Runt...audit_recorded', detail=mappingproxy({'run_id': 'da002b1c-fb19-5acb-8e20-a6ca0bf487bd'}))), legacy_fallback_used=False).state">text = '我写今天日报'
+
+    @pytest.mark.parametrize("text", ["我写今天日报", "进入日报", "写日报"])
+    def test_report_entry_variants_enter_daily_context_without_writing(text: str):
+        client = AdversarialInternalQaClient()
+        actor_id, daily, interpreter, runtime = _runtime(client)
+    
+        outcome = asyncio.run(runtime.handle(_request(actor_id, "daily-entry", text)))
+    
+&gt;       assert outcome.state.current_goal is not None
+E       AssertionError: assert None is not None
+E        +  where None = ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())).current_goal
+E        +    where ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())) = RuntimeFailureOutcome(run_id='da002b1c-fb19-5acb-8e20-a6ca0bf487bd', mode='replay', status='failed_closed', reply=Runt...audit_recorded', detail=mappingproxy({'run_id': 'da002b1c-fb19-5acb-8e20-a6ca0bf487bd'}))), legacy_fallback_used=False).state
+
+tests\test_agent2_historical_daily_context_acceptance.py:171: AssertionError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_report_entry_variants_enter_daily_context_without_writing[\u8fdb\u5165\u65e5\u62a5]" time="0.002"><failure message="AssertionError: assert None is not None&#10; +  where None = ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())).current_goal&#10; +    where ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())) = RuntimeFailureOutcome(run_id='da002b1c-fb19-5acb-8e20-a6ca0bf487bd', mode='replay', status='failed_closed', reply=Runt...audit_recorded', detail=mappingproxy({'run_id': 'da002b1c-fb19-5acb-8e20-a6ca0bf487bd'}))), legacy_fallback_used=False).state">text = '进入日报'
+
+    @pytest.mark.parametrize("text", ["我写今天日报", "进入日报", "写日报"])
+    def test_report_entry_variants_enter_daily_context_without_writing(text: str):
+        client = AdversarialInternalQaClient()
+        actor_id, daily, interpreter, runtime = _runtime(client)
+    
+        outcome = asyncio.run(runtime.handle(_request(actor_id, "daily-entry", text)))
+    
+&gt;       assert outcome.state.current_goal is not None
+E       AssertionError: assert None is not None
+E        +  where None = ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())).current_goal
+E        +    where ConversationState(user_id='dfcd3439-6673-564b-9fb8-f9568dfd4989', conversation_id='historical-explicit-daily-entry', v...raints=UserConstraints(no_daily_write=False, read_only=False, no_history_mutation=False, draft_only=False, sources=())) = RuntimeFailureOutcome(run_id='da002b1c-fb19-5acb-8e20-a6ca0bf487bd', mode='replay', status='failed_closed', reply=Runt...audit_recorded', detail=mappingproxy({'run_id': 'da002b1c-fb19-5acb-8e20-a6ca0bf487bd'}))), legacy_fallback_used=False).state
+
+tests\test_agent2_historical_daily_context_acceptance.py:171: AssertionError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_report_entry_variants_enter_daily_context_without_writing[\u5199\u65e5\u62a5]" time="0.002" /><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_explicit_section_correction_moves_the_exact_existing_item" time="0.030"><failure message="AssertionError: assert () == ('半年度绩效评估',)&#10;  &#10;  Right contains one more item: '半年度绩效评估'&#10;  Use -v to get more diff">def test_explicit_section_correction_moves_the_exact_existing_item():
+        client = AdversarialInternalQaClient()
+        actor_id, daily, interpreter, runtime = _runtime(client)
+        turns = [
+            _fixture_turn("historical-explicit-daily-entry", "b-03"),
+            _fixture_turn("historical-explicit-daily-entry", "b-04"),
+            _fixture_turn("historical-daily-collection-correction", "a-02"),
+            _fixture_turn("historical-daily-collection-correction", "a-03"),
+        ]
+    
+        outcomes = [
+            asyncio.run(runtime.handle(_request(actor_id, f"move-{index}", str(turn["text"]))))
+            for index, turn in enumerate(turns, start=1)
+        ]
+    
+        correction = outcomes[-1]
+&gt;       assert daily.snapshot.today_work == ("半年度绩效评估",)
+E       AssertionError: assert () == ('半年度绩效评估',)
+E         
+E         Right contains one more item: '半年度绩效评估'
+E         Use -v to get more diff
+
+tests\test_agent2_historical_daily_context_acceptance.py:194: AssertionError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_complete_three_section_daily_produces_and_applies_three_typed_commands" time="0.003"><failure message="AttributeError: 'NoneType' object has no attribute 'daily_commands'">def test_complete_three_section_daily_produces_and_applies_three_typed_commands():
+        client = AdversarialInternalQaClient()
+        actor_id, daily, interpreter, runtime = _runtime(client)
+        turn = _fixture_turn("historical-daily-collection-correction", "a-05")
+    
+        outcome = asyncio.run(runtime.handle(_request(actor_id, "complete-document", str(turn["text"]))))
+    
+&gt;       assert [command.command_type for command in outcome.command_plan.daily_commands] == [
+                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            "replace_section",
+            "replace_section",
+            "replace_section",
+        ]
+E       AttributeError: 'NoneType' object has no attribute 'daily_commands'
+
+tests\test_agent2_historical_daily_context_acceptance.py:209: AttributeError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_scheduler_established_daily_collection_context_routes_plain_work_to_daily" time="0.005" /><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_compound_correction_keeps_plan_and_applies_problem_as_separate_segment" time="0.010"><failure message="AssertionError: assert () == ('来函界面被调整，问题没解决被压着上线',)&#10;  &#10;  Right contains one more item: '来函界面被调整，问题没解决被压着上线'&#10;  Use -v to get more diff">def test_compound_correction_keeps_plan_and_applies_problem_as_separate_segment():
+        client = AdversarialInternalQaClient()
+        actor_id, daily, _, runtime = _runtime(client)
+        setup_turns = [
+            "我写今天日报",
+            "梳理推进待办，并梳理参赛作品",
+            "梳理推进待办，并梳理参赛作品，这是明天的计划",
+        ]
+        for index, text in enumerate(setup_turns, start=1):
+            asyncio.run(runtime.handle(_request(actor_id, f"compound-setup-{index}", text)))
+        turn = _fixture_turn("historical-daily-collection-correction", "a-04")
+    
+        outcome = asyncio.run(runtime.handle(_request(actor_id, "compound-correction", str(turn["text"]))))
+    
+        assert daily.snapshot.tomorrow_plan == ("梳理推进待办，并梳理参赛作品",)
+&gt;       assert daily.snapshot.problems == ("来函界面被调整，问题没解决被压着上线",)
+E       AssertionError: assert () == ('来函界面被调整，问题没解决被压着上线',)
+E         
+E         Right contains one more item: '来函界面被调整，问题没解决被压着上线'
+E         Use -v to get more diff
+
+tests\test_agent2_historical_daily_context_acceptance.py:260: AssertionError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_replacing_only_tomorrow_plan_preserves_today_work_and_problems" time="0.006"><failure message="AssertionError: assert 'failed_closed' == 'completed'&#10;  &#10;  - completed&#10;  + failed_closed">def test_replacing_only_tomorrow_plan_preserves_today_work_and_problems():
+        client = AdversarialInternalQaClient()
+        actor_id, daily, _, runtime = _runtime(client)
+        complete = _fixture_turn("historical-daily-collection-correction", "a-05")
+        asyncio.run(runtime.handle(_request(actor_id, "preserve-setup", str(complete["text"]))))
+        before_today = daily.snapshot.today_work
+        before_problems = daily.snapshot.problems
+    
+        outcome = asyncio.run(
+            runtime.handle(_request(actor_id, "replace-plan-only", "明日计划改成跟进新的待办"))
+        )
+    
+&gt;       assert outcome.status == "completed"
+E       AssertionError: assert 'failed_closed' == 'completed'
+E         
+E         - completed
+E         + failed_closed
+
+tests\test_agent2_historical_daily_context_acceptance.py:282: AssertionError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_repeated_section_correction_is_no_op_and_never_claims_changed" time="0.006"><failure message="AssertionError: assert DailyReportMu...15dd4c712',)}) == DailyReportMu..., item_ids={})&#10;  &#10;  Omitting 5 identical items, use -vv to show&#10;  Differing attributes:&#10;  ['version', 'tomorrow_plan', 'item_ids']&#10;  &#10;  Drill down into differing attribute version:&#10;    version: 1 != 0...&#10;  &#10;  ...Full output truncated (11 lines hidden), use '-vv' to show">def test_repeated_section_correction_is_no_op_and_never_claims_changed():
+        client = AdversarialInternalQaClient()
+        actor_id, daily, _, runtime = _runtime(client)
+        complete = _fixture_turn("historical-daily-collection-correction", "a-05")
+        repeat = _fixture_turn("historical-daily-collection-correction", "a-07")
+        asyncio.run(runtime.handle(_request(actor_id, "no-op-setup", str(complete["text"]))))
+        before = daily.snapshot
+    
+        outcome = asyncio.run(runtime.handle(_request(actor_id, "no-op-repeat", str(repeat["text"]))))
+    
+&gt;       assert daily.snapshot == before
+E       AssertionError: assert DailyReportMu...15dd4c712',)}) == DailyReportMu..., item_ids={})
+E         
+E         Omitting 5 identical items, use -vv to show
+E         Differing attributes:
+E         ['version', 'tomorrow_plan', 'item_ids']
+E         
+E         Drill down into differing attribute version:
+E           version: 1 != 0...
+E         
+E         ...Full output truncated (11 lines hidden), use '-vv' to show
+
+tests\test_agent2_historical_daily_context_acceptance.py:298: AssertionError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_formal_historical_replay_has_no_failed_acceptance_check" time="0.013"><failure message="AssertionError: assert {'case_count'...sed': 17, ...} == {'case_count'...sed': 29, ...}&#10;  &#10;  Omitting 4 identical items, use -vv to show&#10;  Differing items:&#10;  {'failed': 12} != {'failed': 0}&#10;  {'passed': 17} != {'passed': 29}&#10;  Use -v to get more diff">def test_formal_historical_replay_has_no_failed_acceptance_check():
+        replay = run_historical_daily_replay_sync(FIXTURE_PATH)
+    
+&gt;       assert replay["summary"] == {
+            "case_count": 2,
+            "turn_count": 17,
+            "acceptance_check_count": 30,
+            "passed": 29,
+            "failed": 0,
+            "not_scored": 1,
+        }
+E       AssertionError: assert {'case_count'...sed': 17, ...} == {'case_count'...sed': 29, ...}
+E         
+E         Omitting 4 identical items, use -vv to show
+E         Differing items:
+E         {'failed': 12} != {'failed': 0}
+E         {'passed': 17} != {'passed': 29}
+E         Use -v to get more diff
+
+tests\test_agent2_historical_daily_context_acceptance.py:307: AssertionError</failure></testcase><testcase classname="tests.test_agent2_historical_daily_context_acceptance" name="test_scheduler_reminder_is_outbound_only_and_does_not_touch_runtime_state" time="0.009" /></testsuite></testsuites>

@@ -895,7 +895,7 @@ async def _process_stream_agent2_daily_if_enabled(
         else None
     )
     if runtime_owner == "blocked":
-        reply_text = "Agent2 身份或租户路由不唯一，本次已阻断，未回退 Agent1，也未写入业务数据。"
+        reply_text = "当前账号或所属组织信息无法唯一确认，本次没有执行任何业务操作。"
         response_payload = {"msgtype": "text", "text": {"content": reply_text}}
         await mark_webhook_event_processed(
             session,
@@ -920,7 +920,7 @@ async def _process_stream_agent2_daily_if_enabled(
     if runtime_owner == "agent1":
         return None
     if phase2_primary and not cognitive_core_v3_enabled(settings):
-        reply_text = "Agent2 业务主路已启用，但 Cognitive Core 未启用。本次已阻断，未回退 Agent1，也未写入业务数据。"
+        reply_text = "当前服务暂时无法处理这条消息，本次没有执行任何业务操作。"
         response_payload = {"msgtype": "text", "text": {"content": reply_text}}
         await mark_webhook_event_processed(
             session,
@@ -1135,7 +1135,7 @@ async def _process_stream_agent2_daily_if_enabled(
             return f"agent2_{safe_reply.reply_kind}"
         except Exception:
             logger.exception("stream cognitive core v3 failed; write path is fail-closed")
-            reply_text = "这条消息暂时无法完成语义判断，本次没有写入日报，请稍后重试。"
+            reply_text = "这条消息暂时没有处理成功，本次没有修改任何业务内容，请稍后重试。"
             response_payload = {"msgtype": "text", "text": {"content": reply_text}}
             await mark_webhook_event_processed(
                 session,
@@ -1291,10 +1291,7 @@ async def _process_stream_agent2_daily_if_enabled(
                 ):
                     pass
                 elif phase2_primary:
-                    reply_text = (
-                        "这条消息未形成可执行的 Agent2 typed command，"
-                        "本次未写入，也未回退 Agent1。"
-                    )
+                    reply_text = "这条消息暂时无法形成明确可执行的操作，本次没有写入任何内容。"
                 else:
                     reply_text = await _agent2_blocked_reply_text(
                         shadow=shadow,

@@ -1,0 +1,132 @@
+{
+  "schema_version": "agent2-historical-replay-v1",
+  "source_status": "historical_pre_current_implementation",
+  "label_status": "acceptance_case",
+  "privacy": {
+    "actors": "aliased",
+    "business_text": "reviewer_supplied_regression_input"
+  },
+  "cases": [
+    {
+      "case_id": "historical-daily-collection-correction",
+      "actor_alias": "reviewer-a",
+      "initial_context": {
+        "daily_collection_active": true
+      },
+      "turns": [
+        {
+          "turn_id": "a-01",
+          "speaker": "user",
+          "text": "半年度绩效评估",
+          "acceptance": ["append_today_work"]
+        },
+        {
+          "turn_id": "a-02",
+          "speaker": "user",
+          "text": "梳理推进待办，并梳理参赛作品",
+          "acceptance": ["append_today_work"]
+        },
+        {
+          "turn_id": "a-03",
+          "speaker": "user",
+          "text": "梳理推进待办，并梳理参赛作品，这是明天的计划",
+          "acceptance": ["move_exact_item_to_tomorrow_plan", "preserve_other_sections"]
+        },
+        {
+          "turn_id": "a-04",
+          "speaker": "user",
+          "text": "梳理推进待办，并梳理参赛作品，这是明天的计划\n\n问题就是，来函界面被调整，问题没解决被压着上线",
+          "acceptance": ["tomorrow_plan_not_duplicated", "append_problem", "segment_level_outcome"]
+        },
+        {
+          "turn_id": "a-05",
+          "speaker": "user",
+          "text": "今日工作\n1. 半年度绩效评估\n问题与风险\n1. 来函界面被调整，问题没解决被压着上线，降低效率\n明日计划\n1. 梳理推进待办，并梳理参赛作品",
+          "acceptance": ["replace_all_three_sections", "three_typed_commands"]
+        },
+        {
+          "turn_id": "a-06",
+          "speaker": "system_event",
+          "event_type": "scheduler_daily_reminder",
+          "text": "daily reminder",
+          "acceptance": ["conversation_state_unchanged", "daily_snapshot_unchanged"]
+        },
+        {
+          "turn_id": "a-07",
+          "speaker": "user",
+          "text": "梳理推进待办，并梳理参赛作品，这是明天的计划",
+          "acceptance": ["no_false_success", "preserve_other_sections", "tomorrow_plan_not_duplicated"]
+        },
+        {
+          "turn_id": "a-08",
+          "speaker": "user",
+          "text": "哎",
+          "acceptance": ["no_daily_mutation"]
+        }
+      ]
+    },
+    {
+      "case_id": "historical-explicit-daily-entry",
+      "actor_alias": "reviewer-b",
+      "initial_context": {
+        "daily_collection_active": false
+      },
+      "turns": [
+        {
+          "turn_id": "b-01",
+          "speaker": "user",
+          "text": "半年度绩效评估",
+          "acceptance": ["not_scored_before_daily_entry"]
+        },
+        {
+          "turn_id": "b-02",
+          "speaker": "user",
+          "text": "不",
+          "acceptance": ["no_daily_mutation"]
+        },
+        {
+          "turn_id": "b-03",
+          "speaker": "user",
+          "text": "我写今天日报",
+          "acceptance": ["enter_daily_context", "no_daily_mutation"]
+        },
+        {
+          "turn_id": "b-04",
+          "speaker": "user",
+          "text": "半年度绩效评估",
+          "acceptance": ["append_today_work", "no_internal_qa_takeover"]
+        },
+        {
+          "turn_id": "b-05",
+          "speaker": "user",
+          "text": "今日工作：半年度绩效评估",
+          "acceptance": ["stable_typed_command", "idempotent_daily_content"]
+        },
+        {
+          "turn_id": "b-06",
+          "speaker": "user",
+          "text": "今日工作是完成了半年度绩效评估",
+          "acceptance": ["stable_typed_command"]
+        },
+        {
+          "turn_id": "b-07",
+          "speaker": "user",
+          "text": "今日工作审核了合同",
+          "acceptance": ["stable_typed_command"]
+        },
+        {
+          "turn_id": "b-08",
+          "speaker": "user",
+          "text": "进入日报",
+          "acceptance": ["enter_daily_context", "no_daily_mutation"]
+        },
+        {
+          "turn_id": "b-09",
+          "speaker": "user",
+          "text": "今天审核了合同",
+          "acceptance": ["stable_typed_command", "preserve_existing_daily_content", "no_internal_qa_takeover"]
+        }
+      ]
+    }
+  ]
+}

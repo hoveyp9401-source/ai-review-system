@@ -258,14 +258,14 @@ async def _submit_manual_agent2_if_applicable(
         return _manual_route_blocked_response(
             existing,
             target_report_date,
-            message="Agent2 身份或租户路由不唯一，本次已阻断，未写入业务数据。",
+            message="当前账号或所属组织信息无法唯一确认，本次没有执行任何业务操作。",
             reply_kind="agent2_entrypoint_blocked",
         )
     if phase2_primary and not cognitive_core_v3_enabled(settings):
         return _manual_route_blocked_response(
             existing,
             target_report_date,
-            message="Agent2 主路由已启用，但认知核心未启用；本次已阻断，未写入业务数据。",
+            message="当前服务暂时无法处理这条消息，本次没有执行任何业务操作。",
             reply_kind="agent2_cognitive_core_disabled",
         )
     if cognitive_core_v3_enabled(settings):

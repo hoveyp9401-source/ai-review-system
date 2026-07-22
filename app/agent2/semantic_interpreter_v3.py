@@ -25,6 +25,10 @@ from app.agent2.oracle_guard import assert_no_oracle_fields
 from app.agent2.report_document_contract import (
     StructuredDailyDocument,
     StructuredReportItem,
+    complete_daily_document_replace_semantic_payload,
+    daily_compound_section_correction_semantic_payload,
+    daily_item_section_correction_semantic_payload,
+    daily_section_cue_semantic_payload,
     parse_structured_daily_document,
     structured_daily_semantic_payload,
 )
@@ -57,6 +61,12 @@ class LLMCognitiveSemanticInterpreter:
             legacy_semantic_enforcers_enabled
         )
         self._prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
+        self._used_sources: dict[str, str] = {}
+
+    def source_for(self, message_id: str) -> str:
+        """Expose the semantic path for deterministic replay evidence."""
+
+        return self._used_sources.get(str(message_id or ""), "")
 
     def runtime_identity(self) -> dict[str, Any]:
         """Return non-secret execution configuration that affects semantics."""
@@ -81,12 +91,52 @@ class LLMCognitiveSemanticInterpreter:
             _conversation_state_oracle_guard_payload(state),
             path="conversation_state",
         )
+        structured_daily_document = parse_structured_daily_document(turn.text)
+        deterministic_payload = (
+            _report_meta_opening_semantic_payload(turn.text)
+            or daily_compound_section_correction_semantic_payload(
+                turn.text,
+                turn.resources,
+            )
+            or daily_item_section_correction_semantic_payload(
+                turn.text,
+                turn.resources,
+            )
+            or daily_section_cue_semantic_payload(turn.text, turn.resources)
+            or complete_daily_document_replace_semantic_payload(
+                turn.text,
+                turn.resources,
+                document=structured_daily_document,
+            )
+            or structured_daily_semantic_payload(turn.text)
+            or _active_daily_plain_content_semantic_payload(turn=turn, state=state)
+        )
+        structured_daily_requires_case_facet = bool(
+            structured_daily_document is not None
+            and not self._legacy_semantic_enforcers_enabled
+            and any(
+                discover_visible_case_references(
+                    item.value,
+                    turn.resources.get("visible_cases"),
+                )
+                for item in structured_daily_document.items
+            )
+        )
+        if (
+            deterministic_payload is not None
+            and not structured_daily_requires_case_facet
+        ):
+            self._used_sources[str(turn.message_id)] = "deterministic_contract"
+            interpretation = SemanticInterpretation.from_payload(deterministic_payload)
+            validate_semantic_interpretation_contract(interpretation)
+            _validate_turn_contract(turn, state, interpretation)
+            return interpretation
         base_prompt = _build_semantic_base_prompt(
             self._prompt_template,
             turn=turn,
             state=state,
         )
-        structured_daily_document = parse_structured_daily_document(turn.text)
+        self._used_sources[str(turn.message_id)] = "live_model"
         output = ""
         validation_error: ValueError | None = None
         for attempt in range(3):
@@ -138,6 +188,12 @@ class LLMCognitiveSemanticInterpreter:
                 interpretation = SemanticInterpretation.from_payload(candidate)
                 validate_semantic_interpretation_contract(interpretation)
                 _validate_turn_contract(turn, state, interpretation)
+                interpretation = _normalize_explicit_travel_runtime_attributes(
+                    interpretation,
+                    turn=turn,
+                )
+                validate_semantic_interpretation_contract(interpretation)
+                _validate_turn_contract(turn, state, interpretation)
                 if not self._legacy_semantic_enforcers_enabled:
                     if structured_daily_document is not None:
                         supplements = await self._reassess_structured_daily_case_items(
@@ -171,13 +227,12 @@ class LLMCognitiveSemanticInterpreter:
                             validate_semantic_interpretation_contract(merged)
                             _validate_turn_contract(turn, state, merged)
                             interpretation = merged
-                if not self._legacy_semantic_enforcers_enabled:
-                    interpretation = _project_case_travel_plan_to_daily_facet(
-                        interpretation,
-                        turn=turn,
-                    )
-                    validate_semantic_interpretation_contract(interpretation)
-                    _validate_turn_contract(turn, state, interpretation)
+                interpretation = _project_case_travel_plan_to_daily_facet(
+                    interpretation,
+                    turn=turn,
+                )
+                validate_semantic_interpretation_contract(interpretation)
+                _validate_turn_contract(turn, state, interpretation)
                 return interpretation
             except ValueError as exc:
                 validation_error = exc
@@ -653,11 +708,13 @@ def _project_case_travel_plan_to_daily_facet(
     *,
     turn: CognitiveTurn,
 ) -> SemanticInterpretation:
-    """Project one unique future Case trip into the report-plan candidate.
+    """Project one explicit future self trip into the report-plan candidate.
 
-    This consumes already structured Case and self-Travel facts.  It never
-    guesses a Case, destination, or date from raw keywords, and it still emits
-    only a semantic candidate for the normal Report admission/executor path.
+    Daily is an independent projection facet rather than an exclusive dialogue
+    domain.  A closed-form future Travel assertion may therefore contribute to
+    ``tomorrow_plan`` even when Daily is not the active conversation goal.  The
+    projection still emits only a semantic candidate for the normal Report
+    admission/executor path.
     """
 
     if interpretation.clarification_need is not None:
@@ -666,8 +723,7 @@ def _project_case_travel_plan_to_daily_facet(
         action.action_type for action in interpretation.required_actions
     }
     if (
-        "record_case_progress" not in action_types
-        or "record_travel_event" not in action_types
+        "record_travel_event" not in action_types
         or "capture_daily_event" in action_types
     ):
         return interpretation
@@ -677,49 +733,59 @@ def _project_case_travel_plan_to_daily_facet(
         for action in interpretation.required_actions
         if action.action_type == "record_travel_event"
     ]
-    case_actions = [
-        action
-        for action in interpretation.required_actions
-        if action.action_type == "record_case_progress"
-    ]
-    if len(travel_actions) != 1 or len(case_actions) != 1:
+    if len(travel_actions) != 1:
         return interpretation
     travel_action = travel_actions[0]
-    case_action = case_actions[0]
-    if len(travel_action.entity_ids) != 1 or len(case_action.entity_ids) != 1:
+    if len(travel_action.entity_ids) != 1:
         return interpretation
     travel_entity = entities_by_id.get(travel_action.entity_ids[0])
-    case_entity = entities_by_id.get(case_action.entity_ids[0])
+    extracted_travel = _extract_explicit_travel_event(turn.text)
+    trusted_model_assertion = bool(
+        travel_entity is not None
+        and str(travel_entity.attributes.get("statement_mode") or "") == "asserted"
+        and str(travel_entity.attributes.get("traveler_scope") or "") == "self"
+    )
     if (
         travel_entity is None
-        or case_entity is None
         or travel_entity.entity_type != "travel_event"
-        or case_entity.entity_type != "case_ref"
-        or str(travel_entity.attributes.get("statement_mode") or "") != "asserted"
-        or str(travel_entity.attributes.get("traveler_scope") or "") != "self"
-        or str(case_entity.attributes.get("report_preference") or "automatic")
-        == "case_only"
+        or (
+            extracted_travel is None
+            and not trusted_model_assertion
+        )
     ):
         return interpretation
     shared_segments = [
         segment
         for segment in interpretation.segments
         if travel_action.action_id in segment.action_ids
-        and case_action.action_id in segment.action_ids
         and segment.text in turn.text
     ]
     if len(shared_segments) != 1:
         return interpretation
     source_segment = shared_segments[0]
-    try:
-        travel_window = resolve_travel_window(
-            str(travel_entity.value or source_segment.text),
-            reference_date=turn.occurred_at.date(),
-        )
-    except ValueError:
-        return interpretation
-    if travel_window.start_date <= turn.occurred_at.date():
-        return interpretation
+    date_hint = str(
+        (extracted_travel or {}).get("date_hint")
+        or travel_entity.attributes.get("date_hint")
+        or ""
+    ).strip()
+    if date_hint not in {
+        "tomorrow",
+        "day_after_tomorrow",
+        "next_monday",
+        "明天",
+        "明日",
+        "后天",
+        "下周一",
+    }:
+        try:
+            travel_window = resolve_travel_window(
+                str(travel_entity.value or source_segment.text),
+                reference_date=turn.occurred_at.date(),
+            )
+        except ValueError:
+            return interpretation
+        if travel_window.start_date <= turn.occurred_at.date():
+            return interpretation
 
     supplemental = SemanticInterpretation.from_payload(
         {
@@ -740,7 +806,7 @@ def _project_case_travel_plan_to_daily_facet(
                     "entity_id": "case-travel-report-plan-event",
                     "entity_type": "daily_event",
                     "value": source_segment.text,
-                    "confidence": min(travel_entity.confidence, case_entity.confidence),
+                    "confidence": travel_entity.confidence,
                     "attributes": {"field": "tomorrow_plan"},
                 }
             ],
@@ -756,13 +822,61 @@ def _project_case_travel_plan_to_daily_facet(
             ],
             "clarification_need": None,
             "context_update": {
-                "current_goal": "case_progress",
+                "preserve_current_goal": True,
                 "remember_entity_ids": ["case-travel-report-plan-event"],
                 "remember_turn": True,
             },
         }
     )
     return _merge_independent_interpretations(interpretation, supplemental)
+
+
+def _normalize_explicit_travel_runtime_attributes(
+    interpretation: SemanticInterpretation,
+    *,
+    turn: CognitiveTurn,
+) -> SemanticInterpretation:
+    """Narrow a validated explicit trip to the closed Runtime attributes.
+
+    Schema-invalid model output must first take the existing repair path.  Only
+    after semantic validation succeeds may an exact source-text trip discard
+    descriptive provider metadata that the Runtime does not consume.
+    """
+
+    extracted = _extract_explicit_travel_event(turn.text)
+    if extracted is None:
+        return interpretation
+    travel_actions = [
+        action
+        for action in interpretation.required_actions
+        if action.action_type == "record_travel_event"
+    ]
+    if len(travel_actions) != 1 or len(travel_actions[0].entity_ids) != 1:
+        return interpretation
+    entity_id = travel_actions[0].entity_ids[0]
+    matching_entities = [
+        entity
+        for entity in interpretation.entities
+        if entity.entity_id == entity_id and entity.entity_type == "travel_event"
+    ]
+    if len(matching_entities) != 1:
+        return interpretation
+    permitted_keys = {"destination", "date_hint", "purpose"}
+    normalized_entities = tuple(
+        replace(
+            entity,
+            value=str(turn.text or "").strip(),
+            attributes={
+                key: value
+                for key, value in entity.attributes.items()
+                if key in permitted_keys
+            },
+        )
+        if entity.entity_id == entity_id
+        else entity
+        for entity in interpretation.entities
+    )
+    return replace(interpretation, entities=normalized_entities)
 
 
 def _merge_independent_interpretations(
@@ -2027,13 +2141,21 @@ def _enforce_report_meta_opening(payload: dict[str, Any], *, text: str) -> dict[
     }
 
 
+def _report_meta_opening_semantic_payload(text: str) -> dict[str, Any] | None:
+    """Establish an explicit report goal before a competing model intent."""
+
+    if report_type_from_meta_opening(text) is None:
+        return None
+    return _enforce_report_meta_opening({}, text=text)
+
+
 def is_daily_report_meta_opening(text: str) -> bool:
     return report_type_from_meta_opening(text) == "daily"
 
 
 def report_type_from_meta_opening(text: str) -> str | None:
     compact = re.sub(r"[\s，。！？、,.!?]", "", str(text or ""))
-    if not compact or len(compact) > 14:
+    if not compact or len(compact) > 18:
         return None
     for report_type, label in (
         ("daily", "日报"),
@@ -2043,11 +2165,162 @@ def report_type_from_meta_opening(text: str) -> str | None:
         if label not in compact:
             continue
         if re.fullmatch(
-            rf"(?:我)?(?:(?:要|想|准备|现在)?(?:填|写|开始填|开始写)(?:个)?|开始)?{label}(?:了|吧|呢|哈)?",
+            rf"(?:我)?(?:"
+            rf"(?:(?:要|想|准备|现在)?(?:填|写|开始填|开始写)"
+            rf"(?:今天|今日|本周|这周|本月|这个月)?(?:的)?(?:个)?)"
+            rf"|(?:进入|打开|切到|切换到|开始)"
+            rf")?{label}(?:了|吧|呢|哈)?",
             compact,
         ):
             return report_type
     return None
+
+
+def _active_daily_plain_content_semantic_payload(
+    *,
+    turn: CognitiveTurn,
+    state: ConversationState,
+) -> dict[str, Any] | None:
+    """Default a plain work statement to today only in trusted Daily context."""
+
+    if not _active_daily_collection_context(turn=turn, state=state):
+        return None
+    source = str(turn.text or "").strip()
+    if not _plain_daily_work_statement(source, resources=turn.resources):
+        return None
+    entity_id = "active-daily-plain-work"
+    action_id = "active-daily-capture-work"
+    return {
+        "intents": ["daily_append"],
+        "segments": [
+            {
+                "segment_id": "active-daily-plain-work-segment",
+                "text": source,
+                "intents": ["daily_append"],
+                "entity_ids": [entity_id],
+                "action_ids": [action_id],
+                "start_offset": 0,
+                "end_offset": len(source),
+            }
+        ],
+        "entities": [
+            {
+                "entity_id": entity_id,
+                "entity_type": "daily_event",
+                "value": source,
+                "confidence": 1.0,
+                "attributes": {"field": "today_work"},
+            }
+        ],
+        "confidence": 1.0,
+        "required_actions": [
+            {
+                "action_id": action_id,
+                "action_type": "capture_daily_event",
+                "intent": "daily_append",
+                "entity_ids": [entity_id],
+                "parameters": {},
+            }
+        ],
+        "clarification_need": None,
+        "context_update": {
+            "current_goal": "daily_report",
+            "remember_entity_ids": [entity_id],
+            "remember_turn": True,
+        },
+    }
+
+
+def _active_daily_collection_context(
+    *,
+    turn: CognitiveTurn,
+    state: ConversationState,
+) -> bool:
+    goal = str(getattr(state.current_goal, "intent", "") or "")
+    if goal in {"daily_report", "daily_append", "daily_modify"}:
+        return True
+    raw_tasks = turn.resources.get("active_tasks")
+    if not isinstance(raw_tasks, (list, tuple)):
+        return False
+    for raw_task in raw_tasks:
+        if not isinstance(raw_task, Mapping):
+            continue
+        task_kind = " ".join(
+            str(raw_task.get(key) or "").strip().lower()
+            for key in ("workflow", "task_type", "domain", "intent", "type")
+        )
+        status = str(raw_task.get("status") or "active").strip().lower()
+        if (
+            any(value in task_kind for value in ("daily_report", "daily", "日报"))
+            and status in {"active", "collecting", "in_progress", "pending"}
+        ):
+            return True
+    return False
+
+
+def _plain_daily_work_statement(
+    text: str,
+    *,
+    resources: Mapping[str, Any],
+) -> bool:
+    source = str(text or "").strip()
+    if len(source) < 2 or len(source) > 120 or "\n" in source:
+        return False
+    if report_type_from_meta_opening(source) is not None:
+        return False
+    if re.search(r"[?？]", source) or re.search(
+        r"(?:什么|为何|为什么|怎么|如何|哪里|哪个|谁|是否|能否|可否|请问|流程|时间安排)",
+        source,
+    ):
+        return False
+    if re.search(
+        r"(?:明天|明日|后天|下周|下月)"
+        r"|(?:没|没有|无)(?:其他|其它)?(?:问题|风险)",
+        source,
+    ):
+        return False
+    compact = re.sub(r"[\s，。！？、,.!?]", "", source)
+    if len(compact) < 2 or compact in {
+        "好的",
+        "好吧",
+        "可以",
+        "确认",
+        "取消",
+        "算了",
+        "不用了",
+        "谢谢",
+    }:
+        return False
+    if re.search(
+        r"(?:关闭|结案|撤销|查询|查看|查一下|更新).{0,12}(?:案件|案子|案号)"
+        r"|(?:案件|案子|案号).{0,12}(?:关闭|结案|撤销|查询|查看|进展)"
+        r"|(?:取消|修改|改期|新增|安排).{0,12}(?:出差|差旅)"
+        r"|(?:出差|差旅).{0,12}(?:取消|修改|改期|新增|安排)",
+        source,
+    ):
+        return False
+    if re.search(
+        r"(?:案件|案子|案号|法院|开庭|庭审|调解|判决|裁定|执行)"
+        r"|(?:出差|差旅|行程)"
+        r"|(?:周报|月报)",
+        source,
+    ):
+        return False
+    visible_cases = resources.get("visible_cases")
+    if isinstance(visible_cases, (list, tuple)):
+        for raw_case in visible_cases:
+            if not isinstance(raw_case, Mapping):
+                continue
+            labels = [
+                str(raw_case.get(key) or "").strip()
+                for key in ("case_name", "case_number", "external_case_id")
+            ]
+            aliases = raw_case.get("confirmed_aliases")
+            if isinstance(aliases, (list, tuple)):
+                labels.extend(str(value or "").strip() for value in aliases)
+            if any(label and label in source for label in labels):
+                return False
+    return True
 
 
 def _enforce_report_task_exit(

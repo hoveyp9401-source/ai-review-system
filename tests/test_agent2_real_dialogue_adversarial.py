@@ -204,9 +204,12 @@ async def test_explicit_future_travel_phrasings_cannot_degrade_to_chat(
 
     actions = [action.action_type for action in decision.required_actions]
     travel = next(entity for entity in decision.entities if entity.entity_type == "travel_event")
-    assert actions == ["record_travel_event"]
+    daily = next(entity for entity in decision.entities if entity.entity_type == "daily_event")
+    assert actions == ["record_travel_event", "capture_daily_event"]
     assert travel.attributes["destination"] == destination
     assert travel.attributes["date_hint"] == date_hint
+    assert daily.value == text
+    assert daily.attributes == {"field": "tomorrow_plan"}
 
 
 @pytest.mark.asyncio

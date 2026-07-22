@@ -1,0 +1,1116 @@
+{
+  "acceptance_failed": 1,
+  "acceptance_passed": 5,
+  "case_count": 2,
+  "client_max_retries": 2,
+  "client_timeout_seconds": 30.0,
+  "execution_mode": "offline_in_memory_no_business_side_effects",
+  "external_business_side_effects": 0,
+  "failed_runs": 0,
+  "generated_at": "2026-07-22T02:14:19.759400+00:00",
+  "model": "deepseek-v4-pro",
+  "model_call_count": 6,
+  "repetitions": 3,
+  "results": [
+    {
+      "acceptance": "PASS",
+      "after_snapshot": {
+        "item_ids": {
+          "problems": [],
+          "today_work": [],
+          "tomorrow_plan": [
+            "di_a954b62e4605ee44"
+          ]
+        },
+        "owner_user_id": "89d61dc1-681d-5fb7-9c42-996117766db0",
+        "problems": [],
+        "report_id": "207b19f1-3b7c-599f-a251-ff16ca9c773c",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [
+          "明天去上海出差"
+        ],
+        "version": 1
+      },
+      "before_snapshot": {
+        "item_ids": {},
+        "owner_user_id": "89d61dc1-681d-5fb7-9c42-996117766db0",
+        "problems": [],
+        "report_id": "207b19f1-3b7c-599f-a251-ff16ca9c773c",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [],
+        "version": 0
+      },
+      "case_id": "active-daily-travel-switch",
+      "clarification": null,
+      "elapsed_ms": 27241.878,
+      "expected": "travel_event_with_required_tomorrow_plan",
+      "input": "明天去上海出差",
+      "model_calls": [
+        {
+          "elapsed_ms": 27236.948,
+          "model": "deepseek-v4-pro",
+          "raw_output": "{\n  \"intents\": [\"travel_event\"],\n  \"segments\": [\n    {\n      \"segment_id\": \"seg-1\",\n      \"text\": \"明天去上海出差\",\n      \"intents\": [\"travel_event\"],\n      \"entity_ids\": [\"travel-1\"],\n      \"action_ids\": [\"action-1\"]\n    }\n  ],\n  \"entities\": [\n    {\n      \"entity_id\": \"travel-1\",\n      \"entity_type\": \"travel_event\",\n      \"value\": \"明天去上海出差\",\n      \"confidence\": 1.0,\n      \"attributes\": {\n        \"destination\": \"上海\",\n        \"date_hint\": \"明天\",\n        \"purpose\": \"出差\",\n        \"statement_mode\": \"asserted\",\n        \"traveler_scope\": \"self\",\n        \"evidence_spans\": [[0, 7]]\n      }\n    }\n  ],\n  \"confidence\": 1.0,\n  \"required_actions\": [\n    {\n      \"action_id\": \"action-1\",\n      \"action_type\": \"record_travel_event\",\n      \"intent\": \"travel_event\",\n      \"entity_ids\": [\"travel-1\"],\n      \"parameters\": {}\n    }\n  ],\n  \"clarification_need\": null,\n  \"context_update\": {\n    \"current_goal\": \"travel_event\"\n  }\n}",
+          "system_prompt_sha256": "0fe769b72625097f917b7171dba01c3161f0b4b2a792d035a2301bee768a5ad7",
+          "thinking_enabled": true,
+          "user_prompt_sha256": "d0557d7fb429481cb8d03188e87e34ee3a3728870730f3638e59af66a2a7a6d5"
+        }
+      ],
+      "repetition": 1,
+      "safe_write": true,
+      "semantic_decision": {
+        "admission_deferred_events": [],
+        "admission_information_pendings": [],
+        "admission_mode": "disabled",
+        "admission_review_items": [],
+        "admission_selection_requests": [],
+        "admission_tickets": [],
+        "admission_trace": null,
+        "clarification_need": null,
+        "confidence": 1.0,
+        "context_update": {
+          "clear_current_goal": false,
+          "current_goal": "travel_event",
+          "preserve_current_goal": false,
+          "remember_entity_ids": [
+            "case-travel-report-plan-event"
+          ],
+          "remember_turn": true,
+          "resume_previous_goal": false
+        },
+        "contract_version": "cognitive_core.v3",
+        "decision_id": "6f6ae18e-0f39-582e-a7f9-88605d8055c1",
+        "entities": [
+          {
+            "attributes": {
+              "date_hint": "tomorrow",
+              "destination": "上海",
+              "purpose": "出差"
+            },
+            "confidence": 1.0,
+            "entity_id": "travel-1",
+            "entity_type": "travel_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          },
+          {
+            "attributes": {
+              "field": "tomorrow_plan"
+            },
+            "confidence": 1.0,
+            "entity_id": "case-travel-report-plan-event",
+            "entity_type": "daily_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          }
+        ],
+        "intents": [
+          "travel_event",
+          "daily_append"
+        ],
+        "required_actions": [
+          {
+            "action_id": "action-1",
+            "action_type": "record_travel_event",
+            "entity_ids": [
+              "travel-1"
+            ],
+            "intent": "travel_event",
+            "parameters": {}
+          },
+          {
+            "action_id": "capture-case-travel-report-plan",
+            "action_type": "capture_daily_event",
+            "entity_ids": [
+              "case-travel-report-plan-event"
+            ],
+            "intent": "daily_append",
+            "parameters": {}
+          }
+        ],
+        "segments": [
+          {
+            "action_ids": [
+              "action-1",
+              "capture-case-travel-report-plan"
+            ],
+            "end_offset": -1,
+            "entity_ids": [
+              "travel-1",
+              "case-travel-report-plan-event"
+            ],
+            "intents": [
+              "travel_event",
+              "daily_append"
+            ],
+            "segment_id": "seg-1",
+            "start_offset": -1,
+            "text": "明天去上海出差",
+            "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+          }
+        ],
+        "source_text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+      },
+      "semantic_source": "live_model",
+      "status": "completed",
+      "typed_command": {
+        "blocked_actions": [],
+        "business_commands": [
+          {
+            "command_id": "c41aa52a-fa96-5227-ad53-4649eb6f3d97",
+            "command_type": "record_travel_candidate",
+            "decision_id": "6f6ae18e-0f39-582e-a7f9-88605d8055c1",
+            "entity_ids": [
+              "travel-1"
+            ],
+            "execution_mode": "candidate",
+            "idempotency_key": "454e1b01b45e21fd9f28850f9fb1a11adca7a7bc48a6a7e441aebfe03a0f5188",
+            "payload": {
+              "entities": [
+                {
+                  "attributes": {
+                    "date_hint": "tomorrow",
+                    "destination": "上海",
+                    "purpose": "出差"
+                  },
+                  "confidence": 1.0,
+                  "entity_id": "travel-1",
+                  "entity_type": "travel_event",
+                  "value": "明天去上海出差"
+                }
+              ],
+              "parameters": {},
+              "source_segments": [
+                {
+                  "end_offset": -1,
+                  "segment_id": "seg-1",
+                  "start_offset": -1,
+                  "text": "明天去上海出差",
+                  "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+                }
+              ]
+            },
+            "sub_decision_id": "c369dd8e-c4d4-50ba-b489-ee31b0390a5c",
+            "target_system": "travel_coordination"
+          }
+        ],
+        "daily_commands": [
+          {
+            "command_id": "ecda1912-cfe2-5df2-814e-d549f9798a9a",
+            "command_type": "append_item",
+            "decision_id": "6f6ae18e-0f39-582e-a7f9-88605d8055c1",
+            "idempotency_key": "active-daily-travel-switch-target-1:daily:1b015da3ce378a9eb6eaf4bcfb3f525dbaf82b6433665ff9674304bb853cf671",
+            "patch": {
+              "field": "tomorrow_plan",
+              "items": [
+                "明天去上海出差"
+              ]
+            },
+            "report_id": "207b19f1-3b7c-599f-a251-ff16ca9c773c",
+            "report_version": 0,
+            "sub_decision_id": "b221fc91-1bc0-5289-b2ae-e44b81b56e95",
+            "target_item_ids": []
+          }
+        ],
+        "decision_id": "6f6ae18e-0f39-582e-a7f9-88605d8055c1",
+        "report_commands": []
+      },
+      "user_reply": {
+        "reply_type": "partial",
+        "text": "日报命令已在 Runtime 模拟执行。\n\ntravel 能力尚未接入 Phase 1 Runtime，本次未执行。"
+      }
+    },
+    {
+      "acceptance": "PASS",
+      "after_snapshot": {
+        "item_ids": {
+          "problems": [],
+          "today_work": [],
+          "tomorrow_plan": [
+            "di_e1f4dfc99511ef23"
+          ]
+        },
+        "owner_user_id": "70483c6b-a3db-5334-8038-04d3cd582695",
+        "problems": [],
+        "report_id": "c197a95f-0032-5349-a3d1-a4adc0d048ce",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [
+          "明天去上海出差"
+        ],
+        "version": 1
+      },
+      "before_snapshot": {
+        "item_ids": {},
+        "owner_user_id": "70483c6b-a3db-5334-8038-04d3cd582695",
+        "problems": [],
+        "report_id": "c197a95f-0032-5349-a3d1-a4adc0d048ce",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [],
+        "version": 0
+      },
+      "case_id": "no-active-daily-future-travel-projection",
+      "clarification": null,
+      "elapsed_ms": 18575.024,
+      "expected": "travel_event_with_required_tomorrow_plan",
+      "input": "明天去上海出差",
+      "model_calls": [
+        {
+          "elapsed_ms": 18573.593,
+          "model": "deepseek-v4-pro",
+          "raw_output": "{\n  \"intents\": [\"travel_event\"],\n  \"segments\": [\n    {\n      \"segment_id\": \"seg-1\",\n      \"text\": \"明天去上海出差\",\n      \"intents\": [\"travel_event\"],\n      \"entity_ids\": [\"travel-1\"],\n      \"action_ids\": [\"act-travel-1\"]\n    }\n  ],\n  \"entities\": [\n    {\n      \"entity_id\": \"travel-1\",\n      \"entity_type\": \"travel_event\",\n      \"value\": \"明天去上海出差\",\n      \"confidence\": 1.0,\n      \"attributes\": {\n        \"destination\": \"上海\",\n        \"date_hint\": \"明天\",\n        \"purpose\": \"出差\",\n        \"statement_mode\": \"asserted\",\n        \"traveler_scope\": \"self\",\n        \"evidence_spans\": [[0, 7]]\n      }\n    }\n  ],\n  \"confidence\": 0.95,\n  \"required_actions\": [\n    {\n      \"action_id\": \"act-travel-1\",\n      \"action_type\": \"record_travel_event\",\n      \"intent\": \"travel_event\",\n      \"entity_ids\": [\"travel-1\"],\n      \"parameters\": {}\n    }\n  ],\n  \"clarification_need\": null,\n  \"context_update\": {}\n}",
+          "system_prompt_sha256": "0fe769b72625097f917b7171dba01c3161f0b4b2a792d035a2301bee768a5ad7",
+          "thinking_enabled": true,
+          "user_prompt_sha256": "967cd043fcb747348ed250879f8cd4b520272278d2b4904e537af885e5ee5d0f"
+        }
+      ],
+      "repetition": 1,
+      "safe_write": true,
+      "semantic_decision": {
+        "admission_deferred_events": [],
+        "admission_information_pendings": [],
+        "admission_mode": "disabled",
+        "admission_review_items": [],
+        "admission_selection_requests": [],
+        "admission_tickets": [],
+        "admission_trace": null,
+        "clarification_need": null,
+        "confidence": 0.95,
+        "context_update": {
+          "clear_current_goal": false,
+          "current_goal": "travel_event",
+          "preserve_current_goal": false,
+          "remember_entity_ids": [
+            "case-travel-report-plan-event"
+          ],
+          "remember_turn": true,
+          "resume_previous_goal": false
+        },
+        "contract_version": "cognitive_core.v3",
+        "decision_id": "a23e3ef5-cc01-51b0-823e-53c3e55130a7",
+        "entities": [
+          {
+            "attributes": {
+              "date_hint": "tomorrow",
+              "destination": "上海",
+              "purpose": "出差"
+            },
+            "confidence": 1.0,
+            "entity_id": "travel-1",
+            "entity_type": "travel_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          },
+          {
+            "attributes": {
+              "field": "tomorrow_plan"
+            },
+            "confidence": 1.0,
+            "entity_id": "case-travel-report-plan-event",
+            "entity_type": "daily_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          }
+        ],
+        "intents": [
+          "travel_event",
+          "daily_append"
+        ],
+        "required_actions": [
+          {
+            "action_id": "act-travel-1",
+            "action_type": "record_travel_event",
+            "entity_ids": [
+              "travel-1"
+            ],
+            "intent": "travel_event",
+            "parameters": {}
+          },
+          {
+            "action_id": "capture-case-travel-report-plan",
+            "action_type": "capture_daily_event",
+            "entity_ids": [
+              "case-travel-report-plan-event"
+            ],
+            "intent": "daily_append",
+            "parameters": {}
+          }
+        ],
+        "segments": [
+          {
+            "action_ids": [
+              "act-travel-1",
+              "capture-case-travel-report-plan"
+            ],
+            "end_offset": -1,
+            "entity_ids": [
+              "travel-1",
+              "case-travel-report-plan-event"
+            ],
+            "intents": [
+              "travel_event",
+              "daily_append"
+            ],
+            "segment_id": "seg-1",
+            "start_offset": -1,
+            "text": "明天去上海出差",
+            "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+          }
+        ],
+        "source_text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+      },
+      "semantic_source": "live_model",
+      "status": "completed",
+      "typed_command": {
+        "blocked_actions": [],
+        "business_commands": [
+          {
+            "command_id": "c5381006-a908-5114-be20-2ed4f19ee710",
+            "command_type": "record_travel_candidate",
+            "decision_id": "a23e3ef5-cc01-51b0-823e-53c3e55130a7",
+            "entity_ids": [
+              "travel-1"
+            ],
+            "execution_mode": "candidate",
+            "idempotency_key": "57f3b5dedf7660fcb419c9ee55f466f7070c9512f82a1f258775ccf711635847",
+            "payload": {
+              "entities": [
+                {
+                  "attributes": {
+                    "date_hint": "tomorrow",
+                    "destination": "上海",
+                    "purpose": "出差"
+                  },
+                  "confidence": 1.0,
+                  "entity_id": "travel-1",
+                  "entity_type": "travel_event",
+                  "value": "明天去上海出差"
+                }
+              ],
+              "parameters": {},
+              "source_segments": [
+                {
+                  "end_offset": -1,
+                  "segment_id": "seg-1",
+                  "start_offset": -1,
+                  "text": "明天去上海出差",
+                  "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+                }
+              ]
+            },
+            "sub_decision_id": "967cc343-04ab-588d-a0ae-f032f183929a",
+            "target_system": "travel_coordination"
+          }
+        ],
+        "daily_commands": [
+          {
+            "command_id": "c9dab63f-5419-5149-93d7-6301cacd0cdd",
+            "command_type": "append_item",
+            "decision_id": "a23e3ef5-cc01-51b0-823e-53c3e55130a7",
+            "idempotency_key": "no-active-daily-future-travel-projection-target-1:daily:7abadbb4de1c79b5a57bce24026d4edf549b7aa78de6c0d96b4e1d5d3c9bf68a",
+            "patch": {
+              "field": "tomorrow_plan",
+              "items": [
+                "明天去上海出差"
+              ]
+            },
+            "report_id": "c197a95f-0032-5349-a3d1-a4adc0d048ce",
+            "report_version": 0,
+            "sub_decision_id": "af059403-daef-5d0a-823e-eecc6dd180b8",
+            "target_item_ids": []
+          }
+        ],
+        "decision_id": "a23e3ef5-cc01-51b0-823e-53c3e55130a7",
+        "report_commands": []
+      },
+      "user_reply": {
+        "reply_type": "partial",
+        "text": "日报命令已在 Runtime 模拟执行。\n\ntravel 能力尚未接入 Phase 1 Runtime，本次未执行。"
+      }
+    },
+    {
+      "acceptance": "FAIL",
+      "after_snapshot": {
+        "item_ids": {},
+        "owner_user_id": "021ea66f-b17f-5292-afda-fa7ed2979797",
+        "problems": [],
+        "report_id": "3f584a8f-3817-5bd7-91f5-31bbab86e5bc",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [],
+        "version": 0
+      },
+      "before_snapshot": {
+        "item_ids": {},
+        "owner_user_id": "021ea66f-b17f-5292-afda-fa7ed2979797",
+        "problems": [],
+        "report_id": "3f584a8f-3817-5bd7-91f5-31bbab86e5bc",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [],
+        "version": 0
+      },
+      "case_id": "active-daily-travel-switch",
+      "clarification": null,
+      "elapsed_ms": 96812.535,
+      "expected": "travel_event_with_required_tomorrow_plan",
+      "input": "明天去上海出差",
+      "model_calls": [
+        {
+          "elapsed_ms": 96812.158,
+          "error": "LLM request timed out after 30.0s",
+          "error_type": "LLMTimeoutError",
+          "model": "deepseek-v4-pro",
+          "system_prompt_sha256": "0fe769b72625097f917b7171dba01c3161f0b4b2a792d035a2301bee768a5ad7",
+          "thinking_enabled": true,
+          "user_prompt_sha256": "cf8ac1b0656b3cf4966fec691a32bc118982479f6cc7eef92f889dabc61cd982"
+        }
+      ],
+      "repetition": 2,
+      "safe_write": false,
+      "semantic_decision": null,
+      "semantic_source": "live_model",
+      "status": "completed",
+      "typed_command": null,
+      "user_reply": {
+        "reply_type": "failure",
+        "text": "Runtime 未通过安全校验，本次没有执行业务写入。"
+      }
+    },
+    {
+      "acceptance": "PASS",
+      "after_snapshot": {
+        "item_ids": {
+          "problems": [],
+          "today_work": [],
+          "tomorrow_plan": [
+            "di_b2281d1600566531"
+          ]
+        },
+        "owner_user_id": "7fae7bdd-46cb-55e0-af1d-b290b6154b14",
+        "problems": [],
+        "report_id": "fe2dacbf-e903-5e42-bb7b-4f8351c8380a",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [
+          "明天去上海出差"
+        ],
+        "version": 1
+      },
+      "before_snapshot": {
+        "item_ids": {},
+        "owner_user_id": "7fae7bdd-46cb-55e0-af1d-b290b6154b14",
+        "problems": [],
+        "report_id": "fe2dacbf-e903-5e42-bb7b-4f8351c8380a",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [],
+        "version": 0
+      },
+      "case_id": "no-active-daily-future-travel-projection",
+      "clarification": null,
+      "elapsed_ms": 20991.576,
+      "expected": "travel_event_with_required_tomorrow_plan",
+      "input": "明天去上海出差",
+      "model_calls": [
+        {
+          "elapsed_ms": 20990.737,
+          "model": "deepseek-v4-pro",
+          "raw_output": "{\n  \"intents\": [\"travel_event\"],\n  \"segments\": [\n    {\n      \"segment_id\": \"seg-1\",\n      \"text\": \"明天去上海出差\",\n      \"intents\": [\"travel_event\"],\n      \"entity_ids\": [\"travel-1\"],\n      \"action_ids\": [\"act-1\"]\n    }\n  ],\n  \"entities\": [\n    {\n      \"entity_id\": \"travel-1\",\n      \"entity_type\": \"travel_event\",\n      \"value\": \"明天去上海出差\",\n      \"confidence\": 1.0,\n      \"attributes\": {\n        \"destination\": \"上海\",\n        \"date_hint\": \"明天\",\n        \"purpose\": \"出差\",\n        \"statement_mode\": \"asserted\",\n        \"traveler_scope\": \"self\",\n        \"evidence_spans\": [[0,7]]\n      }\n    }\n  ],\n  \"confidence\": 1.0,\n  \"required_actions\": [\n    {\n      \"action_id\": \"act-1\",\n      \"action_type\": \"record_travel_event\",\n      \"intent\": \"travel_event\",\n      \"entity_ids\": [\"travel-1\"]\n    }\n  ],\n  \"clarification_need\": null,\n  \"context_update\": {\n    \"current_goal\": \"travel_event\"\n  }\n}",
+          "system_prompt_sha256": "0fe769b72625097f917b7171dba01c3161f0b4b2a792d035a2301bee768a5ad7",
+          "thinking_enabled": true,
+          "user_prompt_sha256": "8ba4af7948f0f37eb57b435c3121cd661ae2857c2bc9e18faf9ff13dd950834c"
+        }
+      ],
+      "repetition": 2,
+      "safe_write": true,
+      "semantic_decision": {
+        "admission_deferred_events": [],
+        "admission_information_pendings": [],
+        "admission_mode": "disabled",
+        "admission_review_items": [],
+        "admission_selection_requests": [],
+        "admission_tickets": [],
+        "admission_trace": null,
+        "clarification_need": null,
+        "confidence": 1.0,
+        "context_update": {
+          "clear_current_goal": false,
+          "current_goal": "travel_event",
+          "preserve_current_goal": false,
+          "remember_entity_ids": [
+            "case-travel-report-plan-event"
+          ],
+          "remember_turn": true,
+          "resume_previous_goal": false
+        },
+        "contract_version": "cognitive_core.v3",
+        "decision_id": "420d0d10-dd8f-5eb6-8993-349dea2d06e1",
+        "entities": [
+          {
+            "attributes": {
+              "date_hint": "tomorrow",
+              "destination": "上海",
+              "purpose": "出差"
+            },
+            "confidence": 1.0,
+            "entity_id": "travel-1",
+            "entity_type": "travel_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          },
+          {
+            "attributes": {
+              "field": "tomorrow_plan"
+            },
+            "confidence": 1.0,
+            "entity_id": "case-travel-report-plan-event",
+            "entity_type": "daily_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          }
+        ],
+        "intents": [
+          "travel_event",
+          "daily_append"
+        ],
+        "required_actions": [
+          {
+            "action_id": "act-1",
+            "action_type": "record_travel_event",
+            "entity_ids": [
+              "travel-1"
+            ],
+            "intent": "travel_event",
+            "parameters": {}
+          },
+          {
+            "action_id": "capture-case-travel-report-plan",
+            "action_type": "capture_daily_event",
+            "entity_ids": [
+              "case-travel-report-plan-event"
+            ],
+            "intent": "daily_append",
+            "parameters": {}
+          }
+        ],
+        "segments": [
+          {
+            "action_ids": [
+              "act-1",
+              "capture-case-travel-report-plan"
+            ],
+            "end_offset": -1,
+            "entity_ids": [
+              "travel-1",
+              "case-travel-report-plan-event"
+            ],
+            "intents": [
+              "travel_event",
+              "daily_append"
+            ],
+            "segment_id": "seg-1",
+            "start_offset": -1,
+            "text": "明天去上海出差",
+            "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+          }
+        ],
+        "source_text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+      },
+      "semantic_source": "live_model",
+      "status": "completed",
+      "typed_command": {
+        "blocked_actions": [],
+        "business_commands": [
+          {
+            "command_id": "dd19b477-84c5-5723-8f20-2b873116c748",
+            "command_type": "record_travel_candidate",
+            "decision_id": "420d0d10-dd8f-5eb6-8993-349dea2d06e1",
+            "entity_ids": [
+              "travel-1"
+            ],
+            "execution_mode": "candidate",
+            "idempotency_key": "a720ab83053fed7ef3be1c9c9adf74c225c70517052052ae64038dcc3ba1f701",
+            "payload": {
+              "entities": [
+                {
+                  "attributes": {
+                    "date_hint": "tomorrow",
+                    "destination": "上海",
+                    "purpose": "出差"
+                  },
+                  "confidence": 1.0,
+                  "entity_id": "travel-1",
+                  "entity_type": "travel_event",
+                  "value": "明天去上海出差"
+                }
+              ],
+              "parameters": {},
+              "source_segments": [
+                {
+                  "end_offset": -1,
+                  "segment_id": "seg-1",
+                  "start_offset": -1,
+                  "text": "明天去上海出差",
+                  "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+                }
+              ]
+            },
+            "sub_decision_id": "edd02cb3-3f13-5483-88dc-dfbfa50c156a",
+            "target_system": "travel_coordination"
+          }
+        ],
+        "daily_commands": [
+          {
+            "command_id": "2fa8a08b-9eb7-553e-9dd2-2e2ed6c6f8a8",
+            "command_type": "append_item",
+            "decision_id": "420d0d10-dd8f-5eb6-8993-349dea2d06e1",
+            "idempotency_key": "no-active-daily-future-travel-projection-target-2:daily:8434e9cb057d3d7fb2b5f4dc9cdf38512002a73c0917649f62dbc257dbfceada",
+            "patch": {
+              "field": "tomorrow_plan",
+              "items": [
+                "明天去上海出差"
+              ]
+            },
+            "report_id": "fe2dacbf-e903-5e42-bb7b-4f8351c8380a",
+            "report_version": 0,
+            "sub_decision_id": "f9afed26-f7de-54d6-87f8-ed3a6e81e350",
+            "target_item_ids": []
+          }
+        ],
+        "decision_id": "420d0d10-dd8f-5eb6-8993-349dea2d06e1",
+        "report_commands": []
+      },
+      "user_reply": {
+        "reply_type": "partial",
+        "text": "日报命令已在 Runtime 模拟执行。\n\ntravel 能力尚未接入 Phase 1 Runtime，本次未执行。"
+      }
+    },
+    {
+      "acceptance": "PASS",
+      "after_snapshot": {
+        "item_ids": {
+          "problems": [],
+          "today_work": [],
+          "tomorrow_plan": [
+            "di_29bd636c8b9f4e6d"
+          ]
+        },
+        "owner_user_id": "41e56267-5abe-5933-a768-3f963071c676",
+        "problems": [],
+        "report_id": "8eb08614-ffb6-5b19-856c-e8578a54fd19",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [
+          "去上海出差"
+        ],
+        "version": 1
+      },
+      "before_snapshot": {
+        "item_ids": {},
+        "owner_user_id": "41e56267-5abe-5933-a768-3f963071c676",
+        "problems": [],
+        "report_id": "8eb08614-ffb6-5b19-856c-e8578a54fd19",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [],
+        "version": 0
+      },
+      "case_id": "active-daily-travel-switch",
+      "clarification": null,
+      "elapsed_ms": 22934.774,
+      "expected": "travel_event_with_required_tomorrow_plan",
+      "input": "明天去上海出差",
+      "model_calls": [
+        {
+          "elapsed_ms": 22933.944,
+          "model": "deepseek-v4-pro",
+          "raw_output": "{\n  \"intents\": [\"daily_append\"],\n  \"segments\": [\n    {\n      \"segment_id\": \"seg-1\",\n      \"text\": \"明天去上海出差\",\n      \"intents\": [\"daily_append\"],\n      \"entity_ids\": [\"daily-event-1\"],\n      \"action_ids\": [\"action-1\"]\n    }\n  ],\n  \"entities\": [\n    {\n      \"entity_id\": \"daily-event-1\",\n      \"entity_type\": \"daily_event\",\n      \"value\": \"去上海出差\",\n      \"confidence\": 1.0,\n      \"attributes\": {\n        \"field\": \"tomorrow_plan\"\n      }\n    }\n  ],\n  \"confidence\": 1.0,\n  \"required_actions\": [\n    {\n      \"action_id\": \"action-1\",\n      \"action_type\": \"capture_daily_event\",\n      \"intent\": \"daily_append\",\n      \"entity_ids\": [\"daily-event-1\"],\n      \"parameters\": {}\n    }\n  ],\n  \"clarification_need\": null,\n  \"context_update\": {\n    \"preserve_current_goal\": true\n  }\n}",
+          "system_prompt_sha256": "0fe769b72625097f917b7171dba01c3161f0b4b2a792d035a2301bee768a5ad7",
+          "thinking_enabled": true,
+          "user_prompt_sha256": "d6ca8d2d6051c079e61f95867287d926f16213eb917f7847976375e57e3a28ed"
+        }
+      ],
+      "repetition": 3,
+      "safe_write": true,
+      "semantic_decision": {
+        "admission_deferred_events": [],
+        "admission_information_pendings": [],
+        "admission_mode": "disabled",
+        "admission_review_items": [],
+        "admission_selection_requests": [],
+        "admission_tickets": [],
+        "admission_trace": null,
+        "clarification_need": null,
+        "confidence": 1.0,
+        "context_update": {
+          "clear_current_goal": false,
+          "current_goal": "",
+          "preserve_current_goal": true,
+          "remember_entity_ids": [
+            "contract-explicit-travel-event"
+          ],
+          "remember_turn": true,
+          "resume_previous_goal": false
+        },
+        "contract_version": "cognitive_core.v3",
+        "decision_id": "0a31d6f1-99d7-5162-b173-2890e6b88cdd",
+        "entities": [
+          {
+            "attributes": {
+              "field": "tomorrow_plan"
+            },
+            "confidence": 1.0,
+            "entity_id": "daily-event-1",
+            "entity_type": "daily_event",
+            "source_context_id": "",
+            "value": "去上海出差"
+          },
+          {
+            "attributes": {
+              "date_hint": "tomorrow",
+              "destination": "上海",
+              "purpose": "出差"
+            },
+            "confidence": 1.0,
+            "entity_id": "contract-explicit-travel-event",
+            "entity_type": "travel_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          }
+        ],
+        "intents": [
+          "daily_append",
+          "travel_event"
+        ],
+        "required_actions": [
+          {
+            "action_id": "action-1",
+            "action_type": "capture_daily_event",
+            "entity_ids": [
+              "daily-event-1"
+            ],
+            "intent": "daily_append",
+            "parameters": {}
+          },
+          {
+            "action_id": "contract-record-explicit-travel",
+            "action_type": "record_travel_event",
+            "entity_ids": [
+              "contract-explicit-travel-event"
+            ],
+            "intent": "travel_event",
+            "parameters": {}
+          }
+        ],
+        "segments": [
+          {
+            "action_ids": [
+              "action-1",
+              "contract-record-explicit-travel"
+            ],
+            "end_offset": -1,
+            "entity_ids": [
+              "daily-event-1",
+              "contract-explicit-travel-event"
+            ],
+            "intents": [
+              "daily_append",
+              "travel_event"
+            ],
+            "segment_id": "seg-1",
+            "start_offset": -1,
+            "text": "明天去上海出差",
+            "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+          }
+        ],
+        "source_text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+      },
+      "semantic_source": "live_model",
+      "status": "completed",
+      "typed_command": {
+        "blocked_actions": [],
+        "business_commands": [
+          {
+            "command_id": "d6607c75-b0bb-59f4-bbc0-3daaaafa82de",
+            "command_type": "record_travel_candidate",
+            "decision_id": "0a31d6f1-99d7-5162-b173-2890e6b88cdd",
+            "entity_ids": [
+              "contract-explicit-travel-event"
+            ],
+            "execution_mode": "candidate",
+            "idempotency_key": "5e66565b9ef60955278098d731f092f72e4753f7f89b2a3e498858bf49075715",
+            "payload": {
+              "entities": [
+                {
+                  "attributes": {
+                    "date_hint": "tomorrow",
+                    "destination": "上海",
+                    "purpose": "出差"
+                  },
+                  "confidence": 1.0,
+                  "entity_id": "contract-explicit-travel-event",
+                  "entity_type": "travel_event",
+                  "value": "明天去上海出差"
+                }
+              ],
+              "parameters": {},
+              "source_segments": [
+                {
+                  "end_offset": -1,
+                  "segment_id": "seg-1",
+                  "start_offset": -1,
+                  "text": "明天去上海出差",
+                  "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+                }
+              ]
+            },
+            "sub_decision_id": "4de2c448-9333-5a1a-bdfb-42eab1b282bd",
+            "target_system": "travel_coordination"
+          }
+        ],
+        "daily_commands": [
+          {
+            "command_id": "2cff4acb-8822-515c-800e-fa46052f818f",
+            "command_type": "append_item",
+            "decision_id": "0a31d6f1-99d7-5162-b173-2890e6b88cdd",
+            "idempotency_key": "active-daily-travel-switch-target-3:daily:e448ef357c7ad7a83acaf03fdea29401de835c71edfc08e5db37cd6d8423ce8e",
+            "patch": {
+              "field": "tomorrow_plan",
+              "items": [
+                "去上海出差"
+              ]
+            },
+            "report_id": "8eb08614-ffb6-5b19-856c-e8578a54fd19",
+            "report_version": 0,
+            "sub_decision_id": "90bbaf08-1c0c-54a3-b371-5d4899a5d217",
+            "target_item_ids": []
+          }
+        ],
+        "decision_id": "0a31d6f1-99d7-5162-b173-2890e6b88cdd",
+        "report_commands": []
+      },
+      "user_reply": {
+        "reply_type": "partial",
+        "text": "日报命令已在 Runtime 模拟执行。\n\ntravel 能力尚未接入 Phase 1 Runtime，本次未执行。"
+      }
+    },
+    {
+      "acceptance": "PASS",
+      "after_snapshot": {
+        "item_ids": {
+          "problems": [],
+          "today_work": [],
+          "tomorrow_plan": [
+            "di_ce7f7344680916e3"
+          ]
+        },
+        "owner_user_id": "e8ae0416-0a8c-5390-850c-98a3de5fc094",
+        "problems": [],
+        "report_id": "14d0f4c1-fadc-5a7b-85b5-8283fbfd3b37",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [
+          "明天去上海出差"
+        ],
+        "version": 1
+      },
+      "before_snapshot": {
+        "item_ids": {},
+        "owner_user_id": "e8ae0416-0a8c-5390-850c-98a3de5fc094",
+        "problems": [],
+        "report_id": "14d0f4c1-fadc-5a7b-85b5-8283fbfd3b37",
+        "status": "collecting",
+        "today_work": [],
+        "tomorrow_plan": [],
+        "version": 0
+      },
+      "case_id": "no-active-daily-future-travel-projection",
+      "clarification": null,
+      "elapsed_ms": 11930.551,
+      "expected": "travel_event_with_required_tomorrow_plan",
+      "input": "明天去上海出差",
+      "model_calls": [
+        {
+          "elapsed_ms": 11929.741,
+          "model": "deepseek-v4-pro",
+          "raw_output": "{\n  \"intents\": [\n    \"travel_event\"\n  ],\n  \"segments\": [\n    {\n      \"segment_id\": \"seg-1\",\n      \"text\": \"明天去上海出差\",\n      \"intents\": [\n        \"travel_event\"\n      ],\n      \"entity_ids\": [\n        \"ent-1\"\n      ],\n      \"action_ids\": [\n        \"act-1\"\n      ]\n    }\n  ],\n  \"entities\": [\n    {\n      \"entity_id\": \"ent-1\",\n      \"entity_type\": \"travel_event\",\n      \"value\": \"明天去上海出差\",\n      \"confidence\": 0.95,\n      \"attributes\": {\n        \"destination\": \"上海\",\n        \"date_hint\": \"明天\",\n        \"purpose\": \"出差\",\n        \"statement_mode\": \"asserted\",\n        \"traveler_scope\": \"self\",\n        \"evidence_spans\": [\n          [0, 7]\n        ]\n      }\n    }\n  ],\n  \"confidence\": 0.95,\n  \"required_actions\": [\n    {\n      \"action_id\": \"act-1\",\n      \"action_type\": \"record_travel_event\",\n      \"intent\": \"travel_event\",\n      \"entity_ids\": [\n        \"ent-1\"\n      ]\n    }\n  ],\n  \"clarification_need\": null,\n  \"context_update\": null\n}",
+          "system_prompt_sha256": "0fe769b72625097f917b7171dba01c3161f0b4b2a792d035a2301bee768a5ad7",
+          "thinking_enabled": true,
+          "user_prompt_sha256": "b9c6a237d632d0feeafdec25cbc6820b794a39922f6d1b526eca26d742ff9ecb"
+        }
+      ],
+      "repetition": 3,
+      "safe_write": true,
+      "semantic_decision": {
+        "admission_deferred_events": [],
+        "admission_information_pendings": [],
+        "admission_mode": "disabled",
+        "admission_review_items": [],
+        "admission_selection_requests": [],
+        "admission_tickets": [],
+        "admission_trace": null,
+        "clarification_need": null,
+        "confidence": 0.95,
+        "context_update": {
+          "clear_current_goal": false,
+          "current_goal": "travel_event",
+          "preserve_current_goal": false,
+          "remember_entity_ids": [
+            "case-travel-report-plan-event"
+          ],
+          "remember_turn": true,
+          "resume_previous_goal": false
+        },
+        "contract_version": "cognitive_core.v3",
+        "decision_id": "4762b893-bbdb-5b55-9e35-fde179c0fc90",
+        "entities": [
+          {
+            "attributes": {
+              "date_hint": "tomorrow",
+              "destination": "上海",
+              "purpose": "出差"
+            },
+            "confidence": 0.95,
+            "entity_id": "ent-1",
+            "entity_type": "travel_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          },
+          {
+            "attributes": {
+              "field": "tomorrow_plan"
+            },
+            "confidence": 0.95,
+            "entity_id": "case-travel-report-plan-event",
+            "entity_type": "daily_event",
+            "source_context_id": "",
+            "value": "明天去上海出差"
+          }
+        ],
+        "intents": [
+          "travel_event",
+          "daily_append"
+        ],
+        "required_actions": [
+          {
+            "action_id": "act-1",
+            "action_type": "record_travel_event",
+            "entity_ids": [
+              "ent-1"
+            ],
+            "intent": "travel_event",
+            "parameters": {}
+          },
+          {
+            "action_id": "capture-case-travel-report-plan",
+            "action_type": "capture_daily_event",
+            "entity_ids": [
+              "case-travel-report-plan-event"
+            ],
+            "intent": "daily_append",
+            "parameters": {}
+          }
+        ],
+        "segments": [
+          {
+            "action_ids": [
+              "act-1",
+              "capture-case-travel-report-plan"
+            ],
+            "end_offset": -1,
+            "entity_ids": [
+              "ent-1",
+              "case-travel-report-plan-event"
+            ],
+            "intents": [
+              "travel_event",
+              "daily_append"
+            ],
+            "segment_id": "seg-1",
+            "start_offset": -1,
+            "text": "明天去上海出差",
+            "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+          }
+        ],
+        "source_text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+      },
+      "semantic_source": "live_model",
+      "status": "completed",
+      "typed_command": {
+        "blocked_actions": [],
+        "business_commands": [
+          {
+            "command_id": "0f2c4307-4b2d-503f-a866-b31f8ab0c155",
+            "command_type": "record_travel_candidate",
+            "decision_id": "4762b893-bbdb-5b55-9e35-fde179c0fc90",
+            "entity_ids": [
+              "ent-1"
+            ],
+            "execution_mode": "candidate",
+            "idempotency_key": "1bb895cf14216738ec642189bdbc24781a097442469b9763f0c96ad227cc2e42",
+            "payload": {
+              "entities": [
+                {
+                  "attributes": {
+                    "date_hint": "tomorrow",
+                    "destination": "上海",
+                    "purpose": "出差"
+                  },
+                  "confidence": 0.95,
+                  "entity_id": "ent-1",
+                  "entity_type": "travel_event",
+                  "value": "明天去上海出差"
+                }
+              ],
+              "parameters": {},
+              "source_segments": [
+                {
+                  "end_offset": -1,
+                  "segment_id": "seg-1",
+                  "start_offset": -1,
+                  "text": "明天去上海出差",
+                  "text_hash": "0edc427df57ec2ab4b0b39b98226720bfaeab6b2a19f79883ff53fd90134a9f0"
+                }
+              ]
+            },
+            "sub_decision_id": "ac8b126a-5598-56e3-a47c-e528e520a61c",
+            "target_system": "travel_coordination"
+          }
+        ],
+        "daily_commands": [
+          {
+            "command_id": "08752095-593b-588f-9862-ce4857058ace",
+            "command_type": "append_item",
+            "decision_id": "4762b893-bbdb-5b55-9e35-fde179c0fc90",
+            "idempotency_key": "no-active-daily-future-travel-projection-target-3:daily:426dececa7b1e7b1047efcb14ac4db1f68d6152e5617b85c5d682e5f3705d83a",
+            "patch": {
+              "field": "tomorrow_plan",
+              "items": [
+                "明天去上海出差"
+              ]
+            },
+            "report_id": "14d0f4c1-fadc-5a7b-85b5-8283fbfd3b37",
+            "report_version": 0,
+            "sub_decision_id": "a90a6e79-f95a-5a2d-8b6e-501cb0a8c9f0",
+            "target_item_ids": []
+          }
+        ],
+        "decision_id": "4762b893-bbdb-5b55-9e35-fde179c0fc90",
+        "report_commands": []
+      },
+      "user_reply": {
+        "reply_type": "partial",
+        "text": "日报命令已在 Runtime 模拟执行。\n\ntravel 能力尚未接入 Phase 1 Runtime，本次未执行。"
+      }
+    }
+  ],
+  "schema_version": "agent2-daily-context-real-model-v1",
+  "semantic_schema_attempts": 3,
+  "successful_runs": 6,
+  "temperature": 0,
+  "thinking_enabled": true,
+  "turn_run_count": 6
+}

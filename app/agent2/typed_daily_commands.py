@@ -22,6 +22,8 @@ DAILY_ADMISSION_OPERATION_CONTRACTS = MappingProxyType({
     "delete_daily_item": ("delete_item", ("items",)),
     "edit_daily_item": ("edit_item", ("items",)),
     "merge_daily_items": ("merge_items", ("items",)),
+    "replace_daily_section": ("replace_section", ("section", "items")),
+    "move_daily_items": ("move_items", ("section", "items")),
     "query_daily_report": ("query_report", ()),
     "clear_daily_report": ("clear_report", ("sections", "items")),
     "clear_daily_section": ("clear_report", ("section", "items")),
@@ -35,6 +37,8 @@ CommandType = Literal[
     "edit_item",
     "delete_item",
     "merge_items",
+    "move_items",
+    "replace_section",
     "submit_report",
     "query_report",
     "copy_report",
@@ -301,16 +305,124 @@ def execute_typed_daily_command(
             ),
         )
 
+    if command.command_type == "replace_section":
+        field_name = str(command.patch["field"])
+        replacement_items = [str(value).strip() for value in command.patch["items"]]
+        existing_values = list(getattr(snapshot, field_name))
+        existing_ids = list(snapshot.item_ids.get(field_name, ()))
+        reusable: dict[str, list[str]] = {}
+        for index, value in enumerate(existing_values):
+            if index < len(existing_ids):
+                reusable.setdefault(value, []).append(existing_ids[index])
+        replacement_ids: list[str] = []
+        for index, value in enumerate(replacement_items, start=1):
+            pool = reusable.get(value) or []
+            replacement_ids.append(
+                pool.pop(0) if pool else _new_item_id(command, field_name, index, value)
+            )
+        after_item_ids = {
+            field: tuple(snapshot.item_ids.get(field, ())) for field in REPORT_FIELDS
+        }
+        after_item_ids[field_name] = tuple(replacement_ids)
+        changed = (
+            tuple(replacement_items) != tuple(existing_values)
+            or tuple(replacement_ids) != tuple(existing_ids)
+        )
+        after = replace(
+            snapshot,
+            version=snapshot.version + (1 if changed else 0),
+            item_ids=after_item_ids,
+            **{field_name: tuple(replacement_items)},
+        )
+        return TypedDailyCommandExecution(
+            command,
+            validation,
+            snapshot,
+            after,
+            changed=changed,
+            should_write_db=changed,
+            audit=_audit_record(
+                command,
+                snapshot,
+                after,
+                result="executed" if changed else "no_change",
+                reason=validation.reason_code,
+            ),
+        )
+
+    if command.command_type == "move_items":
+        locations = [_locate_item(snapshot, item_id) for item_id in command.target_item_ids]
+        source_field = locations[0][0]
+        target_field = str(command.patch["target_field"])
+        source_values = list(getattr(snapshot, source_field))
+        source_ids = list(snapshot.item_ids.get(source_field, ()))
+        target_values = list(getattr(snapshot, target_field))
+        target_ids = list(snapshot.item_ids.get(target_field, ()))
+        selected = sorted(
+            (
+                (location[1], source_values[location[1]], source_ids[location[1]])
+                for location in locations
+            ),
+            key=lambda item: item[0],
+        )
+        for source_index, _, _ in reversed(selected):
+            source_values.pop(source_index)
+            source_ids.pop(source_index)
+        target_keys = {
+            _daily_fact_equivalence_key(value, target_field) for value in target_values
+        }
+        for _, value, item_id in selected:
+            key = _daily_fact_equivalence_key(value, target_field)
+            if key in target_keys:
+                continue
+            target_values.append(value)
+            target_ids.append(item_id)
+            target_keys.add(key)
+        after_item_ids = {
+            field: tuple(snapshot.item_ids.get(field, ())) for field in REPORT_FIELDS
+        }
+        after_item_ids[source_field] = tuple(source_ids)
+        after_item_ids[target_field] = tuple(target_ids)
+        after = replace(
+            snapshot,
+            version=snapshot.version + 1,
+            item_ids=after_item_ids,
+            **{
+                source_field: tuple(source_values),
+                target_field: tuple(target_values),
+            },
+        )
+        return TypedDailyCommandExecution(
+            command,
+            validation,
+            snapshot,
+            after,
+            changed=True,
+            should_write_db=True,
+            audit=_audit_record(
+                command,
+                snapshot,
+                after,
+                result="executed",
+                reason=validation.reason_code,
+            ),
+        )
+
     if command.command_type == "append_item":
         field_name = str(command.patch["field"])
         values = list(getattr(snapshot, field_name))
         ids = list(snapshot.item_ids.get(field_name, ()))
+        equivalent_keys = {
+            _daily_fact_equivalence_key(value, field_name) for value in values
+        }
         for item_index, value in enumerate(command.patch["items"], start=1):
             clean_value = str(value).strip()
-            if clean_value in values:
+            equivalence_key = _daily_fact_equivalence_key(clean_value, field_name)
+            if clean_value in values or equivalence_key in equivalent_keys:
                 continue
             values.append(clean_value)
             ids.append(_new_item_id(command, field_name, item_index, clean_value))
+            equivalent_keys.add(equivalence_key)
     else:
         locations = [_locate_item(snapshot, item_id) for item_id in command.target_item_ids]
         field_name = locations[0][0]
@@ -337,9 +449,13 @@ def execute_typed_daily_command(
             values[item_index] = str(command.patch["replacement"]).strip()
     after_item_ids = {field: tuple(snapshot.item_ids.get(field, ())) for field in REPORT_FIELDS}
     after_item_ids[field_name] = tuple(ids)
+    changed = (
+        tuple(values) != tuple(getattr(snapshot, field_name))
+        or tuple(ids) != tuple(snapshot.item_ids.get(field_name, ()))
+    )
     after = replace(
         snapshot,
-        version=snapshot.version + 1,
+        version=snapshot.version + (1 if changed else 0),
         item_ids=after_item_ids,
         **{field_name: tuple(values)},
     )
@@ -348,10 +464,31 @@ def execute_typed_daily_command(
         validation,
         snapshot,
         after,
-        changed=True,
-        should_write_db=True,
-        audit=_audit_record(command, snapshot, after, result="executed", reason=validation.reason_code),
+        changed=changed,
+        should_write_db=changed,
+        audit=_audit_record(
+            command,
+            snapshot,
+            after,
+            result="executed" if changed else "no_change",
+            reason=validation.reason_code,
+        ),
     )
+
+
+def _daily_fact_equivalence_key(value: str, field: str) -> str:
+    """Compare normalized Daily facts while preserving stored user text."""
+
+    source = str(value or "").strip()
+    prefixes = {
+        "today_work": r"^(?:(?:今天|今日|当日)(?:工作完成情况|完成情况|工作|完成)?)(?:是|为)?",
+        "problems": r"^(?:碰到|遇到)?(?:问题[与和/]?风险|风险[与和/]?问题|问题|风险)(?:是|为)?",
+        "tomorrow_plan": r"^(?:(?:明天|明日|次日)(?:工作计划|计划|工作|安排)?)(?:是|为)?",
+    }
+    prefix = prefixes.get(str(field or ""))
+    if prefix:
+        source = re.sub(prefix, "", source, count=1).lstrip("：:，,。 ")
+    return re.sub(r"[\s，,。．:：；;]", "", source).casefold()
 
 
 def validate_typed_daily_command(
@@ -520,6 +657,8 @@ def validate_typed_daily_command(
         "delete_item",
         "edit_item",
         "merge_items",
+        "move_items",
+        "replace_section",
         "submit_report",
         "query_report",
         "copy_report",
@@ -593,6 +732,46 @@ def validate_typed_daily_command(
             or any(not isinstance(item, str) or not item.strip() for item in items)
         ):
             return TypedDailyCommandValidation("blocked", "forbidden_payload", "append items must be non-empty strings")
+        return TypedDailyCommandValidation("authorized", "exact_target")
+    if command.command_type == "replace_section":
+        items = command.patch.get("items")
+        if (
+            command.target_item_ids
+            or set(command.patch) != {"field", "items"}
+            or command.patch.get("field") not in REPORT_FIELDS
+            or not isinstance(items, (list, tuple))
+            or not items
+            or any(not isinstance(item, str) or not item.strip() for item in items)
+        ):
+            return TypedDailyCommandValidation(
+                "blocked",
+                "forbidden_payload",
+                "replace section requires one field and non-empty items",
+            )
+        return TypedDailyCommandValidation("authorized", "exact_target")
+    if command.command_type == "move_items":
+        target_count = len(command.target_item_ids)
+        if (
+            target_count < 1
+            or len(set(command.target_item_ids)) != target_count
+            or set(command.patch) != {"target_field"}
+            or command.patch.get("target_field") not in REPORT_FIELDS
+        ):
+            return TypedDailyCommandValidation(
+                "blocked",
+                "ambiguous_target",
+                "move requires unique targets and one valid target field",
+            )
+        locations = [_locate_item(snapshot, item_id) for item_id in command.target_item_ids]
+        if any(location is None for location in locations):
+            return TypedDailyCommandValidation("blocked", "target_not_found")
+        source_fields = {location[0] for location in locations}
+        if len(source_fields) != 1 or str(command.patch["target_field"]) in source_fields:
+            return TypedDailyCommandValidation(
+                "blocked",
+                "ambiguous_target",
+                "move targets must share one different source field",
+            )
         return TypedDailyCommandValidation("authorized", "exact_target")
     if command.command_type == "copy_report":
         patch_keys = set(command.patch)

@@ -1,0 +1,47 @@
+{
+  "base_sha": "fd887eca22c8686df3ca26319344b713ca304fab",
+  "branch": "codex/agent2-daily-context-release-candidate",
+  "decision": "CONDITIONAL",
+  "candidate_only_failures": 0,
+  "full_test_baseline": {
+    "passed": 2406,
+    "failed": 65,
+    "skipped": 2
+  },
+  "full_test_candidate": {
+    "passed": 2426,
+    "failed": 65,
+    "skipped": 2
+  },
+  "failure_node_sets_identical": true,
+  "postgresql_gate": "not_executed_no_isolated_postgresql_runtime",
+  "universal_cross_domain_daily_projection": "not_implemented_for_pure_case_or_future_domains",
+  "production_side_effects": 0,
+  "forward_patch_sha256": "632F020604D8C549723021805DFC773AAB7CB23345749FF79E4B923E0D6D3187",
+  "rollback_patch_sha256": "E4217CD91AB12BAB2B43A329C41A93E131DAD8227D0709A5BECB75F35BF0C799",
+  "patch_roundtrip": {
+    "forward_changed_file_count": 19,
+    "rollback_clean": true
+  },
+  "modified_or_added_candidate_files": [
+    "app/agent2/cognitive_contract_v3.py",
+    "app/agent2/command_planner_v3.py",
+    "app/agent2/evaluation/historical_daily_replay.py",
+    "app/agent2/report_document_contract.py",
+    "app/agent2/runtime/context.py",
+    "app/agent2/runtime/domains.py",
+    "app/agent2/runtime/harness.py",
+    "app/agent2/semantic_interpreter_v3.py",
+    "app/agent2/typed_daily_commands.py",
+    "app/agent2/typed_daily_executor.py",
+    "app/api/reports.py",
+    "app/api/webhook.py",
+    "app/stream_runner.py",
+    "evals/agent2/dialogues/historical_daily_context_failures_20260721.json",
+    "scripts/replay_agent2_daily_context_real_model.py",
+    "scripts/replay_agent2_historical_daily_context.py",
+    "tests/test_agent2_daily_context_release_candidate.py",
+    "tests/test_agent2_historical_daily_context_acceptance.py",
+    "tests/test_agent2_real_dialogue_adversarial.py"
+  ]
+}
