@@ -635,6 +635,7 @@ def test_daily_duplicate_returns_prior_receipt_before_ticket_reacquisition(monke
     prior_receipt = SimpleNamespace(
         receipt_id=uuid5(NAMESPACE_URL, "daily-authority-duplicate-receipt"),
         user_id=user.id,
+        report_date=report_date,
         command_id=command.command_id,
         decision_id=command.decision_id,
         sub_decision_id=command.sub_decision_id,

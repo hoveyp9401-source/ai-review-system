@@ -763,6 +763,11 @@ def _prior_receipt_matches(
     require_execution_scope: bool,
 ) -> bool:
     receipt_report_date = getattr(receipt, "report_date", None)
+    expected_report_date = (
+        _query_report_date(command, context.report_date)
+        if command.command_type == "query_report"
+        else _mutation_report_date((command,), context.report_date)
+    )
     receipt_report_id = str(
         getattr(receipt, "report_id", "")
         or getattr(receipt, "resource_id", "")
@@ -787,7 +792,7 @@ def _prior_receipt_matches(
         == command.command_type
         and str(getattr(receipt, "idempotency_key", "") or "")
         == command.idempotency_key
-        and (receipt_report_date is None or receipt_report_date == snapshot.report_date)
+        and (receipt_report_date is None or receipt_report_date == expected_report_date)
         and (not receipt_report_id or receipt_report_id == str(snapshot.report_id))
         and (not receipt_message_id or receipt_message_id == expected_message_id)
         and (scope_matches or not require_execution_scope)
