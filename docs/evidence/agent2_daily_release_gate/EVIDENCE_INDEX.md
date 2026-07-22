@@ -39,3 +39,16 @@ server verification directory and is referenced only by hash.
 
 These are not the final HEAD results; they provide the frozen failure-node set
 used to prove candidate-only failures equal zero.
+
+## Authorized two-user Canary deployment
+
+- `AGENT2_DAILY_TWO_USER_CANARY_DEPLOYMENT_REPORT.md` — deployment decision,
+  route/rollback state, smoke results, open gaps, and rollback checklist.
+- `REPORT_ISSUE_LEDGER_DEPLOYMENT_ADDENDUM_93ff1d7a.md` — deployment findings
+  without modifying the user-owned root ledger.
+- `deployment_20260722_93ff1d7a/` — safe server-side deployment, hash, health,
+  smoke, parity, cleanup, and two-user read-only probe artifacts.
+
+The deployment artifact directory excludes `private_canary_plan.json` and all
+stable user IDs. Real Canary evidence contains only irreversible hashes,
+counts, categories, and booleans.

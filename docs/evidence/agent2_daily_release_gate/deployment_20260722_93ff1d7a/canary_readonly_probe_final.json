@@ -1,0 +1,39 @@
+{
+  "artifact_version": "agent2.daily_release.canary_readonly_probe.v1",
+  "candidate_sha": "93ff1d7a0f07b2d244071e37f1d5efb359acef58",
+  "decision": "PASS",
+  "raw_business_text_in_artifact": false,
+  "results": [
+    {
+      "http_status": 200,
+      "isolated_state_rows_removed": 1,
+      "message_chars": 38,
+      "message_sha256": "73abee3a4468ddbbb9b3c03799c146260ce891624bd5f248390a47c13e2a55fd",
+      "mutation_receipt_delta": 0,
+      "passed": true,
+      "reply_kind": "agent2_read_only",
+      "report_count_unchanged": true,
+      "report_unchanged": true,
+      "response_status": "collecting",
+      "route_audit_delta": 1,
+      "total_receipt_delta": 1,
+      "user_hash": "14b738d85005efdfdce5a0cec030d15ef546cf41b03f7172e27c0ec8a01f7a66"
+    },
+    {
+      "http_status": 200,
+      "isolated_state_rows_removed": 1,
+      "message_chars": 38,
+      "message_sha256": "73abee3a4468ddbbb9b3c03799c146260ce891624bd5f248390a47c13e2a55fd",
+      "mutation_receipt_delta": 0,
+      "passed": true,
+      "reply_kind": "agent2_read_only",
+      "report_count_unchanged": true,
+      "report_unchanged": true,
+      "response_status": "collecting",
+      "route_audit_delta": 1,
+      "total_receipt_delta": 1,
+      "user_hash": "6e143d55ee8ed47770355c4ba667f84a5f569f32dd6d43d406b54688a18d27c1"
+    }
+  ],
+  "user_count": 2
+}

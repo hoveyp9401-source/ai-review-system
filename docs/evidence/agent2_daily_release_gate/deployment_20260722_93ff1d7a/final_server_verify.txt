@@ -1,0 +1,10 @@
+2026-07-22T18:10:00+08:00
+api=active
+stream=active
+scheduler=active
+health={"status":"ok"}
+head=96cecec81c4ac9fe4e0500c08a52e661d094147d
+status_entries=280
+candidate_file_hashes_match=true
+baseline_port_18001_listening=false
+unexpected_test_or_smoke_processes=false

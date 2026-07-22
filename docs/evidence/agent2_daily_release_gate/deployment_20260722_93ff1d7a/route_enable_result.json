@@ -1,0 +1,1 @@
+{"action": "enable", "canary_count": 2, "candidate_sha": "93ff1d7a0f07b2d244071e37f1d5efb359acef58", "rollback_enabled": true, "route_mode": "agent2_canary", "tenant_sha256": "c403e1e59f2e7aa7e13656b96e4fd6d6672264ef1cd5f70dd8529f66ec11dcab", "version": 4}

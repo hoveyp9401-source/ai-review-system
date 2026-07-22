@@ -1,0 +1,54 @@
+{
+  "summary": {
+    "pass": 7,
+    "fail": 0,
+    "total": 7,
+    "seconds": 1.6,
+    "base_url": "http://127.0.0.1:8000",
+    "generated_at": "2026-07-22T17:54:54+08:00"
+  },
+  "results": [
+    {
+      "name": "health_and_admin",
+      "status": "PASS",
+      "seconds": 0.1,
+      "errors": []
+    },
+    {
+      "name": "manual_idempotency",
+      "status": "PASS",
+      "seconds": 0.1,
+      "errors": []
+    },
+    {
+      "name": "same_user_concurrency",
+      "status": "PASS",
+      "seconds": 0.2,
+      "errors": []
+    },
+    {
+      "name": "multi_user_isolation",
+      "status": "PASS",
+      "seconds": 0.9,
+      "errors": []
+    },
+    {
+      "name": "whole_copy_and_numbered_preview",
+      "status": "PASS",
+      "seconds": 0.0,
+      "errors": []
+    },
+    {
+      "name": "previous_plan_range",
+      "status": "PASS",
+      "seconds": 0.0,
+      "errors": []
+    },
+    {
+      "name": "current_short_display",
+      "status": "PASS",
+      "seconds": 0.0,
+      "errors": []
+    }
+  ]
+}

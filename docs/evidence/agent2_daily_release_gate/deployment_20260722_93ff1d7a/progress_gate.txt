@@ -1,0 +1,10 @@
+
+=== PROGRESS_GATE_START progress-outbox-pytest ===
+/home/ai_review_tunnel/ai-review-system/venv/bin/python -m pytest tests/test_progress_outbox.py -q
+............                                                             [100%]
+12 passed in 0.46s
+=== PROGRESS_GATE_END progress-outbox-pytest PASS seconds=1.0 ===
+
+PROGRESS_GATE_SUMMARY_START
+total=1 pass=1 fail=0 seconds=1.0
+PROGRESS_GATE_SUMMARY_END

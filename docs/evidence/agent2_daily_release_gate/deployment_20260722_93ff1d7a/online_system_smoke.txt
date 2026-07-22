@@ -1,0 +1,13 @@
+ONLINE_SYSTEM_SMOKE_PROGRESS PASS health_and_admin
+ONLINE_SYSTEM_SMOKE_PROGRESS PASS manual_idempotency
+ONLINE_SYSTEM_SMOKE_PROGRESS PASS same_user_concurrency
+ONLINE_SYSTEM_SMOKE_PROGRESS PASS multi_user_isolation
+ONLINE_SYSTEM_SMOKE_PROGRESS PASS whole_copy_and_numbered_preview
+ONLINE_SYSTEM_SMOKE_PROGRESS PASS previous_plan_range
+ONLINE_SYSTEM_SMOKE_PROGRESS PASS current_short_display
+ONLINE_SYSTEM_SMOKE_START
+SUMMARY {"pass": 7, "fail": 0, "total": 7, "seconds": 1.6, "base_url": "http://127.0.0.1:8000", "generated_at": "2026-07-22T17:54:54+08:00"}
+OUTPUT /home/ai_review_tunnel/verification/agent2-daily-release-gate-release_20260722_93ff1d7a/deployment_20260722_93ff1d7a/online_system_smoke.json
+FAILURES_START
+FAILURES_END
+ONLINE_SYSTEM_SMOKE_END
