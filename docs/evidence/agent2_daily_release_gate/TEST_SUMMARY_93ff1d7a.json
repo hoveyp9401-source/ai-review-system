@@ -1,0 +1,66 @@
+{
+  "artifact_version": "agent2.daily_release_gate.test_summary.v1",
+  "base_sha": "c577316751ba312968fe85dc01cd4b688fd48369",
+  "candidate_sha": "93ff1d7a0f07b2d244071e37f1d5efb359acef58",
+  "commands": [
+    {
+      "name": "postgres_gate_unit_tests",
+      "command": "python -m pytest -q tests/test_agent2_daily_context_postgres_gate.py",
+      "exit_code": 0,
+      "passed": 7,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "name": "daily_release_targeted",
+      "command": "python -m pytest -q tests/test_agent2_daily_context_postgres_gate.py tests/test_agent2_typed_daily_executor_v3.py tests/test_agent2_daily_context_release_candidate.py tests/test_agent2_historical_daily_context_acceptance.py tests/test_agent2_real_dialogue_adversarial.py",
+      "exit_code": 0,
+      "passed": 62,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "name": "agent2_full",
+      "command": "python -m pytest -q tests/test_agent2*.py",
+      "exit_code": 0,
+      "passed": 1684,
+      "failed": 0,
+      "skipped": 2
+    },
+    {
+      "name": "repository_full",
+      "command": "python -m pytest -q",
+      "exit_code": 1,
+      "passed": 2433,
+      "failed": 65,
+      "skipped": 2,
+      "candidate_only_failures": 0,
+      "base_only_failures": 0,
+      "failure_node_sets_identical": true
+    },
+    {
+      "name": "python_compile",
+      "command": "python -m py_compile scripts/verify_agent2_daily_context_postgres.py app/agent2/typed_daily_executor.py",
+      "exit_code": 0
+    },
+    {
+      "name": "git_diff_check",
+      "command": "git diff --check c577316751ba312968fe85dc01cd4b688fd48369...93ff1d7a0f07b2d244071e37f1d5efb359acef58",
+      "exit_code": 0
+    },
+    {
+      "name": "real_postgresql_gate",
+      "command": "verify_agent2_daily_context_postgres.py (isolated SSH execution; arguments recorded in the report)",
+      "exit_code": 0,
+      "decision": "PASS",
+      "failed_checks": []
+    },
+    {
+      "name": "forward_rollback_round_trip",
+      "command": "git apply --index forward.patch; compare final tree; git apply --index rollback.patch",
+      "exit_code": 0,
+      "forward_matches_final": true,
+      "rollback_status_entries": 0
+    }
+  ]
+}

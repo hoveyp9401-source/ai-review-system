@@ -1,0 +1,51 @@
+{
+  "artifact_version": "agent2.daily_context.postgres_release_gate.v1",
+  "generated_at": "2026-07-22T09:13:10+00:00",
+  "candidate_sha": "93ff1d7a0f07b2d244071e37f1d5efb359acef58",
+  "execution_transport": "ssh",
+  "run_id": "release_20260722_93ff1d7a",
+  "temporary_schema_sha256": "542c7079c1034c486d5b778147105ea684d0083fe97b12b2d0828b5a5af80811",
+  "database_target": "configured_postgresql_redacted",
+  "decision": "PASS",
+  "failed_checks": [],
+  "checks": {
+    "stable_item_id_move_atomic": true,
+    "partial_update_preserved_other_sections": true,
+    "three_command_versions_advanced": true,
+    "duplicate_delivery_idempotent": true,
+    "concurrent_duplicate_serialized": true,
+    "noop_preserved_row_and_version": true,
+    "reply_matches_committed_snapshot": true,
+    "transaction_rollback_atomic": true,
+    "public_schema_unchanged": true,
+    "cleanup_confirmed": true,
+    "database_write_outside_isolated_schema": 0,
+    "external_api_calls": 0,
+    "model_calls": 0,
+    "message_sends": 0
+  },
+  "metrics": {
+    "concurrent_elapsed_ms": 40.631,
+    "final_version": 7,
+    "receipt_count": 7
+  },
+  "snapshot_digests": {
+    "initial_snapshot_sha256": "1adb358b95bea7fb1031aacd19ef0521a200e3d71cb2beeaf5a87ab8308fdd20",
+    "complete_snapshot_sha256": "8457b79748c0a87bac2eadd961809e6b503fd0203e9024649405d57f3f3d1b97",
+    "final_snapshot_sha256": "d6e5b28432fac425295459b6af4f27baf71b03a63d54d415ae0c3f4cd8b59e9f"
+  },
+  "failure_type": "",
+  "failure_sha256": "",
+  "failure_symbol": "",
+  "public_probe_before": {
+    "actor_rows": 0,
+    "report_rows": 0,
+    "receipt_rows": 0
+  },
+  "public_probe_after": {
+    "actor_rows": 0,
+    "report_rows": 0,
+    "receipt_rows": 0
+  },
+  "report_sha256": "f7988dcb316d131a3cdfbf6299a6b3889679aee813348e57d01bece5a03edaa4"
+}

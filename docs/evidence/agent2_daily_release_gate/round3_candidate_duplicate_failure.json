@@ -1,0 +1,51 @@
+{
+  "artifact_version": "agent2.daily_context.postgres_release_gate.v1",
+  "generated_at": "2026-07-22T07:53:56+00:00",
+  "candidate_sha": "c577316751ba312968fe85dc01cd4b688fd48369",
+  "execution_transport": "ssh",
+  "run_id": "release_20260722_c5773167",
+  "temporary_schema_sha256": "f6ddd6865e95ca77877cddac5306e527d2e035c6668b1df9660a8a5a26bd2a2f",
+  "database_target": "configured_postgresql_redacted",
+  "decision": "NO_GO",
+  "failed_checks": [
+    "concurrent_duplicate_serialized",
+    "duplicate_delivery_idempotent",
+    "noop_preserved_row_and_version",
+    "transaction_rollback_atomic"
+  ],
+  "checks": {
+    "stable_item_id_move_atomic": true,
+    "partial_update_preserved_other_sections": true,
+    "three_command_versions_advanced": true,
+    "duplicate_delivery_idempotent": false,
+    "concurrent_duplicate_serialized": false,
+    "noop_preserved_row_and_version": false,
+    "reply_matches_committed_snapshot": true,
+    "transaction_rollback_atomic": false,
+    "public_schema_unchanged": true,
+    "cleanup_confirmed": true,
+    "database_write_outside_isolated_schema": 0,
+    "external_api_calls": 0,
+    "model_calls": 0,
+    "message_sends": 0
+  },
+  "metrics": {},
+  "snapshot_digests": {
+    "initial_snapshot_sha256": "1adb358b95bea7fb1031aacd19ef0521a200e3d71cb2beeaf5a87ab8308fdd20",
+    "complete_snapshot_sha256": "c9dd2d117bf98444408126b93b7da0450459b0763528f6bcfb4613520b13fa71"
+  },
+  "failure_type": "AttributeError",
+  "failure_sha256": "a0d29a0a5b0f499f182b01f31cb4bdad2c4740e7d4b98775d4f3b023f86073d8",
+  "failure_symbol": "report_date",
+  "public_probe_before": {
+    "actor_rows": 0,
+    "report_rows": 0,
+    "receipt_rows": 0
+  },
+  "public_probe_after": {
+    "actor_rows": 0,
+    "report_rows": 0,
+    "receipt_rows": 0
+  },
+  "report_sha256": "bca3e1a044251b01d142bdfe57d1a098e66c3522b0b819cfee267d4ac665f52d"
+}
