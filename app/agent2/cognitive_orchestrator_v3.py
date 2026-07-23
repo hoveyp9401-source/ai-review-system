@@ -88,26 +88,32 @@ async def finalize_cognitive_state_after_execution(
     The cognitive core proposes a version that is exactly one ahead of the
     loaded base state. Command-bearing and planner-blocked turns are not saved
     by the orchestrator. A failed or partial execution therefore returns the
-    untouched base state; a successful execution removes any consumed bound
-    pending and performs one optimistic save against the base version.
+    untouched base state except for an independently safe pending revocation.
+    A successful execution removes any consumed bound pending and performs one
+    optimistic save against the base version.
     """
 
     if result.state_persisted:
         return result.state
-    if (
+    invalidated_pending_ids = _safe_failed_execution_pending_invalidations(result)
+    enforced_nonadvancing_without_effect = (
         _is_enforced_nonadvancing_admission(result.decision)
         and not _has_planned_business_effect(result.command_plan)
+    )
+    if (
+        enforced_nonadvancing_without_effect
         and not selection_pending
+        and not invalidated_pending_ids
     ):
         return result.base_state
-    if not execution_succeeded:
-        if not selection_pending:
+    if not execution_succeeded or enforced_nonadvancing_without_effect:
+        if not selection_pending and not invalidated_pending_ids:
             return result.base_state
-        # A SelectionPending is itself a durable, user-visible state change,
-        # but it is not evidence that any sibling command committed.  Build the
-        # pending-only transition from the loaded base so proposed goals,
-        # entities, constraints, consumed pendings, and recent context from a
-        # failed/partial execution cannot leak into durable conversation state.
+        # SelectionPending and revocation of superseded confirmation authority
+        # are independently safe, user-visible state changes. Build only those
+        # transitions from the loaded base so proposed goals, entities,
+        # constraints, consumed pendings, and recent context from a failed or
+        # partial execution cannot leak into durable conversation state.
         existing_selection = {
             item.pending_id: item for item in result.base_state.selection_pending
         }
@@ -117,6 +123,11 @@ async def finalize_cognitive_state_after_execution(
         pending_only_state = replace(
             result.base_state,
             version=result.base_state.version + 1,
+            pending=tuple(
+                item
+                for item in result.base_state.pending
+                if item.pending_id not in invalidated_pending_ids
+            ),
             selection_pending=tuple(existing_selection.values()),
         )
         return await state_store.save(
@@ -141,6 +152,26 @@ async def finalize_cognitive_state_after_execution(
         existing.update({item.pending_id: item for item in selection_pending})
         next_state = replace(next_state, selection_pending=tuple(existing.values()))
     return await state_store.save(next_state, expected_version=result.base_state.version)
+
+
+def _safe_failed_execution_pending_invalidations(
+    result: CognitiveOrchestrationResult,
+) -> frozenset[str]:
+    update = getattr(result.decision, "context_update", None)
+    if update is None:
+        return frozenset()
+    invalidated = tuple(getattr(update, "invalidated_pending_ids", ()) or ())
+    if (
+        not invalidated
+        or str(getattr(update, "pending_invalidation_reason", "") or "")
+        != "superseded_by_new_instruction"
+        or len(set(invalidated)) != len(invalidated)
+    ):
+        return frozenset()
+    base_pending_ids = {item.pending_id for item in result.base_state.pending}
+    if not set(invalidated).issubset(base_pending_ids):
+        return frozenset()
+    return frozenset(invalidated)
 
 
 def _is_enforced_nonadvancing_admission(decision: CognitiveDecisionV3) -> bool:

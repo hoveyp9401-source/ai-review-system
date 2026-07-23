@@ -307,6 +307,62 @@ def test_cognitive_state_commit_allows_only_admission_nonwrite_block_with_full_r
     ) is False
 
 
+def test_action_free_closed_pending_cancellation_can_persist_but_model_like_update_cannot():
+    update = SimpleNamespace(
+        invalidated_pending_ids=("pending-1",),
+        pending_invalidation_reason="cancelled_by_user",
+        bind_pending=None,
+        consumed_pending_ids=(),
+        current_goal="",
+        remember_entity_ids=(),
+        remember_turn=False,
+        user_constraints=None,
+        resume_previous_goal=False,
+        clear_current_goal=False,
+    )
+    result = SimpleNamespace(
+        command_plan=SimpleNamespace(
+            daily_commands=(),
+            business_commands=(),
+            report_commands=(),
+            blocked_actions=(),
+        ),
+        decision=SimpleNamespace(
+            context_update=update,
+            required_actions=(),
+        ),
+        base_state=SimpleNamespace(
+            pending=(SimpleNamespace(pending_id="pending-1"),),
+        ),
+    )
+
+    assert _all_cognitive_commands_succeeded(
+        result,
+        command_results=[],
+        business_result=None,
+    ) is True
+
+    unsafe = SimpleNamespace(
+        **{
+            **result.__dict__,
+            "decision": SimpleNamespace(
+                context_update=SimpleNamespace(
+                    **{
+                        **update.__dict__,
+                        "current_goal": "model-selected-goal",
+                    }
+                ),
+                required_actions=(),
+            ),
+        }
+    )
+    assert _all_cognitive_commands_succeeded(
+        unsafe,
+        command_results=[],
+        business_result=None,
+    ) is False
+
+
 @pytest.mark.asyncio
 async def test_recent_case_progress_resource_exposes_only_trusted_permission_filtered_ids_and_versions():
     now = datetime(2026, 7, 11, 9, 0, tzinfo=UTC)

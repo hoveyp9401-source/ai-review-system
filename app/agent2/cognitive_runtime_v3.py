@@ -329,7 +329,11 @@ async def evaluate_cognitive_core_v3(
         business_context,
         visible_cases,
     )
-    visible_party_ids, visible_travel_intent_ids = await _case_link_resources(
+    (
+        visible_party_ids,
+        visible_travel_intent_ids,
+        active_travel_intents,
+    ) = await _case_link_resources(
         session,
         business_context,
     )
@@ -372,6 +376,7 @@ async def evaluate_cognitive_core_v3(
             "active_case_progress_followups": active_case_followups,
             "active_case_followup_policies": active_case_followup_policies,
             "active_travel_collaborations": active_travel_collaborations,
+            "active_travel_intents": active_travel_intents,
             "visible_party_ids": visible_party_ids,
             "visible_document_ids": [],
             "visible_travel_intent_ids": visible_travel_intent_ids,
@@ -950,7 +955,41 @@ def _all_cognitive_commands_succeeded(
             return False
     elif report_results:
         return False
-    return bool(expected_daily or expected_business or expected_reports)
+    return bool(
+        expected_daily
+        or expected_business
+        or expected_reports
+        or getattr(result.decision.context_update, "bind_pending", None) is not None
+        or _is_safe_pending_lifecycle_only_transition(result)
+    )
+
+
+def _is_safe_pending_lifecycle_only_transition(
+    result: CognitiveOrchestrationResult,
+) -> bool:
+    """Permit persistence only for the closed, action-free cancellation protocol."""
+
+    update = result.decision.context_update
+    invalidated = tuple(getattr(update, "invalidated_pending_ids", ()) or ())
+    if (
+        not invalidated
+        or getattr(update, "pending_invalidation_reason", "") != "cancelled_by_user"
+        or tuple(getattr(result.decision, "required_actions", ()) or ())
+        or getattr(update, "bind_pending", None) is not None
+        or tuple(getattr(update, "consumed_pending_ids", ()) or ())
+        or getattr(update, "current_goal", "")
+        or tuple(getattr(update, "remember_entity_ids", ()) or ())
+        or bool(getattr(update, "remember_turn", False))
+        or getattr(update, "user_constraints", None) is not None
+        or bool(getattr(update, "resume_previous_goal", False))
+        or bool(getattr(update, "clear_current_goal", False))
+    ):
+        return False
+    base_ids = {
+        item.pending_id
+        for item in tuple(getattr(result.base_state, "pending", ()) or ())
+    }
+    return len(set(invalidated)) == len(invalidated) and set(invalidated).issubset(base_ids)
 
 
 def _is_admission_nonwrite_block(block: Any) -> bool:
@@ -1371,9 +1410,9 @@ async def _case_followup_policy_resource(
 async def _case_link_resources(
     session: Any,
     context: BusinessCommandContext | None,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
     if context is None:
-        return [], []
+        return [], [], []
     case_ids = [
         UUID(str(value))
         for value in context.allowed_case_ids
@@ -1395,18 +1434,35 @@ async def _case_link_resources(
                 )
             ).all()
         ]
-    travel_ids = [
-        str(value)
-        for value in (
+    travel_rows = list(
+        (
             await session.scalars(
-                select(TravelIntent.travel_intent_id).where(
+                select(TravelIntent)
+                .where(
                     TravelIntent.tenant_id == context.tenant_id,
                     TravelIntent.user_id == context.actor_user_id,
                 )
+                .order_by(
+                    TravelIntent.created_at.asc(),
+                    TravelIntent.travel_intent_id.asc(),
+                )
             )
         ).all()
+    )
+    travel_ids = [str(row.travel_intent_id) for row in travel_rows]
+    active_travel_intents = [
+        {
+            "travel_intent_id": str(row.travel_intent_id),
+            "destination": str(row.destination_normalized or ""),
+            "start_at": row.start_at.isoformat(),
+            "end_at": row.end_at.isoformat(),
+            "status": str(row.status or ""),
+            "version": int(row.version or 0),
+        }
+        for row in travel_rows
+        if str(row.status or "") not in {"cancelled", "completed"}
     ]
-    return party_ids, travel_ids
+    return party_ids, travel_ids, active_travel_intents
 
 
 def _is_uuid_text(value: Any) -> bool:

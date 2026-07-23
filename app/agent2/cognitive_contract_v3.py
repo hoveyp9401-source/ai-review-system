@@ -6,7 +6,7 @@ from app.agent2.cognitive_core_v3 import SemanticInterpretation
 
 
 ENTITY_ATTRIBUTE_KEYS = {
-    "daily_event": frozenset({"field", "context_reference"}),
+    "daily_event": frozenset({"field", "statement_mode", "context_reference"}),
     "daily_item_target": frozenset(
         {
             "target_item_ids",
@@ -26,6 +26,16 @@ ENTITY_ATTRIBUTE_KEYS = {
             "statement_mode",
             "traveler_scope",
             "evidence_spans",
+            "context_reference",
+        }
+    ),
+    "travel_intent_ref": frozenset(
+        {
+            "travel_intent_id",
+            "expected_version",
+            "destination",
+            "new_date_hint",
+            "new_status",
             "context_reference",
         }
     ),
@@ -98,6 +108,7 @@ ACTION_PARAMETER_KEYS = {
     "submit_daily_report": frozenset({"confirmed_pending_id"}),
     "answer_case_query": frozenset({"confirmed_pending_id"}),
     "record_travel_event": frozenset({"confirmed_pending_id"}),
+    "update_travel_event": frozenset({"confirmed_pending_id"}),
     "respond_travel_collaboration": frozenset({"confirmed_pending_id"}),
     "search_enterprise_knowledge": frozenset({"confirmed_pending_id"}),
     "capture_report_event": frozenset({"confirmed_pending_id"}),
@@ -112,12 +123,15 @@ CONTEXT_REFERENCE_KEYS = frozenset(
     {"intent", "context_id", "selection", "value_source"}
 )
 STRING_ENTITY_ATTRIBUTES = {
-    "daily_event": frozenset({"field"}),
+    "daily_event": frozenset({"field", "statement_mode"}),
     "daily_item_target": frozenset({"replacement", "source_field", "target_field"}),
     "case_query": frozenset({"matter_hint", "question"}),
     "operation_status_query": frozenset({"domain"}),
     "travel_event": frozenset(
         {"destination", "date_hint", "purpose", "statement_mode", "traveler_scope"}
+    ),
+    "travel_intent_ref": frozenset(
+        {"travel_intent_id", "destination", "new_date_hint", "new_status"}
     ),
     "travel_collaboration_ref": frozenset({"candidate_id", "response"}),
     "daily_report": frozenset({"report_id", "report_date", "field"}),
@@ -205,6 +219,22 @@ def validate_semantic_interpretation_contract(
                 violations.append(
                     f"entities.{entity.entity_id}.attributes.expected_version.value_type"
                 )
+        if entity.entity_type == "travel_intent_ref":
+            version = entity.attributes.get("expected_version")
+            if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+                violations.append(
+                    f"entities.{entity.entity_id}.attributes.expected_version.value_type"
+                )
+            new_status = entity.attributes.get("new_status")
+            new_date_hint = str(entity.attributes.get("new_date_hint") or "").strip()
+            if new_status not in {None, "", "cancelled"}:
+                violations.append(
+                    f"entities.{entity.entity_id}.attributes.new_status.value"
+                )
+            if not new_date_hint and new_status != "cancelled":
+                violations.append(
+                    f"entities.{entity.entity_id}.attributes.requested_change"
+                )
         if entity.entity_type == "case_followup_policy":
             cadence = entity.attributes.get("cadence_type")
             if cadence is not None and cadence not in {
@@ -281,6 +311,18 @@ def validate_semantic_interpretation_contract(
                     violations.append(
                         f"entities.{entity.entity_id}.attributes.{attribute_name}.value_type"
                     )
+        if entity.entity_type == "daily_event":
+            statement_mode = entity.attributes.get("statement_mode")
+            if statement_mode is not None and statement_mode not in {
+                "asserted",
+                "question",
+                "hypothetical",
+                "quoted",
+                "negated",
+            }:
+                violations.append(
+                    f"entities.{entity.entity_id}.attributes.statement_mode.value"
+                )
         if entity.entity_type == "case_ref":
             for attribute_name in (
                 "factual_progress", "completed_actions", "next_actions",
@@ -323,6 +365,7 @@ def validate_semantic_interpretation_contract(
                 "question",
                 "hypothetical",
                 "quoted",
+                "negated",
             }:
                 violations.append(
                     f"entities.{entity.entity_id}.attributes.statement_mode.value"
@@ -334,6 +377,7 @@ def validate_semantic_interpretation_contract(
                 "question",
                 "hypothetical",
                 "quoted",
+                "negated",
             }:
                 violations.append(
                     f"entities.{entity.entity_id}.attributes.statement_mode.value"

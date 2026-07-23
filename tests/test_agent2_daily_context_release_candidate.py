@@ -7,7 +7,10 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
-from app.agent2.report_document_contract import daily_section_cue_semantic_payload
+from app.agent2.report_document_contract import (
+    daily_section_cue_semantic_payload,
+    parse_structured_daily_document,
+)
 from app.agent2.typed_daily_commands import (
     DailyReportMutationSnapshot,
     TypedDailyCommand,
@@ -84,6 +87,68 @@ def test_missing_empty_and_values_are_distinct_daily_section_inputs():
         "field": "tomorrow_plan",
         "items": ["准备评审材料"],
     }
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        (
+            "今日工作\n1. 同事说已经完成合同审核\n"
+            "问题与风险\n1. 客户资料不全\n"
+            "明日计划\n1. 明天整理评审材料"
+        ),
+        (
+            "今日工作\n1. 完成合同审核\n"
+            "问题与风险\n1. 客户资料是否齐全？\n"
+            "明日计划\n1. 明天整理评审材料"
+        ),
+        (
+            "今日工作\n1. 完成合同审核\n"
+            "问题与风险\n1. 客户资料不全\n"
+            "明日计划\n1. 南京出差取消"
+        ),
+        (
+            "今日工作\n1. 如果收到确认再完成合同审核\n"
+            "问题与风险\n1. 客户资料不全\n"
+            "明日计划\n1. 明天整理评审材料"
+        ),
+    ),
+)
+def test_structured_daily_document_rejects_nonassertive_or_cancelled_items(
+    text: str,
+) -> None:
+    assert parse_structured_daily_document(text) is None
+
+
+def test_structured_daily_document_accepts_three_asserted_sections() -> None:
+    document = parse_structured_daily_document(
+        "今日工作\n1. 完成合同审核\n"
+        "问题与风险\n1. 客户资料不全\n"
+        "明日计划\n1. 明天整理评审材料"
+    )
+
+    assert document is not None
+    assert document.fields == {"today_work", "problems", "tomorrow_plan"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "明日计划改成南京出差取消",
+        "明日计划改成如果收到通知再去南京",
+        "问题与风险：同事说客户资料不全",
+        "问题与风险：客户资料是否齐全？",
+    ),
+)
+def test_single_section_replacement_rejects_nonassertive_language(text: str) -> None:
+    resources = {
+        "daily_draft": {
+            "report_id": str(uuid5(NAMESPACE_URL, "release-report")),
+            "version": 7,
+        }
+    }
+
+    assert daily_section_cue_semantic_payload(text, resources) is None
 
 
 def test_empty_replacement_is_not_an_implicit_clear_operation():

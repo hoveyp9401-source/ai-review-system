@@ -24,6 +24,7 @@ from app.agent2.admission_contracts import (
 )
 from app.agent2.cognitive_core_v3 import (
     CognitiveTurn,
+    PendingBindingRequest,
     RequiredAction,
     SemanticInterpretation,
     SemanticSegment,
@@ -34,10 +35,49 @@ from app.agent2.business.case_reference import (
     discover_visible_case_references,
     match_grounded_visible_cases,
 )
+from app.agent2.report_document_contract import (
+    daily_item_has_termination_state,
+    daily_item_is_nominal_termination_work,
+    daily_item_is_unpunctuated_question,
+    daily_semantic_detection_copy,
+    parse_structured_daily_document,
+    parse_structured_daily_section,
+)
 from app.agent2.selection_pending import protect_selection_continuation_payload
 
 
 _DAILY_REPORT_FIELDS = ("today_work", "problems", "tomorrow_plan")
+_DAILY_DRAFT_MUTABLE_STATUSES = frozenset({"collecting", "pending_confirmation"})
+_DAILY_SECTION_ASSERTION_PREFIX = re.compile(
+    r"^\s*(?:"
+    r"【(?:今日|今天|当日)(?:工作|完成)】"
+    r"|【(?:问题与风险|风险与问题|问题和风险|风险和问题|问题/风险|风险/问题|问题|风险)】"
+    r"|【(?:明日|明天|次日)计划】"
+    r"|\[(?:今日|今天|当日)(?:工作|完成)\]"
+    r"|\[(?:问题与风险|风险与问题|问题和风险|风险和问题|问题/风险|风险/问题|问题|风险)\]"
+    r"|\[(?:明日|明天|次日)计划\]"
+    r"|(?:今日|今天|当日)(?:工作|完成)"
+    r"|(?:问题与风险|风险与问题|问题和风险|风险和问题|问题/风险|风险/问题|问题|风险)"
+    r"|(?:明日|明天|次日)计划"
+    r")(?:(?:就是|是|为)|[：:])?\s*"
+)
+_DAILY_ITEM_ASSERTION_PREFIX = re.compile(
+    r"^\s*(?:(?:\d+|[一二三四五六七八九十百]+)[.、．)）]"
+    r"|\((?:\d+|[一二三四五六七八九十百]+)\)"
+    r"|（(?:\d+|[一二三四五六七八九十百]+)）"
+    r"|[-*•·])\s*"
+)
+_DAILY_DROPPED_POLARITY_PREFIX = re.compile(
+    r"(?:不是|并非|没有|尚未|还没|并未|未曾|未能|没能|不能|不得|"
+    r"不再|无需|无须|取消|撤销|撤回|停止|暂停|放弃|算了|不|没|未|别|勿)$"
+)
+_DAILY_DROPPED_POLARITY_SUFFIX = re.compile(
+    r"^(?:算了|不去|不做|不处理|不跟进|不再|不了|不成|不上)"
+)
+_DAILY_NONAFFIRMATIVE_LEADING = re.compile(
+    r"^(?:不|没|未|尚未|还没|并未|别|勿|无需|无须|取消|撤销|撤回|"
+    r"停止|暂停|放弃|算了)"
+)
 _PERIODIC_REPORT_FIELDS = ("accomplishments", "risks", "next_plan", "metrics")
 _READ_ONLY_REPORT_ACTIONS = frozenset(
     {"query_daily_report", "query_periodic_report"}
@@ -57,6 +97,8 @@ _REPORT_ACTIONS = frozenset(
         "edit_daily_item",
         "delete_daily_item",
         "merge_daily_items",
+        "replace_daily_section",
+        "move_daily_items",
         "query_daily_report",
         "clear_daily_section",
         "clear_daily_report",
@@ -77,6 +119,8 @@ _REPORT_MUTATION_CONTRACTS: Mapping[str, tuple[str, tuple[str, ...]]] = {
     "edit_daily_item": ("edit_item", ("items",)),
     "delete_daily_item": ("delete_item", ("items",)),
     "merge_daily_items": ("merge_items", ("items",)),
+    "replace_daily_section": ("replace_section", ("section", "items")),
+    "move_daily_items": ("move_items", ("section", "items")),
     "clear_daily_section": ("clear_report", ("section", "items")),
     "clear_daily_report": ("clear_report", ("sections", "items")),
     "reopen_daily_report": ("reopen_report", ("status",)),
@@ -119,6 +163,14 @@ class AssertionPolarityAssessment:
     classification: str
     authorizes_mutation: bool
     reason_code: str = ""
+
+
+@dataclass(frozen=True)
+class _ValidatedPendingBinding:
+    request: PendingBindingRequest
+    segment_id: str
+    entity_ids: tuple[str, ...]
+    intents: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -246,6 +298,7 @@ class DomainAdmissionEngine:
                 grounded_segments[segment.segment_id] = segment
                 decision, object_ref = self._decide(
                     turn=turn,
+                    state=state,
                     action=action,
                     segment_id=segment_id,
                     segment_text=segment.text if segment is not None else "",
@@ -420,13 +473,30 @@ class DomainAdmissionEngine:
                 information_pendings.append(pending)
             decisions.append(decision)
 
+        validated_pending = _validate_pending_binding(
+            turn=turn,
+            state=state,
+            proposal=proposal,
+            trace_id=trace_id,
+            entity_by_id=entity_by_id,
+        )
+        pending_entity_ids = set(
+            validated_pending.entity_ids if validated_pending is not None else ()
+        )
+        pending_intents = set(
+            validated_pending.intents if validated_pending is not None else ()
+        )
+        pending_segment_ids = {
+            validated_pending.segment_id
+        } if validated_pending is not None else set()
+
         admitted_ids = {action.action_id for action in admitted_actions}
         admitted_entity_ids = {
             entity_id
             for action in admitted_actions
             for entity_id in action.entity_ids
-        }
-        admitted_intents = {action.intent for action in admitted_actions}
+        } | pending_entity_ids
+        admitted_intents = {action.intent for action in admitted_actions} | pending_intents
         no_op_intents = {
             action.intent
             for action, decision in zip(actions_to_evaluate, decisions, strict=True)
@@ -436,10 +506,7 @@ class DomainAdmissionEngine:
         if actions_to_evaluate:
             authorized_goal_intents = admitted_intents | no_op_intents
             goal_authorized = not update.current_goal or update.current_goal in authorized_goal_intents
-            pending_authorized = (
-                update.bind_pending is None
-                or set(update.bind_pending.entity_ids).issubset(admitted_entity_ids)
-            )
+            pending_authorized = update.bind_pending is None or validated_pending is not None
             update = replace(
                 update,
                 current_goal=update.current_goal if goal_authorized else "",
@@ -449,14 +516,44 @@ class DomainAdmissionEngine:
                     for entity_id in update.remember_entity_ids
                     if entity_id in admitted_entity_ids
                 ),
-                bind_pending=update.bind_pending if pending_authorized else None,
-                remember_turn=update.remember_turn and bool(admitted_actions),
+                bind_pending=(
+                    validated_pending.request
+                    if validated_pending is not None
+                    else None
+                ) if pending_authorized else None,
+                remember_turn=update.remember_turn and bool(
+                    admitted_actions or validated_pending is not None
+                ),
+            )
+        elif update.bind_pending is not None:
+            update = replace(
+                update,
+                bind_pending=(
+                    validated_pending.request
+                    if validated_pending is not None
+                    else None
+                ),
+                remember_turn=update.remember_turn and validated_pending is not None,
             )
         ambiguous_case_clarification = (
             proposal.clarification_need is not None
             and proposal.clarification_need.reason == "ambiguous_case_alias"
         )
+        pending_mismatch_clarification = (
+            proposal.clarification_need is not None
+            and proposal.clarification_need.reason == "pending_binding_mismatch"
+            and not admitted_actions
+        )
         if ambiguous_case_clarification and not admitted_actions:
+            active_pending_ids = tuple(
+                item.pending_id for item in state.active_pending(created_at)
+            )
+            preserves_lifecycle_revocation = (
+                update.pending_invalidation_reason
+                == "superseded_by_new_instruction"
+                and tuple(update.invalidated_pending_ids) == active_pending_ids
+                and bool(active_pending_ids)
+            )
             update = replace(
                 update,
                 current_goal="",
@@ -466,6 +563,14 @@ class DomainAdmissionEngine:
                 bind_pending=None,
                 user_constraints=None,
                 consumed_pending_ids=(),
+                invalidated_pending_ids=(
+                    active_pending_ids if preserves_lifecycle_revocation else ()
+                ),
+                pending_invalidation_reason=(
+                    "superseded_by_new_instruction"
+                    if preserves_lifecycle_revocation
+                    else ""
+                ),
                 resume_previous_goal=False,
                 clear_current_goal=False,
             )
@@ -474,7 +579,7 @@ class DomainAdmissionEngine:
             action_ids = tuple(
                 action_id for action_id in segment.action_ids if action_id in admitted_ids
             )
-            if not action_ids:
+            if not action_ids and segment.segment_id not in pending_segment_ids:
                 continue
             segment_entity_ids = tuple(
                 entity_id
@@ -507,7 +612,11 @@ class DomainAdmissionEngine:
             segments=tuple(retained_segments),
             clarification_need=(
                 proposal.clarification_need
-                if ambiguous_case_clarification
+                if (
+                    ambiguous_case_clarification
+                    or pending_mismatch_clarification
+                    or validated_pending is not None
+                )
                 else None
             ),
         )
@@ -550,6 +659,7 @@ class DomainAdmissionEngine:
         self,
         *,
         turn: CognitiveTurn,
+        state: ConversationState,
         action: RequiredAction,
         segment_id: str,
         segment_text: str,
@@ -559,6 +669,7 @@ class DomainAdmissionEngine:
         if action.action_type in _REPORT_ACTIONS:
             return _decide_report_action(
                 turn=turn,
+                state=state,
                 action=action,
                 segment_id=segment_id,
                 segment_text=segment_text,
@@ -1029,6 +1140,15 @@ class DomainAdmissionEngine:
                 entity_by_id=entity_by_id,
             )
 
+        if action.action_type == "update_travel_event":
+            return _decide_travel_update(
+                turn=turn,
+                state=state,
+                action=action,
+                segment_id=segment_id,
+                entity_by_id=entity_by_id,
+            )
+
         if action.action_type == "record_travel_event":
             travel_entity = _single_entity(action, entity_by_id)
             attributes = travel_entity.attributes if travel_entity is not None else {}
@@ -1086,6 +1206,25 @@ class DomainAdmissionEngine:
                         "travel_date": "",
                     },
                 )
+            if not _travel_date_claim_grounded(
+                date_hint,
+                segment_text,
+                occurred_at=turn.occurred_at,
+                timezone_name=str(
+                    turn.resources.get("timezone") or "Asia/Shanghai"
+                ),
+            ):
+                return (
+                    AdmissionDecision(
+                        action_id=action.action_id,
+                        segment_id=segment_id,
+                        domain="travel",
+                        operation="record_travel_event",
+                        status="blocked",
+                        reason_code="travel_date_not_grounded_in_segment",
+                    ),
+                    {},
+                )
             return (
                 AdmissionDecision(
                     action_id=action.action_id,
@@ -1112,6 +1251,357 @@ class DomainAdmissionEngine:
             ),
             {},
         )
+
+
+def _validate_pending_binding(
+    *,
+    turn: CognitiveTurn,
+    state: ConversationState,
+    proposal: SemanticInterpretation,
+    trace_id: str,
+    entity_by_id: Mapping[str, ConversationEntity],
+) -> _ValidatedPendingBinding | None:
+    """Revalidate a model-proposed confirmation without granting it authority.
+
+    The model may describe a pending confirmation, but only trusted resource
+    snapshots and the exact source segment can bind the object.  The returned
+    pending id is derived by the server so model-controlled ids cannot replace
+    an unrelated pending in ConversationState.
+    """
+
+    request = proposal.context_update.bind_pending
+    clarification = proposal.clarification_need
+    if request is None or clarification is None:
+        return None
+    if len(request.entity_ids) != 1 or not 1 <= request.expires_in_seconds <= 1800:
+        return None
+    entity = entity_by_id.get(request.entity_ids[0])
+    if entity is None:
+        return None
+    matching_segments = tuple(
+        segment
+        for segment in proposal.segments
+        if set(request.entity_ids).issubset(segment.entity_ids)
+        and request.intent in segment.intents
+    )
+    if len(matching_segments) != 1:
+        return None
+    segment = matching_segments[0]
+
+    if request.action == "update_travel_event":
+        if (
+            clarification.reason != "medium_risk_confirmation_required"
+            or entity.entity_type != "travel_intent_ref"
+        ):
+            return None
+        attributes = entity.attributes
+        travel_intent_id = str(attributes.get("travel_intent_id") or "").strip()
+        expected_version = attributes.get("expected_version")
+        if (
+            not travel_intent_id
+            or not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 1
+        ):
+            return None
+        matches = _matching_active_travel_intents(
+            turn=turn,
+            segment_text=segment.text,
+            cancellation=str(attributes.get("new_status") or "") == "cancelled",
+        )
+        if len(matches) != 1:
+            return None
+        active = matches[0]
+        if (
+            str(active.get("travel_intent_id") or "") != travel_intent_id
+            or int(active.get("version") or 0) != expected_version
+        ):
+            return None
+        new_status = str(attributes.get("new_status") or "").strip()
+        new_date_hint = str(attributes.get("new_date_hint") or "").strip()
+        framing = _non_assertive_framing(segment.text)
+        if framing:
+            return None
+        if new_status == "cancelled":
+            polarity = evaluate_assertion_polarity_contract(
+                domain="travel",
+                segment_text=segment.text,
+                statement_mode="asserted",
+                evidence_fragments=(segment.text,),
+                claim_anchors=(
+                    str(active.get("destination") or ""),
+                    "出差",
+                ),
+            )
+            if polarity.reason_code != "travel_assertion_negated_or_cancelled" or new_date_hint:
+                return None
+        else:
+            if new_status or not new_date_hint:
+                return None
+            resolved_date = _resolve_travel_date(
+                new_date_hint,
+                occurred_at=turn.occurred_at,
+                timezone_name=str(turn.resources.get("timezone") or "Asia/Shanghai"),
+            )
+            if resolved_date is None or not _date_hint_is_grounded(new_date_hint, segment.text):
+                return None
+            current_start = _parse_in_timezone(
+                active.get("start_at"),
+                str(turn.resources.get("timezone") or "Asia/Shanghai"),
+            )
+            if current_start is not None and current_start.date().isoformat() == resolved_date:
+                return None
+    elif request.action == "clear_daily_report":
+        if (
+            clarification.reason != "high_impact_confirmation_required"
+            or entity.entity_type != "daily_report"
+        ):
+            return None
+        current, snapshots = _trusted_daily_report_context(turn.resources)
+        if (
+            current is None
+            or current.status not in _DAILY_DRAFT_MUTABLE_STATUSES
+            or _resolve_daily_report(entity, snapshots, current=current) != current
+            or not _daily_reference_grounded(entity, current, segment.text)
+        ):
+            return None
+    else:
+        return None
+
+    trusted_request = replace(
+        request,
+        pending_id=_stable_uuid(
+            "bound-pending",
+            trace_id,
+            request.action,
+            request.intent,
+            entity.entity_id,
+        ),
+    )
+    return _ValidatedPendingBinding(
+        request=trusted_request,
+        segment_id=segment.segment_id,
+        entity_ids=request.entity_ids,
+        intents=(request.intent,),
+    )
+
+
+def _confirmed_pending_matches(
+    *,
+    turn: CognitiveTurn,
+    state: ConversationState,
+    pending_id: str,
+    action: str,
+    intent: str,
+    entity_ids: tuple[str, ...],
+) -> bool:
+    matches = tuple(
+        pending
+        for pending in state.active_pending(turn.occurred_at)
+        if pending.pending_id == pending_id
+        and pending.user_id == turn.user_id
+        and pending.conversation_id == turn.conversation_id
+        and pending.action == action
+        and pending.intent == intent
+        and pending.entity_ids == entity_ids
+    )
+    return len(matches) == 1 and len(state.active_pending(turn.occurred_at)) == 1
+
+
+def _decide_travel_update(
+    *,
+    turn: CognitiveTurn,
+    state: ConversationState,
+    action: RequiredAction,
+    segment_id: str,
+    entity_by_id: Mapping[str, ConversationEntity],
+) -> tuple[AdmissionDecision, Mapping[str, Any]]:
+    entity = _single_entity(action, entity_by_id)
+    confirmation_id = str(action.parameters.get("confirmed_pending_id") or "").strip()
+    if (
+        entity is None
+        or entity.entity_type != "travel_intent_ref"
+        or not confirmation_id
+        or not _confirmed_pending_matches(
+            turn=turn,
+            state=state,
+            pending_id=confirmation_id,
+            action="update_travel_event",
+            intent=action.intent,
+            entity_ids=action.entity_ids,
+        )
+    ):
+        return _blocked_decision(
+            action,
+            segment_id,
+            "travel",
+            "update_travel_event",
+            "verified_confirmation_required",
+        )
+    attributes = entity.attributes
+    travel_intent_id = str(attributes.get("travel_intent_id") or "").strip()
+    expected_version = attributes.get("expected_version")
+    active_rows = tuple(
+        raw
+        for raw in turn.resources.get("active_travel_intents") or ()
+        if isinstance(raw, Mapping)
+        and str(raw.get("travel_intent_id") or "") == travel_intent_id
+    )
+    if (
+        len(active_rows) != 1
+        or not isinstance(expected_version, int)
+        or isinstance(expected_version, bool)
+        or expected_version < 1
+        or int(active_rows[0].get("version") or 0) != expected_version
+    ):
+        return _blocked_decision(
+            action,
+            segment_id,
+            "travel",
+            "update_travel_event",
+            "travel_intent_version_or_scope_conflict",
+        )
+    active = active_rows[0]
+    new_status = str(attributes.get("new_status") or "").strip()
+    new_date_hint = str(attributes.get("new_date_hint") or "").strip()
+    authority_scope: dict[str, Any] = {
+        "travel_intent_id": travel_intent_id,
+        "version": expected_version,
+        "confirmed_pending_id": confirmation_id,
+    }
+    if new_status == "cancelled" and not new_date_hint:
+        authority_scope["status"] = "cancelled"
+        allowed_changed_fields = ("status",)
+    elif not new_status and new_date_hint:
+        resolved_date = _resolve_travel_date(
+            new_date_hint,
+            occurred_at=turn.occurred_at,
+            timezone_name=str(turn.resources.get("timezone") or "Asia/Shanghai"),
+        )
+        timezone_name = str(turn.resources.get("timezone") or "Asia/Shanghai")
+        current_start = _parse_in_timezone(active.get("start_at"), timezone_name)
+        current_end = _parse_in_timezone(active.get("end_at"), timezone_name)
+        if resolved_date is None or current_start is None or current_end is None:
+            return _blocked_decision(
+                action,
+                segment_id,
+                "travel",
+                "update_travel_event",
+                "travel_update_payload_invalid",
+            )
+        duration = current_end - current_start
+        local_zone = current_start.tzinfo
+        target_date = date.fromisoformat(resolved_date)
+        new_start = datetime.combine(
+            target_date,
+            current_start.timetz().replace(tzinfo=None),
+            tzinfo=local_zone,
+        )
+        new_end = new_start + duration
+        authority_scope.update(
+            {
+                "start_at": new_start.isoformat(),
+                "end_at": new_end.isoformat(),
+                "status": "changed",
+            }
+        )
+        allowed_changed_fields = ("start_at", "end_at", "status")
+    else:
+        return _blocked_decision(
+            action,
+            segment_id,
+            "travel",
+            "update_travel_event",
+            "travel_update_payload_invalid",
+        )
+    return (
+        AdmissionDecision(
+            action_id=action.action_id,
+            segment_id=segment_id,
+            domain="travel",
+            operation="update_travel_event",
+            status="admitted",
+            reason_code="confirmed_travel_update_authorized",
+        ),
+        {
+            "object_type": "travel_intent",
+            "stable_id": travel_intent_id,
+            "version": expected_version,
+            "authority_scope": authority_scope,
+            "allowed_changed_fields": allowed_changed_fields,
+        },
+    )
+
+
+def _matching_active_travel_intents(
+    *,
+    turn: CognitiveTurn,
+    segment_text: str,
+    cancellation: bool,
+) -> tuple[Mapping[str, Any], ...]:
+    rows: list[Mapping[str, Any]] = []
+    for raw in turn.resources.get("active_travel_intents") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        travel_intent_id = str(raw.get("travel_intent_id") or "").strip()
+        version = raw.get("version")
+        status = str(raw.get("status") or "").strip()
+        if (
+            not travel_intent_id
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or status in {"cancelled", "completed"}
+        ):
+            continue
+        rows.append(raw)
+    normalized_text = _normalize_reference(segment_text)
+    destination_matches = tuple(
+        row
+        for row in rows
+        if (destination := _normalize_reference(row.get("destination")))
+        and destination in normalized_text
+    )
+    candidates = destination_matches or tuple(rows)
+    if cancellation:
+        date_token = _explicit_relative_date_token(segment_text)
+        if date_token:
+            expected_date = _resolve_travel_date(
+                date_token,
+                occurred_at=turn.occurred_at,
+                timezone_name=str(turn.resources.get("timezone") or "Asia/Shanghai"),
+            )
+            dated = tuple(
+                row
+                for row in candidates
+                if (
+                    start := _parse_in_timezone(
+                        row.get("start_at"),
+                        str(turn.resources.get("timezone") or "Asia/Shanghai"),
+                    )
+                )
+                is not None
+                and start.date().isoformat() == expected_date
+            )
+            candidates = dated
+    return candidates
+
+
+def _explicit_relative_date_token(text: str) -> str:
+    match = re.search(r"(?:今天|明天|后天|\d{4}-\d{2}-\d{2})", str(text or ""))
+    return match.group(0) if match else ""
+
+
+def _date_hint_is_grounded(date_hint: str, segment_text: str) -> bool:
+    normalized_hint = re.sub(r"[_\-]", "", _normalize_reference(date_hint))
+    normalized_segment = re.sub(r"[_\-]", "", _normalize_reference(segment_text))
+    aliases = {
+        "tomorrow": "明天",
+        "dayaftertomorrow": "后天",
+        "nextmonday": "下周一",
+    }
+    localized = aliases.get(normalized_hint, normalized_hint)
+    return bool(localized and localized in normalized_segment)
 
 
 def _is_direct_case_query(segment_text: str) -> bool:
@@ -1155,6 +1645,7 @@ def _is_direct_case_query(segment_text: str) -> bool:
 def _decide_report_action(
     *,
     turn: CognitiveTurn,
+    state: ConversationState,
     action: RequiredAction,
     segment_id: str,
     segment_text: str,
@@ -1178,6 +1669,7 @@ def _decide_report_action(
         )
     return _decide_daily_report_action(
         turn=turn,
+        state=state,
         action=action,
         entity=entity,
         segment_entities=tuple(
@@ -1193,6 +1685,7 @@ def _decide_report_action(
 def _decide_daily_report_action(
     *,
     turn: CognitiveTurn,
+    state: ConversationState,
     action: RequiredAction,
     entity: ConversationEntity | None,
     segment_entities: tuple[ConversationEntity, ...],
@@ -1201,6 +1694,21 @@ def _decide_daily_report_action(
 ) -> tuple[AdmissionDecision, Mapping[str, Any]]:
     current, snapshots = _trusted_daily_report_context(turn.resources)
     active_daily = _active_daily_tasks(turn.resources)
+    state_daily_goal_active = str(
+        getattr(state.current_goal, "intent", "") or ""
+    ) in {"daily_report", "daily_append", "daily_modify"}
+    if action.action_type == "capture_daily_event":
+        capture_contract_reason = _daily_capture_contract_reason(
+            entity,
+            segment_text,
+        )
+        if capture_contract_reason:
+            return _report_decision(
+                action,
+                segment_id,
+                status="blocked",
+                reason_code=capture_contract_reason,
+            )
     if action.action_type == "capture_daily_event" and len(active_daily) == 1:
         if _matches_report_no_item_answer(entity, active_daily[0]):
             return _report_decision(
@@ -1309,15 +1817,29 @@ def _decide_daily_report_action(
         )
 
     if action.action_type == "capture_daily_event":
-        if capture_target is None or capture_target.status != "collecting":
+        if (
+            capture_target is None
+            or capture_target.status not in _DAILY_DRAFT_MUTABLE_STATUSES
+        ):
             return _report_decision(
                 action,
                 segment_id,
                 status="blocked",
                 reason_code="report_context_not_uniquely_authorized",
             )
+        explicit_daily_fact = _explicit_standalone_daily_fact_authorized(
+            field_name=(
+                str(entity.attributes.get("field") or "") if entity else ""
+            ),
+            segment_text=segment_text,
+            raw_fact=(str(entity.value or "") if entity else ""),
+        )
         if capture_target == current:
-            if len(active_daily) != 1:
+            if (
+                len(active_daily) != 1
+                and not state_daily_goal_active
+                and not explicit_daily_fact
+            ):
                 return _report_decision(
                     action,
                     segment_id,
@@ -1356,11 +1878,15 @@ def _decide_daily_report_action(
             segment_id,
             capture_target,
             authority_scope=authority_scope,
-            reason_code="active_daily_report_authorized",
+            reason_code=(
+                "active_daily_report_authorized"
+                if len(active_daily) == 1 or state_daily_goal_active
+                else "explicit_daily_fact_authorized"
+            ),
         )
 
     if action.action_type == "submit_daily_report":
-        if current.status != "collecting" or any(
+        if current.status not in _DAILY_DRAFT_MUTABLE_STATUSES or any(
             not current.sections[field_name] for field_name in _DAILY_REPORT_FIELDS
         ):
             return _report_decision(
@@ -1377,12 +1903,44 @@ def _decide_daily_report_action(
             reason_code="current_daily_report_submit_authorized",
         )
 
+    if action.action_type == "replace_daily_section":
+        if current.status not in _DAILY_DRAFT_MUTABLE_STATUSES:
+            return _report_decision(
+                action,
+                segment_id,
+                status="blocked",
+                reason_code="daily_report_not_writable",
+            )
+        if not _daily_section_replacement_grounded(
+            entity,
+            current,
+            segment_text=segment_text,
+            turn_text=turn.text,
+        ):
+            return _report_decision(
+                action,
+                segment_id,
+                status="blocked",
+                reason_code="daily_section_replacement_not_authorized",
+            )
+        field_name = str(entity.attributes.get("field") or "")
+        items = [str(value).strip() for value in entity.attributes.get("items", [])]
+        return _daily_command_admitted(
+            action,
+            segment_id,
+            current,
+            command_type="replace_section",
+            patch={"field": field_name, "items": items},
+            reason_code="daily_section_replacement_authorized",
+        )
+
     if action.action_type in {
         "edit_daily_item",
         "delete_daily_item",
         "merge_daily_items",
+        "move_daily_items",
     }:
-        if current.status != "collecting":
+        if current.status not in _DAILY_DRAFT_MUTABLE_STATUSES:
             return _report_decision(
                 action,
                 segment_id,
@@ -1391,11 +1949,33 @@ def _decide_daily_report_action(
             )
         targets = _entity_target_ids(entity)
         expected_minimum = 2 if action.action_type == "merge_daily_items" else 1
+        source_field = (
+            str(entity.attributes.get("source_field") or "") if entity else ""
+        )
+        target_field = (
+            str(entity.attributes.get("target_field") or "") if entity else ""
+        )
+        move_target_valid = True
+        if action.action_type == "move_daily_items":
+            move_target_valid = bool(
+                len(targets) == 1
+                and source_field in _DAILY_REPORT_FIELDS
+                and target_field in _DAILY_REPORT_FIELDS
+                and source_field != target_field
+                and targets[0] in current.item_ids[source_field]
+                and _daily_item_entity_matches_snapshot(
+                    entity,
+                    current,
+                    field_name=source_field,
+                    target_id=targets[0],
+                )
+            )
         if (
             len(targets) < expected_minimum
             or (action.action_type != "merge_daily_items" and len(targets) != 1)
             or len(set(targets)) != len(targets)
             or any(target not in _daily_item_ids(current) for target in targets)
+            or not move_target_valid
             or (
                 action.action_type == "merge_daily_items"
                 and not _daily_targets_share_field(current, targets)
@@ -1409,6 +1989,8 @@ def _decide_daily_report_action(
                 reason_code="daily_item_target_not_uniquely_authorized",
             )
         patch: dict[str, Any] = {}
+        if action.action_type == "move_daily_items":
+            patch["target_field"] = target_field
         if action.action_type in {"edit_daily_item", "merge_daily_items"}:
             replacement = str(entity.attributes.get("replacement") or "").strip() if entity else ""
             if action.action_type == "edit_daily_item" and not replacement:
@@ -1431,6 +2013,7 @@ def _decide_daily_report_action(
             "edit_daily_item": "edit_item",
             "delete_daily_item": "delete_item",
             "merge_daily_items": "merge_items",
+            "move_daily_items": "move_items",
         }[action.action_type]
         return _daily_command_admitted(
             action,
@@ -1451,7 +2034,7 @@ def _decide_daily_report_action(
                 status="blocked",
                 reason_code="daily_report_snapshot_not_uniquely_authorized",
             )
-        if current.status != "collecting":
+        if current.status not in _DAILY_DRAFT_MUTABLE_STATUSES:
             return _report_decision(
                 action,
                 segment_id,
@@ -1463,8 +2046,20 @@ def _decide_daily_report_action(
             verified_ids = turn.resources.get("verified_confirmation_ids")
             if (
                 not confirmation_id
-                or not isinstance(verified_ids, (list, tuple, set))
-                or confirmation_id not in {str(value) for value in verified_ids}
+                or not (
+                    _confirmed_pending_matches(
+                        turn=turn,
+                        state=state,
+                        pending_id=confirmation_id,
+                        action="clear_daily_report",
+                        intent=action.intent,
+                        entity_ids=action.entity_ids,
+                    )
+                    or (
+                        isinstance(verified_ids, (list, tuple, set))
+                        and confirmation_id in {str(value) for value in verified_ids}
+                    )
+                )
             ):
                 return _report_decision(
                     action,
@@ -1529,7 +2124,7 @@ def _decide_daily_report_action(
         "copy_current_work_to_tomorrow",
         "complete_previous_daily_plan",
     }:
-        if current.status != "collecting":
+        if current.status not in _DAILY_DRAFT_MUTABLE_STATUSES:
             return _report_decision(
                 action,
                 segment_id,
@@ -1889,7 +2484,7 @@ def _parse_daily_report(
         or not isinstance(version, int)
         or isinstance(version, bool)
         or version < 0
-        or status not in {"collecting", "completed"}
+        or status not in {*_DAILY_DRAFT_MUTABLE_STATUSES, "completed"}
     ):
         return None
     sections: dict[str, list[str]] = {field: [] for field in _DAILY_REPORT_FIELDS}
@@ -2039,7 +2634,7 @@ def _active_daily_tasks(resources: Mapping[str, Any]) -> tuple[Mapping[str, Any]
         for item in raw_tasks
         if isinstance(item, dict)
         and item.get("workflow") == "daily_report"
-        and item.get("status") == "collecting"
+        and item.get("status") in _DAILY_DRAFT_MUTABLE_STATUSES
     )
 
 
@@ -2064,6 +2659,316 @@ def _daily_targets_share_field(
         if any(target in item_ids for target in targets)
     }
     return len(fields) == 1
+
+
+def _daily_item_entity_matches_snapshot(
+    entity: ConversationEntity | None,
+    snapshot: _TrustedDailyReport,
+    *,
+    field_name: str,
+    target_id: str,
+) -> bool:
+    if entity is None or field_name not in _DAILY_REPORT_FIELDS:
+        return False
+    try:
+        index = snapshot.item_ids[field_name].index(target_id)
+        trusted_value = snapshot.sections[field_name][index]
+    except (KeyError, IndexError, ValueError):
+        return False
+    return _normalize_reference(entity.value) == _normalize_reference(trusted_value)
+
+
+def _daily_capture_contract_reason(
+    entity: ConversationEntity | None,
+    segment_text: str,
+) -> str:
+    """Reject a non-assertive clause before it can gain Daily write authority."""
+
+    source = str(segment_text or "").strip()
+    if entity is not None and str(entity.value or "").strip():
+        # A semantic segment may legitimately contain an affirmative Daily fact
+        # plus a separate question.  Judge the exact grounded fact clause so a
+        # sibling question cannot erase the positive segment-level outcome.
+        source = _daily_fact_target_context(
+            source,
+            raw_fact=str(entity.value or ""),
+        )
+    source = _daily_assertion_source(source)
+    raw_fact = str(entity.value or "").strip() if entity is not None else ""
+    if raw_fact and not _daily_item_polarity_preserved(
+        source,
+        raw_fact=raw_fact,
+    ):
+        return "daily_statement_polarity_not_preserved"
+    attributes = entity.attributes if entity is not None else {}
+    statement_mode = str(attributes.get("statement_mode") or "").strip()
+    if statement_mode and statement_mode != "asserted":
+        return "daily_statement_not_asserted"
+    if not source:
+        return "daily_statement_not_grounded"
+    if re.search(
+        r"(?:不要|不用|别|无需).{0,8}(?:记入|写入|写进|补到|放进).{0,8}日报"
+        r"|(?:不要|不用|别|无需).{0,8}日报.{0,8}(?:记|写|补|填)",
+        source,
+    ):
+        return "daily_write_opted_out"
+    if re.search(r"[?？]", source) or _non_assertive_framing(source) in {
+        "question",
+        "hypothetical",
+        "quoted",
+        "user_opted_out",
+    }:
+        return "daily_statement_not_asserted"
+    explicit_daily_write = bool(
+        re.search(
+            r"(?:记入|写入|写进|补到|放进).{0,8}日报|日报.{0,8}(?:记|写|补|填)",
+            source,
+        )
+    )
+    if explicit_daily_write:
+        return ""
+    if re.match(
+        r"^\s*(?:听说|据说|\S{1,8}(?:说|称|表示|反馈|提到))",
+        source,
+    ) or re.match(
+        r"^\s*(?:会议纪要|邮件|法院文书|正式材料).{0,12}(?:写着|写明|显示|提到|记录|称)",
+        source,
+    ):
+        return "daily_statement_reported_or_quoted"
+    field_name = str(attributes.get("field") or "")
+    if field_name == "tomorrow_plan" and daily_item_has_termination_state(source):
+        return "daily_positive_plan_fact_cancelled"
+    if field_name in {"today_work", "tomorrow_plan"} and (
+        _DAILY_NONAFFIRMATIVE_LEADING.search(_normalize_reference(source))
+    ):
+        return "daily_statement_not_affirmative"
+    if field_name == "today_work" and re.search(
+        r"(?:没|没有|未|尚未|还没|并未).{0,6}"
+        r"(?:完成|做完|处理|审核|推进|跟进|整理|制作|参加|提交)",
+        source,
+    ):
+        return "daily_positive_work_fact_negated"
+    if (
+        field_name == "tomorrow_plan"
+        and not daily_item_is_nominal_termination_work(source)
+        and re.search(
+            r"(?:取消|不去|不再|不用|无需|没法|无法|去不了).{0,16}"
+            r"(?:明天|明日|计划|出差|会议|开庭|审核|处理|推进|跟进)"
+            r"|(?:明天|明日|计划|出差|会议|开庭).{0,16}"
+            r"(?:取消|不去|不再|不用|无需|没法|无法|去不了)",
+            source,
+        )
+    ):
+        return "daily_positive_plan_fact_cancelled"
+    return ""
+
+
+def _daily_assertion_source(value: str) -> str:
+    """Remove Daily document scaffolding without removing assertion framing."""
+
+    source = str(value or "").strip()
+    source = _DAILY_SECTION_ASSERTION_PREFIX.sub("", source, count=1)
+    source = _DAILY_ITEM_ASSERTION_PREFIX.sub("", source, count=1)
+    return source.strip()
+
+
+def _daily_item_polarity_preserved(source: str, *, raw_fact: str) -> bool:
+    """Reject model items that omit nearby negation or cancellation framing."""
+
+    normalized_source = _normalize_reference(source)
+    normalized_fact = _normalize_reference(_daily_assertion_source(raw_fact))
+    if not normalized_source or not normalized_fact:
+        return False
+    starts: list[int] = []
+    cursor = 0
+    while True:
+        start = normalized_source.find(normalized_fact, cursor)
+        if start < 0:
+            break
+        starts.append(start)
+        cursor = start + max(1, len(normalized_fact))
+    if not starts:
+        return False
+    for start in starts:
+        prefix = normalized_source[:start]
+        suffix = normalized_source[start + len(normalized_fact) :]
+        if _DAILY_DROPPED_POLARITY_PREFIX.search(prefix):
+            return False
+        if _DAILY_DROPPED_POLARITY_SUFFIX.search(
+            suffix
+        ) or daily_item_has_termination_state(suffix):
+            return False
+    return True
+
+
+def _daily_section_replacement_grounded(
+    entity: ConversationEntity | None,
+    snapshot: _TrustedDailyReport,
+    *,
+    segment_text: str,
+    turn_text: str,
+) -> bool:
+    if entity is None or entity.entity_type != "daily_report":
+        return False
+    attributes = entity.attributes
+    field_name = str(attributes.get("field") or "").strip()
+    raw_items = attributes.get("items")
+    if (
+        str(attributes.get("report_id") or "") != snapshot.report_id
+        or attributes.get("version") != snapshot.version
+        or field_name not in _DAILY_REPORT_FIELDS
+        or not isinstance(raw_items, (list, tuple))
+        or not raw_items
+        or any(not isinstance(value, str) or not value.strip() for value in raw_items)
+        or not _entity_value_grounded(entity, segment_text)
+    ):
+        return False
+    items = tuple(str(value).strip() for value in raw_items)
+    if any(
+        _daily_capture_contract_reason(
+            ConversationEntity(
+                entity_id=f"daily-section-item-{index}",
+                entity_type="daily_event",
+                value=item,
+                confidence=1.0,
+                attributes={"field": field_name},
+            ),
+            turn_text,
+        )
+        for index, item in enumerate(items)
+    ):
+        return False
+    document = parse_structured_daily_document(turn_text)
+    if document is not None and set(document.fields) == set(_DAILY_REPORT_FIELDS):
+        expected = tuple(
+            item.value for item in document.items if item.field == field_name
+        )
+        return items == expected
+
+    section_items = parse_structured_daily_section(segment_text, field_name)
+    return section_items is not None and items == tuple(
+        item.value for item in section_items
+    )
+
+
+def _explicit_standalone_daily_fact_authorized(
+    *,
+    field_name: str,
+    segment_text: str,
+    raw_fact: str = "",
+) -> bool:
+    """Authorize only self-identifying Daily facts without an active prompt.
+
+    The semantic model still chooses the facet, but a closed textual contract
+    prevents a bare topic, question, hypothetical, or quoted statement from
+    gaining report-write authority merely because the model labeled it Daily.
+    """
+
+    source = str(segment_text or "").strip()
+    if str(raw_fact or "").strip():
+        source = _daily_fact_target_context(source, raw_fact=raw_fact)
+    if field_name not in _DAILY_REPORT_FIELDS or not source:
+        return False
+    if _daily_capture_contract_reason(
+        ConversationEntity(
+            entity_id="standalone-daily-capture-contract",
+            entity_type="daily_event",
+            value=source,
+            confidence=1.0,
+            attributes={"field": field_name},
+        ),
+        source,
+    ):
+        return False
+    explicit_daily_write = bool(
+        re.search(
+            r"(?:记入|写入|写进|补到|放进).{0,8}日报|日报.{0,8}(?:记|写|补|填)",
+            source,
+        )
+    )
+    if re.search(
+        r"(?:不要|不用|别|无需).{0,8}(?:记入|写入|写进|补到|放进).{0,8}日报"
+        r"|(?:不要|不用|别|无需).{0,8}日报.{0,8}(?:记|写|补|填)",
+        source,
+    ):
+        return False
+    if re.search(r"[?？]", source) or daily_item_is_unpunctuated_question(
+        _daily_assertion_source(source)
+    ):
+        return False
+    if re.match(
+        r"^\s*(?:如果|假如|假设|要是|听说|据说|\S{1,8}(?:说|称|表示|反馈|提到))",
+        source,
+    ):
+        return False
+    if re.match(
+        r"^\s*(?:会议纪要|邮件|法院文书|正式材料).{0,12}(?:写着|写明|显示|提到|记录|称)",
+        source,
+    ):
+        return False
+    framing = _non_assertive_framing(_daily_assertion_source(source))
+    if framing and not (framing == "quoted" and explicit_daily_write):
+        return False
+    if explicit_daily_write:
+        return True
+    if field_name == "today_work":
+        if re.search(
+            r"(?:没|没有|未|尚未|还没|并未).{0,6}"
+            r"(?:完成|做完|处理|审核|推进|跟进|整理|制作|参加|提交)",
+            source,
+        ):
+            return False
+        return bool(
+            re.search(r"(?:^|[\n；;])\s*(?:今日|今天)(?:工作|完成)\s*[：:]", source)
+            or re.search(
+                r"^(?:我)?(?:今天|今日).{0,24}(?:完成|做了|处理|审核|推进|跟进|整理|制作|参加|沟通|开会|开庭|提交|梳理|评估|复盘|出差)",
+                source,
+            )
+            or re.search(
+                r"^(?:我)?(?:已经|已|完成了|做完了|审核了|处理了|推进了|跟进了|整理了|制作了|参加了|提交了)",
+                source,
+            )
+            or re.search(
+                r"^[^\n；;？?]{1,32}(?:已经|已)"
+                r"(?:完成|做完|处理|审核|推进|跟进|整理|制作|参加|提交|梳理|评估|复盘)",
+                source,
+            )
+        )
+    if field_name == "problems":
+        return bool(
+            re.search(
+                r"(?:^|[\n；;])\s*(?:问题(?:与|和|/)?风险|风险(?:与|和|/)?问题|问题)"
+                r"(?:就是|是|为|\s*[，,:：])",
+                source,
+            )
+            or re.search(r"(?:存在|遇到|当前|仍有).{0,12}(?:问题|风险|阻塞|故障|延误)", source)
+        )
+    if (
+        not daily_item_is_nominal_termination_work(
+            _daily_assertion_source(source)
+        )
+        and re.search(
+            r"(?:取消|不去|不再|不用|无需|没法|无法|去不了).{0,16}"
+            r"(?:明天|明日|计划|出差|会议|开庭|审核|处理|推进|跟进)"
+            r"|(?:明天|明日).{0,16}(?:取消|不去|不再|不用|无需|没法|无法|去不了)",
+            source,
+        )
+    ):
+        return False
+    return bool(
+        re.search(
+            r"(?:^|[\n；;])\s*(?:明日|明天)(?:工作)?计划\s*[：:]",
+            source,
+        )
+        or re.search(r"这是(?:明天|明日)(?:的)?(?:工作|计划|工作计划)", source)
+        or (
+            re.search(r"(?:明天|明日)", source)
+            and re.search(
+                r"(?:计划|准备|参加|出差|开庭|审核|处理|推进|跟进|整理|制作|提交|沟通|会议|待办|工作|评估|复盘)",
+                source,
+            )
+        )
+    )
 
 
 def _periodic_item_ids(snapshot: _TrustedPeriodicReport) -> frozenset[str]:
@@ -2268,6 +3173,7 @@ def _action_contract(action: RequiredAction) -> tuple[str, str]:
         "query_operation_status": ("runtime", "query_operation_status"),
         "search_enterprise_knowledge": ("knowledge", "search_enterprise_knowledge"),
         "record_travel_event": ("travel", "record_travel_event"),
+        "update_travel_event": ("travel", "update_travel_event"),
         "respond_travel_collaboration": (
             "travel",
             "respond_travel_collaboration",
@@ -3073,6 +3979,7 @@ def evaluate_assertion_polarity_contract(
 
 def _non_assertive_framing(segment_text: str) -> str:
     normalized = _normalize_reference(segment_text)
+    question_normalized = daily_semantic_detection_copy(segment_text).casefold()
     if any(
         marker in normalized
         for marker in (
@@ -3102,9 +4009,10 @@ def _non_assertive_framing(segment_text: str) -> str:
         return "user_opted_out"
     if re.search(r"[\u201c\u2018\"].+?[\u201d\u2019\"]", segment_text):
         return "quoted"
-    if "?" in segment_text or "\uff1f" in segment_text or re.search(
-        r"(?:\u5417|\u4e48|\u662f\u5426|\u6709\u6ca1\u6709|\u662f\u4e0d\u662f|\u80fd\u4e0d\u80fd|\u53ef\u4e0d\u53ef\u4ee5)[\u3002\uff01!]*$",
-        normalized,
+    if (
+        "?" in segment_text
+        or "\uff1f" in segment_text
+        or daily_item_is_unpunctuated_question(question_normalized)
     ):
         return "question"
     return ""
@@ -3200,7 +4108,8 @@ def _domain_clause_polarity(domain: str, clause: str) -> str:
     if any(re.search(pattern, normalized) for pattern in negative_patterns):
         return "negative"
     if domain == "travel" and re.search(
-        r"(?:\u53d6\u6d88|\u64a4\u9500).{0,8}(?:\u51fa\u5dee|\u884c\u7a0b|\u51fa\u884c)",
+        r"(?:\u53d6\u6d88|\u64a4\u9500).{0,8}(?:\u51fa\u5dee|\u884c\u7a0b|\u51fa\u884c)"
+        r"|(?:\u51fa\u5dee|\u884c\u7a0b|\u51fa\u884c).{0,8}(?:\u53d6\u6d88|\u64a4\u9500|\u4e0d\u53bb\u4e86)",
         normalized,
     ):
         return "negative"
@@ -3392,6 +4301,27 @@ def _grounded_travel_claim_fallback(
     destination = str(attributes.get("destination") or "").strip()
     date_hint = str(attributes.get("date_hint") or "").strip()
     purpose = str(attributes.get("purpose") or "").strip()
+    date_claim_grounded = _travel_date_claim_grounded(
+        date_hint,
+        entity_value,
+        occurred_at=occurred_at,
+        timezone_name=timezone_name,
+    )
+    # An exact but underspecified source date (for example, a week without a
+    # day) is still evidence for an asserted trip.  It must not authorize a
+    # write: the caller resolves the date next and creates InformationPending
+    # when resolution is impossible.  This branch only prevents a valid
+    # missing-information request from being mislabeled as ungrounded input.
+    underspecified_date_grounded = bool(
+        date_hint
+        and _resolve_travel_date(
+            date_hint,
+            occurred_at=occurred_at,
+            timezone_name=timezone_name,
+        )
+        is None
+        and _normalize_reference(date_hint) in _normalize_reference(entity_value)
+    )
     if (
         not entity_value
         or entity_value not in segment_text
@@ -3399,12 +4329,7 @@ def _grounded_travel_claim_fallback(
         or _normalize_reference(destination) not in _normalize_reference(entity_value)
         or not purpose
         or _normalize_reference(purpose) not in _normalize_reference(entity_value)
-        or not _travel_date_claim_grounded(
-            date_hint,
-            entity_value,
-            occurred_at=occurred_at,
-            timezone_name=timezone_name,
-        )
+        or not (date_claim_grounded or underspecified_date_grounded)
     ):
         return ()
     return (entity_value,)
@@ -3476,10 +4401,19 @@ def _resolve_travel_date(
         local_now = occurred_at.astimezone(ZoneInfo(timezone_name))
     except (KeyError, ValueError):
         return None
-    normalized = _normalize_reference(date_hint)
-    offsets = {"今天": 0, "明天": 1, "后天": 2}
+    normalized = re.sub(r"[_\-]", "", _normalize_reference(date_hint))
+    offsets = {
+        "今天": 0,
+        "today": 0,
+        "明天": 1,
+        "tomorrow": 1,
+        "后天": 2,
+        "dayaftertomorrow": 2,
+    }
     if normalized in offsets:
         return (local_now.date() + timedelta(days=offsets[normalized])).isoformat()
+    if normalized in {"下周一", "nextmonday"}:
+        return (local_now.date() + timedelta(days=7 - local_now.weekday())).isoformat()
     try:
         return datetime.fromisoformat(date_hint).date().isoformat()
     except ValueError:
@@ -3516,6 +4450,16 @@ def _parse_aware_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed
+
+
+def _parse_in_timezone(value: Any, timezone_name: str) -> datetime | None:
+    parsed = _parse_aware_datetime(value)
+    if parsed is None:
+        return None
+    try:
+        return parsed.astimezone(ZoneInfo(timezone_name))
+    except (KeyError, ValueError):
+        return None
 
 
 def _resolve_active_case_followup(
@@ -3632,6 +4576,13 @@ def _stable_object_ref(
             "version": int(raw_object_ref.get("version") or 0),
         }
     if domain == "travel":
+        stable_id = str(raw_object_ref.get("stable_id") or "").strip()
+        if stable_id:
+            return {
+                "object_type": "travel_intent",
+                "stable_id": stable_id,
+                "version": raw_object_ref.get("version"),
+            }
         return {
             "object_type": "travel_intent",
             "stable_id": _stable_uuid("travel-intent", trace_id, action.action_id),

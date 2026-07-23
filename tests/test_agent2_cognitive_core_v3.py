@@ -732,7 +732,7 @@ def test_travel_collaboration_response_plans_candidate_bound_to_trusted_id():
     assert plan.business_commands[0].payload["entities"][0]["attributes"]["candidate_id"] == candidate_id
 
 
-def test_explicit_daily_submit_is_not_hijacked_by_bound_monthly_pending():
+def test_explicit_daily_submit_supersedes_bound_monthly_pending_without_confirming_it():
     now = datetime(2026, 7, 10, 9, 0, tzinfo=timezone.utc)
     monthly_entity = ConversationEntity(
         entity_id="monthly-report-1",
@@ -797,7 +797,13 @@ def test_explicit_daily_submit_is_not_hijacked_by_bound_monthly_pending():
     assert [command.command_type for command in plan.daily_commands] == ["submit_report"]
     assert plan.daily_commands[0].report_version == 5
     assert plan.blocked_actions == ()
-    assert result.state.pending == (monthly_pending,)
+    assert result.state.pending == ()
+    assert result.decision.context_update.invalidated_pending_ids == (
+        monthly_pending.pending_id,
+    )
+    assert result.decision.context_update.pending_invalidation_reason == (
+        "superseded_by_new_instruction"
+    )
 
 
 def test_pending_created_by_cognitive_core_is_bound_to_intent_entity_action_and_expiry():
@@ -926,6 +932,22 @@ def test_user_no_write_constraint_persists_and_blocks_daily_command_planning():
 def test_llm_semantic_interpreter_receives_conversation_state_and_returns_only_cognition():
     payload = {
         "intents": ["daily_append", "case_query"],
+        "segments": [
+            {
+                "segment_id": "daily-segment",
+                "text": "今天完成合同审核",
+                "intents": ["daily_append"],
+                "entity_ids": ["daily-llm-1"],
+                "action_ids": ["capture-llm-daily"],
+            },
+            {
+                "segment_id": "case-segment",
+                "text": "王总案件风险怎么看",
+                "intents": ["case_query"],
+                "entity_ids": ["case-llm-1"],
+                "action_ids": ["answer-llm-case"],
+            },
+        ],
         "entities": [
             {
                 "entity_id": "daily-llm-1",
@@ -1715,6 +1737,66 @@ def test_cognitive_orchestrator_never_advances_state_for_enforced_nonadvancing_a
     ) == base_state
 
 
+def test_enforced_block_without_selection_persists_only_superseded_pending_revocation():
+    now = datetime(2026, 7, 10, 9, 0, tzinfo=timezone.utc)
+    old_pending = BoundPending(
+        pending_id="old-travel-confirmation",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        intent="travel_event",
+        action="update_travel_event",
+        entity_ids=("old-travel-intent",),
+        context_id="old-travel-context",
+        created_at=now - timedelta(minutes=1),
+        expires_at=now + timedelta(minutes=10),
+    )
+    base_state = ConversationState(
+        user_id="user-1",
+        conversation_id="conversation-1",
+        pending=(old_pending,),
+    )
+    proposed_state = replace(base_state, version=1, pending=())
+    decision = SimpleNamespace(
+        admission_mode="enforced",
+        admission_information_pendings=(),
+        admission_trace=SimpleNamespace(
+            decisions=(SimpleNamespace(status="blocked"),)
+        ),
+        context_update=SimpleNamespace(
+            consumed_pending_ids=(),
+            invalidated_pending_ids=(old_pending.pending_id,),
+            pending_invalidation_reason="superseded_by_new_instruction",
+        ),
+    )
+    result = SimpleNamespace(
+        decision=decision,
+        base_state=base_state,
+        state=proposed_state,
+        state_persisted=False,
+        command_plan=SimpleNamespace(
+            daily_commands=(),
+            business_commands=(),
+            report_commands=(),
+            blocked_actions=(),
+        ),
+    )
+    store = InMemoryConversationStateStore((base_state,))
+
+    finalized = asyncio.run(
+        finalize_cognitive_state_after_execution(
+            result=result,
+            state_store=store,
+            execution_succeeded=True,
+        )
+    )
+
+    assert finalized.pending == ()
+    assert finalized.version == base_state.version + 1
+    assert asyncio.run(
+        store.load(user_id=base_state.user_id, conversation_id=base_state.conversation_id)
+    ) == finalized
+
+
 def test_conversation_state_payload_round_trip_preserves_bound_state():
     now = datetime(2026, 7, 10, 9, 0, tzinfo=timezone.utc)
     entity = ConversationEntity(
@@ -1896,6 +1978,15 @@ def test_semantic_interpreter_receives_typed_daily_resources_for_exact_target_re
     client = FakeStructuredCompletionClient(
         {
             "intents": ["daily_modify"],
+            "segments": [
+                {
+                    "segment_id": "resource-delete-segment",
+                    "text": "删除第二条",
+                    "intents": ["daily_modify"],
+                    "entity_ids": ["resource-target"],
+                    "action_ids": ["resource-delete"],
+                }
+            ],
             "entities": [
                 {
                     "entity_id": "resource-target",
@@ -1962,6 +2053,49 @@ def test_semantic_interpretation_rejects_execution_and_database_fields():
         )
 
 
+def test_semantic_interpreter_repairs_segment_object_returned_as_top_level_payload():
+    text = "在吗"
+    malformed_segment = {
+        "segment_id": "segment-only",
+        "text": text,
+        "intents": ["chat"],
+        "entity_ids": [],
+        "action_ids": [],
+    }
+    valid_turn = {
+        "intents": ["chat"],
+        "segments": [
+            {
+                "segment_id": "chat-segment",
+                "text": text,
+                "intents": ["chat"],
+                "entity_ids": [],
+                "action_ids": [],
+            }
+        ],
+        "entities": [],
+        "confidence": 1.0,
+        "required_actions": [],
+        "clarification_need": None,
+        "context_update": {"current_goal": "chat", "remember_turn": True},
+    }
+    client = SequenceStructuredCompletionClient(malformed_segment, valid_turn)
+
+    interpretation = asyncio.run(
+        LLMCognitiveSemanticInterpreter(client).interpret(
+            _turn("segment-object-repair", text),
+            ConversationState.empty(
+                user_id="user-1",
+                conversation_id="conversation-1",
+            ),
+        )
+    )
+
+    assert len(client.calls) == 2
+    assert tuple(segment.text for segment in interpretation.segments) == (text,)
+    assert interpretation.required_actions == ()
+
+
 def test_semantic_interpreter_repairs_submit_that_was_wrongly_turned_into_pending():
     report_entity = {
         "entity_id": "current-daily-report",
@@ -1971,6 +2105,15 @@ def test_semantic_interpreter_repairs_submit_that_was_wrongly_turned_into_pendin
     }
     invalid = {
         "intents": ["daily_submit"],
+        "segments": [
+            {
+                "segment_id": "wrong-submit-segment",
+                "text": "提交日报",
+                "intents": ["daily_submit"],
+                "entity_ids": ["current-daily-report"],
+                "action_ids": [],
+            }
+        ],
         "entities": [report_entity],
         "confidence": 1.0,
         "required_actions": [],
@@ -1991,6 +2134,15 @@ def test_semantic_interpreter_repairs_submit_that_was_wrongly_turned_into_pendin
     }
     valid = {
         "intents": ["daily_submit"],
+        "segments": [
+            {
+                "segment_id": "submit-segment",
+                "text": "提交日报",
+                "intents": ["daily_submit"],
+                "entity_ids": ["current-daily-report"],
+                "action_ids": ["submit-current-daily"],
+            }
+        ],
         "entities": [report_entity],
         "confidence": 1.0,
         "required_actions": [
@@ -1998,7 +2150,7 @@ def test_semantic_interpreter_repairs_submit_that_was_wrongly_turned_into_pendin
                 "action_id": "submit-current-daily",
                 "action_type": "submit_daily_report",
                 "intent": "daily_submit",
-                "entity_ids": [],
+                "entity_ids": ["current-daily-report"],
             }
         ],
         "clarification_need": None,

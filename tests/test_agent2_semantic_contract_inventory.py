@@ -5,14 +5,20 @@ import re
 from app.agent2.admission_artifact_sink_sql import (
     _READ_ONLY_ADMITTED_OPERATIONS,
 )
+from app.agent2.admission_store_sql import _ALLOWED_CHANGED_FIELDS
 from app.agent2.command_planner_v3 import _READ_ONLY_COGNITIVE_ACTIONS
-from app.agent2.cognitive_core_v3 import _ACTION_ENTITY_TYPES
+from app.agent2.cognitive_core_v3 import _ACTION_ENTITY_TYPES, SemanticInterpretation
 from app.agent2.domain_admission import (
     _READ_ONLY_ACTIONS,
     _REPORT_ACTIONS,
     _action_requires_execution_ticket,
 )
 from app.agent2.semantic_interpreter_v3 import PROMPT_PATH
+from app.agent2.typed_daily_commands import DAILY_ADMISSION_OPERATION_CONTRACTS
+from app.agent2.cognitive_contract_v3 import (
+    ENTITY_ATTRIBUTE_KEYS,
+    validate_semantic_interpretation_contract,
+)
 
 
 _NON_REPORT_ADMISSION_ACTIONS = {
@@ -25,6 +31,7 @@ _NON_REPORT_ADMISSION_ACTIONS = {
     "query_operation_status",
     "search_enterprise_knowledge",
     "record_travel_event",
+    "update_travel_event",
     "respond_travel_collaboration",
     "update_case_followup_policy",
     "trigger_case_followup_now",
@@ -89,3 +96,66 @@ def test_every_non_read_only_semantic_action_requires_an_execution_ticket():
         _action_requires_execution_ticket(action)
         for action in runtime_actions - set(_READ_ONLY_ACTIONS)
     )
+
+
+def test_deterministic_daily_document_actions_have_complete_admission_contracts():
+    expected = {
+        "replace_daily_section": ("replace_section", ("section", "items")),
+        "move_daily_items": ("move_items", ("section", "items")),
+    }
+
+    assert {
+        action: DAILY_ADMISSION_OPERATION_CONTRACTS[action]
+        for action in expected
+    } == expected
+    assert expected.keys() <= _REPORT_ACTIONS
+    assert {
+        action: tuple(_ALLOWED_CHANGED_FIELDS[("report", action)])
+        for action in expected
+    } == {
+        action: changed_fields
+        for action, (_command_type, changed_fields) in expected.items()
+    }
+
+
+def test_daily_event_contract_preserves_nonassertive_language_signal():
+    assert "statement_mode" in ENTITY_ATTRIBUTE_KEYS["daily_event"]
+    prompt = PROMPT_PATH.read_text(encoding="utf-8")
+    assert "daily_event={field,statement_mode,context_reference}" in prompt
+    assert "Only `asserted` may become a Daily mutation candidate" in prompt
+
+
+def test_negated_statement_mode_is_a_valid_non_mutating_semantic_signal():
+    interpretation = SemanticInterpretation.from_payload(
+        {
+            "intents": ["daily_append"],
+            "segments": [
+                {
+                    "segment_id": "negated-daily",
+                    "text": "今天没有完成合同审核",
+                    "intents": ["daily_append"],
+                    "entity_ids": ["negated-event"],
+                    "action_ids": [],
+                }
+            ],
+            "entities": [
+                {
+                    "entity_id": "negated-event",
+                    "entity_type": "daily_event",
+                    "value": "今天没有完成合同审核",
+                    "confidence": 1.0,
+                    "attributes": {
+                        "field": "today_work",
+                        "statement_mode": "negated",
+                    },
+                }
+            ],
+            "confidence": 1.0,
+            "required_actions": [],
+            "clarification_need": None,
+            "context_update": {"preserve_current_goal": True},
+        }
+    )
+
+    validate_semantic_interpretation_contract(interpretation)
+    assert interpretation.required_actions == ()

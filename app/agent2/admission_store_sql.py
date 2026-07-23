@@ -37,6 +37,7 @@ from app.agent2.business.contracts import (
     RespondTravelCollaboration,
     SnoozeCaseFollowup,
     UpdateCaseProgress,
+    UpdateTravelIntent,
 )
 from app.agent2.case_followup_commands import (
     TriggerCaseFollowupNow,
@@ -277,6 +278,8 @@ _ALLOWED_CHANGED_FIELDS: dict[tuple[str, str], list[str]] = {
     ("report", "delete_daily_item"): ["items"],
     ("report", "edit_daily_item"): ["items"],
     ("report", "merge_daily_items"): ["items"],
+    ("report", "replace_daily_section"): ["section", "items"],
+    ("report", "move_daily_items"): ["section", "items"],
     ("report", "query_daily_report"): [],
     ("report", "clear_daily_report"): ["sections", "items"],
     ("report", "clear_daily_section"): ["section", "items"],
@@ -305,6 +308,7 @@ _ALLOWED_CHANGED_FIELDS: dict[tuple[str, str], list[str]] = {
 }
 
 _DYNAMIC_ALLOWED_CHANGED_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("travel", "update_travel_event"): ("start_at", "end_at", "status"),
     ("case", "update_case_progress"): ("summary", "details"),
     ("case", "link_case_progress"): (
         "related_party_ids",
@@ -2096,6 +2100,33 @@ def _require_command_claims(
             == command.purpose_summary.strip()
             and not command.related_case_ids
         )
+    elif isinstance(command, UpdateTravelIntent):
+        expected_status = str(authority_scope.get("status") or "")
+        matches = (
+            str(authority_scope.get("travel_intent_id") or "")
+            == command.travel_intent_id
+            and _authority_version(authority_scope) == command.expected_version
+            and expected_status == str(command.status or "")
+            and (
+                command.start_at is None
+                or str(authority_scope.get("start_at") or "")
+                == command.start_at.isoformat()
+            )
+            and (
+                command.end_at is None
+                or str(authority_scope.get("end_at") or "")
+                == command.end_at.isoformat()
+            )
+            and (
+                command.destination_normalized is None
+                or str(authority_scope.get("destination_normalized") or "")
+                == command.destination_normalized
+            )
+            and (
+                command.city_code is None
+                or str(authority_scope.get("city_code") or "") == command.city_code
+            )
+        )
     elif isinstance(command, SnoozeCaseFollowup):
         matches = (
             command.pending_id
@@ -2210,6 +2241,21 @@ def _require_command_claims(
 def _compiled_dynamic_changed_fields(
     command: BusinessCommand,
 ) -> tuple[str, ...] | None:
+    if isinstance(command, UpdateTravelIntent):
+        # Include every executor-mutable field.  The current Admission contract
+        # issues only start/end/status authority, so a handcrafted destination
+        # or city mutation necessarily fails the exact changed-field comparison.
+        return tuple(
+            field_name
+            for field_name, value in (
+                ("start_at", command.start_at),
+                ("end_at", command.end_at),
+                ("destination_normalized", command.destination_normalized),
+                ("city_code", command.city_code),
+                ("status", command.status),
+            )
+            if value is not None
+        )
     if isinstance(command, UpdateCaseProgress):
         return tuple(
             field_name

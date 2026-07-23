@@ -16,6 +16,7 @@ from app.agent2.admission_contracts import (
 from app.agent2.admission_hashes import admission_claim_hashes_match
 
 REPORT_FIELDS = ("today_work", "problems", "tomorrow_plan")
+DAILY_DRAFT_MUTABLE_STATUSES = frozenset({"collecting", "pending_confirmation"})
 DAILY_ADMISSION_OPERATION_CONTRACTS = MappingProxyType({
     "capture_daily_event": ("append_item", ("section", "items")),
     "submit_daily_report": ("submit_report", ("status",)),
@@ -704,7 +705,7 @@ def validate_typed_daily_command(
         if snapshot.status != "completed":
             return TypedDailyCommandValidation("blocked", "invalid_report_state")
         return TypedDailyCommandValidation("authorized", "exact_target")
-    if snapshot.status != "collecting":
+    if snapshot.status not in DAILY_DRAFT_MUTABLE_STATUSES:
         return TypedDailyCommandValidation("blocked", "invalid_report_state")
     if command.command_type == "clear_report":
         if command.target_item_ids or set(command.patch) != {"field"}:

@@ -53,7 +53,27 @@ _ENTITY_ATTRIBUTE_KEYS = {
         }
     ),
     "case_query": frozenset({"matter_hint", "question", "context_reference"}),
-    "travel_event": frozenset({"destination", "date_hint", "purpose", "context_reference"}),
+    "travel_event": frozenset(
+        {
+            "destination",
+            "date_hint",
+            "purpose",
+            "statement_mode",
+            "traveler_scope",
+            "evidence_spans",
+            "context_reference",
+        }
+    ),
+    "travel_intent_ref": frozenset(
+        {
+            "travel_intent_id",
+            "expected_version",
+            "destination",
+            "new_date_hint",
+            "new_status",
+            "context_reference",
+        }
+    ),
     "travel_collaboration_ref": frozenset({"candidate_id", "response", "context_reference"}),
     "daily_report": frozenset(
         {"report_id", "version", "report_date", "field", "items", "context_reference"}
@@ -99,6 +119,7 @@ _ACTION_PARAMETER_KEYS = {
     "submit_daily_report": frozenset({"confirmed_pending_id"}),
     "answer_case_query": frozenset({"confirmed_pending_id"}),
     "record_travel_event": frozenset({"confirmed_pending_id"}),
+    "update_travel_event": frozenset({"confirmed_pending_id"}),
     "respond_travel_collaboration": frozenset({"confirmed_pending_id"}),
     "search_enterprise_knowledge": frozenset({"confirmed_pending_id"}),
 }
@@ -107,7 +128,12 @@ _STRING_ENTITY_ATTRIBUTES = {
     "daily_event": frozenset({"field"}),
     "daily_item_target": frozenset({"replacement", "source_field", "target_field"}),
     "case_query": frozenset({"matter_hint", "question"}),
-    "travel_event": frozenset({"destination", "date_hint", "purpose"}),
+    "travel_event": frozenset(
+        {"destination", "date_hint", "purpose", "statement_mode", "traveler_scope"}
+    ),
+    "travel_intent_ref": frozenset(
+        {"travel_intent_id", "destination", "new_date_hint", "new_status"}
+    ),
     "travel_collaboration_ref": frozenset({"candidate_id", "response"}),
     "daily_report": frozenset({"report_id", "report_date", "field"}),
     "case_ref": frozenset({"stage"}),

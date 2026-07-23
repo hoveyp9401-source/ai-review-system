@@ -684,6 +684,15 @@ def test_semantic_interpreter_repairs_entity_attributes_before_runtime_validatio
             self.calls += 1
             payload = {
                 "intents": ["travel_event"],
+                "segments": [
+                    {
+                        "segment_id": "travel-segment",
+                        "text": "明天去南京出差",
+                        "intents": ["travel_event"],
+                        "entity_ids": ["travel-1"],
+                        "action_ids": ["record-travel-1"],
+                    }
+                ],
                 "entities": [
                     {
                         "entity_id": "travel-1",
@@ -732,6 +741,10 @@ def test_semantic_interpreter_repairs_entity_attributes_before_runtime_validatio
     assert interpretation.entities[0].attributes == {
         "destination": "南京",
         "date_hint": "tomorrow",
+        "purpose": "出差",
+        "statement_mode": "asserted",
+        "traveler_scope": "self",
+        "evidence_spans": [[0, len(turn.text)]],
     }
 
 

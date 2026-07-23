@@ -24,6 +24,7 @@ from app.agent2.report_domain import (
 
 
 BusinessExecutionMode = Literal["read_only", "candidate"]
+DAILY_DRAFT_MUTABLE_STATUSES = frozenset({"collecting", "pending_confirmation"})
 
 
 @dataclass(frozen=True)
@@ -460,6 +461,20 @@ class CognitiveCommandPlanner:
                         action=action,
                         entities=action_entities,
                         command_type="record_travel_candidate",
+                        target_system="travel_coordination",
+                        execution_mode="candidate",
+                        message_id=context.message_id,
+                    )
+                )
+                continue
+            if action.action_type == "update_travel_event":
+                business_commands.append(
+                    self._business_command(
+                        decision=decision,
+                        decision_id=decision_id,
+                        action=action,
+                        entities=action_entities,
+                        command_type="update_travel_candidate",
                         target_system="travel_coordination",
                         execution_mode="candidate",
                         message_id=context.message_id,
@@ -907,7 +922,7 @@ class CognitiveCommandPlanner:
             return None, PlanningBlock(action.action_id, "daily_snapshot_required")
         if _historical_write_blocked(context, target):
             return None, PlanningBlock(action.action_id, "historical_daily_mutation_blocked_after_cutoff")
-        if target.status != "collecting":
+        if target.status not in DAILY_DRAFT_MUTABLE_STATUSES:
             return None, PlanningBlock(action.action_id, "invalid_report_state")
         source = _resolve_daily_reference(entities, context)
         if source is None or source.snapshot.report_id == target.report_id:
@@ -961,7 +976,7 @@ class CognitiveCommandPlanner:
             return None, PlanningBlock(action.action_id, "daily_snapshot_required")
         if _historical_write_blocked(context, snapshot):
             return None, PlanningBlock(action.action_id, "historical_daily_mutation_blocked_after_cutoff")
-        if snapshot.status != "collecting":
+        if snapshot.status not in DAILY_DRAFT_MUTABLE_STATUSES:
             return None, PlanningBlock(action.action_id, "invalid_report_state")
         if not str(action.parameters.get("confirmed_pending_id") or "").strip():
             return None, PlanningBlock(action.action_id, "high_impact_confirmation_required")
@@ -1048,7 +1063,7 @@ class CognitiveCommandPlanner:
             return None, PlanningBlock(action.action_id, "daily_snapshot_required")
         if _historical_write_blocked(context, snapshot):
             return None, PlanningBlock(action.action_id, "historical_daily_mutation_blocked_after_cutoff")
-        if snapshot.status != "collecting":
+        if snapshot.status not in DAILY_DRAFT_MUTABLE_STATUSES:
             return None, PlanningBlock(action.action_id, "invalid_report_state")
         if not _entity_targets_snapshot(entities, snapshot):
             return None, PlanningBlock(action.action_id, "daily_report_target_mismatch")
@@ -1094,7 +1109,7 @@ class CognitiveCommandPlanner:
             return None, PlanningBlock(action.action_id, "daily_snapshot_required")
         if _historical_write_blocked(context, target):
             return None, PlanningBlock(action.action_id, "historical_daily_mutation_blocked_after_cutoff")
-        if target.status != "collecting":
+        if target.status not in DAILY_DRAFT_MUTABLE_STATUSES:
             return None, PlanningBlock(action.action_id, "invalid_report_state")
         if action.action_type == "copy_current_work_to_tomorrow":
             if not _entity_targets_snapshot(entities, target):

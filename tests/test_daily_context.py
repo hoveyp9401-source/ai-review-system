@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from app.agent2.daily_state import PENDING_DAILY_CANDIDATE_KEY
 from app.services.state_machine import STATUS_COLLECTING, STATUS_COMPLETED, STATUS_PENDING_CONFIRMATION
 from app.workflows.daily_context import (
+    build_live_daily_active_task,
     daily_active_task_from_report,
     daily_active_task_from_snapshot,
     load_live_daily_context,
@@ -193,3 +194,30 @@ def test_live_daily_context_binds_a_before_cutoff_reply_to_the_recent_reminder_d
     assert context.source == "recent_reminder"
     assert context.active_task is not None
     assert context.active_task.metadata["report_date"] == "2026-07-14"
+
+
+def test_live_daily_active_task_uses_the_recent_reminder_context(monkeypatch):
+    reminder = SimpleNamespace(
+        id="reminder-event-2",
+        report_id=None,
+        report_date=date(2026, 7, 14),
+        backend_action="daily_report_reminder_sent",
+        created_at=datetime(2026, 7, 14, 22, 0),
+    )
+    monkeypatch.setattr(
+        "app.workflows.daily_context.now_in_timezone",
+        lambda _timezone: datetime(2026, 7, 15, 6, 42),
+    )
+
+    task = asyncio.run(
+        build_live_daily_active_task(
+            _SequenceSession((), (reminder,), ()),
+            SimpleNamespace(id="user-1", timezone="Asia/Shanghai"),
+            SimpleNamespace(timezone="Asia/Shanghai"),
+        )
+    )
+
+    assert task is not None
+    assert task.workflow == WORKFLOW_DAILY_REPORT
+    assert task.reply_candidate is True
+    assert task.metadata["report_date"] == "2026-07-14"

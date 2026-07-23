@@ -12,9 +12,16 @@ from app.agent2.cognitive_core_v3 import (
     CognitiveTurn,
     SemanticInputLimitExceeded,
     SemanticInterpretation,
+    SemanticSegment,
+    is_explicit_pending_cancellation,
+    is_explicit_pending_confirmation,
 )
-from app.agent2.conversation_state import ConversationState
-from app.agent2.cognitive_contract_v3 import validate_semantic_interpretation_contract
+from app.agent2.conversation_state import ConversationEntity, ConversationState
+from app.agent2.cognitive_contract_v3 import (
+    ACTION_PARAMETER_KEYS,
+    validate_semantic_interpretation_contract,
+)
+from app.agent2.domain_admission import evaluate_assertion_polarity_contract
 from app.agent2.case_statement_contract import assess_case_progress_statement
 from app.agent2.business.case_reference import (
     discover_visible_case_references,
@@ -29,6 +36,7 @@ from app.agent2.report_document_contract import (
     daily_compound_section_correction_semantic_payload,
     daily_item_section_correction_semantic_payload,
     daily_section_cue_semantic_payload,
+    explicit_standalone_daily_fact_semantic_payload,
     parse_structured_daily_document,
     structured_daily_semantic_payload,
 )
@@ -37,6 +45,43 @@ from app.utils.json import extract_json_object
 
 PROMPT_PATH = Path(__file__).parent.parent / "llm" / "prompts" / "cognitive_core_v3.md"
 MAX_COGNITIVE_INPUT_CHARS = 2000
+_MODEL_SEMANTIC_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "intents",
+        "segments",
+        "entities",
+        "confidence",
+        "required_actions",
+        "clarification_need",
+        "context_update",
+    }
+)
+
+
+def _validate_model_semantic_payload_shape(payload: Mapping[str, Any]) -> None:
+    """Reject fragments or wrappers before defaults can turn them into cognition.
+
+    The model contract requires one object with exactly seven top-level fields.
+    In particular, a response containing several standalone Segment objects can
+    otherwise be parsed at its first ``{`` and silently accepted as an empty,
+    action-free turn because ``SemanticInterpretation.from_payload`` supplies
+    defaults for missing collections. Such output must enter schema repair (or
+    fail closed), never count as a valid negative result.
+    """
+
+    keys = frozenset(str(key) for key in payload)
+    missing = sorted(_MODEL_SEMANTIC_TOP_LEVEL_FIELDS - keys)
+    unexpected = sorted(keys - _MODEL_SEMANTIC_TOP_LEVEL_FIELDS)
+    if missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        if unexpected:
+            details.append("unexpected=" + ",".join(unexpected))
+        raise ValueError(
+            "semantic model output violates top-level contract: "
+            + "; ".join(details)
+        )
 
 
 class StructuredCompletionClient(Protocol):
@@ -93,7 +138,14 @@ class LLMCognitiveSemanticInterpreter:
         )
         structured_daily_document = parse_structured_daily_document(turn.text)
         deterministic_payload = (
-            _report_meta_opening_semantic_payload(turn.text)
+            _single_bound_pending_cancellation_payload(turn=turn, state=state)
+            or _single_bound_pending_confirmation_payload(turn=turn, state=state)
+            or _missing_short_confirmation_payload(
+                text=turn.text,
+                state=state,
+                occurred_at=turn.occurred_at,
+            )
+            or _report_meta_opening_semantic_payload(turn.text)
             or daily_compound_section_correction_semantic_payload(
                 turn.text,
                 turn.resources,
@@ -161,16 +213,60 @@ class LLMCognitiveSemanticInterpreter:
             )
             try:
                 candidate = extract_json_object(output)
+                _validate_model_semantic_payload_shape(candidate)
+                candidate = _normalize_informational_question_mutation_to_read_only(
+                    candidate,
+                    text=turn.text,
+                )
+                candidate = _normalize_informational_question_unbound_authority_refs(
+                    candidate,
+                    text=turn.text,
+                )
+                candidate = _preserve_goal_for_action_free_informational_question(
+                    candidate,
+                    text=turn.text,
+                )
                 if self._legacy_semantic_enforcers_enabled:
                     candidate = _apply_legacy_semantic_enforcers(
                         candidate,
                         turn=turn,
                         state=state,
                     )
+                elif _has_asserted_daily_travel_projection(
+                    candidate,
+                    text=turn.text,
+                ):
+                    # An exact, affirmative self-trip is independently
+                    # meaningful in Travel even when the model sees the active
+                    # Daily dialogue and proposes only its report projection.
+                    # The closed extractor cannot match questions,
+                    # hypotheticals, reported speech, or cancellations, and
+                    # Domain Admission still owns write authority.
+                    candidate = _enforce_explicit_travel_event(
+                        candidate,
+                        text=turn.text,
+                    )
                 candidate = (
                     structured_daily_semantic_payload(turn.text)
                     or candidate
                 )
+                candidate = _normalize_action_free_daily_report_context(candidate)
+                candidate = _normalize_daily_event_attributes(candidate)
+                candidate = _normalize_travel_intent_reference_attributes(candidate)
+                candidate = _normalize_daily_section_clear_binding(candidate)
+                candidate = _recover_unique_bound_travel_date_correction(
+                    candidate,
+                    turn=turn,
+                    state=state,
+                )
+                candidate = _normalize_unbound_travel_reference_to_clarification(
+                    candidate,
+                )
+                candidate = _normalize_travel_update_pending_binding(candidate)
+                candidate = _suppress_coupled_daily_mutation_before_travel_confirmation(
+                    candidate
+                )
+                candidate = _normalize_multi_entity_daily_capture_actions(candidate)
                 candidate = _normalize_incomplete_case_target_to_clarification(
                     candidate,
                 )
@@ -189,6 +285,10 @@ class LLMCognitiveSemanticInterpreter:
                 validate_semantic_interpretation_contract(interpretation)
                 _validate_turn_contract(turn, state, interpretation)
                 interpretation = _normalize_explicit_travel_runtime_attributes(
+                    interpretation,
+                    turn=turn,
+                )
+                interpretation = _normalize_asserted_travel_source_evidence(
                     interpretation,
                     turn=turn,
                 )
@@ -227,6 +327,10 @@ class LLMCognitiveSemanticInterpreter:
                             validate_semantic_interpretation_contract(merged)
                             _validate_turn_contract(turn, state, merged)
                             interpretation = merged
+                interpretation = _project_explicit_standalone_daily_fact(
+                    interpretation,
+                    turn=turn,
+                )
                 interpretation = _project_case_travel_plan_to_daily_facet(
                     interpretation,
                     turn=turn,
@@ -332,6 +436,7 @@ class LLMCognitiveSemanticInterpreter:
                 thinking_enabled=self._thinking_enabled,
             )
             candidate = extract_json_object(output)
+            _validate_model_semantic_payload_shape(candidate)
             candidate = _retain_only_supplemental_case_progress(candidate)
             candidate = _scope_supplemental_case_to_structured_daily_item(
                 candidate,
@@ -703,6 +808,225 @@ def _scope_supplemental_case_to_structured_daily_item(
     return result
 
 
+def _project_explicit_standalone_daily_fact(
+    interpretation: SemanticInterpretation,
+    *,
+    turn: CognitiveTurn,
+) -> SemanticInterpretation:
+    """Recover independently asserted current-day facts from action-free text.
+
+    Model segmentation remains the primary semantic boundary.  When a provider
+    merges multiple strongly-delimited clauses into one action-free segment,
+    each clause is evaluated independently by the existing explicit-fact
+    contract.  This preserves a first-person fact beside a quotation, question,
+    or hypothetical without granting the neighbouring non-fact any mutation.
+    """
+
+    result = interpretation
+    projection_index = 0
+    seen_projection_hashes: set[str] = set()
+    for source_segment in interpretation.segments:
+        if source_segment.action_ids:
+            continue
+        projection_candidates = _explicit_daily_projection_candidates(source_segment)
+        if (
+            projection_candidates
+            and projection_candidates[0][0].text != source_segment.text
+        ):
+            result = _split_action_free_semantic_segment(
+                result,
+                source_segment=source_segment,
+                projected_texts={
+                    candidate.text for candidate, _payload in projection_candidates
+                },
+            )
+        for candidate_segment, payload in projection_candidates:
+            projection_hash = _sha256_text(candidate_segment.text)
+            if projection_hash in seen_projection_hashes:
+                continue
+            seen_projection_hashes.add(projection_hash)
+            projection_index += 1
+            supplemental = _namespace_explicit_daily_fact_projection(
+                SemanticInterpretation.from_payload(payload),
+                source_segment=candidate_segment,
+                index=projection_index,
+            )
+            result = _merge_independent_interpretations(result, supplemental)
+    return result
+
+
+_STRONG_SEMANTIC_CLAUSE_PATTERN = re.compile(
+    r"[^；;\n。！？!?]+(?:[；;\n。！？!?]+|$)"
+)
+
+
+def _explicit_daily_projection_candidates(
+    source_segment: SemanticSegment,
+) -> tuple[tuple[SemanticSegment, dict[str, Any]], ...]:
+    """Return only clauses that independently satisfy the Daily fact contract."""
+
+    text = str(source_segment.text or "")
+    whole_payload = explicit_standalone_daily_fact_semantic_payload(text)
+    if whole_payload is not None:
+        return ((source_segment, whole_payload),)
+
+    candidates: list[tuple[SemanticSegment, dict[str, Any]]] = []
+    for match in _STRONG_SEMANTIC_CLAUSE_PATTERN.finditer(text):
+        raw_fragment = match.group(0)
+        leading_space_count = len(raw_fragment) - len(raw_fragment.lstrip())
+        trailing_space_count = len(raw_fragment) - len(raw_fragment.rstrip())
+        fragment = raw_fragment.strip()
+        if not fragment or fragment == text:
+            continue
+        payload = explicit_standalone_daily_fact_semantic_payload(fragment)
+        if payload is None:
+            continue
+
+        if source_segment.start_offset is None:
+            start_offset = None
+            end_offset = None
+        else:
+            start_offset = (
+                source_segment.start_offset + match.start() + leading_space_count
+            )
+            end_offset = (
+                source_segment.start_offset + match.end() - trailing_space_count
+            )
+        candidates.append(
+            (
+                replace(
+                    source_segment,
+                    text=fragment,
+                    text_hash=_sha256_text(fragment),
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                ),
+                payload,
+            )
+        )
+    return tuple(candidates)
+
+
+def _split_action_free_semantic_segment(
+    interpretation: SemanticInterpretation,
+    *,
+    source_segment: SemanticSegment,
+    projected_texts: set[str],
+) -> SemanticInterpretation:
+    """Split one provider-merged, action-free segment at strong boundaries."""
+
+    matching_index = next(
+        (
+            index
+            for index, segment in enumerate(interpretation.segments)
+            if segment.segment_id == source_segment.segment_id
+            and segment.text == source_segment.text
+            and not segment.action_ids
+        ),
+        None,
+    )
+
+
+    if matching_index is None:
+        return interpretation
+
+    fragments: list[SemanticSegment] = []
+    for position, match in enumerate(
+        _STRONG_SEMANTIC_CLAUSE_PATTERN.finditer(source_segment.text),
+        start=1,
+    ):
+        raw_fragment = match.group(0)
+        leading_space_count = len(raw_fragment) - len(raw_fragment.lstrip())
+        trailing_space_count = len(raw_fragment) - len(raw_fragment.rstrip())
+        fragment = raw_fragment.strip()
+        if not fragment:
+            continue
+        if source_segment.start_offset is None:
+            start_offset = None
+            end_offset = None
+        else:
+            start_offset = (
+                source_segment.start_offset + match.start() + leading_space_count
+            )
+            end_offset = (
+                source_segment.start_offset + match.end() - trailing_space_count
+            )
+        is_projected_fact = fragment in projected_texts
+        fragments.append(
+            replace(
+                source_segment,
+                segment_id=f"{source_segment.segment_id}-contract-clause-{position}",
+                text=fragment,
+                text_hash=_sha256_text(fragment),
+                entity_ids=() if is_projected_fact else source_segment.entity_ids,
+                action_ids=(),
+                start_offset=start_offset,
+                end_offset=end_offset,
+            )
+        )
+    if len(fragments) < 2:
+        return interpretation
+
+    segments = list(interpretation.segments)
+    segments[matching_index : matching_index + 1] = fragments
+    return replace(interpretation, segments=tuple(segments))
+
+
+def _namespace_explicit_daily_fact_projection(
+    interpretation: SemanticInterpretation,
+    *,
+    source_segment: SemanticSegment,
+    index: int,
+) -> SemanticInterpretation:
+    prefix = f"contract-explicit-daily-fact-{index}"
+    entity_id_map = {
+        entity.entity_id: f"{prefix}-entity-{position}"
+        for position, entity in enumerate(interpretation.entities, start=1)
+    }
+    action_id_map = {
+        action.action_id: f"{prefix}-action-{position}"
+        for position, action in enumerate(
+            interpretation.required_actions,
+            start=1,
+        )
+    }
+    update = interpretation.context_update
+    return replace(
+        interpretation,
+        segments=tuple(
+            replace(
+                segment,
+                segment_id=f"{prefix}-segment-{position}",
+                text=source_segment.text,
+                text_hash=_sha256_text(source_segment.text),
+                entity_ids=tuple(entity_id_map[value] for value in segment.entity_ids),
+                action_ids=tuple(action_id_map[value] for value in segment.action_ids),
+                start_offset=source_segment.start_offset,
+                end_offset=source_segment.end_offset,
+            )
+            for position, segment in enumerate(interpretation.segments, start=1)
+        ),
+        entities=tuple(
+            replace(entity, entity_id=entity_id_map[entity.entity_id])
+            for entity in interpretation.entities
+        ),
+        required_actions=tuple(
+            replace(
+                action,
+                action_id=action_id_map[action.action_id],
+                entity_ids=tuple(entity_id_map[value] for value in action.entity_ids),
+            )
+            for action in interpretation.required_actions
+        ),
+        context_update=replace(
+            update,
+            remember_entity_ids=tuple(
+                entity_id_map[value] for value in update.remember_entity_ids
+            ),
+        ),
+    )
+
+
 def _project_case_travel_plan_to_daily_facet(
     interpretation: SemanticInterpretation,
     *,
@@ -763,6 +1087,21 @@ def _project_case_travel_plan_to_daily_facet(
     if len(shared_segments) != 1:
         return interpretation
     source_segment = shared_segments[0]
+    travel_assertion = evaluate_assertion_polarity_contract(
+        domain="travel",
+        segment_text=source_segment.text,
+        statement_mode=(
+            str(travel_entity.attributes.get("statement_mode") or "")
+            or ("asserted" if extracted_travel is not None else "")
+        ),
+        evidence_fragments=(source_segment.text,),
+        claim_anchors=(
+            str(travel_entity.attributes.get("destination") or "")
+            or str(travel_entity.value or ""),
+        ),
+    )
+    if not travel_assertion.authorizes_mutation:
+        return interpretation
     date_hint = str(
         (extracted_travel or {}).get("date_hint")
         or travel_entity.attributes.get("date_hint")
@@ -836,11 +1175,13 @@ def _normalize_explicit_travel_runtime_attributes(
     *,
     turn: CognitiveTurn,
 ) -> SemanticInterpretation:
-    """Narrow a validated explicit trip to the closed Runtime attributes.
+    """Ground a validated explicit self-trip in the closed Runtime contract.
 
     Schema-invalid model output must first take the existing repair path.  Only
-    after semantic validation succeeds may an exact source-text trip discard
-    descriptive provider metadata that the Runtime does not consume.
+    after semantic validation succeeds may an exact source-text trip replace
+    provider metadata with values proven by the deterministic source matcher.
+    The assertion and actor-scope fields are authorization inputs, so they must
+    never be discarded before Domain Admission.
     """
 
     extracted = _extract_explicit_travel_event(turn.text)
@@ -861,22 +1202,98 @@ def _normalize_explicit_travel_runtime_attributes(
     ]
     if len(matching_entities) != 1:
         return interpretation
-    permitted_keys = {"destination", "date_hint", "purpose"}
+    source_text = str(turn.text or "").strip()
+    grounded_attributes = {
+        "destination": extracted["destination"],
+        "date_hint": extracted["date_hint"],
+        "purpose": extracted["purpose"],
+        "statement_mode": "asserted",
+        "traveler_scope": "self",
+        "evidence_spans": [[0, len(source_text)]],
+    }
     normalized_entities = tuple(
         replace(
             entity,
-            value=str(turn.text or "").strip(),
-            attributes={
-                key: value
-                for key, value in entity.attributes.items()
-                if key in permitted_keys
-            },
+            value=source_text,
+            attributes=grounded_attributes,
         )
         if entity.entity_id == entity_id
         else entity
         for entity in interpretation.entities
     )
     return replace(interpretation, entities=normalized_entities)
+
+
+def _normalize_asserted_travel_source_evidence(
+    interpretation: SemanticInterpretation,
+    *,
+    turn: CognitiveTurn,
+) -> SemanticInterpretation:
+    """Anchor an already-proposed self-trip to its exact source segment.
+
+    This does not infer a Travel action or any business value.  It only repairs
+    provider evidence offsets when the proposed destination and purpose are
+    both present in the one bound source segment.  Domain Admission remains
+    responsible for statement polarity, date grounding and ticket issuance.
+    """
+
+    entities_by_id = {
+        entity.entity_id: entity for entity in interpretation.entities
+    }
+    replacements: dict[str, ConversationEntity] = {}
+    for action in interpretation.required_actions:
+        if action.action_type != "record_travel_event" or len(action.entity_ids) != 1:
+            continue
+        entity = entities_by_id.get(action.entity_ids[0])
+        if entity is None or entity.entity_type != "travel_event":
+            continue
+        if (
+            str(entity.attributes.get("statement_mode") or "") != "asserted"
+            or str(entity.attributes.get("traveler_scope") or "") != "self"
+        ):
+            continue
+        matching_segments = [
+            segment
+            for segment in interpretation.segments
+            if action.action_id in segment.action_ids
+            and entity.entity_id in segment.entity_ids
+            and segment.text in turn.text
+        ]
+        if len(matching_segments) != 1:
+            continue
+        source_text = matching_segments[0].text
+        normalized_source = "".join(source_text.split()).casefold()
+        destination = "".join(
+            str(entity.attributes.get("destination") or "").split()
+        ).casefold()
+        purpose = "".join(
+            str(entity.attributes.get("purpose") or "").split()
+        ).casefold()
+        if (
+            not source_text
+            or not destination
+            or destination not in normalized_source
+            or not purpose
+            or purpose not in normalized_source
+        ):
+            continue
+        replacements[entity.entity_id] = replace(
+            entity,
+            value=source_text,
+            attributes={
+                **entity.attributes,
+                "evidence_spans": [[0, len(source_text)]],
+            },
+        )
+    if not replacements:
+        return interpretation
+    return replace(
+        interpretation,
+        entities=tuple(
+            replacements.get(entity.entity_id, entity)
+            for entity in interpretation.entities
+        ),
+    )
 
 
 def _merge_independent_interpretations(
@@ -944,7 +1361,11 @@ def _merge_independent_interpretations(
         else (
             "travel_event"
             if combined_action_types.intersection(
-                {"record_travel_event", "respond_travel_collaboration"}
+                {
+                    "record_travel_event",
+                    "update_travel_event",
+                    "respond_travel_collaboration",
+                }
             )
             else (supplemental_update.current_goal or primary_update.current_goal)
         )
@@ -1082,6 +1503,367 @@ def _apply_legacy_semantic_enforcers(
         ),
         text=turn.text,
     )
+
+
+_READ_ONLY_SEMANTIC_ACTION_TYPES = frozenset(
+    {
+        "answer_case_query",
+        "query_case_progress",
+        "query_daily_report",
+        "query_operation_status",
+        "query_periodic_report",
+        "search_enterprise_knowledge",
+    }
+)
+_MUTATING_SEMANTIC_ACTION_TYPES = (
+    frozenset(ACTION_PARAMETER_KEYS) - _READ_ONLY_SEMANTIC_ACTION_TYPES
+)
+
+
+def _is_informational_question(text: str) -> bool:
+    source = str(text or "").strip()
+    if not source:
+        return False
+    compact = "".join(source.split())
+    if re.match(r"^(?:为什么|为何|怎么会|怎么还|怎么没|是否|有没有|有无)", compact):
+        return True
+    has_question_cue = bool(
+        re.search(r"[?？]", source)
+        or re.search(
+            r"(?:为什么|为何|怎么|如何|是否|有没有|有无|什么|哪个|哪项|多少|几时|何时|吗|呢)$",
+            compact,
+        )
+    )
+    if not has_question_cue:
+        return False
+    explicit_action_request = bool(
+        re.search(
+            r"^(?:请|帮我|麻烦|劳驾|可以|能否|能不能)?(?:把|将).{0,120}"
+            r"(?:改|修改|调整|删除|删掉|取消|写入|记入|添加|补充|提交|关闭|更新|移动|清空)",
+            compact,
+        )
+        or re.search(
+            r"^(?:请|帮我|麻烦|劳驾)(?:直接)?"
+            r"(?:改|修改|调整|删除|删掉|取消|写入|记入|添加|补充|提交|关闭|更新|移动|清空)",
+            compact,
+        )
+    )
+    return not explicit_action_request
+
+
+def _normalize_informational_question_mutation_to_read_only(
+    payload: dict[str, Any],
+    *,
+    text: str,
+) -> dict[str, Any]:
+    """Prevent a direct information question from becoming a mutation candidate.
+
+    This runs before schema validation so a provider cannot turn a question into
+    an unavailable reply merely by attaching invalid mutation parameters.  A
+    polite but explicit action request remains model-decided and continues
+    through the normal contract and Admission checks.
+    """
+
+    actions = payload.get("required_actions")
+    segments = payload.get("segments")
+    if not isinstance(actions, list) or not isinstance(segments, list):
+        return payload
+    entity_by_id = {
+        str(item.get("entity_id") or ""): item
+        for item in (payload.get("entities") or ())
+        if isinstance(item, dict)
+    }
+    segment_text_by_action: dict[str, list[str]] = {}
+    for raw_segment in segments:
+        if not isinstance(raw_segment, dict):
+            continue
+        segment_text = str(raw_segment.get("text") or "")
+        for raw_action_id in raw_segment.get("action_ids") or ():
+            action_id = str(raw_action_id or "").strip()
+            if action_id:
+                segment_text_by_action.setdefault(action_id, []).append(segment_text)
+    removed_action_ids = {
+        str(item.get("action_id") or "").strip()
+        for item in actions
+        if isinstance(item, dict)
+        and str(item.get("action_type") or "") in _MUTATING_SEMANTIC_ACTION_TYPES
+        and len(
+            bound_texts := segment_text_by_action.get(
+                str(item.get("action_id") or "").strip(),
+                [],
+            )
+        )
+        == 1
+        and _is_informational_question(bound_texts[0])
+        and not _is_independent_asserted_daily_capture(
+            item,
+            entity_by_id=entity_by_id,
+            segment_text=bound_texts[0],
+        )
+    }
+    removed_action_ids.discard("")
+    if not removed_action_ids:
+        return payload
+
+    retained_actions = [
+        item
+        for item in actions
+        if not isinstance(item, dict)
+        or str(item.get("action_id") or "").strip() not in removed_action_ids
+    ]
+    if not retained_actions:
+        return {
+            "intents": ["chat"],
+            "segments": [
+                {
+                    "segment_id": "contract-informational-question",
+                    "text": str(text or "").strip(),
+                    "intents": ["chat"],
+                    "entity_ids": [],
+                    "action_ids": [],
+                }
+            ],
+            "entities": [],
+            "confidence": 1.0,
+            "required_actions": [],
+            "clarification_need": None,
+            "context_update": {"preserve_current_goal": True},
+        }
+
+    retained_action_ids = {
+        str(item.get("action_id") or "").strip()
+        for item in retained_actions
+        if isinstance(item, dict) and str(item.get("action_id") or "").strip()
+    }
+    retained_entity_ids = {
+        str(entity_id or "").strip()
+        for item in retained_actions
+        if isinstance(item, dict)
+        for entity_id in (item.get("entity_ids") or ())
+        if str(entity_id or "").strip()
+    }
+    retained_intents = {
+        str(item.get("intent") or "").strip()
+        for item in retained_actions
+        if isinstance(item, dict) and str(item.get("intent") or "").strip()
+    }
+    retained_segments: list[dict[str, Any]] = []
+    for raw_segment in segments:
+        if not isinstance(raw_segment, dict):
+            continue
+        action_ids = [
+            value
+            for value in (raw_segment.get("action_ids") or ())
+            if str(value or "").strip() in retained_action_ids
+        ]
+        if not action_ids:
+            continue
+        segment = dict(raw_segment)
+        segment["action_ids"] = action_ids
+        segment["entity_ids"] = [
+            value
+            for value in (raw_segment.get("entity_ids") or ())
+            if str(value or "").strip() in retained_entity_ids
+        ]
+        segment["intents"] = [
+            value
+            for value in (raw_segment.get("intents") or ())
+            if str(value or "").strip() in retained_intents
+        ]
+        retained_segments.append(segment)
+
+    context = payload.get("context_update")
+    normalized_context = dict(context) if isinstance(context, dict) else {}
+    if isinstance(normalized_context.get("remember_entity_ids"), list):
+        normalized_context["remember_entity_ids"] = [
+            value
+            for value in normalized_context["remember_entity_ids"]
+            if str(value or "").strip() in retained_entity_ids
+        ]
+    pending = normalized_context.get("bind_pending")
+    if isinstance(pending, dict) and not set(
+        str(value or "").strip() for value in pending.get("entity_ids") or ()
+    ).issubset(retained_entity_ids):
+        normalized_context.pop("bind_pending", None)
+
+    result = dict(payload)
+    result["intents"] = [
+        value
+        for value in payload.get("intents") or ()
+        if str(value or "").strip() in retained_intents
+    ]
+    result["segments"] = retained_segments
+    result["entities"] = [
+        item
+        for item in payload.get("entities") or ()
+        if isinstance(item, dict)
+        and str(item.get("entity_id") or "").strip() in retained_entity_ids
+    ]
+    result["required_actions"] = retained_actions
+    result["context_update"] = normalized_context
+    if normalized_context.get("bind_pending") is None:
+        result["clarification_need"] = None
+    return result
+
+
+def _is_independent_asserted_daily_capture(
+    action: dict[str, Any],
+    *,
+    entity_by_id: Mapping[str, dict[str, Any]],
+    segment_text: str,
+) -> bool:
+    """Keep one model-grounded Daily fact beside a sibling question.
+
+    The model must already provide the Daily action, one asserted Daily entity,
+    and a value that independently satisfies the closed standalone-fact
+    contract.  This cannot derive a write from the question or from keywords in
+    the surrounding segment.
+    """
+
+    if (
+        action.get("action_type") != "capture_daily_event"
+        or not isinstance(action.get("entity_ids"), list)
+        or len(action["entity_ids"]) != 1
+    ):
+        return False
+    entity = entity_by_id.get(str(action["entity_ids"][0]))
+    attributes = entity.get("attributes") if isinstance(entity, dict) else None
+    value = str(entity.get("value") or "").strip() if isinstance(entity, dict) else ""
+    if (
+        not isinstance(entity, dict)
+        or entity.get("entity_type") != "daily_event"
+        or not isinstance(attributes, dict)
+        or str(attributes.get("statement_mode") or "") != "asserted"
+        or not value
+        or str(segment_text or "").count(value) != 1
+    ):
+        return False
+    projected = explicit_standalone_daily_fact_semantic_payload(value)
+    if projected is None:
+        return False
+    projected_entities = projected.get("entities") or ()
+    if len(projected_entities) != 1 or not isinstance(projected_entities[0], dict):
+        return False
+    projected_attributes = projected_entities[0].get("attributes")
+    return bool(
+        isinstance(projected_attributes, dict)
+        and str(projected_attributes.get("field") or "")
+        == str(attributes.get("field") or "")
+    )
+
+
+_AUTHORITY_BEARING_REFERENCE_TYPES = frozenset(
+    {
+        "daily_item_target",
+        "daily_report",
+        "periodic_report",
+        "report_item_target",
+        "case_progress_ref",
+        "case_followup_policy",
+        "travel_intent_ref",
+        "travel_collaboration_ref",
+    }
+)
+
+
+def _normalize_informational_question_unbound_authority_refs(
+    payload: dict[str, Any],
+    *,
+    text: str,
+) -> dict[str, Any]:
+    """Drop action-free authority references attached to a read-only question."""
+
+    if not _is_informational_question(text):
+        return payload
+    actions = payload.get("required_actions")
+    entities = payload.get("entities")
+    segments = payload.get("segments")
+    if not all(isinstance(value, list) for value in (actions, entities, segments)):
+        return payload
+    action_entity_ids = {
+        str(entity_id or "").strip()
+        for action in actions
+        if isinstance(action, dict)
+        for entity_id in (action.get("entity_ids") or ())
+        if str(entity_id or "").strip()
+    }
+    removed_entity_ids = {
+        str(entity.get("entity_id") or "").strip()
+        for entity in entities
+        if isinstance(entity, dict)
+        and str(entity.get("entity_type") or "") in _AUTHORITY_BEARING_REFERENCE_TYPES
+        and str(entity.get("entity_id") or "").strip()
+        and str(entity.get("entity_id") or "").strip() not in action_entity_ids
+    }
+    if not removed_entity_ids:
+        return payload
+
+    result = dict(payload)
+    result["entities"] = [
+        entity
+        for entity in entities
+        if not isinstance(entity, dict)
+        or str(entity.get("entity_id") or "").strip() not in removed_entity_ids
+    ]
+    normalized_segments: list[Any] = []
+    for raw_segment in segments:
+        if not isinstance(raw_segment, dict):
+            normalized_segments.append(raw_segment)
+            continue
+        segment = dict(raw_segment)
+        if isinstance(segment.get("entity_ids"), list):
+            segment["entity_ids"] = [
+                value
+                for value in segment["entity_ids"]
+                if str(value or "").strip() not in removed_entity_ids
+            ]
+        normalized_segments.append(segment)
+    result["segments"] = normalized_segments
+
+    context = payload.get("context_update")
+    normalized_context = dict(context) if isinstance(context, dict) else {}
+    if isinstance(normalized_context.get("remember_entity_ids"), list):
+        normalized_context["remember_entity_ids"] = [
+            value
+            for value in normalized_context["remember_entity_ids"]
+            if str(value or "").strip() not in removed_entity_ids
+        ]
+    pending = normalized_context.get("bind_pending")
+    if isinstance(pending, dict) and removed_entity_ids.intersection(
+        str(value or "").strip() for value in pending.get("entity_ids") or ()
+    ):
+        normalized_context.pop("bind_pending", None)
+    result["context_update"] = normalized_context
+    return result
+
+
+def _preserve_goal_for_action_free_informational_question(
+    payload: dict[str, Any],
+    *,
+    text: str,
+) -> dict[str, Any]:
+    """Keep a transient read-only question from replacing an active workflow.
+
+    An action-free question may be answered or declined without becoming the
+    user's new long-running goal.  This does not grant the previous goal any new
+    authority: it emits no entity, action, Pending or Ticket and only prevents a
+    provider-authored ``chat`` goal from discarding trusted dialogue continuity.
+    Explicit query actions and action requests remain untouched.
+    """
+
+    if not _is_informational_question(text):
+        return payload
+    actions = payload.get("required_actions")
+    if not isinstance(actions, list) or actions:
+        return payload
+    context = payload.get("context_update")
+    normalized_context = dict(context) if isinstance(context, dict) else {}
+    normalized_context["preserve_current_goal"] = True
+    normalized_context["clear_current_goal"] = False
+    normalized_context["resume_previous_goal"] = False
+    result = dict(payload)
+    result["context_update"] = normalized_context
+    return result
 
 
 def _normalize_case_evidence_spans(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1343,6 +2125,987 @@ def _normalize_incomplete_case_target_to_clarification(
             "missing_fields": ["case_reference"],
             "question": "请告诉我具体是哪个案件，可以发案件编号、简称或完整名称。",
         }
+    return result
+
+
+def _normalize_unbound_travel_reference_to_clarification(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep an unbound Travel correction as clarification instead of an error.
+
+    A model may correctly understand ``not tomorrow, the day after`` while no
+    trusted Travel object exists.  Such a reference cannot pass the executable
+    ``travel_intent_ref`` contract, but it also must not trigger schema retries
+    or a generic runtime failure.  This normalization only drops unbound,
+    action-free references when the model already requested clarification.
+    """
+
+    entities = payload.get("entities")
+    actions = payload.get("required_actions")
+    clarification = payload.get("clarification_need")
+    if (
+        not isinstance(entities, list)
+        or not isinstance(actions, list)
+        or not isinstance(clarification, dict)
+    ):
+        return payload
+    invalid_ids: set[str] = set()
+    for raw_entity in entities:
+        if not isinstance(raw_entity, dict) or raw_entity.get("entity_type") != "travel_intent_ref":
+            continue
+        entity_id = str(raw_entity.get("entity_id") or "").strip()
+        attributes = raw_entity.get("attributes")
+        attributes = attributes if isinstance(attributes, dict) else {}
+        version = attributes.get("expected_version")
+        if (
+            entity_id
+            and (
+                not str(attributes.get("travel_intent_id") or "").strip()
+                or not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            )
+        ):
+            invalid_ids.add(entity_id)
+    if not invalid_ids:
+        return payload
+    if any(
+        invalid_ids.intersection(
+            str(value or "").strip()
+            for value in raw_action.get("entity_ids", [])
+        )
+        for raw_action in actions
+        if isinstance(raw_action, dict)
+        and isinstance(raw_action.get("entity_ids"), list)
+    ):
+        return payload
+
+    normalized_segments: list[Any] = []
+    for raw_segment in payload.get("segments", []):
+        if not isinstance(raw_segment, dict):
+            normalized_segments.append(raw_segment)
+            continue
+        segment = dict(raw_segment)
+        if isinstance(segment.get("entity_ids"), list):
+            segment["entity_ids"] = [
+                value
+                for value in segment["entity_ids"]
+                if str(value or "").strip() not in invalid_ids
+            ]
+        normalized_segments.append(segment)
+
+    context = payload.get("context_update")
+    normalized_context = dict(context) if isinstance(context, dict) else {}
+    if isinstance(normalized_context.get("remember_entity_ids"), list):
+        normalized_context["remember_entity_ids"] = [
+            value
+            for value in normalized_context["remember_entity_ids"]
+            if str(value or "").strip() not in invalid_ids
+        ]
+    pending = normalized_context.get("bind_pending")
+    if isinstance(pending, dict) and invalid_ids.intersection(
+        str(value or "").strip()
+        for value in pending.get("entity_ids", [])
+    ):
+        normalized_context.pop("bind_pending", None)
+
+    result = dict(payload)
+    result["entities"] = [
+        item
+        for item in entities
+        if not isinstance(item, dict)
+        or str(item.get("entity_id") or "").strip() not in invalid_ids
+    ]
+    result["segments"] = normalized_segments
+    result["context_update"] = normalized_context
+    return result
+
+
+_TRAVEL_DATE_CORRECTION_TOKEN = (
+    r"(?:今天|今日|明天|明日|后天|"
+    r"下周(?:一|二|三|四|五|六|日|天)?|"
+    r"\d{4}[-年]\d{1,2}[-月]\d{1,2}日?|\d{1,2}月\d{1,2}日)"
+)
+
+
+def _explicit_travel_date_correction_hint(text: str) -> str:
+    """Return an exact replacement date only for a closed correction grammar."""
+
+    source = str(text or "").strip()
+    if not source or re.search(r"[?？]", source):
+        return ""
+    if re.match(
+        r"^\s*(?:如果|假如|假设|要是|听说|据说|有人说|\S{1,8}(?:说|称|表示|反馈|提到))",
+        source,
+    ):
+        return ""
+    compact = re.sub(r"[\s，,。.!！]", "", source)
+    patterns = (
+        rf"^(?:不对)?不是{_TRAVEL_DATE_CORRECTION_TOKEN}(?:而)?(?:是|改成|改为|调整到|挪到)(?P<new>{_TRAVEL_DATE_CORRECTION_TOKEN})$",
+        rf"^(?:出差)?(?:日期|时间)?(?:改成|改为|调整到|挪到)(?P<new>{_TRAVEL_DATE_CORRECTION_TOKEN})$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, compact)
+        if match is not None:
+            return str(match.group("new") or "").strip()
+    return ""
+
+
+def _recover_unique_bound_travel_date_correction(
+    payload: dict[str, Any],
+    *,
+    turn: CognitiveTurn,
+    state: ConversationState,
+) -> dict[str, Any]:
+    """Canonicalize one explicit correction when trusted context proves its target.
+
+    The model remains responsible for ordinary semantic interpretation.  This
+    fail-closed recovery applies to either a model no-op or a model-proposed
+    Travel confirmation, and only for an explicit date-correction grammar, an
+    active Travel dialogue, and exactly one permission-filtered active item. It
+    re-anchors provider metadata to the exact source and trusted resource.  It
+    grants no write: it can only request the existing medium-risk confirmation
+    protocol, whose object/version/date binding is revalidated by Admission.
+    """
+
+    actions = payload.get("required_actions")
+    context = payload.get("context_update")
+    clarification = payload.get("clarification_need")
+    if not isinstance(actions, list):
+        return payload
+    if str(getattr(state.current_goal, "intent", "") or "") != "travel_event":
+        return payload
+    new_date_hint = _explicit_travel_date_correction_hint(turn.text)
+    if not new_date_hint:
+        return payload
+    active_rows = [
+        dict(item)
+        for item in turn.resources.get("active_travel_intents") or ()
+        if isinstance(item, Mapping)
+        and str(item.get("status") or "") not in {"cancelled", "completed"}
+    ]
+    if len(active_rows) != 1:
+        return payload
+    active = active_rows[0]
+    travel_intent_id = str(active.get("travel_intent_id") or "").strip()
+    destination = str(active.get("destination") or "").strip()
+    expected_version = active.get("version")
+    if (
+        not travel_intent_id
+        or not destination
+        or not isinstance(expected_version, int)
+        or isinstance(expected_version, bool)
+        or expected_version < 1
+    ):
+        return payload
+
+    existing_pending = context.get("bind_pending") if isinstance(context, dict) else None
+    if existing_pending is not None:
+        if (
+            not isinstance(existing_pending, dict)
+            or existing_pending.get("action") != "update_travel_event"
+        ):
+            return payload
+    elif clarification is not None:
+        return payload
+
+    entity_id = "contract-bound-travel-date-correction"
+    segment_id = "contract-bound-travel-date-correction-segment"
+    return {
+        "intents": ["travel_event"],
+        "segments": [
+            {
+                "segment_id": segment_id,
+                "text": str(turn.text or "").strip(),
+                "intents": ["travel_event"],
+                "entity_ids": [entity_id],
+                "action_ids": [],
+            }
+        ],
+        "entities": [
+            {
+                "entity_id": entity_id,
+                "entity_type": "travel_intent_ref",
+                "value": destination,
+                "confidence": 1.0,
+                "attributes": {
+                    "travel_intent_id": travel_intent_id,
+                    "expected_version": expected_version,
+                    "destination": destination,
+                    "new_date_hint": new_date_hint,
+                },
+            }
+        ],
+        "confidence": 1.0,
+        "required_actions": [],
+        "clarification_need": {
+            "reason": "medium_risk_confirmation_required",
+            "missing_fields": ["confirmation"],
+            "question": "确认修改这项出差的日期吗？",
+        },
+        "context_update": {
+            "preserve_current_goal": True,
+            "remember_turn": True,
+            "bind_pending": {
+                "pending_id": "contract-bound-travel-date-correction",
+                "intent": "travel_event",
+                "action": "update_travel_event",
+                "entity_ids": [entity_id],
+                "expires_in_seconds": 600,
+            },
+        },
+    }
+
+
+def _normalize_travel_update_pending_binding(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Narrow one Travel confirmation pending to its sole Travel reference.
+
+    Models sometimes include an independently described Daily projection in
+    the pending's entity list.  Removing that sibling cannot grant authority;
+    it restores the reviewed one-object confirmation contract while all object
+    ID/version checks remain in trusted Admission.
+    """
+
+    context = payload.get("context_update")
+    if not isinstance(context, dict):
+        return payload
+    pending = context.get("bind_pending")
+    if not isinstance(pending, dict) or pending.get("action") != "update_travel_event":
+        return payload
+    pending_ids = [
+        str(value or "").strip()
+        for value in pending.get("entity_ids", [])
+        if str(value or "").strip()
+    ] if isinstance(pending.get("entity_ids"), list) else []
+    travel_ids = [
+        str(item.get("entity_id") or "").strip()
+        for item in payload.get("entities", [])
+        if isinstance(item, dict)
+        and item.get("entity_type") == "travel_intent_ref"
+        and str(item.get("entity_id") or "").strip() in pending_ids
+    ]
+    if len(travel_ids) != 1:
+        return payload
+    travel_id = travel_ids[0]
+    normalized_pending = dict(pending)
+    normalized_pending["entity_ids"] = travel_ids
+    normalized_context = dict(context)
+    normalized_context["bind_pending"] = normalized_pending
+
+    # A provider can propose the right one-object confirmation while omitting
+    # one side of the segment reference (intent or entity).  Repair only a
+    # unique structural target; Domain Admission still re-binds the object,
+    # version, source text, requested change and risk class from trusted
+    # resources before persisting any Pending.
+    segments = payload.get("segments")
+    normalized_segments = list(segments) if isinstance(segments, list) else []
+
+    def _segment_values(item: dict[str, Any], key: str) -> set[str]:
+        values = item.get(key)
+        if not isinstance(values, list):
+            return set()
+        return {
+            str(value or "").strip()
+            for value in values
+            if str(value or "").strip()
+        }
+
+    exact_matches = [
+        index
+        for index, item in enumerate(normalized_segments)
+        if isinstance(item, dict)
+        and travel_id in _segment_values(item, "entity_ids")
+        and str(pending.get("intent") or "")
+        in _segment_values(item, "intents")
+    ]
+    if not exact_matches:
+        entity_matches = [
+            index
+            for index, item in enumerate(normalized_segments)
+            if isinstance(item, dict)
+            and travel_id in _segment_values(item, "entity_ids")
+        ]
+        intent_matches = [
+            index
+            for index, item in enumerate(normalized_segments)
+            if isinstance(item, dict)
+            and str(pending.get("intent") or "")
+            in _segment_values(item, "intents")
+        ]
+        repair_index: int | None = None
+        if len(entity_matches) == 1:
+            repair_index = entity_matches[0]
+        elif len(intent_matches) == 1:
+            repair_index = intent_matches[0]
+        elif len(normalized_segments) == 1:
+            repair_index = 0
+        if repair_index is not None and isinstance(
+            normalized_segments[repair_index], dict
+        ):
+            segment = dict(normalized_segments[repair_index])
+            existing_entity_ids = segment.get("entity_ids")
+            existing_intents = segment.get("intents")
+            segment["entity_ids"] = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            existing_entity_ids
+                            if isinstance(existing_entity_ids, list)
+                            else []
+                        ),
+                        travel_id,
+                    ]
+                )
+            )
+            segment["intents"] = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            existing_intents
+                            if isinstance(existing_intents, list)
+                            else []
+                        ),
+                        str(pending.get("intent") or ""),
+                    ]
+                )
+            )
+            normalized_segments[repair_index] = segment
+    result = dict(payload)
+    result["context_update"] = normalized_context
+    if isinstance(segments, list):
+        result["segments"] = normalized_segments
+    return result
+
+
+def _suppress_coupled_daily_mutation_before_travel_confirmation(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep a Travel confirmation turn non-mutating until it is confirmed.
+
+    A model can describe a Daily projection edit in the same segment as a
+    medium-risk Travel correction.  That projection has no independent
+    authority and must not either execute early or prevent the trusted Travel
+    pending from being persisted.  Independent Daily segments remain intact.
+    """
+
+    context = payload.get("context_update")
+    if not isinstance(context, dict):
+        return payload
+    pending = context.get("bind_pending")
+    if (
+        not isinstance(pending, dict)
+        or pending.get("action") != "update_travel_event"
+    ):
+        return payload
+    pending_ids = {
+        str(value or "").strip()
+        for value in pending.get("entity_ids", [])
+        if str(value or "").strip()
+    } if isinstance(pending.get("entity_ids"), list) else set()
+    if len(pending_ids) != 1:
+        return payload
+
+    raw_entities = payload.get("entities")
+    raw_actions = payload.get("required_actions")
+    raw_segments = payload.get("segments")
+    if not all(isinstance(value, list) for value in (raw_entities, raw_actions, raw_segments)):
+        return payload
+    entity_types = {
+        str(item.get("entity_id") or "").strip(): str(
+            item.get("entity_type") or ""
+        ).strip()
+        for item in raw_entities
+        if isinstance(item, dict) and str(item.get("entity_id") or "").strip()
+    }
+    if any(entity_types.get(entity_id) != "travel_intent_ref" for entity_id in pending_ids):
+        return payload
+
+    travel_segments: list[dict[str, Any]] = []
+    coupled_segment_action_ids: set[str] = set()
+    coupled_projection_segments: set[int] = set()
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict):
+            continue
+        segment_entity_ids = {
+            str(value or "").strip()
+            for value in raw_segment.get("entity_ids", [])
+            if str(value or "").strip()
+        } if isinstance(raw_segment.get("entity_ids"), list) else set()
+        if not pending_ids.intersection(segment_entity_ids):
+            continue
+        travel_segments.append(raw_segment)
+        coupled_segment_action_ids.update(
+            str(value or "").strip()
+            for value in raw_segment.get("action_ids", [])
+            if str(value or "").strip()
+        )
+
+    # Sometimes the provider duplicates one source span into a Travel segment
+    # and a Daily projection segment.  Treat overlapping/equal source spans as
+    # one coupled confirmation; genuinely separate Daily segments remain
+    # executable independently.
+    if len(travel_segments) == 1:
+        travel_segment = travel_segments[0]
+        travel_text = str(travel_segment.get("text") or "").strip()
+        travel_start = travel_segment.get("start_offset")
+        travel_end = travel_segment.get("end_offset")
+        for raw_segment in raw_segments:
+            if not isinstance(raw_segment, dict) or raw_segment is travel_segment:
+                continue
+            segment_text = str(raw_segment.get("text") or "").strip()
+            segment_start = raw_segment.get("start_offset")
+            segment_end = raw_segment.get("end_offset")
+            equal_source = bool(travel_text and segment_text == travel_text)
+            overlapping_source = (
+                isinstance(travel_start, int)
+                and not isinstance(travel_start, bool)
+                and isinstance(travel_end, int)
+                and not isinstance(travel_end, bool)
+                and isinstance(segment_start, int)
+                and not isinstance(segment_start, bool)
+                and isinstance(segment_end, int)
+                and not isinstance(segment_end, bool)
+                and max(travel_start, segment_start) < min(travel_end, segment_end)
+            )
+            if not (equal_source or overlapping_source):
+                continue
+            coupled_projection_segments.add(id(raw_segment))
+            coupled_segment_action_ids.update(
+                str(value or "").strip()
+                for value in raw_segment.get("action_ids", [])
+                if str(value or "").strip()
+            )
+
+    daily_mutations = {
+        "capture_daily_event",
+        "edit_daily_item",
+        "delete_daily_item",
+        "merge_daily_items",
+        "replace_daily_section",
+        "move_daily_items",
+        "clear_daily_section",
+        "clear_daily_report",
+        "copy_previous_daily_report",
+        "copy_current_work_to_tomorrow",
+        "complete_previous_daily_plan",
+    }
+    removed_action_ids: set[str] = set()
+    daily_projection_entity_types = {
+        "daily_event",
+        "daily_item_target",
+        "daily_report",
+    }
+    removed_entity_ids: set[str] = {
+        str(value or "").strip()
+        for segment in raw_segments
+        if isinstance(segment, dict)
+        and (
+            segment in travel_segments
+            or id(segment) in coupled_projection_segments
+        )
+        and isinstance(segment.get("entity_ids"), list)
+        for value in segment["entity_ids"]
+        if entity_types.get(str(value or "").strip())
+        in daily_projection_entity_types
+    }
+    normalized_actions: list[Any] = []
+    for raw_action in raw_actions:
+        if not isinstance(raw_action, dict):
+            normalized_actions.append(raw_action)
+            continue
+        action_id = str(raw_action.get("action_id") or "").strip()
+        action_type = str(raw_action.get("action_type") or "").strip()
+        action_entity_ids = {
+            str(value or "").strip()
+            for value in raw_action.get("entity_ids", [])
+            if str(value or "").strip()
+        } if isinstance(raw_action.get("entity_ids"), list) else set()
+        if action_type in daily_mutations and (
+            action_id in coupled_segment_action_ids
+            or bool(action_entity_ids.intersection(removed_entity_ids))
+        ):
+            removed_action_ids.add(action_id)
+            removed_entity_ids.update(action_entity_ids)
+            continue
+        normalized_actions.append(raw_action)
+    if not removed_action_ids and not removed_entity_ids:
+        return payload
+
+    retained_entity_ids = {
+        str(value or "").strip()
+        for action in normalized_actions
+        if isinstance(action, dict) and isinstance(action.get("entity_ids"), list)
+        for value in action["entity_ids"]
+        if str(value or "").strip()
+    } | pending_ids
+    removable_entity_ids = removed_entity_ids - retained_entity_ids
+    normalized_segments: list[Any] = []
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict):
+            normalized_segments.append(raw_segment)
+            continue
+        segment = dict(raw_segment)
+        if isinstance(segment.get("action_ids"), list):
+            segment["action_ids"] = [
+                value
+                for value in segment["action_ids"]
+                if str(value or "").strip() not in removed_action_ids
+            ]
+        if isinstance(segment.get("entity_ids"), list):
+            segment["entity_ids"] = [
+                value
+                for value in segment["entity_ids"]
+                if str(value or "").strip() not in removable_entity_ids
+            ]
+        if (
+            id(raw_segment) in coupled_projection_segments
+            and not segment.get("action_ids")
+            and not segment.get("entity_ids")
+        ):
+            continue
+        normalized_segments.append(segment)
+
+    normalized_context = dict(context)
+    if isinstance(normalized_context.get("remember_entity_ids"), list):
+        normalized_context["remember_entity_ids"] = [
+            value
+            for value in normalized_context["remember_entity_ids"]
+            if str(value or "").strip() not in removable_entity_ids
+        ]
+    result = dict(payload)
+    result["entities"] = [
+        item
+        for item in raw_entities
+        if not isinstance(item, dict)
+        or str(item.get("entity_id") or "").strip() not in removable_entity_ids
+    ]
+    result["required_actions"] = normalized_actions
+    result["segments"] = normalized_segments
+    result["context_update"] = normalized_context
+    represented_intents = {
+        str(value or "").strip()
+        for segment in normalized_segments
+        if isinstance(segment, dict) and isinstance(segment.get("intents"), list)
+        for value in segment["intents"]
+        if str(value or "").strip()
+    } | {
+        str(action.get("intent") or "").strip()
+        for action in normalized_actions
+        if isinstance(action, dict) and str(action.get("intent") or "").strip()
+    } | {str(pending.get("intent") or "").strip()}
+    if isinstance(payload.get("intents"), list):
+        result["intents"] = [
+            value
+            for value in payload["intents"]
+            if str(value or "").strip() in represented_intents
+        ]
+    return result
+
+
+def _normalize_multi_entity_daily_capture_actions(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind each Daily capture to one proposed ``daily_event`` entity.
+
+    No entity, field, value, or operation is inferred here.  The normalization
+    only preserves already-proposed ``daily_event`` bindings, drops unrelated
+    context entities accidentally attached to the action, and makes the
+    one-entity cardinality explicit for Admission and Typed Commands.  Context
+    entities remain available to the segment/state; they gain no write authority.
+    """
+
+    raw_entities = payload.get("entities")
+    raw_actions = payload.get("required_actions")
+    raw_segments = payload.get("segments")
+    if (
+        not isinstance(raw_entities, list)
+        or not isinstance(raw_actions, list)
+        or not isinstance(raw_segments, list)
+    ):
+        return payload
+    entity_types = {
+        str(item.get("entity_id") or "").strip(): str(
+            item.get("entity_type") or ""
+        ).strip()
+        for item in raw_entities
+        if isinstance(item, dict) and str(item.get("entity_id") or "").strip()
+    }
+    existing_action_ids = {
+        str(item.get("action_id") or "").strip()
+        for item in raw_actions
+        if isinstance(item, dict) and str(item.get("action_id") or "").strip()
+    }
+    replacements: dict[str, dict[str, str]] = {}
+    normalized_actions: list[Any] = []
+    changed = False
+    for raw_action in raw_actions:
+        if not isinstance(raw_action, dict):
+            normalized_actions.append(raw_action)
+            continue
+        action_id = str(raw_action.get("action_id") or "").strip()
+        entity_ids = [
+            str(value or "").strip()
+            for value in raw_action.get("entity_ids", [])
+            if str(value or "").strip()
+        ] if isinstance(raw_action.get("entity_ids"), list) else []
+        if raw_action.get("action_type") != "capture_daily_event" or not action_id:
+            normalized_actions.append(raw_action)
+            continue
+        daily_entity_ids = [
+            entity_id
+            for entity_id in entity_ids
+            if entity_types.get(entity_id) == "daily_event"
+        ]
+        if not daily_entity_ids:
+            normalized_actions.append(raw_action)
+            continue
+        if len(daily_entity_ids) == 1:
+            if daily_entity_ids == entity_ids:
+                normalized_actions.append(raw_action)
+            else:
+                action = dict(raw_action)
+                action["entity_ids"] = daily_entity_ids
+                normalized_actions.append(action)
+                changed = True
+            continue
+        replacements[action_id] = {}
+        changed = True
+        for index, entity_id in enumerate(daily_entity_ids, start=1):
+            candidate_id = f"{action_id}-entity-{index}"
+            suffix = index
+            while candidate_id in existing_action_ids:
+                suffix += 1
+                candidate_id = f"{action_id}-entity-{suffix}"
+            existing_action_ids.add(candidate_id)
+            replacements[action_id][entity_id] = candidate_id
+            action = dict(raw_action)
+            action["action_id"] = candidate_id
+            action["entity_ids"] = [entity_id]
+            normalized_actions.append(action)
+    if not changed:
+        return payload
+
+    if not replacements:
+        result = dict(payload)
+        result["required_actions"] = normalized_actions
+        return result
+
+    normalized_segments: list[Any] = []
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict):
+            normalized_segments.append(raw_segment)
+            continue
+        segment = dict(raw_segment)
+        segment_entities = {
+            str(value or "").strip()
+            for value in segment.get("entity_ids", [])
+            if str(value or "").strip()
+        } if isinstance(segment.get("entity_ids"), list) else set()
+        action_ids: list[str] = []
+        for raw_id in segment.get("action_ids", []):
+            action_id = str(raw_id or "").strip()
+            replacement = replacements.get(action_id)
+            if replacement is None:
+                if action_id:
+                    action_ids.append(action_id)
+                continue
+            action_ids.extend(
+                new_id
+                for entity_id, new_id in replacement.items()
+                if entity_id in segment_entities
+            )
+        segment["action_ids"] = action_ids
+        normalized_segments.append(segment)
+
+    result = dict(payload)
+    result["required_actions"] = normalized_actions
+    result["segments"] = normalized_segments
+    return result
+
+
+def _normalize_daily_section_clear_binding(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Repair one closed provider-shape error without inferring user intent.
+
+    ``clear_daily_section`` is already an explicit model decision, but providers
+    sometimes bind both a ``daily_item_target`` (which carries ``target_field``)
+    and the trusted ``daily_report`` snapshot.  The semantic contract requires
+    exactly the report entity with ``attributes.field``.  Copying one
+    non-conflicting closed field and dropping only the extraneous action binding
+    preserves the provider's decision while leaving Admission in charge of
+    grounding and write authority.  Missing, conflicting, or unknown fields stay
+    invalid and therefore fail closed inside the normal repair loop.
+    """
+
+    raw_entities = payload.get("entities")
+    raw_actions = payload.get("required_actions")
+    if not isinstance(raw_entities, list) or not isinstance(raw_actions, list):
+        return payload
+    entity_by_id = {
+        str(entity.get("entity_id") or "").strip(): entity
+        for entity in raw_entities
+        if isinstance(entity, dict) and str(entity.get("entity_id") or "").strip()
+    }
+    valid_fields = {"today_work", "problems", "tomorrow_plan"}
+    normalized_entities = list(raw_entities)
+    normalized_actions: list[Any] = []
+    repaired_target_ids: set[str] = set()
+    changed = False
+
+    for raw_action in raw_actions:
+        if (
+            not isinstance(raw_action, dict)
+            or raw_action.get("action_type") != "clear_daily_section"
+            or not isinstance(raw_action.get("entity_ids"), list)
+        ):
+            normalized_actions.append(raw_action)
+            continue
+        bound_ids = [
+            str(value or "").strip()
+            for value in raw_action["entity_ids"]
+            if str(value or "").strip()
+        ]
+        report_ids = [
+            entity_id
+            for entity_id in bound_ids
+            if entity_by_id.get(entity_id, {}).get("entity_type") == "daily_report"
+        ]
+        target_ids = [
+            entity_id
+            for entity_id in bound_ids
+            if entity_by_id.get(entity_id, {}).get("entity_type") == "daily_item_target"
+        ]
+        if (
+            len(report_ids) != 1
+            or not target_ids
+            or len(report_ids) + len(target_ids) != len(bound_ids)
+        ):
+            normalized_actions.append(raw_action)
+            continue
+
+        report = entity_by_id[report_ids[0]]
+        report_attributes = report.get("attributes")
+        if not isinstance(report_attributes, dict):
+            normalized_actions.append(raw_action)
+            continue
+        report_field = str(report_attributes.get("field") or "").strip()
+        target_fields = {
+            str(attributes.get("target_field") or "").strip()
+            for target_id in target_ids
+            if isinstance(
+                attributes := entity_by_id[target_id].get("attributes"),
+                dict,
+            )
+            and str(attributes.get("target_field") or "").strip()
+        }
+        if report_field:
+            if report_field not in valid_fields or target_fields != {report_field}:
+                normalized_actions.append(raw_action)
+                continue
+        elif len(target_fields) == 1 and target_fields <= valid_fields:
+            report_field = next(iter(target_fields))
+            normalized_report = dict(report)
+            normalized_report_attributes = dict(report_attributes)
+            normalized_report_attributes["field"] = report_field
+            normalized_report["attributes"] = normalized_report_attributes
+            report_index = normalized_entities.index(report)
+            normalized_entities[report_index] = normalized_report
+            entity_by_id[report_ids[0]] = normalized_report
+        else:
+            normalized_actions.append(raw_action)
+            continue
+
+        normalized_action = dict(raw_action)
+        normalized_action["entity_ids"] = report_ids
+        normalized_actions.append(normalized_action)
+        repaired_target_ids.update(target_ids)
+        changed = True
+
+    if not changed:
+        return payload
+
+    authoritative_ids = {
+        str(entity_id or "").strip()
+        for action in normalized_actions
+        if isinstance(action, dict) and isinstance(action.get("entity_ids"), list)
+        for entity_id in action["entity_ids"]
+        if str(entity_id or "").strip()
+    }
+    context = payload.get("context_update")
+    normalized_context = dict(context) if isinstance(context, dict) else context
+    pending = context.get("bind_pending") if isinstance(context, dict) else None
+    if isinstance(pending, dict) and isinstance(pending.get("entity_ids"), list):
+        authoritative_ids.update(
+            str(entity_id or "").strip()
+            for entity_id in pending["entity_ids"]
+            if str(entity_id or "").strip()
+        )
+    removable_from_memory = repaired_target_ids - authoritative_ids
+    if (
+        isinstance(normalized_context, dict)
+        and isinstance(normalized_context.get("remember_entity_ids"), list)
+    ):
+        normalized_context["remember_entity_ids"] = [
+            entity_id
+            for entity_id in normalized_context["remember_entity_ids"]
+            if str(entity_id or "").strip() not in removable_from_memory
+        ]
+
+    result = dict(payload)
+    result["entities"] = normalized_entities
+    result["required_actions"] = normalized_actions
+    if isinstance(normalized_context, dict):
+        result["context_update"] = normalized_context
+    return result
+
+
+def _normalize_action_free_daily_report_context(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove malformed embedded items from a non-authoritative report ref.
+
+    Providers sometimes attach display-shaped dictionaries to ``items`` on a
+    context-only ``daily_report`` entity.  The closed contract accepts only a
+    non-empty list of strings, and repeating the malformed context on repair
+    would otherwise make an action-free turn unavailable.  This normalization
+    is deliberately one-way and authority-reducing: it never changes an entity
+    referenced by an action or Pending, never creates an item, and preserves the
+    report ID/version/date used for read-only context.
+    """
+
+    entities = payload.get("entities")
+    actions = payload.get("required_actions")
+    if not isinstance(entities, list) or not isinstance(actions, list):
+        return payload
+    authoritative_entity_ids = {
+        str(entity_id or "").strip()
+        for action in actions
+        if isinstance(action, dict)
+        for entity_id in (action.get("entity_ids") or ())
+        if str(entity_id or "").strip()
+    }
+    context = payload.get("context_update")
+    pending = context.get("bind_pending") if isinstance(context, dict) else None
+    if isinstance(pending, dict):
+        authoritative_entity_ids.update(
+            str(entity_id or "").strip()
+            for entity_id in (pending.get("entity_ids") or ())
+            if str(entity_id or "").strip()
+        )
+
+    changed = False
+    normalized_entities: list[Any] = []
+    for raw_entity in entities:
+        if (
+            not isinstance(raw_entity, dict)
+            or raw_entity.get("entity_type") != "daily_report"
+            or str(raw_entity.get("entity_id") or "").strip()
+            in authoritative_entity_ids
+        ):
+            normalized_entities.append(raw_entity)
+            continue
+        attributes = raw_entity.get("attributes")
+        if not isinstance(attributes, dict) or "items" not in attributes:
+            normalized_entities.append(raw_entity)
+            continue
+        items = attributes.get("items")
+        valid_items = bool(
+            isinstance(items, (list, tuple))
+            and items
+            and all(isinstance(value, str) and value.strip() for value in items)
+        )
+        if valid_items:
+            normalized_entities.append(raw_entity)
+            continue
+        normalized_attributes = dict(attributes)
+        normalized_attributes.pop("items", None)
+        entity = dict(raw_entity)
+        entity["attributes"] = normalized_attributes
+        normalized_entities.append(entity)
+        changed = True
+    if not changed:
+        return payload
+    result = dict(payload)
+    result["entities"] = normalized_entities
+    return result
+
+
+def _normalize_daily_event_attributes(payload: dict[str, Any]) -> dict[str, Any]:
+    """Discard model-only provenance fields outside the Daily entity contract.
+
+    Daily authority is grounded from the exact entity value and source segment;
+    unlike Case and Travel, ``daily_event`` does not accept ``evidence_spans``.
+    Removing only that known extraneous key prevents schema-repair loops without
+    creating an entity, action, field, or write authority.
+    """
+
+    raw_entities = payload.get("entities")
+    if not isinstance(raw_entities, list):
+        return payload
+    changed = False
+    entities: list[Any] = []
+    for raw_entity in raw_entities:
+        if not isinstance(raw_entity, dict) or raw_entity.get("entity_type") != "daily_event":
+            entities.append(raw_entity)
+            continue
+        attributes = raw_entity.get("attributes")
+        if not isinstance(attributes, dict) or "evidence_spans" not in attributes:
+            entities.append(raw_entity)
+            continue
+        normalized_attributes = dict(attributes)
+        normalized_attributes.pop("evidence_spans", None)
+        entity = dict(raw_entity)
+        entity["attributes"] = normalized_attributes
+        entities.append(entity)
+        changed = True
+    if not changed:
+        return payload
+    result = dict(payload)
+    result["entities"] = entities
+    return result
+
+
+def _normalize_travel_intent_reference_attributes(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Discard provider provenance that cannot authorize a Travel update.
+
+    ``travel_intent_ref`` is grounded exclusively by the permission-filtered
+    stable ID, optimistic version, requested change and source segment.  Some
+    providers copy ``evidence_spans`` from the separate ``travel_event`` schema;
+    removing only that known non-authoritative key avoids a repair loop while
+    retaining the closed contract for every other unexpected attribute.
+    """
+
+    raw_entities = payload.get("entities")
+    if not isinstance(raw_entities, list):
+        return payload
+    changed = False
+    entities: list[Any] = []
+    for raw_entity in raw_entities:
+        if (
+            not isinstance(raw_entity, dict)
+            or raw_entity.get("entity_type") != "travel_intent_ref"
+        ):
+            entities.append(raw_entity)
+            continue
+        attributes = raw_entity.get("attributes")
+        if not isinstance(attributes, dict) or "evidence_spans" not in attributes:
+            entities.append(raw_entity)
+            continue
+        normalized_attributes = dict(attributes)
+        normalized_attributes.pop("evidence_spans", None)
+        entity = dict(raw_entity)
+        entity["attributes"] = normalized_attributes
+        entities.append(entity)
+        changed = True
+    if not changed:
+        return payload
+    result = dict(payload)
+    result["entities"] = entities
     return result
 
 
@@ -1707,6 +3470,70 @@ def _enforce_explicit_travel_event(
     return result
 
 
+def _has_asserted_daily_travel_projection(
+    payload: dict[str, Any],
+    *,
+    text: str,
+) -> bool:
+    """Require an existing model-proposed Daily fact before adding Travel.
+
+    This keeps Admission mode from inventing a mutation out of keyword-only
+    chat.  It only restores the parallel Travel facet when the model already
+    asserted the complete turn as a ``tomorrow_plan`` Daily projection.
+    """
+
+    if payload.get("clarification_need") is not None:
+        return False
+    source = str(text or "").strip()
+    if not source or _extract_explicit_travel_event(source) is None:
+        return False
+    raw_entities = payload.get("entities")
+    raw_actions = payload.get("required_actions")
+    raw_segments = payload.get("segments")
+    if not all(
+        isinstance(value, list)
+        for value in (raw_entities, raw_actions, raw_segments)
+    ):
+        return False
+    entity_by_id = {
+        str(item.get("entity_id") or ""): item
+        for item in raw_entities
+        if isinstance(item, dict)
+    }
+    for action in raw_actions:
+        if (
+            not isinstance(action, dict)
+            or action.get("action_type") != "capture_daily_event"
+            or not isinstance(action.get("entity_ids"), list)
+            or len(action["entity_ids"]) != 1
+        ):
+            continue
+        entity_id = str(action["entity_ids"][0])
+        entity = entity_by_id.get(entity_id)
+        attributes = entity.get("attributes") if isinstance(entity, dict) else None
+        if (
+            not isinstance(entity, dict)
+            or entity.get("entity_type") != "daily_event"
+            or str(entity.get("value") or "").strip() != source
+            or not isinstance(attributes, dict)
+            or str(attributes.get("field") or "") != "tomorrow_plan"
+            or str(attributes.get("statement_mode") or "") != "asserted"
+        ):
+            continue
+        action_id = str(action.get("action_id") or "")
+        bound_segments = [
+            segment
+            for segment in raw_segments
+            if isinstance(segment, dict)
+            and action_id in (segment.get("action_ids") or [])
+            and entity_id in (segment.get("entity_ids") or [])
+            and str(segment.get("text") or "").strip() == source
+        ]
+        if len(bound_segments) == 1:
+            return True
+    return False
+
+
 def _enforce_operation_status_query(
     payload: dict[str, Any],
     *,
@@ -2008,7 +3835,7 @@ def _enforce_daily_deictic_projection(
     resolved_count = len(current_work) if expected_count == -1 else expected_count
     has_unique_context = bool(
         str(draft.get("report_id") or "").strip()
-        and str(draft.get("status") or "") == "collecting"
+        and str(draft.get("status") or "") in {"collecting", "pending_confirmation"}
         and resolved_count > 0
         and len(current_work) == resolved_count
         and not state.active_pending(occurred_at)
@@ -2169,7 +3996,7 @@ def report_type_from_meta_opening(text: str) -> str | None:
             rf"(?:(?:要|想|准备|现在)?(?:填|写|开始填|开始写)"
             rf"(?:今天|今日|本周|这周|本月|这个月)?(?:的)?(?:个)?)"
             rf"|(?:进入|打开|切到|切换到|开始)"
-            rf")?{label}(?:了|吧|呢|哈)?",
+            rf")?{label}(?:了|啦|咯|啊|呀|吧|呢|哈|嘛|呗)?",
             compact,
         ):
             return report_type
@@ -2252,7 +4079,14 @@ def _active_daily_collection_context(
         status = str(raw_task.get("status") or "active").strip().lower()
         if (
             any(value in task_kind for value in ("daily_report", "daily", "日报"))
-            and status in {"active", "collecting", "in_progress", "pending"}
+            and status
+            in {
+                "active",
+                "collecting",
+                "in_progress",
+                "pending",
+                "pending_confirmation",
+            }
         ):
             return True
     return False
@@ -2268,6 +4102,18 @@ def _plain_daily_work_statement(
         return False
     if report_type_from_meta_opening(source) is not None:
         return False
+    if re.match(
+        r"^\s*(?:如果|假如|假设|要是|听说|据说|\S{1,8}(?:说|称|表示|反馈|提到))",
+        source,
+    ):
+        return False
+    if re.match(
+        r"^\s*(?:会议纪要|邮件|法院文书|正式材料).{0,12}(?:写着|写明|显示|提到|记录|称)",
+        source,
+    ):
+        return False
+    if re.search(r"[“‘\"].+?[”’\"]", source):
+        return False
     if re.search(r"[?？]", source) or re.search(
         r"(?:什么|为何|为什么|怎么|如何|哪里|哪个|谁|是否|能否|可否|请问|流程|时间安排)",
         source,
@@ -2276,6 +4122,12 @@ def _plain_daily_work_statement(
     if re.search(
         r"(?:明天|明日|后天|下周|下月)"
         r"|(?:没|没有|无)(?:其他|其它)?(?:问题|风险)",
+        source,
+    ):
+        return False
+    if re.search(
+        r"(?:没|没有|未|尚未|还没|并未).{0,6}"
+        r"(?:完成|做完|处理|审核|推进|跟进|整理|制作|参加|提交)",
         source,
     ):
         return False
@@ -2439,6 +4291,28 @@ def _enforce_non_unique_short_confirmation(
 
     if not _is_short_confirmation(text) or len(state.active_pending(occurred_at)) == 1:
         return payload
+    return _short_confirmation_mismatch_payload(text)
+
+
+def _missing_short_confirmation_payload(
+    *,
+    text: str,
+    state: ConversationState,
+    occurred_at: datetime,
+) -> dict[str, Any] | None:
+    """Resolve a bare acknowledgement with no active authority locally."""
+
+    if (
+        not _is_short_confirmation(text)
+        or state.active_pending(occurred_at)
+    ):
+        return None
+    return _short_confirmation_mismatch_payload(text)
+
+
+def _short_confirmation_mismatch_payload(text: str) -> dict[str, Any]:
+    """Return the closed zero-write response for an unbound acknowledgement."""
+
     # Do not preserve model-proposed entities/actions here: a bare acknowledgement
     # cannot establish a legal business object when the state has no unique binding.
     return {
@@ -2465,10 +4339,100 @@ def _enforce_non_unique_short_confirmation(
 
 
 def _is_short_confirmation(text: str) -> bool:
-    compact = re.sub(r"[\s，。！？、,.!?]", "", text)
-    for filler in ("那个", "就这样哈", "就这样", "哈", "嗯", "哦"):
-        compact = compact.replace(filler, "")
-    return compact in {"确认", "是", "是的", "对", "对的", "确定", "没错"}
+    return is_explicit_pending_confirmation(text)
+
+
+def _single_bound_pending_cancellation_payload(
+    *,
+    turn: CognitiveTurn,
+    state: ConversationState,
+) -> dict[str, Any] | None:
+    """Recognize only the closed cancellation protocol for one active pending."""
+
+    if not is_explicit_pending_cancellation(turn.text):
+        return None
+    if len(state.active_pending(turn.occurred_at)) != 1:
+        return None
+    return {
+        "intents": ["pending_cancel"],
+        "segments": [
+            {
+                "segment_id": "bound-pending-cancellation",
+                "text": turn.text,
+                "intents": ["pending_cancel"],
+                "entity_ids": [],
+                "action_ids": [],
+            }
+        ],
+        "entities": [],
+        "confidence": 1.0,
+        "required_actions": [],
+        "clarification_need": None,
+        "context_update": {"preserve_current_goal": True},
+    }
+
+
+def _single_bound_pending_confirmation_payload(
+    *,
+    turn: CognitiveTurn,
+    state: ConversationState,
+) -> dict[str, Any] | None:
+    """Resolve an exact confirmation from one trusted pending without model recopy.
+
+    The model is not asked to reproduce stable IDs, optimistic versions, or the
+    bound action.  Cognitive Core still revalidates this continuation against
+    the active state before trusted Admission can authorize anything.
+    """
+
+    if not is_explicit_pending_confirmation(turn.text):
+        return None
+    active = state.active_pending(turn.occurred_at)
+    if len(active) != 1:
+        return None
+    pending = active[0]
+    by_id = {entity.entity_id: entity for entity in state.current_entities}
+    entities = [by_id.get(entity_id) for entity_id in pending.entity_ids]
+    if any(entity is None for entity in entities):
+        return None
+    action_id = "continue-bound-pending"
+    return {
+        "intents": [pending.intent],
+        "segments": [
+            {
+                "segment_id": "bound-pending-confirmation",
+                "text": turn.text,
+                "intents": [pending.intent],
+                "entity_ids": list(pending.entity_ids),
+                "action_ids": [action_id],
+            }
+        ],
+        "entities": [
+            {
+                "entity_id": entity.entity_id,
+                "entity_type": entity.entity_type,
+                "value": entity.value,
+                "confidence": entity.confidence,
+                "attributes": dict(entity.attributes),
+            }
+            for entity in entities
+            if entity is not None
+        ],
+        "confidence": 1.0,
+        "required_actions": [
+            {
+                "action_id": action_id,
+                "action_type": "continue_pending",
+                "intent": pending.intent,
+                "entity_ids": list(pending.entity_ids),
+                "parameters": {
+                    "pending_id": pending.pending_id,
+                    "bound_action": pending.action,
+                },
+            }
+        ],
+        "clarification_need": None,
+        "context_update": {},
+    }
 
 
 def _state_payload(state: ConversationState) -> dict[str, Any]:
@@ -2506,7 +4470,7 @@ def _conversation_state_oracle_guard_payload(state: ConversationState) -> dict[s
     for raw in payload.get("current_entities", []):
         item = dict(raw)
         attributes = dict(item.get("attributes") or {})
-        if item.get("entity_type") == "case_progress_ref":
+        if item.get("entity_type") in {"case_progress_ref", "travel_intent_ref"}:
             attributes.pop("expected_version", None)
         item["attributes"] = attributes
         sanitized_entities.append(item)
@@ -2530,7 +4494,7 @@ def _validate_turn_contract(
     constraints = state.user_constraints
     submit_is_available = (
         str(draft.get("report_id") or "").strip()
-        and str(draft.get("status") or "") == "collecting"
+        and str(draft.get("status") or "") in {"collecting", "pending_confirmation"}
         and not constraints.read_only
         and not constraints.no_daily_write
         and not constraints.draft_only

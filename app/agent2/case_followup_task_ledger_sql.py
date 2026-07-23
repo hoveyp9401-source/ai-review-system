@@ -12,6 +12,16 @@ from app.agent2.business.models import Agent2TaskLedgerEntry
 
 
 _REPORT_TASK_NAMESPACE = UUID("1eb9d37f-4cec-5bc4-b22b-c74b16bbc506")
+_OPEN_REPORT_STATUSES = frozenset({"collecting", "pending_confirmation"})
+_CLOSED_REPORT_STATUSES = frozenset({"completed", "cancelled"})
+
+
+def _task_status_for_report(report_status: str) -> str:
+    if report_status == "collecting":
+        return "active"
+    if report_status == "pending_confirmation":
+        return "awaiting_input"
+    return report_status
 
 
 @dataclass(frozen=True)
@@ -66,7 +76,7 @@ async def sync_focused_report_task(
         return TaskLedgerSqlTransition("blocked", "conversation_scope_required")
     if report_type not in {"daily", "weekly", "monthly"}:
         return TaskLedgerSqlTransition("blocked", "unknown_report_type")
-    if report_status not in {"collecting", "completed", "cancelled"}:
+    if report_status not in _OPEN_REPORT_STATUSES | _CLOSED_REPORT_STATUSES:
         return TaskLedgerSqlTransition("blocked", "unknown_report_status")
     scoped_task_id = report_task_ledger_id(
         report_id=task_id,
@@ -110,7 +120,7 @@ async def sync_focused_report_task(
         and item.focus_state == "focused"
         and item.status in {"active", "awaiting_input"}
     )
-    if report_status == "collecting" and len(focused) > 1:
+    if report_status in _OPEN_REPORT_STATUSES and len(focused) > 1:
         return TaskLedgerSqlTransition("blocked", "multiple_focused_tasks")
     if current is None:
         current = Agent2TaskLedgerEntry(
@@ -121,8 +131,10 @@ async def sync_focused_report_task(
                 "period_key": period_key,
                 "source_report_id": source_report_id,
             },
-            status="active" if report_status == "collecting" else report_status,
-            focus_state="focused" if report_status == "collecting" else "active",
+            status=_task_status_for_report(report_status),
+            focus_state=(
+                "focused" if report_status in _OPEN_REPORT_STATUSES else "active"
+            ),
             version=1, source_turn_id=source_turn_id,
             pending_requirements_json={},
             resume_policy_json={
@@ -138,8 +150,10 @@ async def sync_focused_report_task(
             "period_key": period_key,
             "source_report_id": source_report_id,
         }
-        current.status = "active" if report_status == "collecting" else report_status
-        current.focus_state = "focused" if report_status == "collecting" else "active"
+        current.status = _task_status_for_report(report_status)
+        current.focus_state = (
+            "focused" if report_status in _OPEN_REPORT_STATUSES else "active"
+        )
         current.resume_policy_json = {
             **dict(current.resume_policy_json or {}),
             "mode": "restore_previous", "report_status": report_status,
@@ -147,7 +161,7 @@ async def sync_focused_report_task(
         current.expires_at = expires_at
         current.version += 1
         current.updated_at = now
-    if report_status == "collecting" and focused:
+    if report_status in _OPEN_REPORT_STATUSES and focused:
         previous = focused[0]
         previous.status = "suspended"
         previous.focus_state = "suspended"
@@ -156,7 +170,11 @@ async def sync_focused_report_task(
     await session.flush()
     return TaskLedgerSqlTransition(
         "transitioned",
-        "report_focused" if report_status == "collecting" else "report_closed",
+        (
+            "report_focused"
+            if report_status in _OPEN_REPORT_STATUSES
+            else "report_closed"
+        ),
         str(current.task_id),
     )
 
@@ -244,7 +262,7 @@ async def complete_followup_and_restore_report(
         and item.status == "suspended"
         and item.focus_state == "suspended"
         and str((item.resume_policy_json or {}).get("report_status") or "")
-        == "collecting"
+        in _OPEN_REPORT_STATUSES
         and (item.expires_at is None or item.expires_at > now)
     )
     exact_previous_task_id = str(
@@ -278,7 +296,9 @@ async def complete_followup_and_restore_report(
         await session.flush()
         return TaskLedgerSqlTransition("transitioned", "followup_completed")
     restored = resumable[0]
-    restored.status = "active"
+    restored.status = _task_status_for_report(
+        str((restored.resume_policy_json or {}).get("report_status") or "")
+    )
     restored.focus_state = "focused"
     restored.version += 1
     restored.updated_at = now

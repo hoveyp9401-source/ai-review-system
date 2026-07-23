@@ -208,6 +208,65 @@ async def test_committed_report_task_is_persisted_and_focused_for_exact_conversa
 
 
 @pytest.mark.asyncio
+async def test_pending_confirmation_report_remains_focused_and_awaits_user_input():
+    session = _Session(None, [])
+    report_id = uuid4()
+
+    result = await sync_focused_report_task(
+        session,
+        task_id=report_id,
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-a",
+        source_turn_id="turn-revision",
+        report_type="daily",
+        period_key="2026-07-22",
+        report_status="pending_confirmation",
+        now=NOW,
+        expires_at=NOW + timedelta(days=1),
+    )
+
+    assert result.status == "transitioned"
+    assert result.reason_code == "report_focused"
+    report = session.rows[0]
+    assert report.status == "awaiting_input"
+    assert report.focus_state == "focused"
+
+
+@pytest.mark.asyncio
+async def test_committed_answer_restores_pending_confirmation_as_awaiting_input():
+    report = _entry(
+        domain="report",
+        status="suspended",
+        focus_state="suspended",
+        resume={
+            "mode": "restore_previous",
+            "report_status": "pending_confirmation",
+        },
+        expires_at=NOW + timedelta(days=2),
+    )
+    followup = _entry(
+        domain="case_followup",
+        status="awaiting_input",
+        focus_state="focused",
+    )
+    session = _Session(followup, (report, followup))
+
+    result = await complete_followup_and_restore_report(
+        session,
+        followup_task_id=followup.task_id,
+        now=NOW,
+        case_receipt_succeeded=True,
+    )
+
+    assert result.status == "transitioned"
+    assert result.restored_task_id == str(report.task_id)
+    assert report.status == "awaiting_input"
+    assert report.focus_state == "focused"
+    assert report.resume_policy_json["report_status"] == "pending_confirmation"
+
+
+@pytest.mark.asyncio
 async def test_existing_legacy_report_task_id_is_reused_in_its_original_conversation():
     report_id = uuid4()
     legacy = Agent2TaskLedgerEntry(

@@ -221,6 +221,59 @@ async def test_future_visit_without_business_travel_assertion_is_not_force_writt
     assert decision.intents == ("chat",)
 
 
+@pytest.mark.parametrize(
+    ("text", "expected_value"),
+    (
+        ("我今天完成了员工访谈", "完成了员工访谈"),
+        ("今天审核了合同", "审核了合同"),
+        ("今日工作：半年度绩效评估", "半年度绩效评估"),
+        ("今天主要做了项目复盘", "主要做了项目复盘"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_explicit_current_day_fact_is_recovered_when_model_calls_it_chat(
+    text: str,
+    expected_value: str,
+):
+    decision = await _interpret(text, _chat_payload(text))
+
+    action = next(
+        action
+        for action in decision.required_actions
+        if action.action_type == "capture_daily_event"
+    )
+    entity = next(entity for entity in decision.entities if entity.entity_id in action.entity_ids)
+    assert entity.entity_type == "daily_event"
+    assert entity.value == expected_value
+    assert entity.attributes == {
+        "field": "today_work",
+        "statement_mode": "asserted",
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "如果今天完成合同审核，再提交给业务部门",
+        "同事说今天完成了合同审核",
+        "今天没有完成合同审核",
+        "今天完成员工访谈了吗？",
+        "今天完成情况如何",
+        "“今天完成了合同审核”",
+        "今天不再推进合同审核",
+        "今日工作：暂无",
+    ),
+)
+@pytest.mark.asyncio
+async def test_nonassertive_today_language_is_not_projected_as_daily_fact(text: str):
+    decision = await _interpret(text, _chat_payload(text))
+
+    assert all(
+        action.action_type != "capture_daily_event"
+        for action in decision.required_actions
+    )
+
+
 @pytest.mark.asyncio
 async def test_case_evidence_span_object_is_normalized_to_closed_integer_pair_shape():
     text = "人民西路8号院今天联系法院推进，法院表示下周重新查控。"

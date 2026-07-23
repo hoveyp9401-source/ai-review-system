@@ -56,7 +56,13 @@ from app.agent2.turn_runtime import (
     production_agent2_turn_runtime,
     verified_turn_rejection_reply,
 )
-from app.agent2.cognitive_reply_v3 import build_cognitive_side_reply_v3
+from app.agent2.cognitive_reply_v3 import (
+    append_cognitive_clarification,
+    build_cognitive_side_reply_v3,
+    has_bound_confirmation_pending,
+    has_pending_lifecycle_update,
+    pending_lifecycle_reply,
+)
 from app.agent2.case_report_projection_runtime import (
     project_committed_case_followup_facts,
 )
@@ -1183,6 +1189,7 @@ async def _process_stream_agent2_daily_if_enabled(
                     if command.command_type
                     in {
                         "record_travel_candidate",
+                        "update_travel_candidate",
                         "respond_travel_collaboration_candidate",
                         "record_case_progress_candidate",
                         "update_case_progress_candidate",
@@ -1251,6 +1258,7 @@ async def _process_stream_agent2_daily_if_enabled(
                     ),
                 )
             elif phase2_business_result is None and not periodic_report_results:
+                lifecycle_message = pending_lifecycle_reply(cognitive_v3.decision)
                 selection_message = selection_request_reply(
                     cognitive_v3.decision
                 )
@@ -1260,7 +1268,19 @@ async def _process_stream_agent2_daily_if_enabled(
                 admission_message = admission_block_reply(
                     cognitive_v3.decision
                 )
-                if selection_message:
+                if lifecycle_message:
+                    if not has_pending_lifecycle_update(cognitive_v3.decision):
+                        raise RuntimeError("pending lifecycle reply requires a state update")
+                    await finalize_cognitive_core_v3_execution(
+                        session=session,
+                        result=cognitive_v3,
+                        command_results=[],
+                        business_result=None,
+                        report_results=[],
+                        business_context=verified_execution_context,
+                    )
+                    reply_text = lifecycle_message
+                elif selection_message:
                     await finalize_cognitive_core_v3_execution(
                         session=session,
                         result=cognitive_v3,
@@ -1270,7 +1290,7 @@ async def _process_stream_agent2_daily_if_enabled(
                         business_context=verified_execution_context,
                     )
                     reply_text = selection_message
-                elif information_message or admission_message:
+                elif information_message:
                     await finalize_cognitive_core_v3_execution(
                         session=session,
                         result=cognitive_v3,
@@ -1279,7 +1299,27 @@ async def _process_stream_agent2_daily_if_enabled(
                         report_results=[],
                         business_context=verified_execution_context,
                     )
-                    reply_text = information_message or admission_message
+                    reply_text = information_message
+                elif has_bound_confirmation_pending(cognitive_v3.decision):
+                    await finalize_cognitive_core_v3_execution(
+                        session=session,
+                        result=cognitive_v3,
+                        command_results=[],
+                        business_result=None,
+                        report_results=[],
+                        business_context=verified_execution_context,
+                    )
+                    reply_text = cognitive_v3.decision.clarification_need.question
+                elif admission_message:
+                    await finalize_cognitive_core_v3_execution(
+                        session=session,
+                        result=cognitive_v3,
+                        command_results=[],
+                        business_result=None,
+                        report_results=[],
+                        business_context=verified_execution_context,
+                    )
+                    reply_text = admission_message
                 elif cognitive_v3.decision.clarification_need is not None:
                     reply_text = cognitive_v3.decision.clarification_need.question
                 elif phase2_primary and (
@@ -1367,7 +1407,10 @@ async def _process_stream_agent2_daily_if_enabled(
                         ),
                         now=verified_execution_context.occurred_at,
                     )
-                reply_text = OutcomeReplyComposer().compose(outcomes)
+                reply_text = append_cognitive_clarification(
+                    OutcomeReplyComposer().compose(outcomes),
+                    cognitive_v3.decision,
+                )
                 latest = periodic_report_results[-1]
                 response_payload = {
                     "msgtype": "text",
@@ -1449,7 +1492,10 @@ async def _process_stream_agent2_daily_if_enabled(
                         source_turn_id=str(envelope.message_id or source_message_id),
                         now=verified_execution_context.occurred_at,
                     )
-                reply_text = OutcomeReplyComposer().compose(outcomes)
+                reply_text = append_cognitive_clarification(
+                    OutcomeReplyComposer().compose(outcomes),
+                    cognitive_v3.decision,
+                )
                 response_payload = {"msgtype": "text", "text": {"content": reply_text}}
                 await mark_webhook_event_processed(
                     session,
@@ -1575,7 +1621,10 @@ async def _process_stream_agent2_daily_if_enabled(
                 source_turn_id=str(envelope.message_id or source_message_id),
                 now=verified_execution_context.occurred_at,
             )
-        reply_message = OutcomeReplyComposer().compose(outcomes)
+        reply_message = append_cognitive_clarification(
+            OutcomeReplyComposer().compose(outcomes),
+            cognitive_v3.decision,
+        )
     elif shadow is not None:
         side_reply_text = await _agent2_side_reply_text(
             shadow=shadow,

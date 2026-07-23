@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
-from app.agent2.cognitive_core_v3 import RequiredAction, SemanticInterpretation
-from app.agent2.conversation_state import ConversationState
+from app.agent2.cognitive_core_v3 import (
+    CognitiveCoreV3,
+    RequiredAction,
+    SemanticInterpretation,
+)
+from app.agent2.cognitive_orchestrator_v3 import (
+    CognitiveOrchestrationResult,
+    finalize_cognitive_state_after_execution,
+)
+from app.agent2.command_planner_v3 import CognitiveCommandPlanner, CommandPlanningContext
+from app.agent2.conversation_state import BoundPending, ConversationState
+from app.agent2.conversation_state_store import InMemoryConversationStateStore
 from app.agent2.domain_admission import DomainAdmissionEngine
 from app.agent2.cognitive_core_v3 import CognitiveTurn
+from app.agent2.selection_pending import SelectionPendingFactory
 from app.agent2.semantic_interpreter_v3 import LLMCognitiveSemanticInterpreter
 
 
@@ -133,6 +144,14 @@ class _SequenceClient:
         self.calls.append(dict(kwargs))
         index = min(len(self.calls) - 1, len(self._payloads) - 1)
         return json.dumps(self._payloads[index], ensure_ascii=False)
+
+
+class _StaticInterpreter:
+    def __init__(self, proposal: SemanticInterpretation) -> None:
+        self.proposal = proposal
+
+    async def interpret(self, turn, state):
+        return self.proposal
 
 
 def test_case09_clarification_only_proposal_cannot_create_selection_authority() -> None:
@@ -320,6 +339,67 @@ def test_existing_required_action_is_evaluated_once_without_derived_duplicate() 
     assert admitted.context_update.preserve_current_goal is True
     assert admitted.context_update.remember_entity_ids == ()
     assert admitted.context_update.remember_turn is False
+
+
+def test_ambiguous_new_case_mutation_revokes_old_confirmation_before_selection() -> None:
+    turn, base = _turn_and_state()
+    old_pending = BoundPending(
+        pending_id="old-travel-confirmation",
+        user_id=base.user_id,
+        conversation_id=base.conversation_id,
+        intent="travel_update",
+        action="update_travel_event",
+        entity_ids=("old-travel-ref",),
+        context_id="old-travel-context",
+        created_at=turn.occurred_at - timedelta(minutes=1),
+        expires_at=turn.occurred_at + timedelta(minutes=9),
+    )
+    state = replace(base, pending=(old_pending,))
+    core = CognitiveCoreV3(
+        _StaticInterpreter(_explicit_action_proposal()),
+        admission_engine=DomainAdmissionEngine(),
+        admission_enforced=True,
+    )
+
+    result = asyncio.run(core.process(turn, state))
+
+    assert result.decision.context_update.invalidated_pending_ids == (
+        old_pending.pending_id,
+    )
+    assert result.decision.context_update.pending_invalidation_reason == (
+        "superseded_by_new_instruction"
+    )
+    assert len(result.decision.admission_selection_requests) == 1
+    selection_pending = SelectionPendingFactory().from_trusted_request(
+        result.decision.admission_selection_requests[0]
+    )
+    plan = CognitiveCommandPlanner().plan(
+        result.decision,
+        CommandPlanningContext(
+            message_id=turn.message_id,
+            actor_user_id=turn.actor_user_id,
+        ),
+    )
+    orchestration = CognitiveOrchestrationResult(
+        decision=result.decision,
+        base_state=state,
+        state=result.state,
+        command_plan=plan,
+        state_persisted=False,
+    )
+    store = InMemoryConversationStateStore((state,))
+
+    persisted = asyncio.run(
+        finalize_cognitive_state_after_execution(
+            result=orchestration,
+            state_store=store,
+            execution_succeeded=False,
+            selection_pending=(selection_pending,),
+        )
+    )
+
+    assert persisted.pending == ()
+    assert persisted.selection_pending == (selection_pending,)
 
 
 @pytest.mark.parametrize("invalid_kind", ("missing_action", "missing_segment_binding"))

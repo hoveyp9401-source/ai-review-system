@@ -256,6 +256,39 @@ def _admit(
             ["items"],
         ),
         (
+            "move_daily_items",
+            "今天完成合同审核，这是明天的计划",
+            "daily_item_target",
+            "今天完成合同审核",
+            {
+                "target_item_ids": ["today-work-1"],
+                "source_field": "today_work",
+                "target_field": "tomorrow_plan",
+            },
+            {},
+            "move_items",
+            ["today-work-1"],
+            {"target_field": "tomorrow_plan"},
+            ["section", "items"],
+        ),
+        (
+            "replace_daily_section",
+            "明日计划：准备评审材料",
+            "daily_report",
+            "明日计划：准备评审材料",
+            {
+                "report_id": CURRENT_REPORT_ID,
+                "version": 4,
+                "field": "tomorrow_plan",
+                "items": ["准备评审材料"],
+            },
+            {},
+            "replace_section",
+            [],
+            {"field": "tomorrow_plan", "items": ["准备评审材料"]},
+            ["section", "items"],
+        ),
+        (
             "clear_daily_section",
             "清空今天日报的问题与风险",
             "daily_report",
@@ -380,6 +413,934 @@ def test_daily_mutation_ticket_binds_exact_trusted_snapshot_and_command(
     }
     assert ticket["allowed_changed_fields"] == changed_fields
     assert admission_claim_hashes_match(ticket) is True
+
+
+@pytest.mark.parametrize(
+    ("text", "field_name", "model_item"),
+    [
+        (
+            "今日工作：1. 刘聪说完成合同审核\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：准备评审材料",
+            "today_work",
+            "完成合同审核",
+        ),
+        (
+            "今日工作：- 刘聪说完成合同审核\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：准备评审材料",
+            "today_work",
+            "完成合同审核",
+        ),
+        (
+            "今日工作：十、刘聪说完成合同审核\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：准备评审材料",
+            "today_work",
+            "完成合同审核",
+        ),
+        (
+            "今日工作：（1） 刘聪说完成合同审核\n"
+            "问题与风险：（1） 来函界面被调整\n"
+            "明日计划：（1） 准备评审材料",
+            "today_work",
+            "完成合同审核",
+        ),
+        (
+            "今日工作：(1) 刘聪说完成合同审核\n"
+            "问题与风险：(1) 来函界面被调整\n"
+            "明日计划：(1) 准备评审材料",
+            "today_work",
+            "完成合同审核",
+        ),
+        (
+            "今日工作：如果完成合同审核，再提交材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：准备评审材料",
+            "today_work",
+            "完成合同审核",
+        ),
+        (
+            "今日工作：没有完成合同审核\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：准备评审材料",
+            "today_work",
+            "完成合同审核",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：明天南京出差取消",
+            "tomorrow_plan",
+            "明天南京出差",
+        ),
+        (
+            "今日工作：1. 不处理合同\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：准备评审材料",
+            "today_work",
+            "处理合同",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 不跟进客户",
+            "tomorrow_plan",
+            "跟进客户",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 不去",
+            "tomorrow_plan",
+            "去",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 取消",
+            "tomorrow_plan",
+            "取消",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 撤销南京行程",
+            "tomorrow_plan",
+            "南京行程",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访已取消",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访已经撤销",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访被暂停",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访暂时终止",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访已取消。",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访已经撤销.……）",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访已经撤销\u200b",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访已经撤销⚠️",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+        (
+            "今日工作：整理评审材料\n"
+            "问题与风险：来函界面被调整\n"
+            "明日计划：1. 客户拜访暂时终止啦",
+            "tomorrow_plan",
+            "客户拜访",
+        ),
+    ],
+)
+def test_replace_section_cannot_strip_nonassertive_framing_before_admission(
+    text: str,
+    field_name: str,
+    model_item: str,
+) -> None:
+    result = _admit(
+        action_type="replace_daily_section",
+        text=text,
+        entity_type="daily_report",
+        entity_value=model_item,
+        attributes={
+            "report_id": CURRENT_REPORT_ID,
+            "version": 4,
+            "field": field_name,
+            "items": [model_item],
+        },
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.decisions[0].reason_code == (
+        "daily_section_replacement_not_authorized"
+    )
+    assert result.tickets == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "明日计划：1. 客户拜访已取消。",
+        "明日计划：1. 客户拜访已经撤销！",
+        "明日计划：1. 客户拜访被暂停？",
+        "明日计划：1. 客户拜访暂时终止，",
+        "明日计划：1. 客户拜访已经撤销.",
+        "明日计划：1. 客户拜访暂时终止……",
+        "明日计划：1. 客户拜访已经撤销）",
+        "明日计划：1. 客户拜访被暂停.……）",
+        "明日计划：1. 客户拜访已经撤销\u200b",
+        "明日计划：1. 客户拜访已经撤销⚠️",
+        "明日计划：1. 客户拜访暂时终止啦",
+        "明日计划：1. 客户拜访已经撤\u200b销",
+        "明日计划：1. 客户拜访已经撤 销",
+        "明日计划：1. 客户拜访已经撤-销",
+        "明日计划：1. 客户拜访已经撤⚠️销",
+        "明日计划：1. 客户拜访已经撤销了吧",
+        "明日计划：1. 客户拜访已经撤销掉了吧",
+        "明日计划：1. 客户拜访暂时终止了呢",
+        "明日计划：1. 客户拜访已经撤销了没",
+        "明日计划：1. 客户拜访已经撤销了没有",
+        "明日计划：1. 客户拜访已经撤销了吗",
+        "明日计划：1. 客户拜访已经取消哈",
+        "明日计划：1. 客户拜访已经取消呐",
+        "明日计划：1. 客户拜访已经取消诶",
+        "明日计划：1. 客户拜访已经取消耶",
+        "明日计划：1. 跟进着的客户拜访取消",
+        "明日计划：1. 审核完的合同撤销",
+        "明日计划：1. 办理了的许可撤销",
+        "明日计划：1. 跟进多日的客户拜访取消",
+        "明日计划：1. 跟进了一段时间的客户拜访取消",
+        "明日计划：1. 审核多次的合同撤销",
+        "明日计划：1. 处理许久的案件撤回",
+        "明日计划：1. 办理到一半的许可撤销",
+        "明日计划：1. 审核完毕的那个合同撤销",
+        "明日计划：1. 跟进已久的客户拜访取消",
+        "明日计划：1. 跟进了三个月的客户拜访取消",
+        "明日计划：1. 处理过程中的案件撤回",
+        "明日计划：1. 办理期间的该项许可撤销",
+        "明日计划：1. 跟进超过一年的客户拜访取消",
+        "明日计划：1. 审核完成后的合同撤销",
+        "明日计划：1. 跟进客户拜访被告知取消",
+        "明日计划：1. 处理公司会议被告知取消",
+        "明日计划：1. 评估阶段的项目暂停",
+        "明日计划：1. 研究阶段的项目暂停",
+        "明日计划：1. 分析阶段的项目终止",
+        "明日计划：1. 审查期内的许可撤销",
+        "明日计划：1. 复核期间内的决定撤销",
+        "明日计划：1. 研究状态下的项目暂停",
+        "明日计划：1. 核查范围内的事项取消",
+    ],
+)
+def test_capture_daily_event_cannot_drop_termination_state(text: str) -> None:
+    result = _admit(
+        action_type="capture_daily_event",
+        text=text,
+        entity_type="daily_event",
+        entity_value="客户拜访",
+        attributes={"field": "tomorrow_plan", "statement_mode": "asserted"},
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.tickets == ()
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        "客户拜访已取消。",
+        "客户拜访已经撤销！",
+        "客户拜访被暂停？",
+        "客户拜访暂时终止，",
+        "客户拜访已经撤销.",
+        "客户拜访暂时终止……",
+        "客户拜访已经撤销）",
+        "客户拜访被暂停.……）",
+        "客户拜访已经撤销\u200b",
+        "客户拜访已经撤销⚠️",
+        "客户拜访暂时终止啦",
+        "客户拜访已经撤\u200b销",
+        "客户拜访已经撤 销",
+        "客户拜访已经撤-销",
+        "客户拜访已经撤⚠️销",
+        "客户拜访已经撤销了吧",
+        "客户拜访已经撤销掉了吧",
+        "客户拜访暂时终止了呢",
+        "客户拜访已经撤销了没",
+        "客户拜访已经撤销了没有",
+        "客户拜访已经撤销了吗",
+        "客户拜访已经取消哈",
+        "客户拜访已经取消呐",
+        "客户拜访已经取消诶",
+        "客户拜访已经取消耶",
+        "跟进着的客户拜访取消",
+        "审核完的合同撤销",
+        "办理了的许可撤销",
+        "跟进多日的客户拜访取消",
+        "跟进了一段时间的客户拜访取消",
+        "审核多次的合同撤销",
+        "处理许久的案件撤回",
+        "办理到一半的许可撤销",
+        "审核完毕的那个合同撤销",
+        "跟进已久的客户拜访取消",
+        "跟进了三个月的客户拜访取消",
+        "处理过程中的案件撤回",
+        "办理期间的该项许可撤销",
+        "跟进超过一年的客户拜访取消",
+        "审核完成后的合同撤销",
+        "跟进客户拜访被告知取消",
+        "处理公司会议被告知取消",
+        "评估阶段的项目暂停",
+        "研究阶段的项目暂停",
+        "分析阶段的项目终止",
+        "审查期内的许可撤销",
+        "复核期间内的决定撤销",
+        "研究状态下的项目暂停",
+        "核查范围内的事项取消",
+    ],
+)
+def test_replace_section_rejects_exact_termination_state(item: str) -> None:
+    result = _admit(
+        action_type="replace_daily_section",
+        text=f"明日计划：1. {item}",
+        entity_type="daily_report",
+        entity_value=item,
+        attributes={
+            "report_id": CURRENT_REPORT_ID,
+            "version": 4,
+            "field": "tomorrow_plan",
+            "items": [item],
+        },
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.tickets == ()
+
+
+def test_capture_daily_event_cannot_strip_parenthesized_attribution() -> None:
+    result = _admit(
+        action_type="capture_daily_event",
+        text="今日工作：（1） 刘聪说完成合同审核",
+        entity_type="daily_event",
+        entity_value="完成合同审核",
+        attributes={"field": "today_work", "statement_mode": "asserted"},
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.tickets == ()
+
+
+def test_replace_section_accepts_exact_parenthesized_numbered_items() -> None:
+    text = "明日计划：\n（1）准备评审材料\n（2）联系业务确认"
+    result = _admit(
+        action_type="replace_daily_section",
+        text=text,
+        entity_type="daily_report",
+        entity_value=text,
+        attributes={
+            "report_id": CURRENT_REPORT_ID,
+            "version": 4,
+            "field": "tomorrow_plan",
+            "items": ["准备评审材料", "联系业务确认"],
+        },
+    )
+
+    assert result.decisions[0].status == "admitted"
+    assert len(result.tickets) == 1
+    assert result.tickets[0].authority_scope["patch"] == {
+        "field": "tomorrow_plan",
+        "items": ("准备评审材料", "联系业务确认"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("text", "entity_value", "field"),
+    [
+        ("今日工作：半年度绩效评估", "半年度绩效评估", "today_work"),
+        ("今天完成了半年度绩效评估", "今天完成了半年度绩效评估", "today_work"),
+        ("合同复核已经完成", "合同复核已经完成", "today_work"),
+        ("明天去南京参加分公司会议", "明天去南京参加分公司会议", "tomorrow_plan"),
+        ("问题与风险：来函流程仍未解决", "来函流程仍未解决", "problems"),
+        ("明日计划：跟进商标撤销", "跟进商标撤销", "tomorrow_plan"),
+        ("明日计划：研究合同撤销", "研究合同撤销", "tomorrow_plan"),
+        ("明日计划：处理公司决议撤销", "处理公司决议撤销", "tomorrow_plan"),
+        ("明日计划：跟进案件撤回", "跟进案件撤回", "tomorrow_plan"),
+        ("明日计划：评估项目暂停", "评估项目暂停", "tomorrow_plan"),
+        ("明日计划：研究已签合同撤销", "研究已签合同撤销", "tomorrow_plan"),
+        ("明日计划：处理已登记商标撤销", "处理已登记商标撤销", "tomorrow_plan"),
+        ("明日计划：继续跟进商标撤销", "继续跟进商标撤销", "tomorrow_plan"),
+        ("明日计划：持续研究合同撤销", "持续研究合同撤销", "tomorrow_plan"),
+        ("明日计划：明天处理公司决议撤销", "明天处理公司决议撤销", "tomorrow_plan"),
+        ("明日计划：重点跟进案件撤回", "重点跟进案件撤回", "tomorrow_plan"),
+        ("明日计划：进一步评估项目暂停", "进一步评估项目暂停", "tomorrow_plan"),
+        ("明日计划：研究正式合同撤销", "研究正式合同撤销", "tomorrow_plan"),
+        ("明日计划：跟进确认书撤销", "跟进确认书撤销", "tomorrow_plan"),
+        ("明日计划：分析主动撤回", "分析主动撤回", "tomorrow_plan"),
+        (
+            "明日计划：评估实际控制人资格取消",
+            "评估实际控制人资格取消",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：研究全面履行后的合同撤销",
+            "研究全面履行后的合同撤销",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：处理明确授权的撤销",
+            "处理明确授权的撤销",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：研究行政许可依法撤销",
+            "研究行政许可依法撤销",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：研究被许可人资格取消",
+            "研究被许可人资格取消",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：评估被投资企业项目暂停",
+            "评估被投资企业项目暂停",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：核查被审计单位资格撤销",
+            "核查被审计单位资格撤销",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：研究被监护人授权撤回",
+            "研究被监护人授权撤回",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：处理被特许经营资格取消",
+            "处理被特许经营资格取消",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：研究已经生效的合同撤销",
+            "研究已经生效的合同撤销",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：分析曾经签订的协议撤销",
+            "分析曾经签订的协议撤销",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：评估已经履行的项目终止",
+            "评估已经履行的项目终止",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：核查已经授权的资格取消",
+            "核查已经授权的资格取消",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：办理客户的申请撤回",
+            "办理客户的申请撤回",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：跟进客户的许可撤销",
+            "跟进客户的许可撤销",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：处理公司的决议撤销",
+            "处理公司的决议撤销",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：办理被许可人的资格取消",
+            "办理被许可人的资格取消",
+            "tomorrow_plan",
+        ),
+        (
+            "明日计划：处理已经生效的合同撤销",
+            "处理已经生效的合同撤销",
+            "tomorrow_plan",
+        ),
+        ("明日计划：研究当前合同撤销", "研究当前合同撤销", "tomorrow_plan"),
+        ("明日计划：研究临时合同撤销", "研究临时合同撤销", "tomorrow_plan"),
+        (
+            "今日工作：核查合同是否完成",
+            "核查合同是否完成",
+            "today_work",
+        ),
+        (
+            "今日工作：研究合同撤销与否",
+            "研究合同撤销与否",
+            "today_work",
+        ),
+        (
+            "今日工作：评估项目继续与否",
+            "评估项目继续与否",
+            "today_work",
+        ),
+        (
+            "今日工作：核查授权有效与否",
+            "核查授权有效与否",
+            "today_work",
+        ),
+        (
+            "今日工作：核查材料发没发",
+            "核查材料发没发",
+            "today_work",
+        ),
+        (
+            "今日工作：研究项目做不做",
+            "研究项目做不做",
+            "today_work",
+        ),
+    ],
+)
+def test_explicit_daily_fact_can_open_current_draft_without_active_daily_task(
+    text: str,
+    entity_value: str,
+    field: str,
+) -> None:
+    resources = _resources()
+    resources["active_tasks"] = []
+
+    result = _admit(
+        action_type="capture_daily_event",
+        text=text,
+        entity_type="daily_event",
+        entity_value=entity_value,
+        attributes={"field": field},
+        resources=resources,
+    )
+
+    assert result.decisions[0].status == "admitted"
+    assert result.decisions[0].reason_code == "explicit_daily_fact_authorized"
+    assert len(result.tickets) == 1
+
+
+def test_affirmative_daily_clause_is_not_poisoned_by_a_sibling_question() -> None:
+    resources = _resources()
+    resources["active_tasks"] = []
+
+    result = _admit(
+        action_type="capture_daily_event",
+        text="今天完成合同复核；证据目录什么时候提交？",
+        entity_type="daily_event",
+        entity_value="今天完成合同复核",
+        attributes={"field": "today_work", "statement_mode": "asserted"},
+        resources=resources,
+    )
+
+    assert result.decisions[0].status == "admitted"
+    assert result.decisions[0].reason_code == "explicit_daily_fact_authorized"
+    assert len(result.tickets) == 1
+
+
+def test_hypothetical_daily_clause_stays_blocked_beside_a_question() -> None:
+    resources = _resources()
+    resources["active_tasks"] = []
+
+    result = _admit(
+        action_type="capture_daily_event",
+        text="如果今天完成合同复核，再提交给业务；证据目录什么时候提交？",
+        entity_type="daily_event",
+        entity_value="如果今天完成合同复核，再提交给业务",
+        attributes={"field": "today_work", "statement_mode": "asserted"},
+        resources=resources,
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.decisions[0].reason_code == "daily_statement_not_asserted"
+    assert result.tickets == ()
+
+
+@pytest.mark.parametrize(
+    ("text", "field", "expected_reason"),
+    [
+        (
+            "半年度绩效评估",
+            "today_work",
+            "report_context_not_uniquely_authorized",
+        ),
+        (
+            "南京出差安排是什么？",
+            "tomorrow_plan",
+            "daily_statement_not_asserted",
+        ),
+        ("最近有什么风险？", "problems", "daily_statement_not_asserted"),
+        (
+            "如果明天去南京，再提前准备材料",
+            "tomorrow_plan",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "刘某说今天完成了合同审核",
+            "today_work",
+            "daily_statement_reported_or_quoted",
+        ),
+        (
+            "同事说合同复核已经完成",
+            "today_work",
+            "daily_statement_reported_or_quoted",
+        ),
+        (
+            "如果合同复核已经完成，再提交材料",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核是否已经完成？",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核完成了没",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核完成了没有",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核完成了-没",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核完成了\u200b没",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核完成了⚠️没",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核完成了…没有",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核完成没有",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        ("合同复核完成没", "today_work", "daily_statement_not_asserted"),
+        (
+            "合同审核做完没有",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "材料整理好没有",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        ("合同复核完成否", "today_work", "daily_statement_not_asserted"),
+        (
+            "合同复核完成了对吧",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        (
+            "合同复核完成了对不对",
+            "today_work",
+            "daily_statement_not_asserted",
+        ),
+        ("合同复核完成了吧", "today_work", "daily_statement_not_asserted"),
+        ("合同复核完成没呢", "today_work", "daily_statement_not_asserted"),
+        ("合同复核完成不", "today_work", "daily_statement_not_asserted"),
+        ("合同看了没", "today_work", "daily_statement_not_asserted"),
+        ("材料发了没", "today_work", "daily_statement_not_asserted"),
+        ("会开完没有", "today_work", "daily_statement_not_asserted"),
+        ("绩效评估弄完没", "today_work", "daily_statement_not_asserted"),
+        ("文档写了没", "today_work", "daily_statement_not_asserted"),
+        ("案件结了没", "today_work", "daily_statement_not_asserted"),
+        ("材料发没发", "today_work", "daily_statement_not_asserted"),
+        ("合同审没审", "today_work", "daily_statement_not_asserted"),
+        ("会议开没开", "today_work", "daily_statement_not_asserted"),
+        ("日报写没写", "today_work", "daily_statement_not_asserted"),
+        ("材料发不发", "today_work", "daily_statement_not_asserted"),
+        ("合同审不审", "today_work", "daily_statement_not_asserted"),
+        ("材料发没", "today_work", "daily_statement_not_asserted"),
+        ("合同审不", "today_work", "daily_statement_not_asserted"),
+        ("材料发对吧", "today_work", "daily_statement_not_asserted"),
+        ("材料发吧", "today_work", "daily_statement_not_asserted"),
+        ("合同审没审完", "today_work", "daily_statement_not_asserted"),
+        ("材料发没发完", "today_work", "daily_statement_not_asserted"),
+        ("会议开没开完", "today_work", "daily_statement_not_asserted"),
+        ("日报写没写完", "today_work", "daily_statement_not_asserted"),
+        ("合同审不审完", "today_work", "daily_statement_not_asserted"),
+        ("材料发还是不发", "today_work", "daily_statement_not_asserted"),
+        ("材料发了还是没发完", "today_work", "daily_statement_not_asserted"),
+        ("合同审没审完全部条款", "today_work", "daily_statement_not_asserted"),
+        ("材料发没发给业务部门", "today_work", "daily_statement_not_asserted"),
+        ("会议开没开出明确结论", "today_work", "daily_statement_not_asserted"),
+        ("日报写没写完全部内容", "today_work", "daily_statement_not_asserted"),
+        ("材料发还是不发给业务部门", "today_work", "daily_statement_not_asserted"),
+        ("材料发没发给HR", "today_work", "daily_statement_not_asserted"),
+        ("合同审没审完NDA", "today_work", "daily_statement_not_asserted"),
+        ("会议开没开出Q3结论", "today_work", "daily_statement_not_asserted"),
+        ("日报写没写完2026Q3内容", "today_work", "daily_statement_not_asserted"),
+        ("材料发还是不发给A组", "today_work", "daily_statement_not_asserted"),
+        ("NDA review了没", "today_work", "daily_statement_not_asserted"),
+        ("合同review了没有", "today_work", "daily_statement_not_asserted"),
+        ("材料check了没", "today_work", "daily_statement_not_asserted"),
+        ("PR merge了没", "today_work", "daily_statement_not_asserted"),
+        ("NDA review没review完", "today_work", "daily_statement_not_asserted"),
+        ("文档check没check", "today_work", "daily_statement_not_asserted"),
+        ("NDA review过没", "today_work", "daily_statement_not_asserted"),
+        ("合同check过没有", "today_work", "daily_statement_not_asserted"),
+        ("PR merge过没", "today_work", "daily_statement_not_asserted"),
+        ("材料review过没", "today_work", "daily_statement_not_asserted"),
+        ("NDA reviewed没", "today_work", "daily_statement_not_asserted"),
+        ("PR merged没有", "today_work", "daily_statement_not_asserted"),
+        ("合同checked没有", "today_work", "daily_statement_not_asserted"),
+        ("合同是不是看完了", "today_work", "daily_statement_not_asserted"),
+        ("材料有没有发出", "today_work", "daily_statement_not_asserted"),
+        (
+            "合同复核尚未完成",
+            "today_work",
+            "daily_positive_work_fact_negated",
+        ),
+        (
+            "会议纪要写着明天去南京出差",
+            "tomorrow_plan",
+            "daily_statement_reported_or_quoted",
+        ),
+    ],
+)
+def test_unscoped_or_question_daily_candidate_stays_blocked_without_active_task(
+    text: str,
+    field: str,
+    expected_reason: str,
+) -> None:
+    resources = _resources()
+    resources["active_tasks"] = []
+
+    result = _admit(
+        action_type="capture_daily_event",
+        text=text,
+        entity_type="daily_event",
+        entity_value=text,
+        attributes={"field": field},
+        resources=resources,
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.decisions[0].reason_code == expected_reason
+    assert result.tickets == ()
+
+
+@pytest.mark.parametrize(
+    ("text", "field"),
+    [
+        ("今天没有完成合同审核", "today_work"),
+        ("明天不去南京出差了", "tomorrow_plan"),
+        ("取消明天南京的会议安排", "tomorrow_plan"),
+        ("不是明天，是后天", "tomorrow_plan"),
+    ],
+)
+def test_correction_or_cancellation_cannot_authorize_a_positive_daily_append(
+    text: str,
+    field: str,
+) -> None:
+    """This blocks only a false positive append, not the business action itself.
+
+    Cancellation and correction may still produce a Travel update, a Daily item
+    move, or clarification through their own bound-object contracts.
+    """
+
+    resources = _resources()
+    resources["active_tasks"] = []
+
+    result = _admit(
+        action_type="capture_daily_event",
+        text=text,
+        entity_type="daily_event",
+        entity_value=text,
+        attributes={"field": field},
+        resources=resources,
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.tickets == ()
+
+
+@pytest.mark.parametrize(
+    ("text", "field", "statement_mode"),
+    [
+        ("如果今天完成合同审核，再提交给业务部门", "today_work", "hypothetical"),
+        ("某同事说今天完成了合同审核", "today_work", "quoted"),
+        ("今天完成合同审核了吗？", "today_work", "question"),
+        ("如果今天完成合同审核，再提交给业务部门", "today_work", "asserted"),
+        ("某同事说今天完成了合同审核", "today_work", "asserted"),
+        ("今天完成合同审核了没", "today_work", "asserted"),
+        ("今天完成合同审核了没有", "today_work", "asserted"),
+        ("今天完成合同审核了-没", "today_work", "asserted"),
+        ("今天完成合同审核了\u200b没", "today_work", "asserted"),
+        ("今天完成合同审核了⚠️没", "today_work", "asserted"),
+        ("今天完成合同审核了…没有", "today_work", "asserted"),
+        ("明天南京出差取消", "tomorrow_plan", "asserted"),
+        ("跟进客户拜访已经正式取消", "tomorrow_plan", "asserted"),
+        ("处理公司会议已确认取消", "tomorrow_plan", "asserted"),
+        ("评估项目目前已经全面暂停", "tomorrow_plan", "asserted"),
+        ("跟进案件被法院裁定终止", "tomorrow_plan", "asserted"),
+        ("研究合同现已依法撤销", "tomorrow_plan", "asserted"),
+        ("跟进客户拜访曾经取消", "tomorrow_plan", "asserted"),
+        ("跟进的客户拜访最终取消", "tomorrow_plan", "asserted"),
+        ("跟进的客户拜访取消", "tomorrow_plan", "asserted"),
+        ("跟进的客户拜访后来取消", "tomorrow_plan", "asserted"),
+        ("跟进的客户拜访突然取消", "tomorrow_plan", "asserted"),
+        ("跟进中的客户拜访取消", "tomorrow_plan", "asserted"),
+        ("处理中的案件撤回", "tomorrow_plan", "asserted"),
+        ("审核过的合同撤销", "tomorrow_plan", "asserted"),
+        (
+            "跟进客户拜访已经因为天气和场地安排发生重大变化而取消",
+            "tomorrow_plan",
+            "asserted",
+        ),
+        (
+            "处理公司会议已由业务部门经过全面评估后决定取消",
+            "tomorrow_plan",
+            "asserted",
+        ),
+        (
+            "跟进客户拜访目前由业务部门经过评估后决定取消",
+            "tomorrow_plan",
+            "asserted",
+        ),
+        (
+            "跟进客户拜访后来因为天气和场地变化而取消",
+            "tomorrow_plan",
+            "asserted",
+        ),
+        ("跟进着的客户拜访取消", "tomorrow_plan", "asserted"),
+        ("审核完的合同撤销", "tomorrow_plan", "asserted"),
+        ("办理了的许可撤销", "tomorrow_plan", "asserted"),
+        ("跟进多日的客户拜访取消", "tomorrow_plan", "asserted"),
+        ("跟进了一段时间的客户拜访取消", "tomorrow_plan", "asserted"),
+        ("审核多次的合同撤销", "tomorrow_plan", "asserted"),
+        ("处理许久的案件撤回", "tomorrow_plan", "asserted"),
+        ("办理到一半的许可撤销", "tomorrow_plan", "asserted"),
+        ("审核完毕的那个合同撤销", "tomorrow_plan", "asserted"),
+        ("跟进已久的客户拜访取消", "tomorrow_plan", "asserted"),
+        ("跟进了三个月的客户拜访取消", "tomorrow_plan", "asserted"),
+        ("处理过程中的案件撤回", "tomorrow_plan", "asserted"),
+        ("办理期间的该项许可撤销", "tomorrow_plan", "asserted"),
+        ("跟进超过一年的客户拜访取消", "tomorrow_plan", "asserted"),
+        ("审核完成后的合同撤销", "tomorrow_plan", "asserted"),
+        ("跟进客户拜访被告知取消", "tomorrow_plan", "asserted"),
+        ("处理公司会议被告知取消", "tomorrow_plan", "asserted"),
+        ("评估项目被告知暂停", "tomorrow_plan", "asserted"),
+        ("研究合同被告知撤销", "tomorrow_plan", "asserted"),
+        ("评估阶段的项目暂停", "tomorrow_plan", "asserted"),
+        ("研究阶段的项目暂停", "tomorrow_plan", "asserted"),
+        ("分析阶段的项目终止", "tomorrow_plan", "asserted"),
+        ("审查期内的许可撤销", "tomorrow_plan", "asserted"),
+        ("复核期间内的决定撤销", "tomorrow_plan", "asserted"),
+        ("研究状态下的项目暂停", "tomorrow_plan", "asserted"),
+        ("核查范围内的事项取消", "tomorrow_plan", "asserted"),
+        ("评估阶段里的那个项目暂停", "tomorrow_plan", "asserted"),
+        ("研究初期的那个项目暂停", "tomorrow_plan", "asserted"),
+        ("复核环节里的那个决定撤销", "tomorrow_plan", "asserted"),
+        ("审查流程上的该项许可撤销", "tomorrow_plan", "asserted"),
+        ("跟进客户的项目已经取消", "tomorrow_plan", "asserted"),
+        ("办理合作方的许可被撤销", "tomorrow_plan", "asserted"),
+        ("处理供应商的申请最终撤回", "tomorrow_plan", "asserted"),
+    ],
+)
+def test_active_daily_context_cannot_authorize_nonassertive_positive_capture(
+    text: str,
+    field: str,
+    statement_mode: str,
+) -> None:
+    resources = _resources()
+    resources["active_tasks"] = [
+        {
+            "workflow": "daily_report",
+            "task_id": "active-daily-task",
+            "status": "collecting",
+        }
+    ]
+
+    result = _admit(
+        action_type="capture_daily_event",
+        text=text,
+        entity_type="daily_event",
+        entity_value=text,
+        attributes={"field": field, "statement_mode": statement_mode},
+        resources=resources,
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.decisions[0].reason_code in {
+        "daily_statement_not_asserted",
+        "daily_statement_reported_or_quoted",
+        "daily_positive_plan_fact_cancelled",
+    }
+    assert result.tickets == ()
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        {
+            "target_item_ids": ["missing-item"],
+            "source_field": "today_work",
+            "target_field": "tomorrow_plan",
+        },
+        {
+            "target_item_ids": ["today-work-1"],
+            "source_field": "tomorrow_plan",
+            "target_field": "today_work",
+        },
+        {
+            "target_item_ids": ["today-work-1"],
+            "source_field": "today_work",
+            "target_field": "today_work",
+        },
+    ],
+)
+def test_move_daily_item_rejects_untrusted_source_or_target(attributes: dict[str, Any]) -> None:
+    result = _admit(
+        action_type="move_daily_items",
+        text="今天完成合同审核，这是明天的计划",
+        entity_type="daily_item_target",
+        entity_value="今天完成合同审核",
+        attributes=attributes,
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert result.tickets == ()
 
 
 def test_reopen_daily_ticket_targets_current_completed_snapshot() -> None:

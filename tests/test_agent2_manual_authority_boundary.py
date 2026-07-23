@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -157,6 +157,67 @@ async def test_ambiguous_trusted_manual_route_fails_closed_before_legacy(
 
     assert response is not None
     assert response["reply_kind"] == "agent2_entrypoint_blocked"
+
+
+@pytest.mark.asyncio
+async def test_manual_daily_reply_uses_server_resolved_reminder_report_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        agent2_business_phase2_enabled=True,
+        agent2_daily_enabled=False,
+        agent2_daily_enabled_user_ids="",
+    )
+    user = SimpleNamespace(
+        id="api-user",
+        dingtalk_user_id="ding-user",
+        name="Test User",
+        timezone="Asia/Shanghai",
+    )
+    reminder_date = date(2026, 7, 13)
+    daily_task = SimpleNamespace(
+        workflow="daily_report",
+        metadata={"report_date": reminder_date.isoformat()},
+    )
+    observed_dates: list[date] = []
+
+    monkeypatch.setattr(reports, "get_settings", lambda: settings)
+
+    async def resolve(*args, **kwargs):
+        return SimpleNamespace(
+            decision=SimpleNamespace(route="blocked"),
+            binding=None,
+        )
+
+    async def load_daily_task(*args, **kwargs):
+        return daily_task
+
+    async def get_target_report(session, user_id, report_date):
+        observed_dates.append(report_date)
+        return None
+
+    monkeypatch.setattr(reports, "resolve_agent2_entrypoint", resolve)
+    monkeypatch.setattr(
+        reports,
+        "build_live_daily_active_task",
+        load_daily_task,
+    )
+    monkeypatch.setattr(reports, "get_report", get_target_report)
+
+    response = await reports._submit_manual_agent2_if_applicable(
+        session=_Session(),  # type: ignore[arg-type]
+        user=user,
+        raw_input="daily follow-up",
+        llm_client=None,
+        message_id="manual-reminder-date",
+        conversation_id="conversation-reminder-date",
+        report_date=None,
+    )
+
+    assert response is not None
+    assert response["report_date"] == reminder_date.isoformat()
+    assert observed_dates == [reminder_date]
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from app.agent2.business.contracts import (
     BusinessCommandError,
     RespondTravelCollaboration,
     UpdateCaseProgress,
+    UpdateTravelIntent,
 )
 from app.agent2.case_followup_commands import (
     TriggerCaseFollowupNow,
@@ -184,6 +185,7 @@ def _integrity_ticket(
 @pytest.mark.parametrize(
     ("domain", "operation", "allowed_changed_fields"),
     [
+        ("travel", "update_travel_event", ["start_at", "end_at", "status"]),
         ("case", "update_case_progress", ["summary", "details"]),
         ("case", "link_case_progress", ["related_party_ids"]),
         (
@@ -216,6 +218,36 @@ def test_dynamic_mutation_changed_field_order_drift_is_rejected():
 
     with pytest.raises(BusinessCommandError) as error:
         admission_store_sql._require_ticket_integrity(ticket)
+
+    assert error.value.code == "admission_ticket_claims_mismatch"
+
+
+def test_sql_travel_claims_reject_hidden_destination_mutation_before_live_query():
+    travel_id = str(uuid4())
+    ticket = _ticket(
+        domain="travel",
+        operation="update_travel_event",
+        object_type="travel_intent",
+        stable_id=travel_id,
+        version=3,
+        authority_scope={
+            "travel_intent_id": travel_id,
+            "version": 3,
+            "status": "cancelled",
+        },
+        allowed_changed_fields=["status"],
+    )
+    command = UpdateTravelIntent(
+        command_id="command-hidden-destination",
+        travel_intent_id=travel_id,
+        expected_version=3,
+        destination_normalized="上海市",
+        city_code="310100",
+        status="cancelled",
+    )
+
+    with pytest.raises(BusinessCommandError) as error:
+        admission_store_sql._require_command_claims(command, ticket)
 
     assert error.value.code == "admission_ticket_claims_mismatch"
 

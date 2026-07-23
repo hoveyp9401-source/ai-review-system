@@ -6,8 +6,10 @@ from pathlib import Path
 import pytest
 
 from app.agent2.evaluation.runtime_scoring import _LABEL_FIELDS
+from app.agent2.conversation_state import ConversationEntity, ConversationState
 from app.agent2.oracle_guard import assert_no_oracle_fields
 from app.agent2.runtime.blind import BlindActualArtifact
+from app.agent2.semantic_interpreter_v3 import _conversation_state_oracle_guard_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,5 +97,36 @@ def test_review_and_sealed_label_metadata_is_rejected_from_runtime_inputs(field_
     with pytest.raises(ValueError, match="forbidden oracle field"):
         assert_no_oracle_fields(
             {"active_tasks": [{"metadata": {field_name: {"candidate": True}}}]},
+            path="runtime_config",
+        )
+
+
+@pytest.mark.parametrize("entity_type", ["case_progress_ref", "travel_intent_ref"])
+def test_trusted_optimistic_version_in_bound_runtime_entity_is_not_an_oracle(
+    entity_type: str,
+) -> None:
+    state = ConversationState(
+        user_id="tenant:user",
+        conversation_id="conversation",
+        current_entities=(
+            ConversationEntity(
+                entity_id="bound-entity",
+                entity_type=entity_type,
+                value="bound runtime entity",
+                confidence=1.0,
+                attributes={"expected_version": 3},
+            ),
+        ),
+    )
+
+    guarded = _conversation_state_oracle_guard_payload(state)
+    assert_no_oracle_fields(guarded, path="conversation_state")
+    assert guarded["current_entities"][0]["attributes"] == {}
+
+
+def test_expected_version_remains_forbidden_in_untrusted_runtime_input() -> None:
+    with pytest.raises(ValueError, match="forbidden oracle field"):
+        assert_no_oracle_fields(
+            {"arbitrary_payload": {"expected_version": 3}},
             path="runtime_config",
         )

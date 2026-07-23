@@ -424,6 +424,8 @@ def _business_operation(compiled: str, semantic: str) -> str:
         return "query"
     if value.startswith("create_travel") or value.startswith("record_travel"):
         return "register"
+    if value.startswith("update_travel"):
+        return "update"
     if value.startswith("respond_travel"):
         return "respond"
     if value.startswith("update_case_followup_policy"):
@@ -450,6 +452,12 @@ def _business_status(
         return "failed"
     if domain == "travel" and compiled == "create_travel_intent" and actual_write:
         return "registered"
+    if domain == "travel" and compiled == "update_travel_intent" and actual_write:
+        return (
+            "cancelled"
+            if str(after.get("status") or "") == "cancelled"
+            else "changed"
+        )
     if domain == "travel" and compiled == "respond_travel_collaboration":
         return {
             "accepted_by_one": "accepted_by_one_party",

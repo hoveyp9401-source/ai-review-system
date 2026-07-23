@@ -573,6 +573,9 @@ async def test_explicit_travel_plan_cannot_be_swallowed_by_active_daily_context(
         "destination": "昆明",
         "date_hint": "tomorrow",
         "purpose": "出差",
+        "statement_mode": "asserted",
+        "traveler_scope": "self",
+        "evidence_spans": [[0, len(text)]],
     }
 
 

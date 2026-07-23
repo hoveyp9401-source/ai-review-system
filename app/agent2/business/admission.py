@@ -24,6 +24,7 @@ from app.agent2.business.contracts import (
     RespondTravelCollaboration,
     SnoozeCaseFollowup,
     UpdateCaseProgress,
+    UpdateTravelIntent,
 )
 from app.agent2.command_planner_v3 import PlanningBlock, TypedBusinessCommand
 
@@ -31,6 +32,7 @@ from app.agent2.command_planner_v3 import PlanningBlock, TypedBusinessCommand
 _CANDIDATE_CONTRACTS: dict[str, tuple[str, str]] = {
     "record_case_progress_candidate": ("case", "record_case_progress"),
     "record_travel_candidate": ("travel", "record_travel_event"),
+    "update_travel_candidate": ("travel", "update_travel_event"),
     "update_case_progress_candidate": ("case", "update_case_progress"),
     "delete_case_progress_candidate": ("case", "delete_case_progress"),
     "link_case_progress_candidate": ("case", "link_case_progress"),
@@ -722,6 +724,8 @@ def _compiled_contract(command: BusinessCommand) -> tuple[str, str] | None:
         return "case", "snooze_case_followup"
     if isinstance(command, CreateTravelIntent):
         return "travel", "record_travel_event"
+    if isinstance(command, UpdateTravelIntent):
+        return "travel", "update_travel_event"
     if isinstance(command, UpdateCaseProgress):
         return "case", "update_case_progress"
     if isinstance(command, DeleteCaseProgress):
@@ -792,6 +796,52 @@ def _require_compiled_object_match(
             == command.start_at.date().isoformat()
             and str(authority_scope.get("purpose") or "").strip()
             == command.purpose_summary.strip()
+        )
+    elif isinstance(command, UpdateTravelIntent):
+        authority_scope = ticket.get("authority_scope")
+        changed_fields = tuple(
+            field_name
+            for field_name, value in (
+                ("start_at", command.start_at),
+                ("end_at", command.end_at),
+                ("destination_normalized", command.destination_normalized),
+                ("city_code", command.city_code),
+                ("status", command.status),
+            )
+            if value is not None
+        )
+        object_matches = (
+            str(object_ref.get("object_type") or "") == "travel_intent"
+            and str(object_ref.get("stable_id") or "") == command.travel_intent_id
+            and _object_version(object_ref.get("version")) == command.expected_version
+        )
+        claims_match = (
+            isinstance(authority_scope, Mapping)
+            and str(authority_scope.get("travel_intent_id") or "")
+            == command.travel_intent_id
+            and _object_version(authority_scope.get("version"))
+            == command.expected_version
+            and str(authority_scope.get("status") or "") == str(command.status or "")
+            and (
+                command.start_at is None
+                or str(authority_scope.get("start_at") or "")
+                == command.start_at.isoformat()
+            )
+            and (
+                command.end_at is None
+                or str(authority_scope.get("end_at") or "")
+                == command.end_at.isoformat()
+            )
+            and (
+                command.destination_normalized is None
+                or str(authority_scope.get("destination_normalized") or "")
+                == command.destination_normalized
+            )
+            and (
+                command.city_code is None
+                or str(authority_scope.get("city_code") or "") == command.city_code
+            )
+            and tuple(ticket.get("allowed_changed_fields") or ()) == changed_fields
         )
     elif isinstance(command, (UpdateCaseProgress, DeleteCaseProgress, LinkCaseProgress)):
         authority_scope = ticket.get("authority_scope")

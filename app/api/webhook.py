@@ -55,7 +55,13 @@ from app.agent2.turn_runtime import (
     production_agent2_turn_runtime,
     verified_turn_rejection_reply,
 )
-from app.agent2.cognitive_reply_v3 import build_cognitive_side_reply_v3
+from app.agent2.cognitive_reply_v3 import (
+    append_cognitive_clarification,
+    build_cognitive_side_reply_v3,
+    has_bound_confirmation_pending,
+    has_pending_lifecycle_update,
+    pending_lifecycle_reply,
+)
 from app.agent2.case_report_projection_runtime import (
     project_committed_case_followup_facts,
 )
@@ -756,6 +762,7 @@ async def _submit_webhook_agent2_if_enabled(
                     if command.command_type
                     in {
                         "record_travel_candidate",
+                        "update_travel_candidate",
                         "respond_travel_collaboration_candidate",
                         "record_case_progress_candidate",
                         "update_case_progress_candidate",
@@ -846,7 +853,10 @@ async def _submit_webhook_agent2_if_enabled(
                     )
                 daily_result = replace(
                     daily_result,
-                    message=OutcomeReplyComposer().compose(outcomes),
+                    message=append_cognitive_clarification(
+                        OutcomeReplyComposer().compose(outcomes),
+                        cognitive_v3.decision,
+                    ),
                 )
                 return daily_result
             if phase2_business_result is not None:
@@ -889,7 +899,10 @@ async def _submit_webhook_agent2_if_enabled(
                         source_turn_id=message_id,
                         now=verified_execution_context.occurred_at,
                     )
-                business_message = OutcomeReplyComposer().compose(outcomes)
+                business_message = append_cognitive_clarification(
+                    OutcomeReplyComposer().compose(outcomes),
+                    cognitive_v3.decision,
+                )
                 return Agent2DailyExecutionResult(
                     report_id=str(getattr(daily_report, "id", "") or "") or None,
                     report_date=report_date,
@@ -946,15 +959,31 @@ async def _submit_webhook_agent2_if_enabled(
                     report_id=str(latest.execution.after.report_id),
                     report_date=report_date,
                     status=latest.execution.after.status,
-                    message=OutcomeReplyComposer().compose(outcomes),
+                    message=append_cognitive_clarification(
+                        OutcomeReplyComposer().compose(outcomes),
+                        cognitive_v3.decision,
+                    ),
                     report_saved=any(item.actual_write for item in periodic_report_results),
                     read_only=not any(item.actual_write for item in periodic_report_results),
                     command_results=[item.as_dict() for item in periodic_report_results],
                 )
+            lifecycle_message = pending_lifecycle_reply(cognitive_v3.decision)
             selection_message = selection_request_reply(cognitive_v3.decision)
             information_message = information_pending_reply(cognitive_v3.decision)
             admission_message = admission_block_reply(cognitive_v3.decision)
-            if selection_message:
+            if lifecycle_message:
+                if not has_pending_lifecycle_update(cognitive_v3.decision):
+                    raise RuntimeError("pending lifecycle reply requires a state update")
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[],
+                    business_context=verified_execution_context,
+                )
+                message = lifecycle_message
+            elif selection_message:
                 await finalize_cognitive_core_v3_execution(
                     session=session,
                     result=cognitive_v3,
@@ -964,7 +993,7 @@ async def _submit_webhook_agent2_if_enabled(
                     business_context=verified_execution_context,
                 )
                 message = selection_message
-            elif information_message or admission_message:
+            elif information_message:
                 await finalize_cognitive_core_v3_execution(
                     session=session,
                     result=cognitive_v3,
@@ -973,7 +1002,27 @@ async def _submit_webhook_agent2_if_enabled(
                     report_results=[],
                     business_context=verified_execution_context,
                 )
-                message = information_message or admission_message
+                message = information_message
+            elif has_bound_confirmation_pending(cognitive_v3.decision):
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[],
+                    business_context=verified_execution_context,
+                )
+                message = cognitive_v3.decision.clarification_need.question
+            elif admission_message:
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[],
+                    business_context=verified_execution_context,
+                )
+                message = admission_message
             elif cognitive_v3.decision.clarification_need is not None:
                 message = cognitive_v3.decision.clarification_need.question
             elif phase2_primary and (

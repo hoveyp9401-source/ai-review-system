@@ -118,6 +118,29 @@ def test_location_and_time_normalization_are_deterministic_and_conservative():
     assert window.end_date == date(2026, 7, 15)
 
 
+@pytest.mark.parametrize(
+    ("destination", "city_code", "province_code"),
+    (
+        ("浙江杭州", "330100", "330000"),
+        ("广东广州", "440100", "440000"),
+        ("湖北武汉", "420100", "420000"),
+        ("四川成都", "510100", "510000"),
+        ("山东青岛", "370200", "370000"),
+        ("福建厦门", "350200", "350000"),
+    ),
+)
+def test_national_core_business_destinations_resolve_from_data_catalog(
+    destination: str,
+    city_code: str,
+    province_code: str,
+):
+    resolution = LocationRegistry.default().resolve(destination)
+
+    assert resolution.status == "resolved"
+    assert resolution.city_code == city_code
+    assert resolution.province_code == province_code
+
+
 def test_travel_match_requires_same_tenant_different_users_same_city_and_overlap():
     executor = InMemoryBusinessExecutor()
     first = executor.execute(

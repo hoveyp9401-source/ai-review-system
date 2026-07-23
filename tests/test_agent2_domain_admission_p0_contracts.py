@@ -377,6 +377,29 @@ def test_negated_travel_model_proposal_cannot_receive_a_ticket() -> None:
     assert result.interpretation.required_actions == ()
 
 
+def test_travel_model_date_must_be_grounded_in_the_source_segment() -> None:
+    text = "\u660e\u5929\u53bb\u5357\u4eac\u51fa\u5dee"
+    result = _admit_travel(
+        text,
+        {
+            "destination": "\u5357\u4eac",
+            "date_hint": "day_after_tomorrow",
+            "purpose": "\u51fa\u5dee",
+            "statement_mode": "asserted",
+            "traveler_scope": "self",
+            "evidence_spans": [[0, len(text)]],
+        },
+    )
+
+    assert result.decisions[0].status == "blocked"
+    assert (
+        result.decisions[0].reason_code
+        == "travel_date_not_grounded_in_segment"
+    )
+    assert result.tickets == ()
+    assert result.interpretation.required_actions == ()
+
+
 def _admit_case(text: str, attributes: dict[str, object]):
     turn = CognitiveTurn(
         tenant_id=TENANT_ID,
@@ -463,6 +486,8 @@ def test_negated_case_progress_model_proposal_cannot_receive_a_ticket() -> None:
     (
         ("travel", "明天不去南京出差了", ("南京",), "negated_or_absent"),
         ("travel", "取消明天南京出差行程", ("南京",), "negated_or_absent"),
+        ("travel", "明天南京出差取消", ("南京",), "negated_or_absent"),
+        ("travel", "南京出差不去了", ("南京",), "negated_or_absent"),
         ("case", "法院尚未通知开庭", ("尚未通知开庭",), "negated_or_absent"),
         ("case", "这个案子暂无新进展", ("暂无新进展",), "negated_or_absent"),
         ("travel", "如果明天去南京出差，就提前订票", ("南京",), "hypothetical"),

@@ -482,6 +482,78 @@ def test_travel_with_missing_date_creates_information_pending_and_no_ticket():
     assert result.as_dict()["information_pendings"] == [pending.as_dict()]
 
 
+def test_grounded_but_underspecified_travel_date_requests_information() -> None:
+    text = "next week I will travel to Beijing for a branch meeting"
+    turn = CognitiveTurn(
+        tenant_id="sandbox-agent2-phase2-20260711",
+        user_id="user-pang",
+        conversation_id="conversation-travel-underspecified-date",
+        message_id="message-travel-underspecified-date",
+        text=text,
+        occurred_at=NOW,
+        resources={"timezone": "Asia/Shanghai"},
+    )
+    proposal = SemanticInterpretation.from_payload(
+        {
+            "intents": ["travel"],
+            "segments": [
+                {
+                    "segment_id": "travel-segment",
+                    "text": text,
+                    "intents": ["travel"],
+                    "entity_ids": ["travel-event"],
+                    "action_ids": ["record-travel"],
+                }
+            ],
+            "entities": [
+                {
+                    "entity_id": "travel-event",
+                    "entity_type": "travel_event",
+                    "value": text,
+                    "confidence": 0.99,
+                    "attributes": {
+                        "destination": "Beijing",
+                        "date_hint": "next week",
+                        "purpose": "branch meeting",
+                        "statement_mode": "asserted",
+                        "traveler_scope": "self",
+                    },
+                }
+            ],
+            "confidence": 0.99,
+            "required_actions": [
+                {
+                    "action_id": "record-travel",
+                    "action_type": "record_travel_event",
+                    "intent": "travel",
+                    "entity_ids": ["travel-event"],
+                }
+            ],
+            "clarification_need": None,
+            "context_update": {
+                "current_goal": "travel",
+                "remember_entity_ids": ["travel-event"],
+                "remember_turn": True,
+            },
+        }
+    )
+
+    result = DomainAdmissionEngine().admit(
+        turn,
+        ConversationState.empty(
+            user_id=turn.user_id,
+            conversation_id=turn.conversation_id,
+        ),
+        proposal,
+    )
+
+    assert result.decisions[0].status == "information_required"
+    assert result.decisions[0].reason_code == "travel_time_information_required"
+    assert result.tickets == ()
+    assert len(result.information_pendings) == 1
+    assert result.information_pendings[0].business_write_allowed is False
+
+
 def test_case_name_without_asserted_grounded_fact_cannot_authorize_progress():
     result = _admit_single_case_fact(
         text="云璟府案",
