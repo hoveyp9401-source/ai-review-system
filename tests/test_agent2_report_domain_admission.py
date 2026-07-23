@@ -1124,6 +1124,10 @@ def test_hypothetical_daily_clause_stays_blocked_beside_a_question() -> None:
         ("NDA reviewed没", "today_work", "daily_statement_not_asserted"),
         ("PR merged没有", "today_work", "daily_statement_not_asserted"),
         ("合同checked没有", "today_work", "daily_statement_not_asserted"),
+        ("你是agent1还是agent2", "today_work", "daily_statement_not_asserted"),
+        ("撤回", "today_work", "daily_control_command_not_report_content"),
+        ("清空", "today_work", "daily_control_command_not_report_content"),
+        ("清空日报", "today_work", "daily_control_command_not_report_content"),
         ("合同是不是看完了", "today_work", "daily_statement_not_asserted"),
         ("材料有没有发出", "today_work", "daily_statement_not_asserted"),
         (

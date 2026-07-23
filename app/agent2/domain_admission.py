@@ -37,6 +37,7 @@ from app.agent2.business.case_reference import (
 )
 from app.agent2.report_document_contract import (
     daily_item_has_termination_state,
+    daily_item_is_control_command,
     daily_item_is_nominal_termination_work,
     daily_item_is_unpunctuated_question,
     daily_semantic_detection_copy,
@@ -2706,6 +2707,8 @@ def _daily_capture_contract_reason(
         return "daily_statement_not_asserted"
     if not source:
         return "daily_statement_not_grounded"
+    if daily_item_is_control_command(source):
+        return "daily_control_command_not_report_content"
     if re.search(
         r"(?:不要|不用|别|无需).{0,8}(?:记入|写入|写进|补到|放进).{0,8}日报"
         r"|(?:不要|不用|别|无需).{0,8}日报.{0,8}(?:记|写|补|填)",

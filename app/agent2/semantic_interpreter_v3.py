@@ -34,6 +34,8 @@ from app.agent2.report_document_contract import (
     StructuredReportItem,
     complete_daily_document_replace_semantic_payload,
     daily_compound_section_correction_semantic_payload,
+    daily_item_is_control_command,
+    daily_item_is_unpunctuated_question,
     daily_item_section_correction_semantic_payload,
     daily_section_cue_semantic_payload,
     explicit_standalone_daily_fact_semantic_payload,
@@ -4124,6 +4126,8 @@ def _plain_daily_work_statement(
         r"|(?:没|没有|无)(?:其他|其它)?(?:问题|风险)",
         source,
     ):
+        return False
+    if daily_item_is_unpunctuated_question(source) or daily_item_is_control_command(source):
         return False
     if re.search(
         r"(?:没|没有|未|尚未|还没|并未).{0,6}"

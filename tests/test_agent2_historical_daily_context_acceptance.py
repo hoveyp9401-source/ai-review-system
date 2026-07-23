@@ -957,6 +957,7 @@ def test_structured_document_does_not_authorize_decorated_termination_state(
         "NDA reviewed没",
         "PR merged没有",
         "合同checked没有",
+        "你是agent1还是agent2",
         "合同是不是看完了",
         "材料有没有发出",
     ],
@@ -1269,6 +1270,10 @@ def test_active_daily_goal_does_not_swallow_explicit_cross_domain_or_question(te
         "某同事说今天完成了合同审核",
         "会议纪要写着今天完成了合同审核",
         "会议纪要写着明天去南京出差",
+        "你是agent1还是agent2",
+        "撤回",
+        "清空",
+        "清空日报",
     ],
 )
 def test_active_daily_plain_work_fallback_defers_nonaffirmative_language_to_model(

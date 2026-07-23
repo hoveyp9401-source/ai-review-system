@@ -86,6 +86,13 @@ _OPEN_QUESTION_CONSTRUCTION = re.compile(
     r"(?:是否|是不是|有没有|能不能|可不可以|什么|为何|为什么|怎么|如何|"
     r"能否|可否|请问)"
 )
+_ALTERNATIVE_QUESTION_CONSTRUCTION = re.compile(
+    r"^(?=.{2,80}$).*(?:是|用|走|选|选择).{1,24}还是.{1,24}$"
+)
+_DAILY_CONTROL_COMMAND = re.compile(
+    r"^(?:撤回|撤销|清空|清空日报|清空今天日报|清空今日日报|"
+    r"撤回日报|撤回今天日报|删除日报|删除今天日报|重写日报|重新写日报)$"
+)
 _QUESTION_AS_WORK_PREFIX = re.compile(
     r"^(?:核查|确认|检查|梳理|研究|评估|分析|复核|调研)"
 )
@@ -225,9 +232,18 @@ def daily_item_is_unpunctuated_question(value: str) -> bool:
     ):
         return True
     return bool(
-        _OPEN_QUESTION_CONSTRUCTION.search(source)
+        (
+            _OPEN_QUESTION_CONSTRUCTION.search(source)
+            or _ALTERNATIVE_QUESTION_CONSTRUCTION.search(source)
+        )
         and work_prefix is None
     )
+
+
+def daily_item_is_control_command(value: str) -> bool:
+    """Return whether a short utterance controls the report rather than describes work."""
+
+    return bool(_DAILY_CONTROL_COMMAND.fullmatch(daily_semantic_detection_copy(value)))
 
 
 def daily_item_has_termination_state(value: str) -> bool:
