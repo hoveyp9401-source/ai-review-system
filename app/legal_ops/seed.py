@@ -7,7 +7,21 @@ from typing import Any
 
 
 FIXTURE_PATH = Path(__file__).with_name("fixtures") / "phase0_manifest.json"
-SEED_GENERATOR_REVISION = 8
+SEED_GENERATOR_REVISION = 9
+FICTIONAL_CASE_PLAINTIFFS = (
+    "示例建设公司甲（虚构）",
+    "示例产业公司乙（虚构）",
+    "示例供应链公司丙（虚构）",
+)
+FICTIONAL_CASE_DEFENDANTS = tuple(
+    f"示例被告公司{index:02d}（虚构）"
+    for index in range(1, 13)
+)
+FICTIONAL_TRAVEL_DESTINATIONS = (
+    "示例城市甲",
+    "示例城市乙",
+    "示例城市甲",
+)
 ORIGIN_STATUSES = {
     "system_fact",
     "human_record",
@@ -39,7 +53,7 @@ def build_phase0_seed(manifest_path: str | Path = FIXTURE_PATH) -> dict[str, Any
             "schema_version": 1,
             "generator_revision": SEED_GENERATOR_REVISION,
             "fixture": True,
-            "fixture_notice": "Synthetic Sandbox fixtures; not production business facts.",
+            "fixture_notice": "Fictional public examples only; not production business facts.",
             "as_of": manifest["as_of"],
             "origin_statuses": sorted(ORIGIN_STATUSES),
         },
@@ -269,12 +283,8 @@ def _add_cases(
     phases = ["intake", "filing", "trial", "execution", "closure"]
     statuses = ["open", "open", "open", "monitoring", "closed", "open"]
     risk_levels = ["high", "medium", "low", "medium", "low", "high"]
-    plaintiffs = ["华东建设有限公司", "长江产业发展集团", "新港供应链有限公司"]
-    defendants = [
-        "南京同名科技有限公司", "苏州恒远设备有限公司", "无锡嘉盛贸易有限公司", "上海衡达工程有限公司",
-        "杭州启辰数据有限公司", "常州宏图材料有限公司", "南通瑞和物流有限公司", "镇江安信服务有限公司",
-        "扬州云帆制造有限公司", "泰州汇诚商贸有限公司", "盐城东联实业有限公司", "徐州鼎盛建设有限公司",
-    ]
+    plaintiffs = FICTIONAL_CASE_PLAINTIFFS
+    defendants = FICTIONAL_CASE_DEFENDANTS
     causes = ["建设工程施工合同纠纷", "买卖合同纠纷", "服务合同纠纷", "执行异议", "仲裁保全", "应收账款催收"]
     for index in range(1, int(config["case_count"]) + 1):
         case_id = f"{tenant_id.removeprefix('sandbox-')}-case-{index:02d}"
@@ -294,7 +304,7 @@ def _add_cases(
                 "title": f"{plaintiffs[(index - 1) % len(plaintiffs)]}诉{defendants[(index - 1) % len(defendants)]}",
                 "plaintiff": plaintiffs[(index - 1) % len(plaintiffs)],
                 "defendants": [defendants[(index - 1) % len(defendants)]],
-                "case_number": f"(2026)苏01{['民初', '执', '仲'][index % 3]}{1200 + index}号",
+                "case_number": f"EXAMPLE-CASE-2026-{index:04d}",
                 "cause": causes[(index - 1) % len(causes)],
                 "owner_name": owner.get("name", owner["id"]),
                 "last_progress": f"2026-07-{max(1, 12 - index):02d}",
@@ -429,7 +439,7 @@ def _add_daily_history(
     end_date = date.fromisoformat(as_of)
     work_templates = (
         (
-            "完成华东建设执行案财产查控材料复核，并电话联系南京中院确认下周反馈安排。",
+            "完成示例案件甲（虚构）的财产查控材料复核，并联系示例法院确认下周反馈安排。",
             "整理查控材料并跟进法院",
             "等待法院反馈后更新执行方案",
             "案件推进",
@@ -447,25 +457,25 @@ def _add_daily_history(
             "运营管理",
         ),
         (
-            "参加王喜案庭前会议，对方提出分期调解方案；已记录要点并安排明日与业务负责人评估。",
+            "参加示例案件乙（虚构）的庭前会议，对方提出分期调解方案；已记录要点并安排明日与业务负责人评估。",
             "参加庭前会议并记录调解方案",
             "评估分期方案及担保条件",
             "庭审与调解",
         ),
         (
-            "赴南京处理两起执行案件，现场调取卷宗并与同事合并安排法院沟通，减少一次重复行程。",
-            "南京出差处理执行案件并完成协同",
+            "赴示例城市甲处理两起虚构执行案件，现场调取示例卷宗并与同事合并安排法院沟通，减少一次重复行程。",
+            "示例城市甲出差处理虚构执行案件并完成协同",
             "整理出差材料并关联案件进展",
             "出差办案",
         ),
         (
-            "补充昨日遗漏的回款记录 12 万元，核对银行流水后将原摘要从“已确认”改为“待财务复核”。",
+            "补充一笔虚构的 12 万元回款记录，核对示例流水后将原摘要从“已确认”改为“待财务复核”。",
             "补充回款记录并修订确认状态",
             "等待财务复核到账信息",
             "执行回款",
         ),
     )
-    history_days = 6 if tenant_id == "sandbox-alpha" else 3
+    history_days = int(config.get("daily_history_days", 3))
     for day_offset in range(history_days):
         report_date = end_date - timedelta(days=day_offset)
         for index, user in enumerate(config["users"], start=1):
@@ -599,7 +609,7 @@ def _add_performance_reporting(
                 "status": "待管理人员确认" if period_type == "weekly" else "报告预览已生成",
                 "overall_summary": "重点案件推进总体平稳，合同治理组目标填报与执行回款数据仍需补充说明。",
                 "risk_summary": "3 个案件超过 21 天无实质进展；1 项回款数据等待财务复核。",
-                "coordination_needed": "协调合同治理组负责人完成月度目标回复，并确认南京同期出差安排。",
+                "coordination_needed": "协调合同治理组负责人完成月度目标回复，并确认示例城市甲同期出差安排。",
                 "next_period_goal": "重点案件按期推进率达到 90%，完成执行回款 150 万元。",
                 "generated_at": f"{as_of}T10:30:00+08:00",
                 "fixture": True,
@@ -658,7 +668,7 @@ def _add_travels(snapshot: dict[str, Any], config: dict[str, Any], source_ids: d
                 "team_id": user["team_id"],
                 "traveler_user_id": user["id"],
                 "case_id": case_id,
-                "destination": ["上海", "北京", "上海"][index - 1],
+                "destination": FICTIONAL_TRAVEL_DESTINATIONS[index - 1],
                 "start_date": ["2026-07-11", "2026-07-12", "2026-07-12"][index - 1],
                 "end_date": ["2026-07-12", "2026-07-13", "2026-07-14"][index - 1],
                 "status": "active" if index < 3 else "planned",

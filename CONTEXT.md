@@ -1,109 +1,88 @@
-# Legal Operations
+# 法务业务中台领域词汇
 
-The Legal Operations context describes matters handled by the legal team, their procedural position, lifecycle stage, responsible lawyer, and auditable progress records.
+本文件统一代码、接口、测试和文档中的业务用语。示例必须使用虚构数据，不得写入真实人员、公司、案件或用户标识。
 
-## Language
+## 核心原则
 
-**Case**:
-A legal matter uniquely identified by its business case identity, regardless of whether it has reached formal court filing.
-_Avoid_: Row, task, ticket
+- 案件事实、报告内容和对话上下文是不同的数据，不能互相隐式写入。
+- 查询不产生写入；任何写入都必须有明确目标、权限、版本和回执。
+- 模型负责理解语言，业务执行层负责权限、状态和数据一致性。
+- “平台已受理消息”不等于“对方已收到或阅读消息”。
 
-**Plaintiff Case**:
-A Case in which the represented company is pursuing a claim or enforcing an effective legal instrument.
-_Avoid_: Active case
+## 词汇
 
-**Defendant Case**:
-A Case in which the represented company is responding as defendant, respondent, judgment debtor, or another defensive party.
-_Avoid_: Passive case
+**案件（Case）**
+由稳定业务标识唯一确定的法律事项，不以是否正式立案作为唯一判断条件。不要称为“行”“工单”或“任务”。
 
-**Plaintiff Lifecycle Stage**:
-The mutually exclusive top-level stage of a Plaintiff Case: Intended Filing, Litigation, Enforcement, or Closed.
-_Avoid_: Plaintiff status, process node
+**原告案件（Plaintiff Case）**
+所代表主体主动主张权利或申请执行的案件。
 
-**Intended Filing**:
-The Plaintiff Lifecycle Stage before formal case acceptance, covering evaluation, decision, and filing preparation.
-_Avoid_: Pre-litigation catch-all
+**被告案件（Defendant Case）**
+所代表主体作为被告、被申请人、被执行人或其他防御方参与的案件。
 
-**Litigation**:
-The Plaintiff Lifecycle Stage after formal acceptance and before enforcement or closure; hearing is a sub-stage, not a top-level stage.
-_Avoid_: Hearing as a top-level stage, In Suit
+**原告阶段（Plaintiff Lifecycle Stage）**
+原告案件互斥的顶层阶段：拟立案、诉讼、执行、结案。开庭属于诉讼中的节点，不单列为顶层阶段。
 
-**Enforcement**:
-The Plaintiff Lifecycle Stage in which an effective instrument is being enforced.
-_Avoid_: Execution status
+**被告阶段（Defendant Lifecycle Stage）**
+被告案件互斥的顶层阶段：已受理、开庭、已裁判、履行、结案。
 
-**Defendant Lifecycle Stage**:
-The mutually exclusive top-level stage of a Defendant Case: Accepted, Hearing, Adjudicated, Performance, or Closed.
-_Avoid_: Defendant status, Basic Information
+**案件基本信息（Basic Case Information）**
+用于描述案件身份和背景的信息，不是案件阶段。
 
-**Basic Case Information**:
-Descriptive identity and background of a Case; it is not a lifecycle stage.
-_Avoid_: Basic Information stage
+**案件授权（Case Assignment）**
+用户与案件之间的责任和权限关系。只有经过授权的用户才能查看或操作对应案件。
 
-**Case Assignment**:
-The responsibility relationship that gives one testing lawyer permission to view and operate a Case in the grey-test environment.
-_Avoid_: Case copy, fixture ownership
+**案件进展（Case Progress）**
+由用户发起、附着在唯一案件上的可审计更新。案件进展不会自动成为法院事实，也不会自动写入日报。
 
-**Case Progress**:
-An auditable, user-originated update attached to one uniquely resolved and authorized Case; it does not by itself become a formal court fact.
-_Avoid_: Chat history, Case note
+**报告域（Report Domain）**
+日报、周报和月报的统一业务边界。开场语不作为报告内容；所有修改都通过结构化命令、版本检查和回执完成。
 
-**Report Domain**:
-The unified business domain for Daily, Weekly, and Monthly reports. A report opener changes conversation focus but is never persisted as report content. Daily uses the existing daily-report adapter; Weekly and Monthly share one periodic-report model, typed lifecycle commands, optimistic versions, stable item IDs, idempotent receipts, and full-snapshot replies after every mutation.
-_Avoid_: Weekly or Monthly as Chat, one-off routing branches
+**当前目标（Current Goal）**
+本轮对话正在处理的业务目标。历史目标只能作为可恢复上下文，不能授权另一个业务域的写入。
 
-**Conversation Goal Stack**:
-The ordered list of suspended business goals when a user switches domains. The current goal is handled first. Prior goals are resumable context only and cannot authorize a write in another domain.
-_Avoid_: One global stale goal, implicit cross-domain write permission
+**操作结果（Operation Outcome）**
+一次业务操作实际改变了什么的权威记录。它来自执行结果和回执，不来自回复文案或模型判断。
 
-**Operation Outcome**:
-The authoritative, receipt-backed account of what one requested business operation actually changed, exposed for state progression, audit, replay, and user reply composition.
-_Avoid_: Reply text, executor message, model judgement
+**选择待定（Selection Pending）**
+目标存在多个候选时，要求同一用户选择稳定候选的对话状态。
 
-**Selection Pending**:
-A conversation-scoped request for the same user to select one stable, versioned candidate before a bound operation can continue.
-_Avoid_: Confirmation Pending, recent-object guess, list-position memory
+**确认待定（Confirmation Pending）**
+目标已经唯一确定，但高风险操作仍需用户批准或拒绝的对话状态。它不能代替候选选择。
 
-**Confirmation Pending**:
-A conversation-scoped request to approve or reject one already-identified operation and target; it never resolves ambiguity between candidates.
-_Avoid_: Selection Pending, enterprise approval
+**消息受理（Message Acceptance）**
+外部平台接受发送请求并返回平台标识。它不证明收件人已收到或阅读。
 
-**Message Acceptance**:
-Evidence that an external provider accepted a message request and returned a provider identifier; it is not evidence that the recipient received or read the message.
-_Avoid_: Delivered, received, agreed
+**送达确认（Delivery Confirmation）**
+外部平台通过可靠回调给出的送达状态。
 
-**Delivery Confirmation**:
-Reliable provider callback evidence that a message reached the provider-defined delivery state.
-_Avoid_: Message Acceptance, send success
+**跟盯策略（Case Follow-up Policy）**
+决定案件何时具备主动跟盯资格的版本化规则。
 
-**Case Follow-up Policy**:
-The effective, versioned rule set that determines when one assigned Case is eligible for proactive lifecycle communication.
-_Avoid_: Reminder setting, Scheduler configuration
+**跟盯任务（Case Follow-up Task）**
+由一个或多个有效触发条件产生、分配给授权用户的持久化工作单元。
 
-**Case Follow-up Task**:
-A persistent, auditable unit of proactive Case work created from one or more eligible triggers and assigned to one authorized lawyer.
-_Avoid_: Notification row, prompt, cron job
+**跟盯待回复（Case Follow-up Pending）**
+绑定用户、对话、案件和跟盯任务的回复期待，不能用“最近案件”猜测归属。
 
-**Case Follow-up Pending**:
-A tenant-, user-, conversation-, Case-, and Follow-up-bound expectation that may claim a natural-language reply to one delivered Case Follow-up Task.
-_Avoid_: Selection Pending, recent Case context
+**任务台账（Task Ledger）**
+记录当前、暂停和已完成目标及其状态变化的权威集合。
 
-**Task Ledger**:
-The authoritative collection of focused, active, and suspended user tasks whose transitions are receipt-driven and versioned.
-_Avoid_: Conversation stack, active prompt list
+**有意义的案件进展（Meaningful Case Progress）**
+能够推进案件记录的已提交事实、已完成动作、下一步计划、准备情况或阶段变化。查询、浏览和简单确认不属于案件进展。
 
-**Meaningful Case Progress**:
-A committed Case fact, completed work action, next action, readiness update, lifecycle-stage change, or allowlisted lifecycle-node change that advances the Case work record.
-_Avoid_: Query, page view, acknowledgement, display-only edit
+**报告投影请求（Report Projection Request）**
+从已提交案件事实派生、请求报告域决定是否生成报告条目的持久化请求。
 
-**Report Projection Request**:
-A durable request, derived only from a committed Case fact, asking the Report Domain to decide and execute an optional report projection.
-_Avoid_: Case-report dual write, automatic Daily append
+**案件报告投影（Case Report Projection）**
+案件事实与报告条目之间可独立修正的稳定关系。当前生产基线不默认启用自动投影。
 
-**Case Report Projection**:
-The stable, versioned relationship between one Case fact and one Report item, independently correctable without changing the Case fact.
-_Avoid_: Copied chat text, implicit report side effect
+**消息发送状态（Message Dispatch State）**
+消息在发送通道中的状态，与用户是否回复跟盯任务分开记录。
 
-**Message Dispatch State**:
-The transport lifecycle of a Follow-up message, separate from whether the user answered the Follow-up Task.
-_Avoid_: Follow-up task status, user response status
+## 用语边界
+
+- 使用 `LIVE` 表示已进入生产路径。
+- 使用 `CONTROLLED LIVE` 表示只向受控白名单开放。
+- 使用 `NOT LIVE` 表示代码可能存在，但未作为生产承诺启用。
+- 任何文档都不得用“搜索不到引用”直接判定代码无用；还需核对启动入口、动态加载、迁移和回滚依赖。

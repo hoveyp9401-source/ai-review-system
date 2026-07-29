@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Review System DingTalk Stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<APP_USER>
+Group=<APP_USER>
+WorkingDirectory=<APP_DIR>
+EnvironmentFile=<ENV_FILE>
+ExecStart=<APP_DIR>/venv/bin/python -m app.stream_runner
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

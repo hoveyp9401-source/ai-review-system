@@ -29,6 +29,7 @@ from .domains import InMemoryDailyDomainExecutor
 
 BLIND_INPUT_SCHEMA_VERSION = "agent2.runtime_blind_input.v1"
 BLIND_ACTUAL_SCHEMA_VERSION = "agent2.runtime_actual_artifact.v1"
+BLIND_EXAMPLE_TENANT_ID = "example-blind-tenant"
 
 _PACK_FIELDS = frozenset({"schema_version", "pack_id", "cases", "digest"})
 _CASE_FIELDS = frozenset(
@@ -364,7 +365,7 @@ class BlindSemanticRunner:
         turns: list[dict[str, Any]] = []
         for turn in case.turns:
             request = RuntimeTurnRequest(
-                tenant_id="blind-offline-tenant",
+                tenant_id=BLIND_EXAMPLE_TENANT_ID,
                 actor=RuntimeActor(actor_id=case.actor_id),
                 conversation_id=case.conversation_id,
                 message_id=f"{case.case_id}:{turn.turn_id}",

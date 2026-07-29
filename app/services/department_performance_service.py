@@ -274,14 +274,14 @@ def build_test_department_monthly_sources(period_label: str, *, seed: int = 2026
     rng = random.Random(seed)
     sources: list[dict[str, Any]] = []
     owners = {
-        "法务一部": "杨弟桦",
-        "法务二部": "丁益明",
-        "法务三部": "刘波",
-        "法务四部": "薛旭",
-        "法务五部": "曹俊",
-        "法务六部": "王睿",
-        "综合管理部": "刘聪",
-        "朱佳佳": "朱佳佳",
+        "法务一部": "一部示例负责人",
+        "法务二部": "二部示例负责人",
+        "法务三部": "三部示例负责人",
+        "法务四部": "四部示例负责人",
+        "法务五部": "五部示例负责人",
+        "法务六部": "六部示例负责人",
+        "综合管理部": "综合管理示例负责人",
+        "朱佳佳": "特殊岗位示例负责人",
     }
     for unit_index, unit_name in enumerate(REQUIRED_DEPARTMENT_MONTHLY_UNITS, start=1):
         metrics = template_metrics_for_unit(unit_name)
@@ -475,7 +475,6 @@ def _metric_item_from_source_metric(
     raw_text = "\n".join([*display_lines, reason, next_target, *actions, _text(metric.get("raw_text"))]).strip()
     metric_type = _infer_metric_type(metric_name, unit, display_lines)
     fields = _extract_numeric_fields(display_lines, unit=unit, metric_type=metric_type)
-    fields = _normalize_zero_target_completion_rates(fields)
     flags = _validation_flags(
         metric_type=metric_type,
         raw_text=raw_text,
@@ -521,8 +520,8 @@ def _core_metric_block(item: MetricAggregate) -> list[str]:
     name = _aggregate_name(item)
     return [
         f"- **{name}**",
-        f"  月度：目标 {_format_metric_value(item.month_target, item.unit)}，实际 {_format_metric_value(item.month_actual, item.unit)}，完成率 {_format_completion_rate(item.month_completion_rate, item.month_target, item.month_actual)}。",
-        f"  年度：目标 {_format_metric_value(item.year_target, item.unit)}，累计 {_format_metric_value(item.year_actual_cumulative, item.unit)}，累计完成率 {_format_completion_rate(item.year_completion_rate, item.year_target, item.year_actual_cumulative)}。",
+        f"  月度：目标 {_format_metric_value(item.month_target, item.unit)}，实际 {_format_metric_value(item.month_actual, item.unit)}，完成率 {_format_percent(item.month_completion_rate)}。",
+        f"  年度：目标 {_format_metric_value(item.year_target, item.unit)}，累计 {_format_metric_value(item.year_actual_cumulative, item.unit)}，累计完成率 {_format_percent(item.year_completion_rate)}。",
         f"  同比/环比：{_format_change(item.yoy_change, item)} / {_format_change(item.mom_change, item)}。",
         "",
     ]
@@ -555,19 +554,6 @@ def _extract_numeric_fields(display_lines: list[str], *, unit: str, metric_type:
     }
 
 
-def _normalize_zero_target_completion_rates(fields: dict[str, float | None]) -> dict[str, float | None]:
-    normalized = dict(fields)
-    if _zero_target_with_actual(normalized.get("month_target"), normalized.get("month_actual")):
-        normalized["month_completion_rate"] = None
-    if _zero_target_with_actual(normalized.get("year_target"), normalized.get("year_actual_cumulative")):
-        normalized["year_completion_rate"] = None
-    return normalized
-
-
-def _zero_target_with_actual(target: float | None, actual: float | None) -> bool:
-    return target == 0 and actual is not None
-
-
 def _validation_flags(
     *,
     metric_type: str,
@@ -581,7 +567,7 @@ def _validation_flags(
     flags: list[str] = []
     if re.search(r"_{2,}|NA#", raw_text):
         flags.append("未填写字段")
-    if month_target is None or month_actual is None or (month_completion_rate is None and not _zero_target_with_actual(month_target, month_actual)):
+    if month_target is None or month_actual is None or month_completion_rate is None:
         flags.append("关键数据缺失")
     if metric_type == "amount" and month_target not in (None, 0) and month_actual is not None and month_completion_rate is not None:
         calculated = month_actual / month_target * 100
@@ -700,7 +686,7 @@ def _overall_conclusions(summary: DepartmentMonthlySummary, coverage: Department
     annual_lag = [metric for metric in metrics if metric.year_completion_rate is not None and metric.year_completion_rate < summary.annual_time_progress]
     return [
         f"本月收集情况：已收集 {len(coverage.completed_units)}/{len(coverage.expected_units)} 份，{'全部收齐' if coverage.ready else '待补齐：' + '、'.join(coverage.missing_units)}。",
-        f"整体完成情况：金额类可汇总指标月目标 {_format_metric_value(amount_target, '万元')}，月实际 {_format_metric_value(amount_actual, '万元')}，月完成率 {_format_completion_rate(amount_rate, amount_target, amount_actual)}。",
+        f"整体完成情况：金额类可汇总指标月目标 {_format_metric_value(amount_target, '万元')}，月实际 {_format_metric_value(amount_actual, '万元')}，月完成率 {_format_percent(amount_rate)}。",
         f"完成较好的指标：{_join_names(green[:3]) if green else '暂无达到绿色状态的核心指标'}。",
         f"主要短板：{_join_names([f'{item.department}-{item.metric_name}' for item in risks[:3]]) if risks else '暂无红黄风险指标'}。",
         f"年度目标风险：截至{_period_title_short(summary.reports[0].period_label if summary.reports else '2026-06')}，年度时间进度 {_format_percent(summary.annual_time_progress)}，{len(annual_lag)} 个指标累计完成率低于时间进度。",
@@ -1048,15 +1034,12 @@ def _suggested_deadline(actions: list[str]) -> str:
 
 def _metric_deviation(metric: MetricItem, annual_time_progress: float) -> str:
     parts = []
-    if metric.month_completion_rate is not None or _zero_target_with_actual(metric.month_target, metric.month_actual):
-        parts.append(f"月完成率{_format_completion_rate(metric.month_completion_rate, metric.month_target, metric.month_actual)}")
-    if metric.year_completion_rate is not None or _zero_target_with_actual(metric.year_target, metric.year_actual_cumulative):
-        if metric.year_completion_rate is None:
-            parts.append(f"累计完成率{_format_completion_rate(metric.year_completion_rate, metric.year_target, metric.year_actual_cumulative)}")
-        else:
-            delta = round(metric.year_completion_rate - annual_time_progress, 2)
-            direction = "高于" if delta >= 0 else "低于"
-            parts.append(f"累计完成率{_format_percent(metric.year_completion_rate)}，{direction}时间进度{_format_percent(abs(delta))}")
+    if metric.month_completion_rate is not None:
+        parts.append(f"月完成率{_format_percent(metric.month_completion_rate)}")
+    if metric.year_completion_rate is not None:
+        delta = round(metric.year_completion_rate - annual_time_progress, 2)
+        direction = "高于" if delta >= 0 else "低于"
+        parts.append(f"累计完成率{_format_percent(metric.year_completion_rate)}，{direction}时间进度{_format_percent(abs(delta))}")
     if metric.validation_flags:
         parts.append("；".join(metric.validation_flags))
     return "；".join(parts) if parts else "关键数据缺失"
@@ -1085,12 +1068,6 @@ def _format_percent(value: float | None) -> str:
     if value is None:
         return "未填写"
     return f"{_clean_number(value)}%"
-
-
-def _format_completion_rate(value: float | None, target: float | None, actual: float | None) -> str:
-    if _zero_target_with_actual(target, actual):
-        return "无"
-    return _format_percent(value)
 
 
 def _format_change(value: float | None, item: MetricAggregate) -> str:

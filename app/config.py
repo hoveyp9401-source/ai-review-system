@@ -5,7 +5,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", case_sensitive=False, extra="ignore"
+    )
 
     app_name: str = "ai-review-system"
     app_env: str = "production"
@@ -13,11 +15,13 @@ class Settings(BaseSettings):
     clock_override_enabled: bool = False
     clock_override_now: str = ""
 
-    database_url: str = "postgresql+asyncpg://review:review_password@localhost:5432/review"
+    database_url: str = (
+        "postgresql+asyncpg://example_user:example_password@localhost:5432/example_db"
+    )
     db_pool_size: int = Field(default=10, ge=1)
     db_max_overflow: int = Field(default=20, ge=0)
 
-    llm_base_url: str = "https://api.deepseek.com/v1"
+    llm_base_url: str = "https://api.example.invalid/v1"
     llm_api_key: str = ""
     llm_model: str = "deepseek-v4-pro"
     llm_timeout_seconds: float = Field(default=30.0, gt=0)
@@ -62,6 +66,45 @@ class Settings(BaseSettings):
     legal_ops_live_tenant_id: str = ""
     legal_ops_live_token: str = ""
     legal_ops_live_principals_json: str = ""
+    legal_ops_data_intake_enabled: bool = False
+    agent2_performance_knowledge_enabled: bool = False
+    agent2_performance_tool_enabled: bool = False
+    agent2_performance_knowledge_timeout_seconds: float = Field(
+        default=8.0,
+        gt=0,
+        le=15.0,
+    )
+    legal_ops_data_intake_storage_path: str = "data/legal_ops_data_intake"
+    legal_ops_data_intake_max_file_mb: int = Field(default=25, ge=1, le=100)
+    legal_ops_data_intake_max_rows: int = Field(default=100000, ge=1, le=500000)
+    legal_ops_rule_understanding_enabled: bool = True
+    legal_ops_rule_understanding_model: str = "deepseek-v4-pro"
+    legal_ops_rule_understanding_timeout_seconds: float = Field(default=90.0, gt=0)
+    legal_ops_rule_understanding_long_document_timeout_seconds: float = Field(
+        default=180.0,
+        gt=0,
+        le=300,
+    )
+    legal_daily_dashboard_enabled: bool = False
+    agent2_cross_user_daily_read_enabled: bool = False
+    legal_daily_dashboard_tenant_id: str = ""
+    legal_daily_dashboard_token: str = ""
+    legal_daily_dashboard_principals_json: str = ""
+    legal_daily_dashboard_system_user_id: str = "system:legal-daily-dashboard"
+    management_daily_briefing_department_cc_user_ids: str = ""
+    legal_daily_dashboard_manager_write_enabled: bool = False
+    legal_daily_dashboard_analysis_enabled: bool = False
+    legal_daily_dashboard_analysis_model: str = ""
+    legal_daily_dashboard_analysis_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        le=300,
+    )
+    legal_daily_dashboard_analysis_max_retries: int = Field(
+        default=0,
+        ge=0,
+        le=1,
+    )
     shadow_memory_enabled: bool = False
     progress_enabled: bool = False
     progress_outbox_enabled: bool = False
@@ -94,11 +137,17 @@ class Settings(BaseSettings):
     agent2_business_travel_enabled: bool = False
     agent2_business_travel_write_enabled: bool = False
     agent2_travel_notification_worker_enabled: bool = False
-    agent2_travel_notification_worker_interval_seconds: int = Field(default=15, ge=5, le=3600)
+    agent2_travel_notification_worker_interval_seconds: int = Field(
+        default=15, ge=5, le=3600
+    )
     agent2_travel_notification_batch_size: int = Field(default=50, ge=1, le=500)
     agent2_travel_notification_max_attempts: int = Field(default=5, ge=1, le=20)
-    agent2_travel_notification_retry_base_seconds: int = Field(default=30, ge=1, le=3600)
-    agent2_travel_notification_stale_lock_minutes: int = Field(default=10, ge=1, le=1440)
+    agent2_travel_notification_retry_base_seconds: int = Field(
+        default=30, ge=1, le=3600
+    )
+    agent2_travel_notification_stale_lock_minutes: int = Field(
+        default=10, ge=1, le=1440
+    )
     agent2_case_followup_enabled: bool = False
     agent2_case_followup_send_enabled: bool = False
     agent2_case_followup_tenant_ids: str = ""
@@ -125,6 +174,8 @@ class Settings(BaseSettings):
     dingtalk_agent_id: str = ""
     dingtalk_app_key: str = ""
     dingtalk_app_secret: str = ""
+    dingtalk_api_base_url: str = "https://api.dingtalk.com"
+    dingtalk_oapi_base_url: str = "https://oapi.dingtalk.com"
 
     scheduler_enabled: bool = False
     reminder_send_enabled: bool = False
@@ -144,6 +195,21 @@ class Settings(BaseSettings):
     stream_queue_size: int = Field(default=200, ge=1)
     stream_processing_timeout_seconds: float = Field(default=120.0, gt=0)
     stream_reply_timeout_seconds: float = Field(default=8.0, gt=0)
+    agent2_tool_call_canary_max_active_users: int = Field(
+        default=1,
+        ge=1,
+        le=70,
+    )
+    agent2_canary_turn_batch_quiet_seconds: float = Field(
+        default=2.0,
+        ge=0.1,
+        le=5.0,
+    )
+    agent2_canary_turn_batch_max_window_seconds: float = Field(
+        default=4.0,
+        ge=0.1,
+        le=10.0,
+    )
 
 
 @lru_cache

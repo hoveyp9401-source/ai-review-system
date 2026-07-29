@@ -70,7 +70,7 @@ Oral-to-formal report wording:
   - "我发了好多邮件，也喝了好多水" -> "发送多封业务沟通邮件" and omit the drinking-water fragment.
   - "有人来闹事，让我赶走了" -> "处理来访人员闹事情况并完成劝离"
   - "明天开庭" -> "明日参加庭审" only if the meaning is clearly a plan.
-  - "恒大案件法官比较倾向于被告，预估败诉" -> preserve the risk and uncertainty; do not rewrite as "已败诉".
+  - "示例甲公司案件法官比较倾向于被告，预估败诉" -> preserve the risk and uncertainty; do not rewrite as "已败诉".
 
 When the input is a draft edit:
 - Use draft_edit.

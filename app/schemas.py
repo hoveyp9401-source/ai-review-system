@@ -143,6 +143,7 @@ class DailyInputIntentDecision(BaseModel):
             "non_report_interaction",
             "long_report_content",
             "quality_clarification_response",
+            "pending_interaction_response",
             "ambiguous",
         }
         text = "" if value is None else str(value).strip()
@@ -189,6 +190,7 @@ class DailyInputIntentDecision(BaseModel):
             "delete_item",
             "rewrite_item",
             "move_item",
+            "select_target_field",
             "answer_question",
             "clarify",
             "none",
@@ -438,6 +440,7 @@ class DraftDecision(BaseModel):
             "non_report_interaction",
             "long_report_content",
             "quality_clarification_response",
+            "pending_interaction_response",
             "ambiguous",
             "no_op",
         }
@@ -457,6 +460,7 @@ class DraftDecision(BaseModel):
             "rewrite_item",
             "move_item",
             "restore_previous",
+            "select_target_field",
             "answer_question",
             "history_query",
             "clarify",
@@ -528,11 +532,6 @@ class DraftDecision(BaseModel):
     @classmethod
     def clean_new_content(cls, value: Any) -> str:
         return "" if value is None else str(value).strip()[:1000]
-
-    @field_validator("target_report_date", mode="before")
-    @classmethod
-    def clean_target_report_date(cls, value: Any) -> str:
-        return "" if value is None else str(value).strip()[:20]
 
     @field_validator("clarification_question", "reply_to_user", "reason", "user_intent", mode="before")
     @classmethod

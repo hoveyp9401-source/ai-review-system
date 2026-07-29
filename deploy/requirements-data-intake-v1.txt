@@ -1,0 +1,5 @@
+# Scoped runtime additions for Legal Ops 数据接入中心 v1.
+# The existing application environment supplies FastAPI, SQLAlchemy and asyncpg.
+openpyxl==3.1.5
+python-multipart==0.0.20
+python-docx==1.2.0

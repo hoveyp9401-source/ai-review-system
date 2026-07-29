@@ -355,45 +355,22 @@ def _actions_for_segment(
                 )
             ]
         return []
-    if (
-        _looks_like_lifestyle_question_turn(whole_text)
-        and not _has_current_reportable_work_piece(whole_text)
-    ):
-        independent_daily_segment = (
-            _has_daily_time_anchor(segment)
-            and _has_reportable_work_piece(segment)
-            and not _looks_like_lifestyle_question_turn(segment)
-        )
-        if not independent_daily_segment and index != 1:
-            return []
-        if not independent_daily_segment:
+    if _looks_like_lifestyle_question_turn(whole_text) and not _has_current_reportable_work_piece(whole_text):
+        if index == 1:
             return [
                 _action(
                     ACTION_SMALL_TALK,
                     WORKFLOW_CHAT,
                     "small_talk",
-                    whole_text,
+                    segment,
                     index,
                     write_policy=POLICY_NO_WRITE,
                     confidence=0.84,
                     safety_flags=["blocks_context_write", "lifestyle_question"],
-                    reason="whole turn is a lifestyle question without an independent daily update",
+                    reason="whole turn is a lifestyle question with incidental work context, not a daily update",
                 )
             ]
-    if _looks_like_lifestyle_question_turn(segment) and not _has_current_reportable_work_piece(segment):
-        return [
-            _action(
-                ACTION_SMALL_TALK,
-                WORKFLOW_CHAT,
-                "small_talk",
-                segment,
-                index,
-                write_policy=POLICY_NO_WRITE,
-                confidence=0.84,
-                safety_flags=["blocks_context_write", "lifestyle_question"],
-                reason="segment is a lifestyle question with incidental work context, not a daily update",
-            )
-        ]
+        return []
     if _looks_like_today_task_question(whole_text):
         if index == 1:
             return [
@@ -1613,15 +1590,7 @@ def _actions_for_segment(
                 reason="segment is not a daily-report work item",
             )
         ]
-    monthly_meta_is_active_daily_work = (
-        active_daily
-        and _looks_like_monthly_meta_request(segment)
-        and _has_current_reportable_work_piece(segment)
-    )
-    if (
-        _looks_like_monthly_meta_request(segment)
-        and not monthly_meta_is_active_daily_work
-    ) or _looks_like_daily_bot_feedback(whole_text):
+    if _looks_like_monthly_meta_request(segment) or _looks_like_daily_bot_feedback(whole_text):
         return [
             _action(
                 ACTION_SMALL_TALK,
@@ -1871,8 +1840,6 @@ def _actions_for_segment(
             received_at=received_at,
             reason_prefix="case/travel follow-up detail is collected as a sidecar candidate, not direct daily content",
         )
-    if _looks_like_future_travel_schedule_continuation(segment, whole_text=whole_text):
-        return []
     if _looks_like_future_case_schedule_update(segment, whole_text=whole_text, received_at=received_at):
         return _sidecar_candidate_actions(
             segment,
@@ -2163,7 +2130,6 @@ def _actions_for_segment(
                 target_field=daily_field,
                 write_policy=POLICY_WRITE,
                 confidence=0.84,
-                safety_flags=["active_daily_explicit_work"] if monthly_meta_is_active_daily_work else [],
                 reason="segment contains daily-report work, problem, or plan content",
             )
         )
@@ -2713,18 +2679,7 @@ def _daily_field_for_segment(
         return ""
     if _looks_like_personal_state_only(segment) or _looks_like_calendar_or_offday_chatter(segment):
         return ""
-    monthly_meta_is_active_daily_work = (
-        active_daily
-        and _looks_like_monthly_meta_request(segment)
-        and _has_current_reportable_work_piece(segment)
-    )
-    if (
-        _looks_like_monthly_meta_request(segment)
-        and not monthly_meta_is_active_daily_work
-    ) or (
-        _looks_like_monthly_meta_request(whole_text)
-        and not monthly_meta_is_active_daily_work
-    ) or _looks_like_daily_bot_feedback(whole_text):
+    if _looks_like_monthly_meta_request(segment) or _looks_like_monthly_meta_request(whole_text) or _looks_like_daily_bot_feedback(whole_text):
         return ""
     if _looks_like_process_help_reason_fragment(segment):
         return ""
@@ -6493,32 +6448,6 @@ def _looks_like_future_daily_makeup_notice(segment: str) -> bool:
     if not compact:
         return False
     return _contains_any(compact, ("\u65e5\u62a5", "\u65e5\u5fd7")) and _contains_any(compact, ("\u5468\u4e94\u4e00\u8d77\u8865", "\u56de\u6765\u4e00\u8d77\u8865", "\u5230\u65f6\u5019\u4e00\u8d77\u8865", "\u4e00\u8d77\u8865"))
-
-
-def _looks_like_future_travel_schedule_continuation(
-    segment: str, *, whole_text: str
-) -> bool:
-    compact = _compact(segment)
-    whole = _compact(whole_text)
-    if not (
-        _looks_like_future_daily_makeup_notice(whole_text)
-        and _looks_like_travel_event(whole_text)
-    ):
-        return False
-    has_range = bool(
-        re.search(r"(?:周|星期)[一二三四五六日天].{0,5}(?:到|至|-)(?:周|星期)?[一二三四五六日天]", compact)
-    )
-    location_continuation = _contains_any(
-        compact, ("都在那边", "都在那里", "一直在那边", "在当地", "在南京")
-    )
-    business_action = _contains_any(
-        compact,
-        (
-            "联系", "沟通", "提交", "审核", "整理", "推进", "开庭", "调查",
-            "完成", "处理", "起草", "修改", "查控", "执行申请",
-        ),
-    )
-    return has_range and location_continuation and not business_action and compact in whole
 
 
 def _looks_like_moyu_self_deprecation(segment: str) -> bool:

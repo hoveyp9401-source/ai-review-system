@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -27,7 +28,6 @@ SECTION_LABELS = {
 }
 CONFIRMATION_REMINDED_ON_KEY = "_confirmation_reminded_on"
 CONFIRMATION_REMINDED_AT_KEY = "_confirmation_reminded_at"
-UNRESOLVED_DRAFT_EDIT_KEY = "_unresolved_draft_edit"
 logger = logging.getLogger(__name__)
 
 
@@ -274,6 +274,142 @@ def _configured_test_user_ids(settings: Settings) -> set[str]:
     return {str(part).strip() for part in parts if str(part).strip()}
 
 
+async def ensure_daily_submission_obligations(
+    session: AsyncSession,
+    settings: Settings,
+    report_date: date,
+) -> dict[str, Any]:
+    """Persist the server-owned submission scope used by management reads."""
+
+    configured_user_ids = sorted(
+        _configured_test_user_ids(settings)
+    )
+    tenant_id = str(
+        getattr(
+            settings,
+            "legal_daily_dashboard_tenant_id",
+            "",
+        )
+        or ""
+    ).strip()
+    if not configured_user_ids or not tenant_id:
+        return {
+            "report_date": report_date.isoformat(),
+            "configured_identifiers": len(configured_user_ids),
+            "inserted": 0,
+            "effective_obligations": 0,
+        }
+    deadline_at = datetime.combine(
+        report_date + timedelta(days=1),
+        time(9),
+        tzinfo=ZoneInfo(settings.timezone),
+    )
+    parameters = {
+        "tenant_id": tenant_id,
+        "report_date": report_date,
+        "deadline_at": deadline_at,
+        "configured_user_ids": configured_user_ids,
+    }
+    inserted = (
+        await session.execute(
+            text(
+                """
+                INSERT INTO legal_daily_submission_obligations (
+                    obligation_id,
+                    tenant_id,
+                    user_id,
+                    team_id,
+                    report_date,
+                    required,
+                    exemption_reason,
+                    deadline_at,
+                    source,
+                    data_complete
+                )
+                SELECT
+                    CAST(
+                        MD5(
+                            :tenant_id || ':' || users.id::text || ':'
+                            || CAST(:report_date AS text)
+                        )
+                        AS uuid
+                    ),
+                    :tenant_id,
+                    users.id,
+                    membership_scope.team_id,
+                    :report_date,
+                    TRUE,
+                    '',
+                    :deadline_at,
+                    'scheduler_test_allowlist',
+                    TRUE
+                FROM users
+                JOIN LATERAL (
+                    SELECT
+                        CAST(
+                            MIN(memberships.team_id::text)
+                            AS uuid
+                        ) AS team_id
+                    FROM legal_daily_team_memberships memberships
+                    WHERE memberships.tenant_id = :tenant_id
+                      AND memberships.user_id = users.id
+                      AND memberships.effective_from <= :report_date
+                      AND (
+                          memberships.effective_to IS NULL
+                          OR memberships.effective_to >= :report_date
+                      )
+                    HAVING COUNT(*) = 1
+                ) membership_scope ON TRUE
+                WHERE users.active IS TRUE
+                  AND (
+                      users.id::text = ANY(
+                          CAST(:configured_user_ids AS text[])
+                      )
+                      OR users.dingtalk_user_id = ANY(
+                          CAST(:configured_user_ids AS text[])
+                      )
+                  )
+                ON CONFLICT (tenant_id, user_id, report_date)
+                DO NOTHING
+                RETURNING user_id::text
+                """
+            ),
+            parameters,
+        )
+    ).scalars().all()
+    effective_obligations = int(
+        (
+            await session.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM legal_daily_submission_obligations obligations
+                    JOIN users ON users.id = obligations.user_id
+                    WHERE obligations.tenant_id = :tenant_id
+                      AND obligations.report_date = :report_date
+                      AND obligations.data_complete IS TRUE
+                      AND (
+                          users.id::text = ANY(
+                              CAST(:configured_user_ids AS text[])
+                          )
+                          OR users.dingtalk_user_id = ANY(
+                              CAST(:configured_user_ids AS text[])
+                          )
+                      )
+                    """
+                ),
+                parameters,
+            )
+        ).scalar_one()
+    )
+    return {
+        "report_date": report_date.isoformat(),
+        "configured_identifiers": len(configured_user_ids),
+        "inserted": len(inserted),
+        "effective_obligations": effective_obligations,
+    }
+
+
 def _partition_reminder_users(users: list[User], test_user_ids: set[str]) -> tuple[list[User], list[User]]:
     if not test_user_ids:
         return [], list(users)
@@ -294,9 +430,7 @@ def _filter_reminder_users(users: list[User], reports_by_user: dict, report_date
     for user in users:
         report = reports_by_user.get(user.id)
         status = getattr(report, "status", None)
-        if status == STATUS_COMPLETED:
-            continue
-        if status == STATUS_PENDING_CONFIRMATION and _confirmation_reminded_for_date(report, report_date):
+        if status in {STATUS_COMPLETED, STATUS_PENDING_CONFIRMATION}:
             continue
         filtered.append(user)
     return filtered
@@ -376,10 +510,9 @@ def _build_report_reminder_text_legacy(
         )
     if report.status == "pending_confirmation":
         return (
-            f"{date_text} \u590d\u76d8\u786e\u8ba4\u63d0\u9192\uff1a{name}\uff0c"
+            f"{date_text} \u590d\u76d8\u8bb0\u5f55\uff1a{name}\uff0c"
             f"\u6211\u5df2\u7ecf\u5e2e\u4f60\u6574\u7406\u597d{period_text}\uff0c"
-            "\u8fd8\u5dee\u6700\u540e\u4e00\u6b65\u786e\u8ba4\u3002"
-            "\u5982\u679c\u5185\u5bb9\u6ca1\u95ee\u9898\uff0c\u56de\u590d\u201c\u786e\u8ba4\u201d\u5373\u53ef\uff1b"
+            "\u7cfb\u7edf\u4f1a\u6309\u65f6\u81ea\u52a8\u63d0\u4ea4\uff0c\u65e0\u9700\u518d\u786e\u8ba4\u3002"
             "\u5982\u679c\u9700\u8981\u4fee\u6539\uff0c\u53ef\u4ee5\u76f4\u63a5\u8bf4\u8981\u6539\u54ea\u4e00\u6bb5\u3002"
         )
     missing = _missing_report_fields(report)
@@ -428,15 +561,9 @@ def build_report_reminder_text(
             "不用写得很正式，你按自己的话说，我来帮你整理。"
         )
     if report.status == STATUS_PENDING_CONFIRMATION:
-        if is_second_reminder:
-            return (
-                f"{name}，今天的复盘我已经整理好了，还差最后确认。"
-                "如果内容没问题，可以回复“确认”；如果今晚不再修改，后续我会按当前内容自动确认提交。"
-                "需要调整的话，直接告诉我要改哪一段。"
-            )
         return (
-            f"{name}，我已经帮你整理好{period_text}，还差最后确认。"
-            "内容没问题的话回复“确认”即可；需要修改的话，直接告诉我要改哪一段。"
+            f"{name}，我已经帮你整理好{period_text}。"
+            "系统会按时自动提交，无需再确认；需要调整的话，直接告诉我要改哪一段。"
         )
     missing = _missing_report_fields(report)
     missing_text = "、".join(SECTION_LABELS[field] for field in missing) if missing else "未完成部分"
@@ -468,26 +595,33 @@ async def auto_submit_due_pending_reports(
     settings: Settings,
     *,
     now: datetime | None = None,
+    report_date: date | None = None,
 ) -> dict[str, Any]:
     now = now or now_in_timezone(settings.timezone)
-    result = await session.execute(select(DailyReport).where(DailyReport.status.in_([STATUS_PENDING_CONFIRMATION, "collecting"])))
+    query = select(DailyReport).where(
+        DailyReport.status.in_(
+            [STATUS_PENDING_CONFIRMATION, "collecting"]
+        )
+    )
+    if report_date is not None:
+        query = query.where(DailyReport.report_date == report_date)
+    result = await session.execute(query)
     reports = [
         report
         for report in result.scalars().all()
-        if _report_has_any_content(report)
-        and not _report_has_unresolved_draft_edit(report)
-        and (
-            getattr(report, "status", None) == "collecting"
-            or (
-                getattr(report, "status", None) == STATUS_PENDING_CONFIRMATION
-                and getattr(report, "auto_submit_at", None) is not None
-                and report.auto_submit_at <= now
-            )
+        if (
+            report_date is None
+            or getattr(report, "report_date", None) == report_date
         )
+        if _report_has_any_content(report)
     ]
     for report in reports:
         mark_report_auto_submitted(report, now)
-    return {"auto_submitted": len(reports), "report_ids": [str(report.id) for report in reports]}
+    return {
+        "report_date": report_date.isoformat() if report_date else None,
+        "auto_submitted": len(reports),
+        "report_ids": [str(report.id) for report in reports],
+    }
 
 
 def _report_has_any_content(report: DailyReport) -> bool:
@@ -497,10 +631,6 @@ def _report_has_any_content(report: DailyReport) -> bool:
         or report.tomorrow_plan
         or (report.section_status or {}).get("problems_acknowledged_empty")
     )
-
-
-def _report_has_unresolved_draft_edit(report: DailyReport) -> bool:
-    return bool((report.section_status or {}).get(UNRESOLVED_DRAFT_EDIT_KEY))
 
 
 def mark_report_auto_submitted(report: DailyReport, now: datetime) -> None:

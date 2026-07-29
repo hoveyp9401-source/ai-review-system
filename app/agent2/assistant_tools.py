@@ -1,8 +1,9 @@
 import json
-from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 from app.agent2.assistant_responder import AssistantReply
+from app.agent2.performance_qa import build_performance_qa_reply
 from app.agent2.rag_qa import build_rag_qa_reply
 from app.agent2.reply_composer import compose_assistant_reply
 from app.utils.json import extract_json_object
@@ -30,12 +31,29 @@ async def build_tool_assisted_reply(
     llm_client: "LLMClient",
     context_pack: "Agent2ContextPack | None" = None,
 ) -> AssistantToolReplyResult:
-    fallback = _fallback_text(raw_text=raw_text, assistant_reply=assistant_reply, context_pack=context_pack)
+    safe_context_pack = _without_performance_catalog(context_pack)
+    fallback = _fallback_text(
+        raw_text=raw_text,
+        assistant_reply=assistant_reply,
+        context_pack=safe_context_pack,
+    )
     if assistant_reply is None or assistant_reply.reply_type not in TOOL_REPLY_TYPES:
         return AssistantToolReplyResult(text=fallback, source="static", fallback_used=True)
+    if assistant_reply.reply_type == "internal_qa":
+        performance_reply = await build_performance_qa_reply(
+            raw_text=raw_text,
+            context_pack=context_pack,
+            llm_client=llm_client,
+        )
+        if performance_reply is not None:
+            return AssistantToolReplyResult(
+                text=performance_reply.text,
+                source=performance_reply.source,
+                fallback_used=False,
+            )
     rag_reply = build_rag_qa_reply(
         raw_text=raw_text,
-        context_pack=context_pack,
+        context_pack=safe_context_pack,
         reply_type=assistant_reply.reply_type,
     )
     if rag_reply is not None:
@@ -44,7 +62,11 @@ async def build_tool_assisted_reply(
     try:
         output = await llm_client.complete_json(
             system_prompt=_system_prompt(assistant_reply.reply_type),
-            user_prompt=_user_prompt(raw_text=raw_text, assistant_reply=assistant_reply, context_pack=context_pack),
+            user_prompt=_user_prompt(
+                raw_text=raw_text,
+                assistant_reply=assistant_reply,
+                context_pack=safe_context_pack,
+            ),
             model=_model_for_reply(llm_client, assistant_reply.reply_type),
             thinking_enabled=_thinking_for_reply(llm_client, assistant_reply.reply_type),
             timeout_seconds=_timeout_for_reply(llm_client, assistant_reply.reply_type),
@@ -55,7 +77,10 @@ async def build_tool_assisted_reply(
             return AssistantToolReplyResult(text=fallback, source="fallback_empty", fallback_used=True)
         reply_text = _ensure_non_daily_prefix(reply, assistant_reply.reply_type)
         return AssistantToolReplyResult(
-            text=_ensure_case_count_details(reply_text, context_pack=context_pack),
+            text=_ensure_case_count_details(
+                reply_text,
+                context_pack=safe_context_pack,
+            ),
             source="llm",
             fallback_used=False,
         )
@@ -66,6 +91,21 @@ async def build_tool_assisted_reply(
             fallback_used=True,
             error=exc.__class__.__name__,
         )
+
+
+def _without_performance_catalog(
+    context_pack: "Agent2ContextPack | None",
+) -> "Agent2ContextPack | None":
+    if context_pack is None:
+        return None
+    knowledge = tuple(
+        item
+        for item in context_pack.knowledge
+        if str(item.source_type or "") != "performance_report_catalog"
+    )
+    if len(knowledge) == len(context_pack.knowledge):
+        return context_pack
+    return replace(context_pack, knowledge=knowledge)
 
 
 def _fallback_text(

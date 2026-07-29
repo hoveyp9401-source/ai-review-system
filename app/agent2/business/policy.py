@@ -9,8 +9,6 @@ from app.agent2.business.contracts import (
     CreateTravelIntent,
     DeleteCaseProgress,
     LinkCaseProgress,
-    ListAssignedCases,
-    QueryOperationStatus,
     QueryCaseProgress,
     QueryPartyCases,
     RespondTravelCollaboration,
@@ -64,18 +62,6 @@ class BusinessEffectPolicy:
         )
 
     def require(self, command: BusinessCommand) -> None:
-        if isinstance(command, QueryOperationStatus):
-            if command.domain == "case_progress":
-                self._require(
-                    self.case_progress_enabled,
-                    "case_progress_domain_kill_switch_closed",
-                )
-            else:
-                self._require(self.travel_enabled, "travel_domain_kill_switch_closed")
-            return
-        if isinstance(command, ListAssignedCases):
-            self._require(self.case_progress_enabled, "case_progress_domain_kill_switch_closed")
-            return
         if isinstance(command, QueryPartyCases):
             self._require(self.party_query_enabled, "party_query_kill_switch_closed")
             return

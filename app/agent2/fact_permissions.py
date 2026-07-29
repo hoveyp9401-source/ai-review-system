@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
 
+def _csv_env(name: str) -> frozenset[str]:
+    return frozenset(
+        item.strip()
+        for item in os.getenv(name, "").split(",")
+        if item.strip()
+    )
+
+
 TEAM_LEADER_ROLES = {"team_lead", "team_leader", "team_manager", "leader", "manager", "负责人", "团队负责人"}
 DEPARTMENT_HEAD_ROLES = {"department_head", "dept_head", "department_manager", "admin", "部门负责人", "部长"}
-ALL_ACCESS_DINGTALK_USER_IDS = {"0515246015778891"}
-ALL_ACCESS_NAMES = {"庞浩"}
+ALL_ACCESS_DINGTALK_USER_IDS = _csv_env(
+    "AGENT2_FACT_ALL_ACCESS_DINGTALK_USER_IDS"
+)
+ALL_ACCESS_NAMES = _csv_env("AGENT2_FACT_ALL_ACCESS_NAMES")
 
 
 @dataclass(frozen=True)

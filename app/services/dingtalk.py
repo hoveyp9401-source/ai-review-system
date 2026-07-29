@@ -170,6 +170,8 @@ class DingTalkRobotClient:
         self._client = httpx.AsyncClient(timeout=10, trust_env=False)
         self._access_token: str | None = None
         self._access_token_expires_at: float = 0.0
+        self._api_base_url = settings.dingtalk_api_base_url.rstrip("/")
+        self._oapi_base_url = settings.dingtalk_oapi_base_url.rstrip("/")
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -189,7 +191,7 @@ class DingTalkRobotClient:
             return self._access_token
 
         response = await self._client.post(
-            "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+            f"{self._api_base_url}/v1.0/oauth2/accessToken",
             json={
                 "appKey": self.settings.dingtalk_app_key,
                 "appSecret": self.settings.dingtalk_app_secret,
@@ -225,7 +227,7 @@ class DingTalkRobotClient:
             },
         }
         response = await self._client.post(
-            "https://oapi.dingtalk.com/topapi/message/corpconversation/asyncsend_v2",
+            f"{self._oapi_base_url}/topapi/message/corpconversation/asyncsend_v2",
             params={"access_token": access_token},
             json=payload,
         )
@@ -244,7 +246,7 @@ class DingTalkRobotClient:
 
         access_token = await self.get_enterprise_access_token()
         response = await self._client.post(
-            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+            f"{self._api_base_url}/v1.0/robot/oToMessages/batchSend",
             headers={"x-acs-dingtalk-access-token": access_token},
             json={
                 "robotCode": self.settings.dingtalk_app_key,
@@ -268,7 +270,7 @@ class DingTalkRobotClient:
 
         access_token = await self.get_enterprise_access_token()
         response = await self._client.post(
-            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+            f"{self._api_base_url}/v1.0/robot/oToMessages/batchSend",
             headers={"x-acs-dingtalk-access-token": access_token},
             json={
                 "robotCode": self.settings.dingtalk_app_key,
@@ -299,7 +301,7 @@ class DingTalkRobotClient:
         """Call DingTalk ASR API for one-sentence voice recognition."""
         access_token = await self.get_enterprise_access_token()
         response = await self._client.post(
-            "https://api.dingtalk.com/v1.0/robot/audio/asr",
+            f"{self._api_base_url}/v1.0/robot/audio/asr",
             headers={"x-acs-dingtalk-access-token": access_token},
             json={"downloadCode": download_code},
         )

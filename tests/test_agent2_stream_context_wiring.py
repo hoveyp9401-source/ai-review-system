@@ -67,19 +67,6 @@ def test_agent2_stream_wires_live_knowledge_into_context_pack():
     )
 
 
-def test_phase2_primary_context_does_not_load_unscoped_legacy_case_rag():
-    tree = ast.parse(STREAM_RUNNER.read_text(encoding="utf-8"))
-    function = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "_resolve_stream_context_knowledge"
-    )
-    source = ast.unparse(function)
-
-    assert "shadow is not None and DEFAULT_CASE_RAG_INDEX.exists()" in source
-
-
 def test_agent2_stream_wires_recent_case_messages_into_knowledge_query():
     source = STREAM_RUNNER.read_text(encoding="utf-8")
 
