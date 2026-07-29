@@ -41,6 +41,7 @@ MutationExecutionAuthority = Literal[
     "legacy_user_compatibility",
     "authenticated_admin_command",
     "derived_committed_receipt",
+    "tool_call_core_registry",
 ]
 MUTATION_EXECUTION_AUTHORITIES = frozenset(
     {
@@ -48,6 +49,7 @@ MUTATION_EXECUTION_AUTHORITIES = frozenset(
         "legacy_user_compatibility",
         "authenticated_admin_command",
         "derived_committed_receipt",
+        "tool_call_core_registry",
     }
 )
 SEMANTIC_REVIEW_STATUSES = frozenset(

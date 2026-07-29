@@ -28,6 +28,12 @@ class LLMClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    @property
+    def native_http_client(self) -> httpx.AsyncClient:
+        """Shared authenticated transport for independent native Tool Calling."""
+
+        return self._client
+
     async def complete_json(
         self,
         *,
@@ -37,6 +43,7 @@ class LLMClient:
         thinking_enabled: bool | None = None,
         timeout_seconds: float | None = None,
         max_retries: int | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         payload: dict[str, Any] = {
             "model": model or self.model,
@@ -49,6 +56,8 @@ class LLMClient:
         }
         if thinking_enabled is not None:
             payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
 
         attempts = max(1, (self.settings.llm_max_retries if max_retries is None else max_retries) + 1)
         timeout = self.settings.llm_timeout_seconds if timeout_seconds is None else timeout_seconds

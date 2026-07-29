@@ -38,6 +38,7 @@ CommandType = Literal[
     "edit_item",
     "delete_item",
     "merge_items",
+    "move_item",
     "move_items",
     "replace_section",
     "submit_report",
@@ -169,6 +170,7 @@ def execute_typed_daily_command(
     actor_user_id: UUID,
     executed_idempotency_keys: Collection[str] = (),
     admission_scope: AdmissionExecutionScope | None = None,
+    allow_completed_append: bool = False,
 ) -> TypedDailyCommandExecution:
     validation = validate_typed_daily_command(
         command,
@@ -176,6 +178,7 @@ def execute_typed_daily_command(
         actor_user_id=actor_user_id,
         executed_idempotency_keys=executed_idempotency_keys,
         admission_scope=admission_scope,
+        allow_completed_append=allow_completed_append,
     )
     if validation.status == "duplicate":
         return TypedDailyCommandExecution(
@@ -302,6 +305,58 @@ def execute_typed_daily_command(
                 snapshot,
                 after,
                 result="executed" if changed else "no_change",
+                reason=validation.reason_code,
+            ),
+        )
+
+    if command.command_type == "move_item":
+        locations = [
+            _locate_item(snapshot, item_id)
+            for item_id in command.target_item_ids
+        ]
+        source_field = str(command.patch["source_field"])
+        target_field = str(command.patch["target_field"])
+        source_values = list(getattr(snapshot, source_field))
+        source_ids = list(snapshot.item_ids.get(source_field, ()))
+        target_values = list(getattr(snapshot, target_field))
+        target_ids = list(snapshot.item_ids.get(target_field, ()))
+        indices = sorted(
+            location[1] for location in locations if location is not None
+        )
+        moved_values = [source_values[index] for index in indices]
+        moved_ids = [source_ids[index] for index in indices]
+        for index in reversed(indices):
+            source_values.pop(index)
+            source_ids.pop(index)
+        target_values.extend(moved_values)
+        target_ids.extend(moved_ids)
+        after_item_ids = {
+            field: tuple(snapshot.item_ids.get(field, ()))
+            for field in REPORT_FIELDS
+        }
+        after_item_ids[source_field] = tuple(source_ids)
+        after_item_ids[target_field] = tuple(target_ids)
+        after = replace(
+            snapshot,
+            version=snapshot.version + 1,
+            item_ids=after_item_ids,
+            **{
+                source_field: tuple(source_values),
+                target_field: tuple(target_values),
+            },
+        )
+        return TypedDailyCommandExecution(
+            command,
+            validation,
+            snapshot,
+            after,
+            changed=True,
+            should_write_db=True,
+            audit=_audit_record(
+                command,
+                snapshot,
+                after,
+                result="executed",
                 reason=validation.reason_code,
             ),
         )
@@ -499,6 +554,7 @@ def validate_typed_daily_command(
     actor_user_id: UUID,
     executed_idempotency_keys: Collection[str] = (),
     admission_scope: AdmissionExecutionScope | None = None,
+    allow_completed_append: bool = False,
 ) -> TypedDailyCommandValidation:
     if (
         not isinstance(command.command_type, str)
@@ -658,6 +714,7 @@ def validate_typed_daily_command(
         "delete_item",
         "edit_item",
         "merge_items",
+        "move_item",
         "move_items",
         "replace_section",
         "submit_report",
@@ -705,7 +762,14 @@ def validate_typed_daily_command(
         if snapshot.status != "completed":
             return TypedDailyCommandValidation("blocked", "invalid_report_state")
         return TypedDailyCommandValidation("authorized", "exact_target")
-    if snapshot.status not in DAILY_DRAFT_MUTABLE_STATUSES:
+    if (
+        snapshot.status not in DAILY_DRAFT_MUTABLE_STATUSES
+        and not (
+            allow_completed_append
+            and snapshot.status == "completed"
+            and command.command_type == "append_item"
+        )
+    ):
         return TypedDailyCommandValidation("blocked", "invalid_report_state")
     if command.command_type == "clear_report":
         if command.target_item_ids or set(command.patch) != {"field"}:
@@ -772,6 +836,42 @@ def validate_typed_daily_command(
                 "blocked",
                 "ambiguous_target",
                 "move targets must share one different source field",
+            )
+        return TypedDailyCommandValidation("authorized", "exact_target")
+    if command.command_type == "move_item":
+        target_count = len(command.target_item_ids)
+        source_field = command.patch.get("source_field")
+        target_field = command.patch.get("target_field")
+        if (
+            target_count < 1
+            or len(set(command.target_item_ids)) != target_count
+            or set(command.patch) != {"source_field", "target_field"}
+            or source_field not in REPORT_FIELDS
+            or target_field not in REPORT_FIELDS
+            or source_field == target_field
+        ):
+            return TypedDailyCommandValidation(
+                "blocked",
+                "ambiguous_target",
+                "move requires unique targets and different valid fields",
+            )
+        locations = [
+            _locate_item(snapshot, item_id)
+            for item_id in command.target_item_ids
+        ]
+        if any(location is None for location in locations):
+            return TypedDailyCommandValidation(
+                "blocked",
+                "target_not_found",
+            )
+        if any(
+            location is None or location[0] != source_field
+            for location in locations
+        ):
+            return TypedDailyCommandValidation(
+                "blocked",
+                "ambiguous_target",
+                "move targets must exist in the source field",
             )
         return TypedDailyCommandValidation("authorized", "exact_target")
     if command.command_type == "copy_report":

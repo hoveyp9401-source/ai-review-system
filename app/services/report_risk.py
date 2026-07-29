@@ -178,6 +178,16 @@ def format_items(values: list[str], *, empty: str = "") -> str:
     return "；".join(cleaned) if cleaned else empty
 
 
+def problems_acknowledged_empty(report: Any) -> bool:
+    """Use the shared report normalization for an explicitly empty problem field."""
+
+    section_status = getattr(report, "section_status", None) or {}
+    if bool(section_status.get("problems_acknowledged_empty")):
+        return True
+    problems = list(getattr(report, "problems", None) or [])
+    return bool(problems) and all(_is_no_problem_text(text) for text in problems)
+
+
 def _append_content_risks(risks: list[dict[str, str]], field: str, values: list[str]) -> None:
     label = FIELD_LABELS[field]
     for value in values:
@@ -239,7 +249,16 @@ def _no_problem_for_recent_days(report: DailyReport, history: list[DailyReport],
 
 def _is_no_problem_text(text: str) -> bool:
     compact = _compact(text)
-    return compact in {"暂无明显问题", "暂无问题", "无明显问题", "无问题", "没有问题", "没问题"}
+    return compact in {
+        "暂无",
+        "无",
+        "暂无明显问题",
+        "暂无问题",
+        "无明显问题",
+        "无问题",
+        "没有问题",
+        "没问题",
+    }
 
 
 def _has_real_legal_risk(values: list[str]) -> bool:

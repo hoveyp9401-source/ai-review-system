@@ -51,7 +51,7 @@ Routing rules:
 - For a genuinely new item, set relation_to_existing=new_item, choose the correct target_field, and set should_append=true.
 - If the relation or target field is unclear, set relation_to_existing=unclear, message_kind=ambiguous, should_update_report=false, needs_clarification=true.
 - Examples: if today_work already has "今天吃了手抓饼" and the user repeats "今天吃了手抓饼", do not fill missing problems or tomorrow_plan.
-- Examples: if today_work already has "处理恒大事务" and the user says "处理恒大事务，并和项目部确认资料缺口", this is elaboration of today_work item 1, not a problems entry.
+- Examples: if today_work already has "处理示例甲公司事务" and the user says "处理示例甲公司事务，并和项目部确认资料缺口", this is elaboration of today_work item 1, not a problems entry.
 - Examples: if the assistant is asking for problems and the user says "晴空" or "测试", treat it as ambiguous/non-report unless there is clear report meaning.
 - If the user is editing existing draft items, choose message_kind=draft_edit_instruction and intent=draft_edit_instruction. Do not treat the instruction text as report content.
 - Draft edit examples: "把第一条改下", "第一条改成恢复 work body 技能", "刚才那个不对，应该是恢复 work body 技能", "前面那个帮我换个说法", "第一条和第五条其实是一回事", "删除第二条", "这个不要单列", "其他保持不变".

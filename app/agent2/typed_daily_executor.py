@@ -55,9 +55,18 @@ class TypedDailyExecutionContext:
     team_id: str = ""
     actor_role_ids: tuple[str, ...] = ()
     allowed_case_ids: tuple[str, ...] = ()
+    runtime_label: str = "agent2_cognitive_core_v3"
+    contract_version: str = "cognitive_core.v3"
+    allow_completed_append: bool = False
 
     def __post_init__(self) -> None:
-        if not self.source or len(self.source_text_hash) != 64 or not self.tenant_id.strip():
+        if (
+            not self.source
+            or len(self.source_text_hash) != 64
+            or not self.tenant_id.strip()
+            or not self.runtime_label.strip()
+            or not self.contract_version.strip()
+        ):
             raise ValueError("typed execution context requires source and SHA-256 source hash")
         if self.execution_started_at is not None and self.execution_started_at.tzinfo is None:
             raise ValueError("typed execution start must be timezone-aware")
@@ -170,6 +179,7 @@ async def execute_typed_agent2_daily_commands(
                 snapshot=snapshot,
                 actor_user_id=user.id,
                 executed_idempotency_keys=successful_receipt_keys,
+                allow_completed_append=execution_context.allow_completed_append,
                 admission_scope=_daily_admission_scope(
                     command=command,
                     user_id=str(user.id),
@@ -339,6 +349,7 @@ async def execute_typed_agent2_daily_commands(
                 snapshot=working,
                 actor_user_id=user.id,
                 executed_idempotency_keys=known_keys,
+                allow_completed_append=execution_context.allow_completed_append,
                 admission_scope=_daily_admission_scope(
                     command=command,
                     user_id=str(user.id),
@@ -483,10 +494,10 @@ async def execute_typed_agent2_daily_commands(
         completeness_score=_completeness(working),
         status=working.status,
         section_status=section_status,
-        llm_model="agent2_cognitive_core_v3",
+        llm_model=execution_context.runtime_label,
         llm_payload={
             "agent2": True,
-            "contract_version": "cognitive_core.v3",
+            "contract_version": execution_context.contract_version,
             "source_text_hash": execution_context.source_text_hash,
             "typed_commands": [command.as_dict() for command in commands],
             "typed_audit": [execution.audit.as_dict() for execution in executions],

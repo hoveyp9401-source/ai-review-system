@@ -437,8 +437,8 @@ function renderOverview(data) {
     <div class="grid-2 command-lower">
       <section class="panel"><h3 class="panel-title">案件态势 <span>风险与回款</span></h3>
         <div class="case-posture"><div><strong>${data.case_status.open || 0}</strong><span>在办</span></div><div><strong>${data.risk_levels.high || 0}</strong><span>高风险</span></div><div><strong>3</strong><span>长期无进展</span></div><div><strong>¥120万</strong><span>本月回款</span></div></div>
-        <button class="command-case" data-page-route="forest"><strong>华东建设有限公司</strong><span>关联 3 个案件 · 1 个执行预警 · 最近进展 24 天前</span><em>进入案件森林 →</em></button>
-        <button class="command-case" data-page-route="forest"><strong>南京同名科技有限公司</strong><span>存在同名主体待核实 · 涉及 2 个案件</span><em>核实主体 →</em></button>
+        <button class="command-case" data-page-route="forest"><strong>示例建设公司甲（虚构）</strong><span>关联 3 个案件 · 1 个执行预警 · 最近进展 24 天前</span><em>进入案件森林 →</em></button>
+        <button class="command-case" data-page-route="forest"><strong>示例科技公司乙（虚构）</strong><span>存在同名主体待核实 · 涉及 2 个案件</span><em>核实主体 →</em></button>
       </section>
       <section class="panel action-center"><h3 class="panel-title">行动中心 <span>${data.actions.length} 项需要处理</span></h3>
         ${data.actions.map(action => `<button data-page-route="${escapeHtml(action.route)}"><span class="action-type">${escapeHtml(action.type)}</span><strong>${escapeHtml(action.object)}</strong><p>${escapeHtml(action.reason)}</p><small>${escapeHtml(action.owner)} · ${escapeHtml(action.duration)}</small><em>${escapeHtml(action.status)} →</em></button>`).join("")}
@@ -1096,8 +1096,14 @@ loginForm.addEventListener("submit", async event => {
 
 if (window.location.port === "8765") demoLoginButton.classList.remove("hidden");
 demoLoginButton.addEventListener("click", async () => {
-  state.token = "codex-local-legal-ops";
+  const tokenInput = document.querySelector("#token-input");
+  state.token = tokenInput.value.trim();
   loginError.textContent = "";
+  if (!state.token) {
+    loginError.textContent = "请先输入由本地环境提供的演示访问令牌。";
+    tokenInput.focus();
+    return;
+  }
   sessionStorage.setItem("legalOpsCredential", state.token);
   await bootstrap();
 });

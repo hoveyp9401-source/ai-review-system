@@ -10,12 +10,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import dingtalk_stream
+from sqlalchemy import select
 
 from app.config import Settings, get_settings
 from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
 from app.llm.extractor import DailyReportExtractor, LLMOutputError
 from app.message_identity import canonical_dingtalk_idempotency_key
+from app.models import WebhookEvent
 from app.progress.outbox import enqueue_daily_report_outbox_best_effort
 from app.repositories import (
     create_webhook_event_once,
@@ -63,6 +65,23 @@ from app.agent2.cognitive_reply_v3 import (
     has_pending_lifecycle_update,
     pending_lifecycle_reply,
 )
+from app.agent2.tool_calling.canary_service import (
+    CanaryIngressExecutionError,
+    build_canary_response_payload,
+    deliver_cached_canary_message_if_enabled,
+    deliver_canary_message_if_enabled,
+    process_tool_call_canary_ingress,
+    resolve_tool_call_canary_route,
+)
+from app.agent2.tool_calling.turn_batching import (
+    CanaryTurnBatchCoordinator,
+    SealedTurnBatch,
+    TurnFragment,
+    build_batched_follower_payload,
+    is_recoverable_ingress_payload,
+    prepare_recoverable_ingress_payload,
+    provider_payload_from_ingress,
+)
 from app.agent2.case_report_projection_runtime import (
     project_committed_case_followup_facts,
 )
@@ -96,6 +115,7 @@ from app.agent2.knowledge_resolver import (
     resolve_knowledge,
 )
 from app.agent2.personal_memory import build_personal_memory_profile
+from app.agent2.performance_knowledge import attach_live_performance_catalog
 from app.agent2.recent_context import load_recent_case_context_messages
 from app.agent2.daily_clarification import (
     DailyCandidateClarification,
@@ -154,6 +174,19 @@ class StreamJob:
     message_type: str = "text"
     voice_download_seconds: float = 0.0
     voice_transcribe_seconds: float = 0.0
+    event_id: uuid.UUID | None = None
+    idempotency_key: str = ""
+    recovered: bool = False
+
+
+@dataclass(frozen=True)
+class PersistedStreamIngress:
+    event_id: uuid.UUID
+    idempotency_key: str
+    inserted: bool
+    status: str
+    response_payload: dict[str, Any]
+    payload: dict[str, Any]
 
 
 STREAM_TIMING_FIELDS = (
@@ -161,6 +194,7 @@ STREAM_TIMING_FIELDS = (
     "voice_download_seconds",
     "voice_transcribe_seconds",
     "load_user_seconds",
+    "turn_batch_wait_seconds",
     "acquire_report_lock_seconds",
     "llm_intent_seconds",
     "llm_extract_seconds",
@@ -214,6 +248,8 @@ STREAM_AGENT_META_FIELDS = (
     "rollover_unfinished_items",
     "deduped_items",
     "post_action_preview",
+    "turn_batch_id",
+    "turn_batch_size",
 )
 
 
@@ -410,6 +446,57 @@ async def _send_stream_reply(
         )
 
 
+async def _persist_stream_ingress(
+    job: StreamJob,
+) -> PersistedStreamIngress:
+    idempotency_key = _stream_idempotency_key(job.message, job.text)
+    payload = prepare_recoverable_ingress_payload(
+        job.payload,
+        text=job.text,
+        message_type=job.message_type,
+        voice_download_seconds=job.voice_download_seconds,
+        voice_transcribe_seconds=job.voice_transcribe_seconds,
+    )
+    async with AsyncSessionLocal() as session:
+        event, inserted = await create_webhook_event_once(
+            session,
+            idempotency_key=idempotency_key,
+            external_message_id=job.message.message_id,
+            dingtalk_user_id=_stream_user_id(job.message),
+            payload=payload,
+        )
+        await session.commit()
+        return PersistedStreamIngress(
+            event_id=event.id,
+            idempotency_key=event.idempotency_key,
+            inserted=inserted,
+            status=event.status,
+            response_payload=dict(event.response_payload or {}),
+            payload=payload if inserted else dict(event.payload or {}),
+        )
+
+
+async def _fail_persisted_stream_ingress(
+    *,
+    event_id: uuid.UUID,
+    error_message: str,
+    response_payload: dict[str, Any],
+    settings: Settings,
+) -> None:
+    async with AsyncSessionLocal() as session:
+        event = await session.get(WebhookEvent, event_id)
+        if event is None or event.status != "processing":
+            return
+        await mark_webhook_event_failed(
+            session,
+            event,
+            error_message=error_message,
+            response_payload=response_payload,
+            now=now_in_timezone(settings.timezone),
+        )
+        await session.commit()
+
+
 class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
     def __init__(self, queue: asyncio.Queue[StreamJob], robot: DingTalkRobotClient, settings: Settings):
         super().__init__()
@@ -423,6 +510,27 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
                 await _send_stream_reply(self.robot, incoming, text, self.settings.stream_reply_timeout_seconds)
             except Exception:
                 logger.exception("stream immediate reply failed")
+
+        asyncio.create_task(_safe_reply())
+
+    def _reply_cached_soon(
+        self,
+        incoming: dingtalk_stream.ChatbotMessage,
+        response_payload: dict[str, Any],
+    ) -> None:
+        async def _safe_reply() -> None:
+            try:
+                await deliver_cached_canary_message_if_enabled(
+                    response_payload,
+                    lambda text: _send_stream_reply(
+                        self.robot,
+                        incoming,
+                        text,
+                        self.settings.stream_reply_timeout_seconds,
+                    ),
+                )
+            except Exception:
+                logger.exception("stream cached reply failed")
 
         asyncio.create_task(_safe_reply())
 
@@ -539,21 +647,61 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
             )
             return dingtalk_stream.AckMessage.STATUS_OK, "ok"
 
+        job = StreamJob(
+            message=incoming,
+            text=text,
+            payload=incoming.to_dict(),
+            received_at_monotonic=received_at_monotonic,
+            message_type=message_type,
+            voice_download_seconds=voice_download_seconds,
+            voice_transcribe_seconds=voice_transcribe_seconds,
+        )
         try:
-            queued_at_monotonic = time.perf_counter()
-            self.queue.put_nowait(
-                StreamJob(
-                    message=incoming,
-                    text=text,
-                    payload=incoming.to_dict(),
-                    received_at_monotonic=received_at_monotonic,
-                    queued_at_monotonic=queued_at_monotonic,
-                    message_type=message_type,
-                    voice_download_seconds=voice_download_seconds,
-                    voice_transcribe_seconds=voice_transcribe_seconds,
-                )
+            persisted = await _persist_stream_ingress(job)
+        except Exception:
+            logger.exception("stream ingress persistence failed")
+            self._reply_soon(incoming, TEXT_PROCESS_FAILED)
+            _log_immediate_stream_timing(
+                incoming=incoming,
+                user_id=user_id,
+                message_type=message_type,
+                text_len=len(text),
+                received_at_monotonic=received_at_monotonic,
+                status="ingress_persistence_failed",
+                voice_download_seconds=voice_download_seconds,
+                voice_transcribe_seconds=voice_transcribe_seconds,
+                error="ingress_persistence_failed",
             )
+            return dingtalk_stream.AckMessage.STATUS_OK, "persistence failed"
+
+        if not persisted.inserted:
+            if persisted.status in {"processed", "failed"}:
+                self._reply_cached_soon(
+                    incoming,
+                    persisted.response_payload,
+                )
+            return dingtalk_stream.AckMessage.STATUS_OK, "duplicate"
+
+        job = replace(
+            job,
+            payload=persisted.payload,
+            queued_at_monotonic=time.perf_counter(),
+            event_id=persisted.event_id,
+            idempotency_key=persisted.idempotency_key,
+        )
+        try:
+            self.queue.put_nowait(job)
         except asyncio.QueueFull:
+            response_payload = {
+                "msgtype": "text",
+                "text": {"content": TEXT_QUEUE_FULL},
+            }
+            await _fail_persisted_stream_ingress(
+                event_id=persisted.event_id,
+                error_message="stream_queue_full",
+                response_payload=response_payload,
+                settings=self.settings,
+            )
             self._reply_soon(incoming, TEXT_QUEUE_FULL)
             _log_immediate_stream_timing(
                 incoming=incoming,
@@ -574,6 +722,123 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
             self.queue.qsize(),
         )
         return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+
+
+async def _mark_canary_turn_closed(
+    *,
+    session: Any,
+    event: WebhookEvent,
+    turn_batch: SealedTurnBatch | None,
+    report_id: uuid.UUID | None,
+    response_payload: dict[str, Any],
+    now: Any,
+    error_message: str | None = None,
+) -> None:
+    if turn_batch is None:
+        rows = [event]
+        leader_event_id = event.id
+    else:
+        rows = list(
+            (
+                await session.scalars(
+                    select(WebhookEvent).where(
+                        WebhookEvent.id.in_(turn_batch.event_ids)
+                    )
+                )
+            ).all()
+        )
+        if len(rows) != len(turn_batch.event_ids):
+            raise RuntimeError("turn batch event set is incomplete")
+        leader_event_id = turn_batch.leader_event_id
+    for row in rows:
+        payload = (
+            response_payload
+            if row.id == leader_event_id
+            else build_batched_follower_payload(
+                batch_id=turn_batch.batch_id if turn_batch else "",
+                leader_event_id=str(leader_event_id),
+            )
+        )
+        if error_message is None:
+            await mark_webhook_event_processed(
+                session,
+                row,
+                report_id=report_id,
+                response_payload=payload,
+                now=now,
+            )
+        else:
+            await mark_webhook_event_failed(
+                session,
+                row,
+                error_message=error_message,
+                response_payload=payload,
+                now=now,
+            )
+
+
+async def _enqueue_recoverable_stream_jobs(
+    queue: asyncio.Queue[StreamJob],
+) -> int:
+    recovered = 0
+    async with AsyncSessionLocal() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(WebhookEvent)
+                    .where(WebhookEvent.status == "processing")
+                    .order_by(WebhookEvent.received_at, WebhookEvent.id)
+                    .limit(max(1, queue.maxsize))
+                )
+            ).all()
+        )
+        for event in rows:
+            payload = dict(event.payload or {})
+            if not is_recoverable_ingress_payload(payload):
+                continue
+            meta = payload.get("_agent2_stream_ingress_v1")
+            if not isinstance(meta, dict):
+                continue
+            try:
+                message = dingtalk_stream.ChatbotMessage.from_dict(
+                    provider_payload_from_ingress(payload)
+                )
+                job = StreamJob(
+                    message=message,
+                    text=str(meta.get("text") or ""),
+                    payload=payload,
+                    queued_at_monotonic=time.perf_counter(),
+                    message_type=str(
+                        meta.get("message_type") or "text"
+                    ),
+                    voice_download_seconds=float(
+                        meta.get("voice_download_seconds") or 0.0
+                    ),
+                    voice_transcribe_seconds=float(
+                        meta.get("voice_transcribe_seconds") or 0.0
+                    ),
+                    event_id=event.id,
+                    idempotency_key=event.idempotency_key,
+                    recovered=True,
+                )
+            except (TypeError, ValueError):
+                logger.exception(
+                    "cannot recover stream event=%s",
+                    event.id,
+                )
+                continue
+            try:
+                queue.put_nowait(job)
+            except asyncio.QueueFull:
+                logger.warning(
+                    "stream recovery queue full recovered=%s",
+                    recovered,
+                )
+                break
+            recovered += 1
+    if recovered:
+        logger.info("recovered unfinished stream jobs=%s", recovered)
+    return recovered
 
 
 async def _reply(
@@ -1158,6 +1423,24 @@ async def _process_stream_agent2_daily_if_enabled(
         else:
             verified_execution_context = (
                 turn_runtime_result.business_execution_context
+            )
+            context_pack = await attach_live_performance_catalog(
+                context_pack=context_pack,
+                session=session,
+                user=user,
+                settings=settings,
+                decision=cognitive_v3.decision,
+                anchor_date=now_in_timezone(settings.timezone).date(),
+                tenant_id=(
+                    verified_execution_context.tenant_id
+                    if verified_execution_context is not None
+                    else ""
+                ),
+                actor_role_ids=(
+                    tuple(verified_execution_context.actor_role_ids)
+                    if verified_execution_context is not None
+                    else ()
+                ),
             )
             if cognitive_v3.command_plan.report_commands:
                 if verified_execution_context is None:
@@ -1957,15 +2240,20 @@ async def _handle_job(
     performance_service: PerformanceTaskService,
     report_service: DailyReportService,
     robot: DingTalkRobotClient,
+    turn_batch_coordinator: CanaryTurnBatchCoordinator | None = None,
 ) -> None:
     started_at = time.perf_counter()
     timings = _initial_stream_timings(job, started_at)
-    idempotency_key = _stream_idempotency_key(job.message, job.text)
+    idempotency_key = (
+        job.idempotency_key
+        or _stream_idempotency_key(job.message, job.text)
+    )
     dingtalk_user_id = _stream_user_id(job.message)
     status = "started"
     user_name: str | None = None
     report_id: str | None = None
     error_message: str | None = None
+    turn_batch: SealedTurnBatch | None = None
     logger.info(
         "stream job start idempotency_key=%s user=%s message=%s",
         idempotency_key,
@@ -1976,25 +2264,70 @@ async def _handle_job(
     async with AsyncSessionLocal() as session:
         event = None
         try:
-            logger.info("creating stream event key=%s", idempotency_key)
-            event, inserted = await create_webhook_event_once(
-                session,
-                idempotency_key=idempotency_key,
-                external_message_id=job.message.message_id,
-                dingtalk_user_id=dingtalk_user_id,
-                payload=job.payload,
-            )
-            commit_start = time.perf_counter()
-            await session.commit()
-            _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
-            logger.info("stream event committed key=%s inserted=%s status=%s", idempotency_key, inserted, event.status)
+            if job.event_id is not None:
+                event = await session.get(WebhookEvent, job.event_id)
+                if event is None:
+                    raise RuntimeError(
+                        "persisted stream event cannot be loaded"
+                    )
+                if event.idempotency_key != idempotency_key:
+                    raise RuntimeError(
+                        "persisted stream event identity mismatch"
+                    )
+                if event.status != "processing":
+                    status = "already_closed"
+                    return
+                inserted = True
+            else:
+                logger.info(
+                    "creating stream event key=%s",
+                    idempotency_key,
+                )
+                event, inserted = await create_webhook_event_once(
+                    session,
+                    idempotency_key=idempotency_key,
+                    external_message_id=job.message.message_id,
+                    dingtalk_user_id=dingtalk_user_id,
+                    payload=job.payload,
+                )
+                commit_start = time.perf_counter()
+                await session.commit()
+                _add_timing(
+                    timings,
+                    "db_commit_seconds",
+                    _elapsed_seconds(commit_start),
+                )
+                logger.info(
+                    "stream event committed key=%s inserted=%s status=%s",
+                    idempotency_key,
+                    inserted,
+                    event.status,
+                )
 
             if not inserted:
                 status = "duplicate"
                 response_payload = event.response_payload or {}
-                cached_text = (response_payload.get("text") or {}).get("content")
-                if cached_text:
-                    _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, cached_text))
+                send_seconds = 0.0
+
+                async def send_cached_reply(text: str) -> None:
+                    nonlocal send_seconds
+                    send_seconds = await _reply(
+                        handler,
+                        robot,
+                        job,
+                        text,
+                    )
+
+                sent = await deliver_cached_canary_message_if_enabled(
+                    response_payload,
+                    send_cached_reply,
+                )
+                if sent:
+                    _add_timing(
+                        timings,
+                        "dingtalk_send_seconds",
+                        send_seconds,
+                    )
                 return
 
             if not dingtalk_user_id:
@@ -2071,18 +2404,167 @@ async def _handle_job(
                 status = "performance_no_active_task"
                 return
 
-            agent2_status = await _process_stream_agent2_daily_if_enabled(
-                session=session,
-                user=user,
-                event=event,
-                job=job,
-                handler=handler,
-                robot=robot,
-                llm_client=report_service.extractor.client,
-                settings=settings,
-                performance_service=performance_service,
-                timings=timings,
+            conversation_id = str(
+                getattr(job.message, "conversation_id", "") or ""
             )
+            canary_now = now_in_timezone(
+                user.timezone or settings.timezone
+            )
+            if (
+                turn_batch_coordinator is not None
+                and job.event_id is not None
+            ):
+                try:
+                    route_probe = await resolve_tool_call_canary_route(
+                        session,
+                        user=user,
+                        dingtalk_user_id=dingtalk_user_id,
+                        settings=settings,
+                        conversation_id=conversation_id,
+                        source_message_id=idempotency_key,
+                        now=canary_now,
+                    )
+                except Exception:
+                    route_probe = None
+                    logger.exception(
+                        "turn batch canary route probe failed"
+                    )
+                if (
+                    route_probe is not None
+                    and route_probe.decision.owner == "tool_call_core"
+                ):
+                    batch_started = time.perf_counter()
+                    turn_batch = await turn_batch_coordinator.collect(
+                        fragment=TurnFragment(
+                            event_id=event.id,
+                            source_message_id=idempotency_key,
+                            dingtalk_user_id=dingtalk_user_id,
+                            conversation_id=(
+                                conversation_id
+                                or (
+                                    "dingtalk:dingtalk_stream_text:"
+                                    f"{dingtalk_user_id}"
+                                )
+                            ),
+                            text=job.text,
+                            received_at=event.received_at,
+                        ),
+                    )
+                    timings["turn_batch_wait_seconds"] = _elapsed_seconds(
+                        batch_started
+                    )
+                    if turn_batch is not None:
+                        timings["turn_batch_id"] = turn_batch.batch_id
+                        timings["turn_batch_size"] = len(
+                            turn_batch.fragments
+                        )
+                        if not turn_batch.is_leader(event.id):
+                            status = "tool_call_canary_batched_follower"
+                            return
+
+            turn_user_messages = (
+                turn_batch.user_messages
+                if turn_batch is not None
+                else (job.text,)
+            )
+            turn_source_message_id = (
+                turn_batch.source_message_id
+                if turn_batch is not None
+                else idempotency_key
+            )
+            tool_call_canary = await process_tool_call_canary_ingress(
+                session,
+                user=user,
+                dingtalk_user_id=dingtalk_user_id,
+                user_text=(
+                    turn_user_messages[0]
+                    if len(turn_user_messages) == 1
+                    else ""
+                ),
+                user_messages=(
+                    turn_user_messages
+                    if len(turn_user_messages) > 1
+                    else ()
+                ),
+                source_channel="dingtalk_stream_text",
+                conversation_id=conversation_id,
+                source_message_id=turn_source_message_id,
+                settings=settings,
+                llm_client=report_service.extractor.client,
+                now=now_in_timezone(
+                    user.timezone or settings.timezone
+                ),
+            )
+            if tool_call_canary.handled:
+                reply_text = tool_call_canary.message
+                response_payload = build_canary_response_payload(
+                    tool_call_canary
+                )
+                await _mark_canary_turn_closed(
+                    session=session,
+                    event=event,
+                    turn_batch=turn_batch,
+                    report_id=(
+                        uuid.UUID(tool_call_canary.report_id)
+                        if tool_call_canary.report_id
+                        else None
+                    ),
+                    response_payload=response_payload,
+                    now=now_in_timezone(settings.timezone),
+                )
+                commit_start = time.perf_counter()
+                await session.commit()
+                _add_timing(
+                    timings,
+                    "db_commit_seconds",
+                    _elapsed_seconds(commit_start),
+                )
+                send_seconds = 0.0
+
+                async def send_canary_reply() -> None:
+                    nonlocal send_seconds
+                    send_seconds = await _reply(
+                        handler,
+                        robot,
+                        job,
+                        reply_text,
+                    )
+
+                await deliver_canary_message_if_enabled(
+                    tool_call_canary,
+                    send_canary_reply,
+                )
+                _add_timing(
+                    timings,
+                    "dingtalk_send_seconds",
+                    send_seconds,
+                )
+                status = (
+                    "tool_call_canary_processed"
+                    if tool_call_canary.owner == "tool_call_core"
+                    else "tool_call_canary_blocked"
+                )
+                return
+
+            if turn_batch is not None:
+                raise RuntimeError(
+                    "canary route changed after the turn batch was sealed"
+                )
+
+            agent2_status = None
+            if tool_call_canary.owner != "agent1":
+                agent2_status = await _process_stream_agent2_daily_if_enabled(
+                    session=session,
+                    user=user,
+                    event=event,
+                    job=job,
+                    handler=handler,
+                    robot=robot,
+                    llm_client=report_service.extractor.client,
+                    settings=settings,
+                    performance_service=performance_service,
+                    timings=timings,
+                )
             if agent2_status is not None:
                 status = agent2_status
                 return
@@ -2196,6 +2678,57 @@ async def _handle_job(
                 source_id=idempotency_key,
             )
             status = "processed"
+        except CanaryIngressExecutionError as exc:
+            status = "tool_call_canary_failed"
+            error_message = exc.error_type
+            await session.rollback()
+            failure_outcome = exc.outcome()
+            reply_text = failure_outcome.message
+            response_payload = build_canary_response_payload(
+                failure_outcome
+            )
+            if event is not None:
+                commit_start = time.perf_counter()
+                async with session.begin():
+                    event = await session.get(WebhookEvent, event.id)
+                    if event is None:
+                        raise RuntimeError(
+                            "stream event missing during failure handling"
+                        )
+                    await _mark_canary_turn_closed(
+                        session=session,
+                        event=event,
+                        turn_batch=turn_batch,
+                        report_id=None,
+                        error_message=exc.error_type,
+                        response_payload=response_payload,
+                        now=now_in_timezone(settings.timezone),
+                    )
+                _add_timing(
+                    timings,
+                    "db_commit_seconds",
+                    _elapsed_seconds(commit_start),
+                )
+            send_seconds = 0.0
+
+            async def send_canary_failure() -> None:
+                nonlocal send_seconds
+                send_seconds = await _reply(
+                    handler,
+                    robot,
+                    job,
+                    reply_text,
+                )
+
+            await deliver_canary_message_if_enabled(
+                failure_outcome,
+                send_canary_failure,
+            )
+            _add_timing(
+                timings,
+                "dingtalk_send_seconds",
+                send_seconds,
+            )
         except LLMOutputError as exc:
             status = "llm_failed"
             error_message = exc.__class__.__name__
@@ -2204,10 +2737,16 @@ async def _handle_job(
             if event is not None:
                 commit_start = time.perf_counter()
                 async with session.begin():
-                    event = await session.merge(event)
-                    await mark_webhook_event_failed(
-                        session,
-                        event,
+                    event = await session.get(WebhookEvent, event.id)
+                    if event is None:
+                        raise RuntimeError(
+                            "stream event missing during failure handling"
+                        )
+                    await _mark_canary_turn_closed(
+                        session=session,
+                        event=event,
+                        turn_batch=turn_batch,
+                        report_id=None,
                         error_message=str(exc),
                         response_payload={"msgtype": "text", "text": {"content": reply_text}},
                         now=now_in_timezone(settings.timezone),
@@ -2223,10 +2762,16 @@ async def _handle_job(
             if event is not None:
                 commit_start = time.perf_counter()
                 async with session.begin():
-                    event = await session.merge(event)
-                    await mark_webhook_event_failed(
-                        session,
-                        event,
+                    event = await session.get(WebhookEvent, event.id)
+                    if event is None:
+                        raise RuntimeError(
+                            "stream event missing during failure handling"
+                        )
+                    await _mark_canary_turn_closed(
+                        session=session,
+                        event=event,
+                        turn_batch=turn_batch,
+                        report_id=None,
                         error_message=str(exc),
                         response_payload={"msgtype": "text", "text": {"content": reply_text}},
                         now=now_in_timezone(settings.timezone),
@@ -2256,6 +2801,7 @@ async def _worker(
     performance_service: PerformanceTaskService,
     report_service: DailyReportService,
     robot: DingTalkRobotClient,
+    turn_batch_coordinator: CanaryTurnBatchCoordinator,
 ) -> None:
     while True:
         job = await queue.get()
@@ -2268,6 +2814,7 @@ async def _worker(
                 performance_service=performance_service,
                 report_service=report_service,
                 robot=robot,
+                turn_batch_coordinator=turn_batch_coordinator,
             )
         finally:
             queue.task_done()
@@ -2285,17 +2832,37 @@ async def run_stream() -> None:
     report_service = DailyReportService(settings, DailyReportExtractor(llm_client))
     queue: asyncio.Queue[StreamJob] = asyncio.Queue(maxsize=settings.stream_queue_size)
     handler = DailyReviewStreamHandler(queue, robot, settings)
+    turn_batch_coordinator = CanaryTurnBatchCoordinator(
+        quiet_seconds=(
+            settings.agent2_canary_turn_batch_quiet_seconds
+        ),
+        max_window_seconds=(
+            settings.agent2_canary_turn_batch_max_window_seconds
+        ),
+    )
 
     credential = dingtalk_stream.Credential(settings.dingtalk_app_key, settings.dingtalk_app_secret)
     client = dingtalk_stream.DingTalkStreamClient(credential)
     client.register_callback_handler(dingtalk_stream.ChatbotMessage.TOPIC, handler)
 
     workers = [
-        asyncio.create_task(_worker(i + 1, queue, handler, settings, performance_service, report_service, robot))
+        asyncio.create_task(
+            _worker(
+                i + 1,
+                queue,
+                handler,
+                settings,
+                performance_service,
+                report_service,
+                robot,
+                turn_batch_coordinator,
+            )
+        )
         for i in range(settings.stream_worker_count)
     ]
 
     try:
+        await _enqueue_recoverable_stream_jobs(queue)
         logger.info(
             "starting DingTalk stream workers=%s queue_size=%s",
             settings.stream_worker_count,

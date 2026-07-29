@@ -24,6 +24,10 @@ from .domains import InMemoryDailyDomainExecutor
 
 REPORT_FIELDS = ("today_work", "problems", "tomorrow_plan")
 _TEXT_KEYS = ("text", "raw_text", "message_text", "content", "msg")
+EXAMPLE_REPLAY_TENANT_ID = "example-replay-tenant"
+EXAMPLE_REPLAY_SENDER_ID = "example-replay-user"
+EXAMPLE_REPLAY_SENDER_NAME = "Example Replay User"
+EXAMPLE_REPLAY_DINGTALK_USER_ID = "example-replay-dingtalk-user"
 
 
 @dataclass(frozen=True)
@@ -40,9 +44,9 @@ class RuntimeReplayCase:
     dialogue_id: str
     turns: tuple[RuntimeReplayTurn, ...]
     source: str = "dialogue"
-    sender_id: str = "dialogue-user"
-    sender_name: str = "Dialogue User"
-    dingtalk_user_id: str = "dialogue-dingtalk-user"
+    sender_id: str = EXAMPLE_REPLAY_SENDER_ID
+    sender_name: str = EXAMPLE_REPLAY_SENDER_NAME
+    dingtalk_user_id: str = EXAMPLE_REPLAY_DINGTALK_USER_ID
     conversation_id: str = ""
     received_at: datetime | None = None
     active_tasks: tuple[ActiveWorkflowTask, ...] = ()
@@ -90,7 +94,7 @@ async def replay_runtime_case(case: RuntimeReplayCase, *, baseline: dict[str, An
     candidate_turns: list[dict[str, Any]] = []
     for turn, baseline_turn in zip(case.turns, baseline_turns, strict=True):
         request = RuntimeTurnRequest(
-            tenant_id="replay-tenant",
+            tenant_id=EXAMPLE_REPLAY_TENANT_ID,
             actor=RuntimeActor(
                 actor_id=actor_id,
                 display_name=case.sender_name,
@@ -1118,15 +1122,22 @@ def _runtime_replay_case_from_mapping(
         turns=tuple(turns),
         source=str(value.get("source") or context.get("source") or "dialogue"),
         sender_id=str(
-            value.get("sender_id") or context.get("sender_id") or context.get("user_id") or "dialogue-user"
+            value.get("sender_id")
+            or context.get("sender_id")
+            or context.get("user_id")
+            or EXAMPLE_REPLAY_SENDER_ID
         ),
-        sender_name=str(value.get("sender_name") or context.get("sender_name") or "Dialogue User"),
+        sender_name=str(
+            value.get("sender_name")
+            or context.get("sender_name")
+            or EXAMPLE_REPLAY_SENDER_NAME
+        ),
         dingtalk_user_id=str(
             value.get("dingtalk_user_id")
             or context.get("dingtalk_user_id")
             or context.get("userid")
             or value.get("sender_id")
-            or "dialogue-dingtalk-user"
+            or EXAMPLE_REPLAY_DINGTALK_USER_ID
         ),
         conversation_id=str(value.get("conversation_id") or context.get("conversation_id") or dialogue_id),
         received_at=_parse_datetime(value.get("received_at") or context.get("received_at")),

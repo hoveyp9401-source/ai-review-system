@@ -33,12 +33,18 @@ from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.llm.client import LLMClient
 from app.llm.extractor import TeamSummaryGenerator
-from app.scheduler.jobs import auto_submit_due_pending_reports, remind_missing_reports, send_user_message
+from app.scheduler.jobs import (
+    auto_submit_due_pending_reports,
+    ensure_daily_submission_obligations,
+    remind_missing_reports,
+    send_user_message,
+)
 from app.services.dingtalk import DingTalkRobotClient
 from app.services.summary_service import SummaryService
 from app.utils.time import today_in_timezone
 
 logger = logging.getLogger(__name__)
+DAILY_BRIEFING_SAFE_MESSAGE_CHARS = 3600
 
 
 def resolve_followup_conversation_id(
@@ -93,6 +99,11 @@ async def run_scheduler() -> None:
             logger.info("daily report reminder skipped by reporting calendar date=%s", current_date.isoformat())
             return
         async with AsyncSessionLocal() as session:
+            await ensure_daily_submission_obligations(
+                session,
+                settings,
+                current_date,
+            )
             await remind_missing_reports(session, settings, robot, current_date)
             await session.commit()
 
@@ -105,6 +116,11 @@ async def run_scheduler() -> None:
             logger.info("second report reminder skipped by reporting calendar date=%s", current_date.isoformat())
             return
         async with AsyncSessionLocal() as session:
+            await ensure_daily_submission_obligations(
+                session,
+                settings,
+                current_date,
+            )
             await remind_missing_reports(
                 session,
                 settings,
@@ -120,7 +136,38 @@ async def run_scheduler() -> None:
             logger.info("auto submit skipped by scheduler pause date=%s", current_date.isoformat())
             return
         async with AsyncSessionLocal() as session:
-            await auto_submit_due_pending_reports(session, settings)
+            await ensure_daily_submission_obligations(
+                session,
+                settings,
+                current_date,
+            )
+            await auto_submit_due_pending_reports(
+                session,
+                settings,
+                report_date=current_date,
+            )
+            await session.commit()
+
+    async def submission_obligation_job() -> None:
+        current_date = today_in_timezone(settings.timezone)
+        if _scheduler_paused(settings, current_date):
+            logger.info(
+                "daily submission scope skipped by scheduler pause date=%s",
+                current_date.isoformat(),
+            )
+            return
+        if not _reporting_required_on(current_date):
+            logger.info(
+                "daily submission scope skipped by reporting calendar date=%s",
+                current_date.isoformat(),
+            )
+            return
+        async with AsyncSessionLocal() as session:
+            await ensure_daily_submission_obligations(
+                session,
+                settings,
+                current_date,
+            )
             await session.commit()
 
     async def catchup_reminder_job() -> None:
@@ -137,6 +184,11 @@ async def run_scheduler() -> None:
             )
             return
         async with AsyncSessionLocal() as session:
+            await ensure_daily_submission_obligations(
+                session,
+                settings,
+                report_date,
+            )
             await remind_missing_reports(session, settings, robot, report_date, reminder_kind="catchup")
             await session.commit()
 
@@ -154,6 +206,16 @@ async def run_scheduler() -> None:
             )
             return
         async with AsyncSessionLocal() as session:
+            await ensure_daily_submission_obligations(
+                session,
+                settings,
+                summary_date,
+            )
+            await auto_submit_due_pending_reports(
+                session,
+                settings,
+                report_date=summary_date,
+            )
             briefings = await summary_service.build_daily_briefings(session, summary_date)
             sent = await _send_daily_briefings(robot, briefings)
             logger.info("daily briefing sent date=%s sent=%s", summary_date.isoformat(), sent)
@@ -420,6 +482,13 @@ async def run_scheduler() -> None:
 
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
     scheduler.add_job(
+        submission_obligation_job,
+        CronTrigger(hour=0, minute=5, timezone=settings.timezone),
+        id="daily_report_submission_scope",
+        replace_existing=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
         reminder_job,
         CronTrigger(hour=settings.reminder_cron_hour, minute=0, timezone=settings.timezone),
         id="daily_report_reminder",
@@ -483,19 +552,55 @@ async def run_scheduler() -> None:
 
 async def _send_daily_briefings(robot: DingTalkRobotClient, briefings: dict) -> int:
     sent = 0
-    messages = [*briefings.get("team_messages", []), *briefings.get("team_detail_messages", [])]
+    messages = [*briefings.get("team_messages", [])]
     if briefings.get("department_message"):
         messages.append(briefings["department_message"])
-    if briefings.get("department_detail_message"):
-        messages.append(briefings["department_detail_message"])
     for item in messages:
         user_ids = [user.get("dingtalk_user_id") for user in item.get("recipients", []) if user.get("dingtalk_user_id")]
         if not user_ids:
             continue
         title = f"{item.get('team_name') or item.get('department_name') or '部门'}晨报"
-        await send_user_message(robot, user_ids, item.get("text") or "", markdown=True, title=title)
-        sent += len(user_ids)
+        message_parts = _split_daily_briefing_text(item.get("text") or "")
+        for index, message_part in enumerate(message_parts, start=1):
+            part_title = (
+                title
+                if len(message_parts) == 1
+                else f"{title}（{index}/{len(message_parts)}）"
+            )
+            await send_user_message(
+                robot,
+                user_ids,
+                message_part,
+                markdown=True,
+                title=part_title,
+            )
+            sent += len(user_ids)
     return sent
+
+
+def _split_daily_briefing_text(
+    text: str,
+    *,
+    max_chars: int = DAILY_BRIEFING_SAFE_MESSAGE_CHARS,
+) -> tuple[str, ...]:
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    if len(text) <= max_chars:
+        return (text,)
+
+    remaining = text
+    parts: list[str] = []
+    while len(remaining) > max_chars:
+        cut = remaining.rfind("\n\n", 0, max_chars + 1)
+        if cut <= 0:
+            cut = remaining.rfind("\n", 0, max_chars + 1)
+        if cut <= 0:
+            cut = max_chars
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        parts.append(remaining)
+    return tuple(parts)
 
 
 def _reporting_required_on(target_date: date) -> bool:

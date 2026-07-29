@@ -59,7 +59,9 @@ async def send_daily_briefings(
     effective_dry_run = bool(dry_run or not send_enabled)
     sent = 0
     would_send = 0
-    messages = [*result["team_messages"], result["department_message"]]
+    messages = [*result["team_messages"], *result.get("team_detail_messages", []), result["department_message"]]
+    if result.get("department_detail_message"):
+        messages.append(result["department_detail_message"])
     for message in messages:
         user_ids = [item["dingtalk_user_id"] for item in message["recipients"] if item.get("dingtalk_user_id")]
         if not user_ids:

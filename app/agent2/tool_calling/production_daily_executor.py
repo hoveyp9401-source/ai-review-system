@@ -1,0 +1,1008 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import timedelta
+import hashlib
+import json
+from typing import Any, Iterable
+from uuid import NAMESPACE_URL, UUID, uuid5
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import select
+
+from app.agent2.tool_calling.context import (
+    CANARY_STATE_NAMESPACE,
+    TrustedContext,
+    TrustedReportSnapshot,
+)
+from app.agent2.tool_calling.contracts import (
+    AddDailyItemsArgs,
+    CompletePreviousPlanArgs,
+    ConfirmReportArgs,
+    CopyPreviousToTodayArgs,
+    DeleteDailyItemsArgs,
+    EditDailyItemsArgs,
+    MoveDailyItemsArgs,
+    QueryManagedDailyReportsArgs,
+    QueryReportByDateArgs,
+    ReceiptStatus,
+    RequestClearReportArgs,
+)
+from app.agent2.tool_calling.idempotency import build_write_idempotency_key
+from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
+from app.agent2.tool_calling.production_store import (
+    ProductionContextStore,
+    ProductionDateResolver,
+    ToolCallCanaryClearPending,
+    report_state_hash,
+)
+from app.agent2.tool_calling.validation import BoundCall
+from app.agent2.typed_daily_commands import TypedDailyCommand
+from app.agent2.typed_daily_executor import (
+    TypedDailyExecutionContext,
+    build_typed_daily_snapshot,
+    execute_typed_agent2_daily_commands,
+)
+from app.models import DailyReport, User
+from app.legal_daily_dashboard.chat_query import (
+    ManagedDailyQuery,
+    ManagedDailyQueryAmbiguous,
+    ManagedDailyQueryRequest,
+)
+from app.legal_daily_dashboard.domain import DashboardActor
+from app.legal_daily_dashboard.service import DashboardNotFound
+from app.legal_daily_dashboard.sql_repository import (
+    SqlDashboardRepository,
+)
+
+
+class ProductionExecutionError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ProductionHandlerOutcome:
+    target_type: str
+    target_id: str
+    before_report: TrustedReportSnapshot | None
+    after_report: TrustedReportSnapshot | None
+    idempotency_key: str | None
+    typed_receipt_ids: tuple[str, ...] = ()
+    affected_item_ids: tuple[str, ...] = ()
+    safe_user_facts: dict[str, Any] | None = None
+    status_if_unchanged: ReceiptStatus = ReceiptStatus.NO_OP
+    before_version: int | None = None
+    after_version: int | None = None
+    error_code: str | None = None
+
+
+class ProductionDailyExecutor:
+    """Translate validated Tool Calls into the existing typed daily executor."""
+
+    def __init__(
+        self,
+        *,
+        session: Any,
+        user: User,
+        context: TrustedContext,
+        settings: object,
+        bound_calls: dict[str, BoundCall],
+        source_channel: str,
+        source_text_hash: str,
+        date_resolver: ProductionDateResolver,
+        managed_daily_query: ManagedDailyQuery | None = None,
+    ) -> None:
+        self._session = session
+        self._user = user
+        self._context = context
+        self._settings = settings
+        self._bound_calls = bound_calls
+        self._source_channel = source_channel
+        self._source_text_hash = source_text_hash
+        self._date_resolver = date_resolver
+        self._managed_daily_query = (
+            managed_daily_query
+            or ManagedDailyQuery(SqlDashboardRepository(session))
+        )
+        self._context_store = ProductionContextStore(
+            session,
+            user=user,
+            tenant_id=context.principal.tenant_id,
+            settings=settings,
+        )
+
+    async def query_today_report(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        report_date = self._context.now.astimezone(
+            ZoneInfo(self._context.principal.timezone)
+        ).date()
+        return await self._query(request, report_date)
+
+    async def query_report_by_date(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(request, QueryReportByDateArgs)
+        bound = self._bound(request)
+        report_date = self._resolved_date(bound, "resolved_date")
+        del arguments
+        return await self._query(request, report_date)
+
+    async def query_managed_daily_reports(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(
+            request,
+            QueryManagedDailyReportsArgs,
+        )
+        report_date = self._today()
+        candidate_matches: bool | None = None
+        if arguments.report_date_expression is not None:
+            resolution = self._date_resolver.resolve(
+                expression=arguments.report_date_expression,
+                proposed_date=arguments.proposed_report_date,
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+            if resolution.resolved_date is None:
+                return self._managed_daily_read_outcome(
+                    request=request,
+                    report_date=report_date,
+                    status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                    error_code=(
+                        resolution.error_code
+                        or "DATE_EXPRESSION_UNRESOLVED"
+                    ),
+                    facts={
+                        "clarification": {
+                            "reason": "date_unresolved",
+                        },
+                    },
+                )
+            report_date = resolution.resolved_date
+            candidate_matches = resolution.candidate_matches
+        try:
+            result = await self._managed_daily_query.execute(
+                actor=DashboardActor(
+                    tenant_id=self._managed_daily_data_tenant_id(),
+                    user_id=str(
+                        self._context.principal.user_id
+                    ),
+                ),
+                request=ManagedDailyQueryRequest(
+                    view=arguments.view,
+                    report_date=report_date,
+                    member_name=arguments.member_name,
+                    team_name=arguments.team_name,
+                ),
+                now=self._context.now,
+            )
+        except ManagedDailyQueryAmbiguous as exc:
+            return self._managed_daily_read_outcome(
+                request=request,
+                report_date=report_date,
+                status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                error_code="MANAGED_DAILY_TARGET_AMBIGUOUS",
+                facts={
+                    "clarification": {
+                        "reason": "ambiguous_target",
+                        "candidates": list(exc.candidates),
+                    },
+                },
+            )
+        except DashboardNotFound:
+            return self._managed_daily_read_outcome(
+                request=request,
+                report_date=report_date,
+                status=ReceiptStatus.BLOCKED,
+                error_code="MANAGED_DAILY_TARGET_NOT_FOUND",
+                facts={
+                    "access": "not_found",
+                },
+            )
+        facts: dict[str, Any] = {
+            "managed_daily_query": result,
+        }
+        if candidate_matches is not None:
+            facts["date_candidate_matches"] = (
+                candidate_matches
+            )
+        return self._managed_daily_read_outcome(
+            request=request,
+            report_date=report_date,
+            status=ReceiptStatus.SUCCESS,
+            facts=facts,
+        )
+
+    def _managed_daily_data_tenant_id(self) -> str:
+        """Use the server-owned dashboard data scope, never a model argument."""
+
+        configured = str(
+            getattr(
+                self._settings,
+                "legal_daily_dashboard_tenant_id",
+                "",
+            )
+            or ""
+        ).strip()
+        return configured or self._context.principal.tenant_id
+
+    async def add_daily_items(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(request, AddDailyItemsArgs)
+        bound = self._bound(request)
+        report_date = self._resolved_date(bound, "resolved_date")
+        before = await self._snapshot(report_date)
+        typed_before = await self._typed_snapshot(report_date)
+        existing = {
+            field: set(getattr(typed_before, field))
+            for field in ("today_work", "problems", "tomorrow_plan")
+        }
+        additions: dict[str, list[str]] = {
+            "today_work": [],
+            "problems": [],
+            "tomorrow_plan": [],
+        }
+        for item in arguments.items:
+            if (
+                item.content in existing[item.field]
+                or item.content in additions[item.field]
+            ):
+                continue
+            additions[item.field].append(item.content)
+        commands: list[TypedDailyCommand] = []
+        next_version = typed_before.version
+        for field in ("today_work", "problems", "tomorrow_plan"):
+            values = additions[field]
+            if not values:
+                continue
+            commands.append(
+                self._command(
+                    request,
+                    ordinal=len(commands),
+                    command_type="append_item",
+                    report_id=typed_before.report_id,
+                    report_version=next_version,
+                    patch={"field": field, "items": values},
+                )
+            )
+            next_version += 1
+        typed_receipts = await self._execute_typed(
+            report_date,
+            commands,
+            allow_completed_append=True,
+        )
+        after = await self._snapshot(report_date)
+        return self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+
+    async def edit_daily_items(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(request, EditDailyItemsArgs)
+        bound = self._bound(request)
+        report = self._required_bound_report(bound)
+        before = await self._snapshot(report.report_date)
+        live = await self._typed_snapshot(report.report_date)
+        self._require_same_report(report, live.report_id)
+        all_contents = {item.content for item in report.items}
+        target_contents = {
+            report.item(item_id).content
+            for item_id in arguments.target_item_ids
+            if report.item(item_id) is not None
+        }
+        if (
+            arguments.replacement in all_contents
+            and arguments.replacement not in target_contents
+        ):
+            raise ProductionExecutionError("DUPLICATE_ITEM_CONTENT")
+        commands = tuple(
+            self._command(
+                request,
+                ordinal=index,
+                command_type="edit_item",
+                report_id=report.report_id,
+                report_version=live.version + index,
+                target_item_ids=(item_id,),
+                patch={"replacement": arguments.replacement},
+            )
+            for index, item_id in enumerate(arguments.target_item_ids)
+        )
+        typed_receipts = await self._execute_typed(report.report_date, commands)
+        after = await self._snapshot(report.report_date)
+        return self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+
+    async def delete_daily_items(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(request, DeleteDailyItemsArgs)
+        bound = self._bound(request)
+        report = self._required_bound_report(bound)
+        before = await self._snapshot(report.report_date)
+        live = await self._typed_snapshot(report.report_date)
+        self._require_same_report(report, live.report_id)
+        commands = tuple(
+            self._command(
+                request,
+                ordinal=index,
+                command_type="delete_item",
+                report_id=report.report_id,
+                report_version=live.version + index,
+                target_item_ids=(item_id,),
+                patch={},
+            )
+            for index, item_id in enumerate(arguments.target_item_ids)
+        )
+        typed_receipts = await self._execute_typed(report.report_date, commands)
+        after = await self._snapshot(report.report_date)
+        return self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+
+    async def move_daily_items(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(request, MoveDailyItemsArgs)
+        bound = self._bound(request)
+        report = self._required_bound_report(bound)
+        before = await self._snapshot(report.report_date)
+        live = await self._typed_snapshot(report.report_date)
+        self._require_same_report(report, live.report_id)
+        command = self._command(
+            request,
+            ordinal=0,
+            command_type="move_item",
+            report_id=report.report_id,
+            report_version=live.version,
+            target_item_ids=arguments.target_item_ids,
+            patch={
+                "source_field": arguments.source_field,
+                "target_field": arguments.target_field,
+            },
+        )
+        typed_receipts = await self._execute_typed(
+            report.report_date,
+            (command,),
+        )
+        after = await self._snapshot(report.report_date)
+        return self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+
+    async def copy_previous_to_today(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        self._arguments(request, CopyPreviousToTodayArgs)
+        bound = self._bound(request)
+        source = self._required_source_report(bound)
+        target_date = self._today()
+        before = await self._snapshot(target_date)
+        target = await self._typed_snapshot(target_date)
+        sections = self._sections(source)
+        command = self._command(
+            request,
+            ordinal=0,
+            command_type="copy_report",
+            report_id=target.report_id,
+            report_version=target.version,
+            patch={
+                "sections": sections,
+                "source_report_date": source.report_date.isoformat(),
+                "source_report_id": str(source.report_id),
+            },
+        )
+        typed_receipts = await self._execute_typed(target_date, (command,))
+        after = await self._snapshot(target_date)
+        return self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+
+    async def complete_previous_plan(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(request, CompletePreviousPlanArgs)
+        bound = self._bound(request)
+        source = self._required_source_report(bound)
+        target_date = self._today()
+        before = await self._snapshot(target_date)
+        target = await self._typed_snapshot(target_date)
+        existing = set(target.today_work)
+        values = [
+            source.item(item_id).content
+            for item_id in arguments.target_item_ids
+            if source.item(item_id) is not None
+            and source.item(item_id).content not in existing
+        ]
+        commands = (
+            self._command(
+                request,
+                ordinal=0,
+                command_type="append_item",
+                report_id=target.report_id,
+                report_version=target.version,
+                patch={"field": "today_work", "items": values},
+            ),
+        ) if values else ()
+        typed_receipts = await self._execute_typed(target_date, commands)
+        after = await self._snapshot(target_date)
+        return self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+
+    async def confirm_report(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        self._arguments(request, ConfirmReportArgs)
+        bound = self._bound(request)
+        report = self._required_bound_report(bound)
+        before = await self._snapshot(report.report_date)
+        live = await self._typed_snapshot(report.report_date)
+        self._require_same_report(report, live.report_id)
+        command = self._command(
+            request,
+            ordinal=0,
+            command_type="submit_report",
+            report_id=report.report_id,
+            report_version=live.version,
+            patch={},
+        )
+        typed_receipts = await self._execute_typed(
+            report.report_date,
+            (command,),
+        )
+        after = await self._snapshot(report.report_date)
+        return self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+
+    async def request_clear_report(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        self._arguments(request, RequestClearReportArgs)
+        bound = self._bound(request)
+        report = self._required_bound_report(bound)
+        ttl = request.pending_ttl_seconds
+        if ttl is None or ttl <= 0:
+            raise ProductionExecutionError("CLEAR_PENDING_TTL_REQUIRED")
+        active = list(
+            (
+                await self._session.scalars(
+                    select(ToolCallCanaryClearPending).where(
+                        ToolCallCanaryClearPending.namespace
+                        == CANARY_STATE_NAMESPACE,
+                        ToolCallCanaryClearPending.tenant_id
+                        == self._context.principal.tenant_id,
+                        ToolCallCanaryClearPending.user_id
+                        == str(self._context.principal.user_id),
+                        ToolCallCanaryClearPending.conversation_id
+                        == self._context.principal.conversation_id,
+                        ToolCallCanaryClearPending.consumed_at.is_(None),
+                        ToolCallCanaryClearPending.expires_at
+                        > self._context.now,
+                    )
+                )
+            ).all()
+        )
+        if len(active) > 1:
+            raise ProductionExecutionError("MULTIPLE_CLEAR_PENDINGS")
+        key = self._tool_idempotency_key(request)
+        if active:
+            pending = active[0]
+            if (
+                pending.report_id != report.report_id
+                or pending.report_version != report.version
+                or pending.report_state_hash != report_state_hash(report)
+            ):
+                raise ProductionExecutionError("CLEAR_PENDING_CONFLICT")
+        else:
+            pending = ToolCallCanaryClearPending(
+                pending_id=uuid5(
+                    NAMESPACE_URL,
+                    f"agent2-tool-call-clear-pending:{key}",
+                ),
+                namespace=CANARY_STATE_NAMESPACE,
+                tenant_id=self._context.principal.tenant_id,
+                user_id=str(self._context.principal.user_id),
+                conversation_id=self._context.principal.conversation_id,
+                report_id=report.report_id,
+                report_version=report.version,
+                report_state_hash=report_state_hash(report),
+                target_date=report.report_date,
+                expires_at=self._context.now + timedelta(seconds=ttl),
+                source_message_id=self._context.principal.source_message_id,
+            )
+            self._session.add(pending)
+            await self._session.flush()
+        facts = {
+            "actual_write": True,
+            "pending_created": True,
+            "target_date": report.report_date.isoformat(),
+            "confirmation_required": True,
+        }
+        return ProductionHandlerOutcome(
+            target_type="clear_pending",
+            target_id=str(pending.pending_id),
+            before_report=report,
+            after_report=report,
+            idempotency_key=key,
+            safe_user_facts=facts,
+            status_if_unchanged=ReceiptStatus.SUCCESS,
+        )
+
+    async def confirm_clear_report(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        bound = self._bound(request)
+        report = self._required_bound_report(bound)
+        rows = list(
+            (
+                await self._session.scalars(
+                    select(ToolCallCanaryClearPending)
+                    .where(
+                        ToolCallCanaryClearPending.namespace
+                        == CANARY_STATE_NAMESPACE,
+                        ToolCallCanaryClearPending.tenant_id
+                        == self._context.principal.tenant_id,
+                        ToolCallCanaryClearPending.user_id
+                        == str(self._context.principal.user_id),
+                        ToolCallCanaryClearPending.conversation_id
+                        == self._context.principal.conversation_id,
+                        ToolCallCanaryClearPending.consumed_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if len(rows) != 1:
+            raise ProductionExecutionError("CLEAR_PENDING_REQUIRED")
+        pending = rows[0]
+        if (
+            pending.expires_at <= self._context.now
+            or pending.source_message_id
+            == self._context.principal.source_message_id
+        ):
+            raise ProductionExecutionError("CLEAR_PENDING_EXPIRED")
+        if (
+            pending.report_id != report.report_id
+            or pending.report_version != report.version
+            or pending.target_date != report.report_date
+            or pending.report_state_hash != report_state_hash(report)
+        ):
+            raise ProductionExecutionError("CLEAR_PENDING_STALE")
+        before = await self._snapshot(report.report_date)
+        live = await self._typed_snapshot(report.report_date)
+        self._require_same_report(report, live.report_id)
+        commands: list[TypedDailyCommand] = []
+        next_version = live.version
+        if live.status == "completed":
+            commands.append(
+                self._command(
+                    request,
+                    ordinal=0,
+                    command_type="reopen_report",
+                    report_id=report.report_id,
+                    report_version=next_version,
+                    patch={},
+                )
+            )
+            next_version += 1
+        commands.append(
+            self._command(
+                request,
+                ordinal=len(commands),
+                command_type="clear_report",
+                report_id=report.report_id,
+                report_version=next_version,
+                patch={"field": "all"},
+            )
+        )
+        typed_receipts = await self._execute_typed(
+            report.report_date,
+            tuple(commands),
+        )
+        pending.consumed_at = self._context.now
+        await self._session.flush()
+        after = await self._snapshot(report.report_date)
+        outcome = self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+        return ProductionHandlerOutcome(
+            **{
+                **outcome.__dict__,
+                "safe_user_facts": {
+                    **(outcome.safe_user_facts or {}),
+                    "pending_consumed": True,
+                },
+            }
+        )
+
+    async def _query(
+        self,
+        request: ProductionHandlerRequest,
+        report_date,
+    ) -> ProductionHandlerOutcome:
+        before = await self._snapshot(report_date)
+        typed = await self._typed_snapshot(report_date)
+        command = self._command(
+            request,
+            ordinal=0,
+            command_type="query_report",
+            report_id=typed.report_id,
+            report_version=typed.version,
+            patch={"report_date": report_date.isoformat()},
+        )
+        typed_receipts = await self._execute_typed(report_date, (command,))
+        after = await self._snapshot(report_date)
+        facts = {
+            "actual_write": False,
+            "report_found": after is not None,
+            "report_snapshot": after.safe_snapshot() if after is not None else None,
+            "report_date": report_date.isoformat(),
+        }
+        return ProductionHandlerOutcome(
+            target_type="daily_report",
+            target_id=str(typed.report_id),
+            before_report=before,
+            after_report=after,
+            idempotency_key=None,
+            typed_receipt_ids=typed_receipts,
+            safe_user_facts=facts,
+            status_if_unchanged=(
+                ReceiptStatus.SUCCESS
+                if after is not None
+                else ReceiptStatus.NO_OP
+            ),
+        )
+
+    def _managed_daily_read_outcome(
+        self,
+        *,
+        request: ProductionHandlerRequest,
+        report_date,
+        status: ReceiptStatus,
+        facts: dict[str, Any],
+        error_code: str | None = None,
+    ) -> ProductionHandlerOutcome:
+        target_material = json.dumps(
+            {
+                "tenant_id": (
+                    self._context.principal.tenant_id
+                ),
+                "user_id": str(
+                    self._context.principal.user_id
+                ),
+                "report_date": report_date.isoformat(),
+                "arguments": request.arguments.model_dump(
+                    mode="json"
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ProductionHandlerOutcome(
+            target_type="managed_daily_report",
+            target_id=hashlib.sha256(
+                target_material.encode("utf-8")
+            ).hexdigest(),
+            before_report=None,
+            after_report=None,
+            idempotency_key=None,
+            safe_user_facts={
+                "actual_write": False,
+                **facts,
+            },
+            status_if_unchanged=status,
+            error_code=error_code,
+        )
+
+    async def _execute_typed(
+        self,
+        report_date,
+        commands: Iterable[TypedDailyCommand],
+        *,
+        allow_completed_append: bool = False,
+    ) -> tuple[str, ...]:
+        command_tuple = tuple(commands)
+        if not command_tuple:
+            return ()
+        result = await execute_typed_agent2_daily_commands(
+            self._session,
+            user=self._user,
+            commands=command_tuple,
+            execution_context=TypedDailyExecutionContext(
+                report_date=report_date,
+                source="agent2_tool_call_canary",
+                source_text_hash=self._source_text_hash,
+                tenant_id=self._context.principal.tenant_id,
+                conversation_id="",
+                source_turn_id=self._context.principal.source_message_id,
+                occurred_at=self._context.now,
+                execution_started_at=self._context.now,
+                runtime_label="agent2_tool_call_core",
+                contract_version="tool_call_registry.v1",
+                allow_completed_append=allow_completed_append,
+            ),
+            settings=self._settings,
+            execution_authority="tool_call_core_registry",
+        )
+        blocked = next(
+            (
+                item
+                for item in result.command_results
+                if item.get("validation_status") == "blocked"
+                or item.get("status") == "blocked"
+            ),
+            None,
+        )
+        if blocked is not None:
+            raise ProductionExecutionError(
+                str(blocked.get("reason") or "TYPED_EXECUTOR_BLOCKED")
+            )
+        await self._session.flush()
+        return tuple(
+            str(item["receipt_id"])
+            for item in result.command_results
+            if item.get("receipt_id")
+        )
+
+    async def _snapshot(
+        self,
+        report_date,
+    ) -> TrustedReportSnapshot | None:
+        return await self._context_store.load_report(
+            self._context_request(),
+            report_date,
+        )
+
+    async def _typed_snapshot(self, report_date):
+        report = await self._session.scalar(
+            select(DailyReport).where(
+                DailyReport.user_id == self._user.id,
+                DailyReport.report_date == report_date,
+            )
+        )
+        return build_typed_daily_snapshot(
+            user=self._user,
+            report_date=report_date,
+            report=report,
+        )
+
+    def _context_request(self):
+        from app.agent2.tool_calling.assembly import TrustedContextRequest
+
+        return TrustedContextRequest(
+            tenant_id=self._context.principal.tenant_id,
+            user_id=self._context.principal.user_id,
+            conversation_id=self._context.principal.conversation_id,
+            source_message_id=self._context.principal.source_message_id,
+            timezone=self._context.principal.timezone,
+            server_now=self._context.now,
+            display_name=self._context.principal.display_name,
+        )
+
+    def _bound(self, request: ProductionHandlerRequest) -> BoundCall:
+        bound = self._bound_calls.get(request.tool_call_id)
+        if bound is None or bound.call.tool_name != request.tool_name:
+            raise ProductionExecutionError("BOUND_TOOL_CALL_REQUIRED")
+        return bound
+
+    @staticmethod
+    def _arguments(request: ProductionHandlerRequest, model_type):
+        if not isinstance(request.arguments, model_type):
+            raise ProductionExecutionError("TYPED_ARGUMENTS_REQUIRED")
+        return request.arguments
+
+    @staticmethod
+    def _required_bound_report(bound: BoundCall) -> TrustedReportSnapshot:
+        if bound.report is None:
+            raise ProductionExecutionError("REPORT_NOT_FOUND")
+        return bound.report
+
+    @staticmethod
+    def _required_source_report(bound: BoundCall) -> TrustedReportSnapshot:
+        if bound.source_report is None:
+            raise ProductionExecutionError("SOURCE_REPORT_NOT_FOUND")
+        return bound.source_report
+
+    @staticmethod
+    def _require_same_report(
+        trusted: TrustedReportSnapshot,
+        live_report_id: UUID,
+    ) -> None:
+        if live_report_id != trusted.report_id:
+            raise ProductionExecutionError("REPORT_BINDING_CHANGED")
+
+    @staticmethod
+    def _resolved_date(bound: BoundCall, key: str):
+        value = bound.date_facts.get(key)
+        if not isinstance(value, str) or not value:
+            raise ProductionExecutionError("DATE_BINDING_REQUIRED")
+        from datetime import date
+
+        return date.fromisoformat(value)
+
+    def _today(self):
+        return self._context.now.astimezone(
+            ZoneInfo(self._context.principal.timezone)
+        ).date()
+
+    @staticmethod
+    def _sections(report: TrustedReportSnapshot) -> dict[str, list[str]]:
+        sections = {
+            "today_work": [],
+            "problems": [],
+            "tomorrow_plan": [],
+        }
+        for item in report.items:
+            sections[item.field].append(item.content)
+        return sections
+
+    def _command(
+        self,
+        request: ProductionHandlerRequest,
+        *,
+        ordinal: int,
+        command_type: str,
+        report_id: UUID,
+        report_version: int,
+        target_item_ids: tuple[str, ...] = (),
+        patch: dict[str, Any],
+    ) -> TypedDailyCommand:
+        tool_key = self._tool_idempotency_key(request)
+        identity = (
+            f"{self._context.principal.tenant_id}:"
+            f"{self._context.principal.source_message_id}:"
+            f"{request.tool_call_id}:{ordinal}"
+        )
+        return TypedDailyCommand(
+            command_id=uuid5(NAMESPACE_URL, f"{identity}:command"),
+            decision_id=uuid5(
+                NAMESPACE_URL,
+                f"{self._context.principal.source_message_id}:decision",
+            ),
+            sub_decision_id=uuid5(NAMESPACE_URL, f"{identity}:subdecision"),
+            command_type=command_type,
+            report_id=report_id,
+            report_version=report_version,
+            target_item_ids=target_item_ids,
+            patch=patch,
+            idempotency_key=f"{tool_key}:daily:{ordinal}",
+        )
+
+    def _tool_idempotency_key(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> str:
+        bound = self._bound(request)
+        report = bound.source_report or bound.report
+        target = (
+            str(report.report_id)
+            if report is not None
+            else f"daily_report:{self._context.principal.user_id}"
+        )
+        expected_version = report.version if report is not None else None
+        return build_write_idempotency_key(
+            tenant_id=self._context.principal.tenant_id,
+            user_id=str(self._context.principal.user_id),
+            conversation_id=self._context.principal.conversation_id,
+            source_message_id=self._context.principal.source_message_id,
+            tool_call_id=request.tool_call_id,
+            tool_name=request.tool_name,
+            canonical_arguments={
+                "tool_arguments": bound.arguments,
+                "date_facts": bound.date_facts,
+                "report_id": (
+                    str(bound.report.report_id)
+                    if bound.report is not None
+                    else None
+                ),
+                "source_report_id": (
+                    str(bound.source_report.report_id)
+                    if bound.source_report is not None
+                    else None
+                ),
+            },
+            target_object=target,
+            expected_version=expected_version,
+        )
+
+    def _outcome(
+        self,
+        request: ProductionHandlerRequest,
+        *,
+        before: TrustedReportSnapshot | None,
+        after: TrustedReportSnapshot | None,
+        typed_receipt_ids: tuple[str, ...],
+    ) -> ProductionHandlerOutcome:
+        affected = _affected_item_ids(before, after)
+        changed = report_state_hash(before) != report_state_hash(after)
+        report = after or before
+        facts = {
+            "actual_write": changed,
+            "report_date": (
+                report.report_date.isoformat() if report is not None else None
+            ),
+            "report_status": report.status if report is not None else None,
+            "affected_item_ids": list(affected),
+        }
+        return ProductionHandlerOutcome(
+            target_type="daily_report",
+            target_id=str(report.report_id) if report is not None else "",
+            before_report=before,
+            after_report=after,
+            idempotency_key=self._tool_idempotency_key(request),
+            typed_receipt_ids=typed_receipt_ids,
+            affected_item_ids=affected,
+            safe_user_facts=facts,
+            status_if_unchanged=(
+                ReceiptStatus.SUCCESS if changed else ReceiptStatus.NO_OP
+            ),
+        )
+
+
+def _affected_item_ids(
+    before: TrustedReportSnapshot | None,
+    after: TrustedReportSnapshot | None,
+) -> tuple[str, ...]:
+    before_items = {
+        item.item_id: (item.field, item.content)
+        for item in before.items
+    } if before is not None else {}
+    after_items = {
+        item.item_id: (item.field, item.content)
+        for item in after.items
+    } if after is not None else {}
+    return tuple(
+        sorted(
+            item_id
+            for item_id in set(before_items) | set(after_items)
+            if before_items.get(item_id) != after_items.get(item_id)
+        )
+    )
+
+
+def source_text_hash(user_text: str) -> str:
+    return hashlib.sha256(user_text.encode("utf-8")).hexdigest()

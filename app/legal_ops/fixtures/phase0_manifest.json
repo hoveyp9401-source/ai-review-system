@@ -1,33 +1,36 @@
 {
-  "seed_id": "legal-ops-product-redesign-v8",
+  "seed_id": "legal-ops-public-fictional-v1",
   "as_of": "2026-07-11",
+  "data_classification": "fictional_examples_only",
   "tenants": [
     {
-      "id": "sandbox-alpha",
-      "name": "第一 Sandbox 租户",
-      "company": {"id": "alpha-company", "name": "演示法务公司 A"},
-      "department": {"id": "alpha-legal", "name": "法务中心"},
+      "id": "example-tenant-alpha",
+      "name": "示例租户甲（虚构）",
+      "company": {"id": "example-company-alpha", "name": "示例企业甲（虚构）"},
+      "department": {"id": "example-department-alpha", "name": "示例法务中心"},
       "teams": [
-        {"id": "alpha-dispute", "name": "争议解决组"},
-        {"id": "alpha-contract", "name": "合同治理组"},
-        {"id": "alpha-ops", "name": "法务运营组"}
+        {"id": "example-team-dispute", "name": "示例争议解决组"},
+        {"id": "example-team-contract", "name": "示例合同治理组"},
+        {"id": "example-team-ops", "name": "示例法务运营组"}
       ],
       "users": [
-        {"id": "alpha-admin", "name": "Sandbox 管理员", "team_id": "alpha-ops", "roles": ["tenant_admin"]},
-        {"id": "alpha-owner-1", "name": "演示成员 01", "team_id": "alpha-dispute", "roles": ["case_owner"]},
-        {"id": "alpha-owner-2", "name": "演示成员 02", "team_id": "alpha-contract", "roles": ["case_owner"]},
-        {"id": "alpha-owner-3", "name": "演示成员 03", "team_id": "alpha-ops", "roles": ["team_lead"]}
+        {"id": "example-user-admin", "name": "示例管理员（虚构）", "team_id": "example-team-ops", "roles": ["tenant_admin"]},
+        {"id": "example-user-01", "name": "示例用户甲（虚构）", "team_id": "example-team-dispute", "roles": ["case_owner"]},
+        {"id": "example-user-02", "name": "示例用户乙（虚构）", "team_id": "example-team-contract", "roles": ["case_owner"]},
+        {"id": "example-user-03", "name": "示例用户丙（虚构）", "team_id": "example-team-ops", "roles": ["team_lead"]}
       ],
-      "case_count": 12
+      "case_count": 12,
+      "daily_history_days": 6
     },
     {
-      "id": "sandbox-beta",
-      "name": "隔离验证租户",
-      "company": {"id": "beta-company", "name": "演示法务公司 B"},
-      "department": {"id": "beta-legal", "name": "法务部"},
-      "teams": [{"id": "beta-team", "name": "综合法务组"}],
-      "users": [{"id": "beta-reader", "name": "隔离读取用户", "team_id": "beta-team", "roles": ["tenant_reader"]}],
-      "case_count": 2
+      "id": "example-tenant-beta",
+      "name": "示例租户乙（虚构）",
+      "company": {"id": "example-company-beta", "name": "示例企业乙（虚构）"},
+      "department": {"id": "example-department-beta", "name": "示例法务部"},
+      "teams": [{"id": "example-team-beta", "name": "示例综合法务组"}],
+      "users": [{"id": "example-user-reader", "name": "示例只读用户（虚构）", "team_id": "example-team-beta", "roles": ["tenant_reader"]}],
+      "case_count": 2,
+      "daily_history_days": 3
     }
   ]
 }
