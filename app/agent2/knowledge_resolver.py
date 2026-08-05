@@ -8,6 +8,7 @@ from app.agent2.context_pack import KnowledgeEvidenceFrame
 
 
 STRUCTURED_SOURCE_PRIORITY = {
+    "daily_report_insight": -1,
     "org_directory": 0,
     "case_registry": 1,
     "case_table_rag": 2,

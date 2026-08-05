@@ -87,6 +87,20 @@ def test_agent2_stream_wires_recent_case_messages_into_knowledge_query():
     assert "recent_case_messages" in source
 
 
+def test_agent2_stream_loads_report_insights_for_the_current_question():
+    tree = ast.parse(STREAM_RUNNER.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_resolve_stream_context_knowledge"
+    )
+    source = ast.unparse(function)
+
+    assert "load_live_report_insight_adapter" in source
+    assert "text=envelope.raw_text" in source
+
+
 def test_agent2_stream_legacy_gate_block_uses_tool_assisted_reply():
     source = STREAM_RUNNER.read_text(encoding="utf-8")
     tree = ast.parse(source)

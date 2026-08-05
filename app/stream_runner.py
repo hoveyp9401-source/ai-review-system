@@ -89,6 +89,11 @@ from app.agent2.knowledge_resolver import (
     load_live_org_directory_adapter,
     resolve_knowledge,
 )
+from app.agent2.report_insight_intent import is_report_insight_question
+from app.agent2.report_insights import (
+    load_live_report_insight_adapter,
+    load_live_report_insight_answer,
+)
 from app.agent2.personal_memory import build_personal_memory_profile
 from app.agent2.recent_context import load_recent_case_context_messages
 from app.agent2.daily_clarification import (
@@ -802,6 +807,18 @@ async def _resolve_stream_context_knowledge(
         )
     except Exception as exc:
         logger.info("stream context pack skipped daily history knowledge: %s", exc)
+    try:
+        timezone = getattr(user, "timezone", "") or getattr(settings, "timezone", "Asia/Shanghai")
+        adapters.append(
+            await load_live_report_insight_adapter(
+                session,
+                requester=user,
+                text=envelope.raw_text,
+                current_date=now_in_timezone(timezone).date(),
+            )
+        )
+    except Exception as exc:
+        logger.info("stream context pack skipped report insight knowledge: %s", exc)
     if shadow is not None and DEFAULT_CASE_RAG_INDEX.exists():
         adapters.append(CaseTableRagAdapter(DEFAULT_CASE_RAG_INDEX))
     if not adapters:
@@ -907,6 +924,35 @@ async def _process_stream_agent2_daily_if_enabled(
         await session.commit()
         _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
         return "agent2_phase2_entrypoint_blocked"
+    if is_report_insight_question(job.text):
+        current_date = now_in_timezone(settings.timezone).date()
+        try:
+            report_insight_answer = await load_live_report_insight_answer(
+                session,
+                requester=user,
+                text=job.text,
+                current_date=current_date,
+            )
+            reply_text = report_insight_answer.text if report_insight_answer is not None else ""
+        except Exception as exc:
+            logger.warning("stream report insight failed error_type=%s", type(exc).__name__)
+            reply_text = "日报查询暂时不可用，本次没有写入任何内容，请稍后重试。"
+        if reply_text:
+            response_payload = {"msgtype": "text", "text": {"content": reply_text}}
+            await mark_webhook_event_processed(
+                session,
+                event,
+                report_id=None,
+                response_payload=response_payload,
+                now=now_in_timezone(settings.timezone),
+            )
+            await session.commit()
+            _add_timing(
+                timings,
+                "dingtalk_send_seconds",
+                await _reply(handler, robot, job, reply_text),
+            )
+            return "daily_report_insight_processed"
     if entrypoint.decision.route == "agent2_shadow":
         await _evaluate_stream_daily_shadow(
             session=session,

@@ -20,7 +20,7 @@
 ## 本地测试
 
 ```bash
-python -m pytest tests/test_agent2_daily_commands.py tests/test_action_intake.py tests/test_workflow_intake.py tests/test_agent2_daily_execution.py tests/test_agent2_llm_dialogue_generation.py -q
+python -m pytest tests/test_agent2_daily_commands.py tests/test_action_intake.py tests/test_workflow_intake.py tests/test_agent2_daily_execution.py tests/test_agent2_llm_dialogue_generation.py tests/test_agent2_report_insights.py -q
 ```
 
 Agent2 对话回放：

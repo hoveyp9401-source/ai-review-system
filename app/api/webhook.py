@@ -56,6 +56,8 @@ from app.agent2.turn_runtime import (
     verified_turn_rejection_reply,
 )
 from app.agent2.cognitive_reply_v3 import build_cognitive_side_reply_v3
+from app.agent2.report_insight_intent import is_report_insight_question
+from app.agent2.report_insights import load_live_report_insight_answer
 from app.agent2.case_report_projection_runtime import (
     project_committed_case_followup_facts,
 )
@@ -559,6 +561,36 @@ async def _submit_webhook_agent2_if_enabled(
             read_only=True,
             command_results=[],
         )
+    if is_report_insight_question(str(getattr(incoming, "text", "") or "")):
+        current_date = now_in_timezone(settings.timezone).date()
+        try:
+            report_insight_answer = await load_live_report_insight_answer(
+                session,
+                requester=user,
+                text=str(getattr(incoming, "text", "") or ""),
+                current_date=current_date,
+            )
+        except Exception as exc:
+            _log_runtime_failure("webhook_report_insight_failed", exc)
+            return Agent2DailyExecutionResult(
+                report_id=None,
+                report_date=current_date,
+                status="collecting",
+                message="日报查询暂时不可用，本次没有写入任何内容，请稍后重试。",
+                report_saved=False,
+                read_only=True,
+                command_results=[],
+            )
+        if report_insight_answer is not None:
+            return Agent2DailyExecutionResult(
+                report_id=None,
+                report_date=current_date,
+                status="collecting",
+                message=report_insight_answer.text,
+                report_saved=False,
+                read_only=True,
+                command_results=[],
+            )
     if runtime_owner == "agent1":
         return None
     daily_context = await load_live_daily_context(session, user, settings)

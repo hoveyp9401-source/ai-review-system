@@ -739,6 +739,73 @@ def test_agent2_plan_routes_case_count_question_to_qa_not_case_progress():
     assert WORKFLOW_DAILY_REPORT not in plan.matched_workflows
 
 
+def test_agent2_plan_routes_report_insight_questions_to_read_only_report_domain():
+    for text in (
+        "庞浩目前有多少份日报了？",
+        "庞浩已经完成了多少份日报？",
+        "总结下综合管理部本周都做了什么",
+        "综合管理部本周完成了什么？",
+        "总结下综合管理部上周都做了什么",
+        "最近部门有什么重点需要关注的事情吗？",
+        "看下综合部没闭环的工作",
+    ):
+        plan = WorkflowRouter().plan(_envelope(text))
+
+        assert plan.primary_workflow == WORKFLOW_DAILY_REPORT, text
+        assert plan.matched_workflows == [WORKFLOW_DAILY_REPORT], text
+        assert plan.effects == [], text
+        assert "read_only_daily_report_insight" in plan.safety_decision.flags, text
+
+
+def test_person_insights_that_need_directory_validation_are_left_to_the_direct_entrypoint():
+    for text in (
+        "总结下庞浩最近的工作",
+        "请总结一下庞浩最近已完成的工作",
+        "庞浩最近完成了哪些工作？",
+        "看下刘聪有什么没闭环的工作。",
+        "总结下风控最近的工作",
+        "看下招聘有什么没闭环的工作",
+    ):
+        plan = WorkflowRouter().plan(_envelope(text))
+
+        assert "read_only_daily_report_insight" not in plan.safety_decision.flags, text
+
+
+def test_agent2_plan_does_not_treat_work_statements_or_mixed_messages_as_insight_queries():
+    for text in (
+        "上周工作挺忙",
+        "今天完成了日报数量统计",
+        "最近这部分工作有问题",
+        "今天完成了上周工作总结",
+        "整理了综合管理部本周工作总结",
+        "今天完成合同审查；顺便庞浩有多少份日报？",
+        "今天完成合同审查，顺便庞浩有多少份日报？",
+        "今天完成合同审查顺便庞浩有多少份日报？",
+        "今天审核了合同然后庞浩有多少份日报？",
+        "今天起草了合同还有庞浩有多少份日报？",
+        "今天完成合同审查，顺便看下刘聪有什么没闭环的工作。",
+        "今天完成合同审查看下刘聪有什么没闭环的工作",
+        "今天审核了合同看下刘聪有什么没闭环的工作",
+        "总结下恒大案最近的工作",
+        "总结下合同审查最近的工作",
+        "总结下审计最近的工作",
+        "看下恒大案还有哪些未闭环事项",
+        "看下预算审批有什么未闭环事项",
+        "看下预算有什么未闭环事项",
+        "看下开完会刘聪有什么没闭环的工作",
+        "今天核对目前有多少份日报",
+        "审了合同庞浩有多少份日报？",
+        "合同审完庞浩有多少份日报？",
+        "开完会庞浩有多少份日报？",
+        "综合管理部本周放假吗？",
+        "综合管理部上周有人请假吗？",
+        "庞浩本周请假吗？",
+    ):
+        plan = WorkflowRouter().plan(_envelope(text))
+
+        assert "read_only_daily_report_insight" not in plan.safety_decision.flags, text
+
+
 def test_agent2_plan_allows_multi_workflow_hit_but_keeps_writes_pending():
     plan = WorkflowRouter().plan(_envelope("明天去上海出差处理盖章事项，今日完成合同审查"))
 

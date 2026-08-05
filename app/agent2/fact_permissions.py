@@ -7,7 +7,6 @@ from typing import Any
 TEAM_LEADER_ROLES = {"team_lead", "team_leader", "team_manager", "leader", "manager", "负责人", "团队负责人"}
 DEPARTMENT_HEAD_ROLES = {"department_head", "dept_head", "department_manager", "admin", "部门负责人", "部长"}
 ALL_ACCESS_DINGTALK_USER_IDS = {"0515246015778891"}
-ALL_ACCESS_NAMES = {"庞浩"}
 
 
 @dataclass(frozen=True)
@@ -96,10 +95,7 @@ def _target_scope(facts: dict[str, Any]) -> dict[str, str]:
 
 
 def _has_all_access(requester: dict[str, str]) -> bool:
-    return (
-        requester.get("dingtalk_user_id") in ALL_ACCESS_DINGTALK_USER_IDS
-        or requester.get("name") in ALL_ACCESS_NAMES
-    )
+    return requester.get("dingtalk_user_id") in ALL_ACCESS_DINGTALK_USER_IDS
 
 
 def _is_self_scope(requester: dict[str, str], target: dict[str, str]) -> bool:

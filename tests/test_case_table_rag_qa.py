@@ -246,6 +246,17 @@ def test_case_table_rag_permission_allows_panghao_all_teams(tmp_path):
     assert evidence.facts["permission"]["allowed"] is True
 
 
+def test_case_table_rag_display_name_alone_does_not_grant_all_team_access(tmp_path):
+    evidence = _resolve(
+        _build_index(tmp_path),
+        "各团队被告案件有多少",
+        metadata=_requester(name="庞浩", role="member", dingtalk_user_id="dt-not-privileged"),
+    )
+
+    assert evidence.facts["permission_denied"] is True
+    assert evidence.facts["permission"]["allowed"] is False
+
+
 def test_case_table_rag_counts_defendant_inventory_by_department_using_monthly_formula(tmp_path):
     evidence = _resolve(_build_index(tmp_path), "\u6cd5\u52a1\u4e8c\u90e8\u76ee\u524d\u88ab\u544a\u5b58\u91cf\u591a\u5c11")
 

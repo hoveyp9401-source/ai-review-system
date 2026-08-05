@@ -6,7 +6,7 @@ import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
@@ -90,12 +90,48 @@ async def list_reports_between_dates(
     start_date: date,
     end_date: date,
     team_id: uuid.UUID | None = None,
+    *,
+    team_ids: Sequence[uuid.UUID] | None = None,
+    user_ids: Sequence[uuid.UUID] | None = None,
 ) -> list[DailyReport]:
     stmt = select(DailyReport).where(DailyReport.report_date >= start_date, DailyReport.report_date <= end_date)
     if team_id is not None:
         stmt = stmt.where(DailyReport.team_id == team_id)
+    if team_ids is not None:
+        if not team_ids:
+            return []
+        stmt = stmt.where(DailyReport.team_id.in_(team_ids))
+    if user_ids is not None:
+        if not user_ids:
+            return []
+        stmt = stmt.where(DailyReport.user_id.in_(user_ids))
     result = await session.execute(stmt.order_by(DailyReport.report_date.desc(), DailyReport.team_id, DailyReport.user_id))
     return list(result.scalars().all())
+
+
+async def count_daily_reports_by_status(
+    session: AsyncSession,
+    *,
+    user_ids: Sequence[uuid.UUID],
+    end_date: date,
+    team_ids: Sequence[uuid.UUID] | None = None,
+) -> dict[str, int]:
+    if not user_ids:
+        return {}
+    filters = [
+        DailyReport.user_id.in_(user_ids),
+        DailyReport.report_date <= end_date,
+    ]
+    if team_ids is not None:
+        if not team_ids:
+            return {}
+        filters.append(DailyReport.team_id.in_(team_ids))
+    result = await session.execute(
+        select(DailyReport.status, func.count(DailyReport.id))
+        .where(*filters)
+        .group_by(DailyReport.status)
+    )
+    return {str(status or "collecting"): int(count or 0) for status, count in result.all()}
 
 
 async def list_missing_users(session: AsyncSession, report_date: date) -> list[User]:

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from app.agent2.daily_state import PENDING_DAILY_CANDIDATE_KEY
+from app.agent2.report_insight_intent import routable_report_insight_query_kind
 from app.workflows.relative_dates import date_hint_from_text
 
 
@@ -252,6 +253,17 @@ class WorkflowRouter:
             WORKFLOW_UNKNOWN_OR_HELP: help_signal,
             "daily_context": daily_context_signal,
         }
+        report_insight_kind = routable_report_insight_query_kind(envelope.raw_text)
+        if report_insight_kind:
+            signals[WORKFLOW_DAILY_REPORT] = max(0.92, signals[WORKFLOW_DAILY_REPORT])
+            signals[WORKFLOW_INTERNAL_QA] = 0.0
+            return _blocked_plan(
+                primary_workflow=WORKFLOW_DAILY_REPORT,
+                matched_workflows=[WORKFLOW_DAILY_REPORT],
+                signals=signals,
+                flags=["read_only_daily_report_insight"],
+                reason=f"read-only daily-report insight query: {report_insight_kind}",
+            )
         user_action_plan = _plan_user_actions(envelope)
 
         if _looks_like_usage_preference_instruction(envelope.raw_text):
@@ -541,6 +553,16 @@ class WorkflowRouter:
             WORKFLOW_UNKNOWN_OR_HELP: help_signal,
             "daily_context": daily_context_signal,
         }
+        report_insight_kind = routable_report_insight_query_kind(envelope.raw_text)
+        if report_insight_kind:
+            signals[WORKFLOW_DAILY_REPORT] = max(0.92, signals[WORKFLOW_DAILY_REPORT])
+            signals[WORKFLOW_INTERNAL_QA] = 0.0
+            return WorkflowRoute(
+                workflow=WORKFLOW_DAILY_REPORT,
+                confidence=signals[WORKFLOW_DAILY_REPORT],
+                reason=f"read-only daily-report insight query: {report_insight_kind}",
+                signals=signals,
+            )
         user_action_plan = _plan_user_actions(envelope)
 
         if _action_plan_is_chat_only(user_action_plan):
@@ -725,6 +747,19 @@ def _classify_segment(segment_text: str, *, index: int, envelope: IncomingMessag
     qa_signal = _internal_qa_signal(segment_text)
     help_signal = _help_signal(segment_text)
     small_talk_signal = _small_talk_signal(segment_text)
+
+    report_insight_kind = routable_report_insight_query_kind(segment_text)
+    if report_insight_kind:
+        return WorkflowSegment(
+            index=index,
+            text_hash=_hash_text(segment_text),
+            text_chars=len(segment_text),
+            primary_workflow=WORKFLOW_DAILY_REPORT,
+            matched_workflows=[WORKFLOW_DAILY_REPORT],
+            confidence=0.92,
+            intent="daily_report_insight",
+            reason=f"read-only daily-report insight query: {report_insight_kind}",
+        )
 
     if small_talk_signal >= 0.45 and max(
         daily_signal,

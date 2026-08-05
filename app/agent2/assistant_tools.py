@@ -4,6 +4,7 @@ from typing import Any, TYPE_CHECKING
 
 from app.agent2.assistant_responder import AssistantReply
 from app.agent2.rag_qa import build_rag_qa_reply
+from app.agent2.report_insights import report_insight_reply_from_context
 from app.agent2.reply_composer import compose_assistant_reply
 from app.utils.json import extract_json_object
 
@@ -33,6 +34,13 @@ async def build_tool_assisted_reply(
     fallback = _fallback_text(raw_text=raw_text, assistant_reply=assistant_reply, context_pack=context_pack)
     if assistant_reply is None or assistant_reply.reply_type not in TOOL_REPLY_TYPES:
         return AssistantToolReplyResult(text=fallback, source="static", fallback_used=True)
+    report_insight_reply = report_insight_reply_from_context(context_pack)
+    if report_insight_reply:
+        return AssistantToolReplyResult(
+            text=report_insight_reply,
+            source="report_insight",
+            fallback_used=False,
+        )
     rag_reply = build_rag_qa_reply(
         raw_text=raw_text,
         context_pack=context_pack,
