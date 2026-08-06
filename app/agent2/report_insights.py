@@ -6,6 +6,9 @@ from datetime import date, datetime, timedelta
 from typing import Any, Protocol, Sequence
 from uuid import UUID
 
+from sqlalchemy import select, text
+from sqlalchemy.orm import selectinload
+
 from app.agent2.context_pack import KnowledgeEvidenceFrame
 from app.agent2.fact_permissions import (
     ALL_ACCESS_DINGTALK_USER_IDS,
@@ -16,6 +19,8 @@ from app.agent2.report_insight_intent import (
     report_insight_query_scope,
     standalone_report_insight_query_kind,
 )
+from app.config import get_settings
+from app.models import User
 from app.repositories import (
     count_daily_reports_by_status,
     get_active_teams,
@@ -142,11 +147,73 @@ class InMemoryReportInsightRepository:
 
 
 class SqlReportInsightRepository:
-    def __init__(self, session: Any) -> None:
+    def __init__(
+        self,
+        session: Any,
+        *,
+        roster_date: date | None = None,
+        roster_tenant_id: str = "",
+    ) -> None:
         self.session = session
+        self.roster_date = roster_date
+        self.roster_tenant_id = str(roster_tenant_id or "").strip()
 
     async def list_users(self) -> Sequence[Any]:
-        return await get_active_users(self.session)
+        active_users = tuple(await get_active_users(self.session))
+        if self.roster_date is None or not self.roster_tenant_id:
+            return active_users
+
+        roster_user_ids = tuple(
+            (
+                await self.session.execute(
+                    text(
+                        """
+                        SELECT DISTINCT memberships.user_id
+                        FROM legal_daily_team_memberships memberships
+                        JOIN teams team ON team.id = memberships.team_id
+                        JOIN users roster_user ON roster_user.id = memberships.user_id
+                        WHERE memberships.tenant_id = :tenant_id
+                          AND memberships.effective_from <= :roster_date
+                          AND (
+                              memberships.effective_to IS NULL
+                              OR memberships.effective_to >= :roster_date
+                          )
+                          AND memberships.data_complete IS TRUE
+                          AND team.active IS TRUE
+                          AND roster_user.team_id = memberships.team_id
+                        ORDER BY memberships.user_id
+                        """
+                    ),
+                    {
+                        "tenant_id": self.roster_tenant_id,
+                        "roster_date": self.roster_date,
+                    },
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not roster_user_ids:
+            return active_users
+
+        roster_users = tuple(
+            (
+                await self.session.execute(
+                    select(User)
+                    .options(selectinload(User.team))
+                    .where(User.id.in_(roster_user_ids))
+                    .order_by(User.team_id, User.name)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        merged: dict[str, Any] = {}
+        for user in (*active_users, *roster_users):
+            user_id = str(_value(user, "id") or _value(user, "user_id") or "")
+            if user_id:
+                merged[user_id] = user
+        return tuple(merged.values())
 
     async def list_teams(self) -> Sequence[Any]:
         return await get_active_teams(self.session)
@@ -231,7 +298,17 @@ async def load_live_report_insight_answer(
     text: str,
     current_date: date,
 ) -> ReportInsightAnswer | None:
-    return await ReportInsightModule(SqlReportInsightRepository(session)).answer(
+    settings = get_settings()
+    roster_tenant_id = str(
+        getattr(settings, "legal_daily_dashboard_tenant_id", "") or ""
+    ).strip()
+    return await ReportInsightModule(
+        SqlReportInsightRepository(
+            session,
+            roster_date=current_date,
+            roster_tenant_id=roster_tenant_id,
+        )
+    ).answer(
         text,
         requester=requester,
         current_date=current_date,

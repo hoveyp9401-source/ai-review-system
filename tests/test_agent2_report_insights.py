@@ -995,7 +995,13 @@ async def test_longest_person_name_wins_over_a_shorter_substring_name():
 
 
 @pytest.mark.asyncio
-async def test_live_report_insight_adapter_answers_count_from_database_rows():
+async def test_live_report_insight_adapter_answers_count_from_database_rows(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "app.agent2.report_insights.get_settings",
+        lambda: SimpleNamespace(legal_daily_dashboard_tenant_id=""),
+    )
     team_id = UUID("10000000-0000-0000-0000-000000000001")
     manager_id = UUID("20000000-0000-0000-0000-000000000001")
     pang_id = UUID("20000000-0000-0000-0000-000000000002")
@@ -1095,6 +1101,75 @@ async def test_sql_report_insight_repository_filters_by_report_team_id():
     assert team_id.hex in compiled
     assert "daily_reports.user_id IN" in compiled
     assert user_id.hex in compiled
+
+
+@pytest.mark.asyncio
+async def test_sql_repository_adds_current_complete_roster_users_without_activating_them(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    active_user = SimpleNamespace(
+        id=UUID("20000000-0000-0000-0000-000000000001"),
+        name="已启用成员",
+        team_id=UUID("10000000-0000-0000-0000-000000000001"),
+        active=True,
+    )
+    roster_user = SimpleNamespace(
+        id=UUID("20000000-0000-0000-0000-000000000002"),
+        name="名单成员",
+        team_id=UUID("10000000-0000-0000-0000-000000000002"),
+        active=False,
+    )
+
+    async def fake_get_active_users(_session):
+        return [active_user]
+
+    monkeypatch.setattr(
+        "app.agent2.report_insights.get_active_users",
+        fake_get_active_users,
+    )
+
+    class _Scalars:
+        def __init__(self, values):
+            self.values = values
+
+        def all(self):
+            return self.values
+
+    class _Result:
+        def __init__(self, values):
+            self.values = values
+
+        def scalars(self):
+            return _Scalars(self.values)
+
+    class _Session:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, statement, params=None):
+            self.calls.append((statement, params))
+            if len(self.calls) == 1:
+                return _Result([active_user.id, roster_user.id])
+            return _Result([active_user, roster_user])
+
+    session = _Session()
+    users = await SqlReportInsightRepository(
+        session,
+        roster_date=date(2026, 8, 6),
+        roster_tenant_id="legal-daily-production-v1",
+    ).list_users()
+
+    assert [user.id for user in users] == [active_user.id, roster_user.id]
+    assert roster_user.active is False
+    roster_query = str(session.calls[0][0])
+    assert "legal_daily_team_memberships" in roster_query
+    assert "memberships.data_complete IS TRUE" in roster_query
+    assert "team.active IS TRUE" in roster_query
+    assert "roster_user.team_id = memberships.team_id" in roster_query
+    assert session.calls[0][1] == {
+        "tenant_id": "legal-daily-production-v1",
+        "roster_date": date(2026, 8, 6),
+    }
 
 
 @pytest.mark.asyncio
