@@ -11,6 +11,7 @@ from app.agent2.tool_calling.context import (
     TrustedReportItem,
     TrustedReportSnapshot,
 )
+from app.agent2.tool_calling.canary_config import canary_system_prompt
 from app.agent2.tool_calling.contracts import ExecutionMode
 from app.agent2.tool_calling.validation import (
     DateResolution,
@@ -25,6 +26,13 @@ TODAY_REPORT_ID = UUID("20000000-0000-0000-0000-000000000001")
 SOURCE_REPORT_ID = UUID("20000000-0000-0000-0000-000000000002")
 TODAY = date(2026, 8, 9)
 SOURCE_DATE = date(2026, 8, 8)
+
+
+def test_agent2_does_not_promise_an_unregistered_future_copy() -> None:
+    prompt = canary_system_prompt()
+
+    assert "Do not promise that you will execute it later" in prompt
+    assert "fresh user turn" in prompt
 
 
 class _DateResolver:

@@ -10,6 +10,7 @@ from app.agent2.tool_calling.contracts import ReceiptStatus, ToolReceipt
 
 WriteOperationOutcome = Literal[
     "changed",
+    "partial",
     "no_change",
     "not_executed",
     "needs_clarification",
@@ -40,6 +41,16 @@ def expected_write_outcome(
             and definition.read_or_write == "write"
         )
     )
+    has_changed = any(receipt.changed for receipt in write_receipts)
+    has_non_success = any(
+        receipt.status in {ReceiptStatus.BLOCKED, ReceiptStatus.FAILED}
+        for receipt in write_receipts
+    ) or any(
+        receipt.status == ReceiptStatus.CLARIFICATION_REQUIRED
+        for receipt in write_receipts
+    )
+    if has_changed and has_non_success:
+        return "partial"
     if any(
         receipt.status in {ReceiptStatus.BLOCKED, ReceiptStatus.FAILED}
         for receipt in write_receipts
@@ -50,7 +61,7 @@ def expected_write_outcome(
         for receipt in write_receipts
     ):
         return "needs_clarification"
-    if any(receipt.changed for receipt in write_receipts):
+    if has_changed:
         return "changed"
     return "no_change"
 
@@ -82,7 +93,8 @@ def write_reply_protocol(
             "reply": "natural user-facing text based only on safe_user_facts",
             "actual_write": "boolean",
             "operation_outcome": (
-                "changed | no_change | not_executed | needs_clarification"
+                "changed | partial | no_change | not_executed | "
+                "needs_clarification"
             ),
         },
         "expected_actual_write": any(
@@ -93,6 +105,7 @@ def write_reply_protocol(
             "Return one JSON object and nothing else.",
             "Compose reply naturally; do not expose internal codes or identifiers.",
             "Do not claim a write unless expected_actual_write is true.",
+            "For partial, state separately what succeeded and what did not.",
             "Do not call another tool in this user turn.",
         ],
     }

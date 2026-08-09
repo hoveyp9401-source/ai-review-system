@@ -82,6 +82,21 @@ Managed daily-report reply contract:
 """.strip()
 
 
+_DEFERRED_ACTION_POLICY = """
+Deferred and conditional action boundary:
+- A future or conditional request is executable only when an enabled tool in
+  the current registry explicitly creates that exact scheduled action. Audit-only
+  deferred artifacts and conversation memory never schedule a business write.
+- When no such tool is available, do not execute the requested write now, do not
+  claim that a schedule or reminder was registered, and do not imply that you are
+  waiting in the background. Explain the limitation naturally and invite a fresh
+  user turn when the condition or time has actually arrived.
+- Do not promise that you will execute it later. A fresh user turn must authorize
+  any later daily-report write unless a trusted scheduled-action receipt proves
+  otherwise.
+""".strip()
+
+
 _ASSISTANT_NAMING_POLICY = """
 Assistant naming and user-address rules:
 - Your default name is 小律. If trusted personal memory contains
@@ -121,6 +136,7 @@ def canary_system_prompt() -> str:
         f"{_CONVERSATION_CONTINUITY_POLICY}\n\n"
         f"{_REPORT_INSIGHT_TOOL_POLICY}\n\n"
         f"{_MANAGED_DAILY_REPLY_POLICY}\n\n"
+        f"{_DEFERRED_ACTION_POLICY}\n\n"
         f"{_ASSISTANT_NAMING_POLICY}"
     )
 

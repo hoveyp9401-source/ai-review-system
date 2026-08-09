@@ -25,6 +25,10 @@ from app.agent2.tool_calling.deepseek_adapter import (
 from app.agent2.tool_calling.production_contracts import (
     ProductionRuntimeResult,
 )
+from app.agent2.tool_calling.write_reply import (
+    expected_write_outcome,
+    validate_write_reply,
+)
 
 
 def _context() -> TrustedContext:
@@ -77,6 +81,25 @@ def _blocked_receipt() -> ToolReceipt:
         error_code="SOURCE_REPORT_DATE_MISMATCH",
         execution_mode=ExecutionMode.CANARY_EXECUTE,
     )
+
+
+def test_independent_mixed_write_receipts_are_reported_as_partial() -> None:
+    receipts = (_changed_receipt(), _blocked_receipt())
+    content = json.dumps(
+        {
+            "reply": "第一项已写入，第二项没有执行。",
+            "actual_write": True,
+            "operation_outcome": "partial",
+        },
+        ensure_ascii=False,
+    )
+
+    envelope, errors = validate_write_reply(content, receipts)
+
+    assert expected_write_outcome(receipts) == "partial"
+    assert errors == ()
+    assert envelope is not None
+    assert envelope.operation_outcome == "partial"
 
 
 class _DeferredRuntimeSession:
