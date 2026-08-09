@@ -284,7 +284,10 @@ async def main() -> None:
                     remaining = int(
                         insight_facts.get("unclosed_remaining_count") or 0
                     )
-                    assert f"共{total}项" in compact_reply, outcome.message
+                    assert re.search(
+                        rf"(?:共|共有){total}项",
+                        compact_reply,
+                    ), outcome.message
                     assert f"前{preview}项" in compact_reply, outcome.message
                     assert str(remaining) in compact_reply and any(
                         label in compact_reply

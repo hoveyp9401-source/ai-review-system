@@ -808,7 +808,7 @@ async def main() -> None:
         },
         {
             "name": "confirm_date_explicit",
-            "text": "提交8月7日的日报",
+            "text": f"提交{SOURCE_DATE.month}月{SOURCE_DATE.day}日的日报",
             "mode": "confirmation",
             "history": ("可以提交吗", "你指哪一天的日报？"),
         },
