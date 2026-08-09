@@ -68,7 +68,7 @@ from app.agent2.cognitive_reply_v3 import (
 )
 from app.agent2.tool_calling.canary_service import (
     CanaryIngressExecutionError,
-    build_canary_response_payload,
+    build_canary_persisted_response_payload,
     deliver_cached_canary_message_if_enabled,
     deliver_canary_message_if_enabled,
     process_tool_call_canary_ingress,
@@ -190,6 +190,15 @@ class PersistedStreamIngress:
     payload: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class StreamReplyObservation:
+    elapsed_seconds: float
+    transport_status: str
+    provider_accepted: bool
+    delivery_verified: bool
+    error_type: str = ""
+
+
 STREAM_TIMING_FIELDS = (
     "queue_wait_seconds",
     "voice_download_seconds",
@@ -199,6 +208,7 @@ STREAM_TIMING_FIELDS = (
     "acquire_report_lock_seconds",
     "llm_intent_seconds",
     "llm_extract_seconds",
+    "agent2_model_elapsed_seconds",
     "report_merge_seconds",
     "db_commit_seconds",
     "dingtalk_send_seconds",
@@ -215,6 +225,20 @@ STREAM_LLM_META_FIELDS = (
     "llm_extract_timeout",
     "llm_fallback_to_pro",
     "llm_fallback_reason",
+)
+
+STREAM_AGENT2_MODEL_META_FIELDS = (
+    "agent2_model_call_count",
+    "agent2_model_request_attempt_count",
+    "agent2_model_transport_retry_count",
+)
+
+STREAM_AGENT2_TOOL_COUNT_FIELDS = (
+    "agent2_tool_success_count",
+    "agent2_tool_no_op_count",
+    "agent2_tool_clarification_count",
+    "agent2_tool_blocked_count",
+    "agent2_tool_failure_count",
 )
 
 STREAM_AGENT_META_FIELDS = (
@@ -265,12 +289,135 @@ def _safe_seconds(value: Any) -> float:
         return 0.0
 
 
+def _safe_nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _add_timing(timings: dict[str, Any], key: str, value: float) -> None:
     timings[key] = round(_safe_seconds(timings.get(key)) + _safe_seconds(value), 4)
 
 
+def _apply_canary_observability(
+    timings: dict[str, Any],
+    outcome: Any,
+) -> None:
+    timings["agent2_model_call_count"] = _safe_nonnegative_int(
+        getattr(outcome, "model_call_count", 0)
+    )
+    timings["agent2_model_request_attempt_count"] = _safe_nonnegative_int(
+        getattr(outcome, "model_request_attempt_count", 0)
+    )
+    timings["agent2_model_transport_retry_count"] = _safe_nonnegative_int(
+        getattr(outcome, "model_transport_retry_count", 0)
+    )
+    timings["agent2_model_elapsed_seconds"] = _safe_seconds(
+        getattr(outcome, "model_elapsed_seconds", 0.0)
+    )
+    timings["agent2_model_result_status"] = str(
+        getattr(outcome, "model_result_status", "not_called")
+        or "not_called"
+    )
+    for timing_field, outcome_field in (
+        ("agent2_tool_success_count", "tool_success_count"),
+        ("agent2_tool_no_op_count", "tool_no_op_count"),
+        (
+            "agent2_tool_clarification_count",
+            "tool_clarification_count",
+        ),
+        ("agent2_tool_blocked_count", "tool_blocked_count"),
+        ("agent2_tool_failure_count", "tool_failure_count"),
+    ):
+        timings[timing_field] = _safe_nonnegative_int(
+            getattr(outcome, outcome_field, 0)
+        )
+    timings["agent2_user_visible_result"] = str(
+        getattr(outcome, "user_visible_result", "unknown")
+        or "unknown"
+    )
+    timings["agent2_reply_formed"] = bool(
+        getattr(outcome, "reply_formed", False)
+    )
+    timings["agent2_message_processing_status"] = "consumed"
+    timings["agent2_business_result_status"] = str(
+        getattr(outcome, "user_visible_result", "unknown")
+        or "unknown"
+    )
+    timings["agent2_business_transaction_status"] = "pending"
+    timings["agent2_business_changed"] = bool(
+        getattr(outcome, "actual_write", False)
+    )
+    timings["agent2_reply_status"] = (
+        "formed"
+        if bool(getattr(outcome, "reply_formed", False))
+        else "missing"
+    )
+
+
+def _apply_reply_observability(
+    timings: dict[str, Any],
+    observation: StreamReplyObservation,
+) -> None:
+    _add_timing(
+        timings,
+        "dingtalk_send_seconds",
+        observation.elapsed_seconds,
+    )
+    timings["agent2_transport_status"] = observation.transport_status
+    timings["agent2_provider_accepted"] = observation.provider_accepted
+    timings["agent2_delivery_verified"] = observation.delivery_verified
+    timings["agent2_transport_error_type"] = observation.error_type
+    timings["agent2_delivery_status"] = (
+        "verified"
+        if observation.delivery_verified
+        else (
+            "suppressed"
+            if observation.transport_status == "suppressed"
+            else (
+                "unverified"
+                if observation.provider_accepted
+                else "not_delivered"
+            )
+        )
+    )
+
+
+def _canary_stream_status(
+    outcome: Any,
+    observation: StreamReplyObservation,
+) -> str:
+    if observation.transport_status == "failed":
+        return "tool_call_canary_reply_failed"
+    if observation.transport_status == "suppressed":
+        return "tool_call_canary_delivery_suppressed"
+    if str(getattr(outcome, "user_visible_result", "")) == "failed":
+        return "tool_call_canary_failed"
+    if str(getattr(outcome, "owner", "")) == "blocked":
+        return "tool_call_canary_blocked"
+    return "tool_call_canary_processed"
+
+
 def _initial_stream_timings(job: StreamJob, started_at: float) -> dict[str, Any]:
     timings = {field: 0.0 for field in STREAM_TIMING_FIELDS}
+    for field in STREAM_AGENT2_MODEL_META_FIELDS:
+        timings[field] = 0
+    for field in STREAM_AGENT2_TOOL_COUNT_FIELDS:
+        timings[field] = 0
+    timings["agent2_user_visible_result"] = "unknown"
+    timings["agent2_reply_formed"] = False
+    timings["agent2_model_result_status"] = "not_called"
+    timings["agent2_message_processing_status"] = "not_consumed"
+    timings["agent2_business_result_status"] = "unknown"
+    timings["agent2_business_transaction_status"] = "not_started"
+    timings["agent2_business_changed"] = False
+    timings["agent2_reply_status"] = "not_formed"
+    timings["agent2_transport_status"] = "not_attempted"
+    timings["agent2_provider_accepted"] = False
+    timings["agent2_delivery_verified"] = False
+    timings["agent2_transport_error_type"] = ""
+    timings["agent2_delivery_status"] = "not_attempted"
     for field in STREAM_LLM_META_FIELDS:
         timings[field] = False if field.endswith("_timeout") or field == "llm_fallback_to_pro" else None
     for field in STREAM_AGENT_META_FIELDS:
@@ -310,7 +457,28 @@ def _log_stream_timing(
     error: str | None = None,
 ) -> None:
     entered_report_agent = bool(timings.get("entered_report_agent") or timings.get("report_agent_seconds"))
-    entered_llm = bool(timings.get("llm_intent_seconds") or timings.get("llm_extract_seconds") or entered_report_agent)
+    agent2_model_call_count = _safe_nonnegative_int(
+        timings.get("agent2_model_call_count")
+    )
+    agent2_model_request_attempt_count = _safe_nonnegative_int(
+        timings.get("agent2_model_request_attempt_count")
+    )
+    if (
+        timings.get("agent2_message_processing_status")
+        == "consumed"
+    ):
+        entered_llm = bool(
+            agent2_model_call_count
+            or agent2_model_request_attempt_count
+        )
+    else:
+        entered_llm = bool(
+            agent2_model_call_count
+            or agent2_model_request_attempt_count
+            or timings.get("llm_intent_seconds")
+            or timings.get("llm_extract_seconds")
+            or entered_report_agent
+        )
     record: dict[str, Any] = {
         "message_id": job.message.message_id,
         "user_id": dingtalk_user_id,
@@ -326,11 +494,63 @@ def _log_stream_timing(
     }
     for field in STREAM_TIMING_FIELDS:
         record[field] = _safe_seconds(timings.get(field))
+    for field in STREAM_AGENT2_MODEL_META_FIELDS:
+        record[field] = _safe_nonnegative_int(timings.get(field))
+    for field in STREAM_AGENT2_TOOL_COUNT_FIELDS:
+        record[field] = _safe_nonnegative_int(timings.get(field))
+    record["agent2_user_visible_result"] = str(
+        timings.get("agent2_user_visible_result") or "unknown"
+    )
+    record["agent2_reply_formed"] = bool(
+        timings.get("agent2_reply_formed")
+    )
+    record["agent2_model_result_status"] = str(
+        timings.get("agent2_model_result_status") or "not_called"
+    )
+    record["agent2_message_processing_status"] = str(
+        timings.get("agent2_message_processing_status")
+        or "not_consumed"
+    )
+    record["agent2_business_result_status"] = str(
+        timings.get("agent2_business_result_status") or "unknown"
+    )
+    record["agent2_business_transaction_status"] = str(
+        timings.get("agent2_business_transaction_status")
+        or "not_started"
+    )
+    record["agent2_business_changed"] = bool(
+        timings.get("agent2_business_changed")
+    )
+    record["agent2_reply_status"] = str(
+        timings.get("agent2_reply_status") or "not_formed"
+    )
+    record["agent2_transport_status"] = str(
+        timings.get("agent2_transport_status") or "not_attempted"
+    )
+    record["agent2_provider_accepted"] = bool(
+        timings.get("agent2_provider_accepted")
+    )
+    record["agent2_delivery_verified"] = bool(
+        timings.get("agent2_delivery_verified")
+    )
+    record["agent2_transport_error_type"] = str(
+        timings.get("agent2_transport_error_type") or ""
+    )
+    record["agent2_delivery_status"] = str(
+        timings.get("agent2_delivery_status") or "not_attempted"
+    )
     for field in STREAM_LLM_META_FIELDS:
         record[field] = timings.get(field)
     for field in STREAM_AGENT_META_FIELDS:
         record[field] = timings.get(field)
-    logger.info("stream timing %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
+    try:
+        logger.info(
+            "stream timing %s",
+            json.dumps(record, ensure_ascii=False, sort_keys=True),
+        )
+    except Exception:
+        # Monitoring is best-effort and must never change the user-facing turn.
+        pass
 
 
 def _log_immediate_stream_timing(
@@ -848,16 +1068,42 @@ async def _reply(
     job: StreamJob,
     text: str,
 ) -> float:
+    observation = await _reply_with_observability(
+        handler,
+        robot,
+        job,
+        text,
+    )
+    return observation.elapsed_seconds
+
+
+async def _reply_with_observability(
+    handler: DailyReviewStreamHandler,
+    robot: DingTalkRobotClient,
+    job: StreamJob,
+    text: str,
+) -> StreamReplyObservation:
     send_start = time.perf_counter()
     try:
         await _send_stream_reply(robot, job.message, text, handler.settings.stream_reply_timeout_seconds)
         send_seconds = _elapsed_seconds(send_start)
         logger.info("stream final reply sent message=%s send_seconds=%s", job.message.message_id, send_seconds)
-        return send_seconds
+        return StreamReplyObservation(
+            elapsed_seconds=send_seconds,
+            transport_status="provider_accepted",
+            provider_accepted=True,
+            delivery_verified=False,
+        )
     except Exception as exc:
         send_seconds = _elapsed_seconds(send_start)
         logger.exception("stream final reply failed: %s", exc)
-        return send_seconds
+        return StreamReplyObservation(
+            elapsed_seconds=send_seconds,
+            transport_status="failed",
+            provider_accepted=False,
+            delivery_verified=False,
+            error_type=type(exc).__name__,
+        )
 
 
 async def _evaluate_stream_legacy_daily_gate(
@@ -2497,9 +2743,10 @@ async def _handle_job(
                     user.timezone or settings.timezone
                 ),
             )
+            _apply_canary_observability(timings, tool_call_canary)
             if tool_call_canary.handled:
                 reply_text = tool_call_canary.message
-                response_payload = build_canary_response_payload(
+                response_payload = build_canary_persisted_response_payload(
                     tool_call_canary
                 )
                 await _mark_canary_turn_closed(
@@ -2516,16 +2763,28 @@ async def _handle_job(
                 )
                 commit_start = time.perf_counter()
                 await session.commit()
+                timings[
+                    "agent2_business_transaction_status"
+                ] = "committed"
                 _add_timing(
                     timings,
                     "db_commit_seconds",
                     _elapsed_seconds(commit_start),
                 )
-                send_seconds = 0.0
+                send_observation = StreamReplyObservation(
+                    elapsed_seconds=0.0,
+                    transport_status=(
+                        "not_attempted"
+                        if tool_call_canary.messages_enabled
+                        else "suppressed"
+                    ),
+                    provider_accepted=False,
+                    delivery_verified=False,
+                )
 
                 async def send_canary_reply() -> None:
-                    nonlocal send_seconds
-                    send_seconds = await _reply(
+                    nonlocal send_observation
+                    send_observation = await _reply_with_observability(
                         handler,
                         robot,
                         job,
@@ -2536,15 +2795,10 @@ async def _handle_job(
                     tool_call_canary,
                     send_canary_reply,
                 )
-                _add_timing(
-                    timings,
-                    "dingtalk_send_seconds",
-                    send_seconds,
-                )
-                status = (
-                    "tool_call_canary_processed"
-                    if tool_call_canary.owner == "tool_call_core"
-                    else "tool_call_canary_blocked"
+                _apply_reply_observability(timings, send_observation)
+                status = _canary_stream_status(
+                    tool_call_canary,
+                    send_observation,
                 )
                 return
 
@@ -2560,8 +2814,12 @@ async def _handle_job(
             error_message = exc.error_type
             await session.rollback()
             failure_outcome = exc.outcome()
+            _apply_canary_observability(timings, failure_outcome)
+            timings[
+                "agent2_business_transaction_status"
+            ] = "rolled_back"
             reply_text = failure_outcome.message
-            response_payload = build_canary_response_payload(
+            response_payload = build_canary_persisted_response_payload(
                 failure_outcome
             )
             if event is not None:
@@ -2586,11 +2844,20 @@ async def _handle_job(
                     "db_commit_seconds",
                     _elapsed_seconds(commit_start),
                 )
-            send_seconds = 0.0
+            send_observation = StreamReplyObservation(
+                elapsed_seconds=0.0,
+                transport_status=(
+                    "not_attempted"
+                    if failure_outcome.messages_enabled
+                    else "suppressed"
+                ),
+                provider_accepted=False,
+                delivery_verified=False,
+            )
 
             async def send_canary_failure() -> None:
-                nonlocal send_seconds
-                send_seconds = await _reply(
+                nonlocal send_observation
+                send_observation = await _reply_with_observability(
                     handler,
                     robot,
                     job,
@@ -2601,10 +2868,10 @@ async def _handle_job(
                 failure_outcome,
                 send_canary_failure,
             )
-            _add_timing(
-                timings,
-                "dingtalk_send_seconds",
-                send_seconds,
+            _apply_reply_observability(timings, send_observation)
+            status = _canary_stream_status(
+                failure_outcome,
+                send_observation,
             )
         except LLMOutputError as exc:
             status = "llm_failed"
@@ -2634,6 +2901,13 @@ async def _handle_job(
             status = "failed"
             error_message = exc.__class__.__name__
             await session.rollback()
+            if (
+                timings.get("agent2_business_transaction_status")
+                == "pending"
+            ):
+                timings[
+                    "agent2_business_transaction_status"
+                ] = "rolled_back"
             reply_text = TEXT_PROCESS_FAILED
             logger.exception("stream job failed")
             if event is not None:

@@ -140,6 +140,18 @@ class CanaryIngressOutcome:
     handled: bool = False
     actual_write: bool = False
     messages_enabled: bool = False
+    model_call_count: int = 0
+    model_request_attempt_count: int = 0
+    model_transport_retry_count: int = 0
+    model_elapsed_seconds: float = 0.0
+    model_result_status: str = "not_called"
+    tool_success_count: int = 0
+    tool_no_op_count: int = 0
+    tool_clarification_count: int = 0
+    tool_blocked_count: int = 0
+    tool_failure_count: int = 0
+    user_visible_result: str = "unknown"
+    reply_formed: bool = False
 
 
 class CanaryIngressExecutionError(RuntimeError):
@@ -153,11 +165,28 @@ class CanaryIngressExecutionError(RuntimeError):
         messages_enabled: bool,
         error_type: str,
         reason: str | None = None,
+        model_call_count: int = 0,
+        model_request_attempt_count: int = 0,
+        model_transport_retry_count: int = 0,
+        model_elapsed_seconds: float = 0.0,
     ) -> None:
         self.reason = reason or self.reason
         super().__init__(self.reason)
         self.messages_enabled = messages_enabled
         self.error_type = error_type
+        self.model_call_count = max(0, int(model_call_count))
+        self.model_request_attempt_count = max(
+            self.model_call_count,
+            int(model_request_attempt_count),
+        )
+        self.model_transport_retry_count = max(
+            0,
+            int(model_transport_retry_count),
+        )
+        self.model_elapsed_seconds = max(
+            0.0,
+            float(model_elapsed_seconds),
+        )
 
     def outcome(self) -> CanaryIngressOutcome:
         return CanaryIngressOutcome(
@@ -167,6 +196,18 @@ class CanaryIngressExecutionError(RuntimeError):
             handled=True,
             actual_write=False,
             messages_enabled=self.messages_enabled,
+            model_call_count=self.model_call_count,
+            model_request_attempt_count=self.model_request_attempt_count,
+            model_transport_retry_count=self.model_transport_retry_count,
+            model_elapsed_seconds=self.model_elapsed_seconds,
+            model_result_status=(
+                "failed"
+                if self.model_request_attempt_count
+                or self.model_call_count
+                else "not_called"
+            ),
+            user_visible_result="failed",
+            reply_formed=True,
         )
 
 
@@ -181,52 +222,111 @@ def _record_canary_execution_failure(
     conversation_id: str = "",
 ) -> CanaryIngressExecutionError:
     model_turns = tuple(getattr(error, "model_turns", ()) or ())
-    failure_reason = _canary_execution_failure_reason(error)
-    _model_audit_logger.info(
-        "agent2_tool_call_model_audit %s",
-        json.dumps(
-            {
-                "schema_version": "agent2.tool_call.model_audit.v1",
-                "status": "failed",
-                "error_type": type(error).__name__,
-                "error_message": str(error),
-                "failure_reason": failure_reason,
-                "source_message_id": source_message_id,
-                "tenant_id": tenant_id,
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "model_turns": [
-                    asdict(turn)
-                    for turn in model_turns
-                    if is_dataclass(turn) and not isinstance(turn, type)
-                ],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
+    model_call_count = max(
+        len(model_turns),
+        _nonnegative_count(getattr(error, "model_call_count", 0)),
+    )
+    model_request_attempt_count = max(
+        model_call_count,
+        _nonnegative_count(
+            getattr(error, "request_attempt_count", 0)
         ),
     )
-    CanaryMetricsRecorder().record(
-        CanaryMetricEvent(
-            tool_names=(),
-            success_count=0,
-            failure_count=1,
-            clarification_count=0,
-            receipt_mismatch_count=0,
-            rollback_count=0,
-            latency_ms=max(
-                0,
-                int((perf_counter() - started) * 1000),
-            ),
-            model_error_count=1,
-        )
+    model_transport_retry_count = _nonnegative_count(
+        getattr(error, "transport_retry_count", 0)
+    )
+    model_elapsed_seconds = max(
+        _model_elapsed_seconds(model_turns),
+        _nonnegative_seconds(
+            getattr(error, "model_elapsed_seconds", 0.0)
+        ),
+    )
+    failure_reason = _canary_execution_failure_reason(error)
+    _record_model_audit_safely(
+        {
+            "schema_version": "agent2.tool_call.model_audit.v1",
+            "status": "failed",
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "failure_reason": failure_reason,
+            "source_message_id": source_message_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "model_call_count": model_call_count,
+            "model_request_attempt_count": model_request_attempt_count,
+            "model_transport_retry_count": model_transport_retry_count,
+            "model_elapsed_seconds": model_elapsed_seconds,
+            "model_turns": [
+                asdict(turn)
+                for turn in model_turns
+                if is_dataclass(turn) and not isinstance(turn, type)
+            ],
+        }
+    )
+    _record_canary_metric_safely(
+        tool_names=(),
+        success_count=0,
+        failure_count=1,
+        clarification_count=0,
+        receipt_mismatch_count=0,
+        rollback_count=0,
+        latency_ms=max(
+            0,
+            int((perf_counter() - started) * 1000),
+        ),
+        model_error_count=1,
     )
     return CanaryIngressExecutionError(
         messages_enabled=messages_enabled,
         error_type=type(error).__name__,
         reason=failure_reason,
+        model_call_count=model_call_count,
+        model_request_attempt_count=model_request_attempt_count,
+        model_transport_retry_count=model_transport_retry_count,
+        model_elapsed_seconds=model_elapsed_seconds,
     )
+
+
+def _nonnegative_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _nonnegative_seconds(value: Any) -> float:
+    try:
+        return round(max(0.0, float(value or 0.0)), 4)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_canary_metric_safely(**event_fields: Any) -> None:
+    try:
+        CanaryMetricsRecorder().record(
+            CanaryMetricEvent(**event_fields)
+        )
+    except Exception:
+        # Metrics are best-effort and cannot change the Agent2 turn result.
+        pass
+
+
+def _record_model_audit_safely(payload: Mapping[str, Any]) -> None:
+    try:
+        _model_audit_logger.info(
+            "agent2_tool_call_model_audit %s",
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+    except Exception:
+        # Audit transport failure cannot replace the original Agent2 result.
+        pass
 
 
 def _canary_execution_failure_reason(error: Exception) -> str:
@@ -244,6 +344,7 @@ def _canary_execution_failure_reason(error: Exception) -> str:
 
 
 _CANARY_TRANSPORT_MARKER = "_agent2_tool_call_canary"
+_CANARY_TURN_OBSERVATION_MARKER = "_agent2_turn_observation_v1"
 
 
 def build_canary_response_payload(
@@ -260,7 +361,71 @@ def build_canary_response_payload(
         _CANARY_TRANSPORT_MARKER: {
             "messages_enabled": False,
             "delivery": "suppressed",
-        }
+        },
+    }
+
+
+def build_canary_persisted_response_payload(
+    outcome: CanaryIngressOutcome,
+) -> dict[str, Any]:
+    """Add internal status evidence only to the database copy."""
+
+    payload = build_canary_response_payload(outcome)
+    payload[_CANARY_TURN_OBSERVATION_MARKER] = (
+        _canary_turn_observation(outcome)
+    )
+    return payload
+
+
+def canary_provider_response_payload(
+    persisted_payload: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Remove internal monitoring fields before replying to DingTalk."""
+
+    if not isinstance(persisted_payload, Mapping):
+        return {}
+    payload = dict(persisted_payload)
+    payload.pop(_CANARY_TURN_OBSERVATION_MARKER, None)
+    return payload
+
+
+def _canary_turn_observation(
+    outcome: CanaryIngressOutcome,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "agent2.turn.observation.v1",
+        "message_processing_status": "consumed",
+        "business_result_status": outcome.user_visible_result,
+        "business_write_committed": bool(outcome.actual_write),
+        "reply_status": "formed" if outcome.reply_formed else "missing",
+        "transport_status": (
+            "pending" if outcome.messages_enabled else "suppressed"
+        ),
+        "delivery_status": (
+            "unverified" if outcome.messages_enabled else "suppressed"
+        ),
+        "model_call_count": max(0, outcome.model_call_count),
+        "model_request_attempt_count": max(
+            0,
+            outcome.model_request_attempt_count,
+        ),
+        "model_transport_retry_count": max(
+            0,
+            outcome.model_transport_retry_count,
+        ),
+        "model_elapsed_seconds": max(
+            0.0,
+            outcome.model_elapsed_seconds,
+        ),
+        "model_result_status": outcome.model_result_status,
+        "tool_success_count": max(0, outcome.tool_success_count),
+        "tool_no_op_count": max(0, outcome.tool_no_op_count),
+        "tool_clarification_count": max(
+            0,
+            outcome.tool_clarification_count,
+        ),
+        "tool_blocked_count": max(0, outcome.tool_blocked_count),
+        "tool_failure_count": max(0, outcome.tool_failure_count),
     }
 
 
@@ -494,30 +659,36 @@ async def process_tool_call_canary_ingress(
         ) from exc
     decision = resolution.decision
     if decision.owner == "blocked":
+        message = canary_block_message(decision.reason)
         return CanaryIngressOutcome(
             owner="blocked",
             reason=decision.reason,
-            message=canary_block_message(decision.reason),
+            message=message,
             handled=True,
             messages_enabled=(
                 bool(resolution.control.messages_enabled)
                 if resolution.control is not None
                 else True
             ),
+            user_visible_result="blocked",
+            reply_formed=bool(message),
         )
     if (
         resolution.binding is None
         or resolution.capability is None
         or resolution.control is None
     ):
+        message = canary_block_message(
+            "tool_call_canary_server_scope_missing"
+        )
         return CanaryIngressOutcome(
             owner="blocked",
             reason="tool_call_canary_server_scope_missing",
-            message=canary_block_message(
-                "tool_call_canary_server_scope_missing"
-            ),
+            message=message,
             handled=True,
             messages_enabled=True,
+            user_visible_result="blocked",
+            reply_formed=bool(message),
         )
 
     try:
@@ -659,31 +830,29 @@ async def process_tool_call_canary_ingress(
         if failure.messages_enabled:
             return failure.outcome()
         raise failure from exc
-    CanaryMetricsRecorder().record(
-        CanaryMetricEvent(
-            tool_names=tuple(
-                receipt.tool_name for receipt in result.receipts
-            ),
-            success_count=sum(
-                receipt.status.value in {"success", "no_op"}
-                for receipt in result.receipts
-            ),
-            failure_count=sum(
-                receipt.status.value in {"failed", "blocked"}
-                for receipt in result.receipts
-            ),
-            clarification_count=sum(
-                receipt.status.value == "clarification_required"
-                for receipt in result.receipts
-            ),
-            receipt_mismatch_count=0,
-            rollback_count=sum(
-                runtime_result.rolled_back
-                for runtime_result in result.runtime_results
-            ),
-            latency_ms=max(0, int((perf_counter() - started) * 1000)),
-            model_error_count=0,
-        )
+    _record_canary_metric_safely(
+        tool_names=tuple(
+            receipt.tool_name for receipt in result.receipts
+        ),
+        success_count=sum(
+            receipt.status.value in {"success", "no_op"}
+            for receipt in result.receipts
+        ),
+        failure_count=sum(
+            receipt.status.value in {"failed", "blocked"}
+            for receipt in result.receipts
+        ),
+        clarification_count=sum(
+            receipt.status.value == "clarification_required"
+            for receipt in result.receipts
+        ),
+        receipt_mismatch_count=0,
+        rollback_count=sum(
+            runtime_result.rolled_back
+            for runtime_result in result.runtime_results
+        ),
+        latency_ms=max(0, int((perf_counter() - started) * 1000)),
+        model_error_count=0,
     )
     report_id = next(
         (
@@ -694,15 +863,77 @@ async def process_tool_call_canary_ingress(
         ),
         None,
     )
+    formatted_message = format_dingtalk_plain_text(final_content)
+    receipt_counts = _receipt_status_counts(result.receipts)
     return CanaryIngressOutcome(
         owner="tool_call_core",
         reason=decision.reason,
-        message=format_dingtalk_plain_text(final_content),
+        message=formatted_message,
         report_id=report_id,
         handled=True,
         actual_write=any(receipt.changed for receipt in result.receipts),
         messages_enabled=bool(resolution.control.messages_enabled),
+        model_call_count=len(result.model_turns),
+        model_request_attempt_count=result.request_attempt_count,
+        model_transport_retry_count=result.transport_retry_count,
+        model_elapsed_seconds=_model_elapsed_seconds(
+            result.model_turns
+        ),
+        model_result_status="success",
+        tool_success_count=receipt_counts["success"],
+        tool_no_op_count=receipt_counts["no_op"],
+        tool_clarification_count=receipt_counts[
+            "clarification_required"
+        ],
+        tool_blocked_count=receipt_counts["blocked"],
+        tool_failure_count=receipt_counts["failed"],
+        user_visible_result=_user_visible_result(receipt_counts),
+        reply_formed=bool(formatted_message),
     )
+
+
+def _receipt_status_counts(receipts: tuple[Any, ...]) -> dict[str, int]:
+    counts = {
+        "success": 0,
+        "no_op": 0,
+        "clarification_required": 0,
+        "blocked": 0,
+        "failed": 0,
+    }
+    for receipt in receipts:
+        status = getattr(receipt, "status", "")
+        value = str(getattr(status, "value", status) or "")
+        if value in counts:
+            counts[value] += 1
+    return counts
+
+
+def _model_elapsed_seconds(model_turns: tuple[Any, ...]) -> float:
+    elapsed = 0.0
+    for turn in model_turns:
+        metadata = getattr(turn, "response_metadata", None)
+        if not isinstance(metadata, Mapping):
+            continue
+        try:
+            elapsed += max(
+                0.0,
+                float(metadata.get("elapsed_seconds") or 0.0),
+            )
+        except (TypeError, ValueError):
+            continue
+    return round(elapsed, 4)
+
+
+def _user_visible_result(counts: Mapping[str, int]) -> str:
+    if counts.get("failed", 0):
+        return "failed"
+    if counts.get("blocked", 0):
+        return "blocked"
+    if counts.get("clarification_required", 0):
+        return "clarification"
+    if counts.get("success", 0) or counts.get("no_op", 0):
+        return "success"
+    return "reply_only"
 
 
 def _trusted_authoritative_read_response(

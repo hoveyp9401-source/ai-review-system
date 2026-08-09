@@ -67,7 +67,9 @@ from app.agent2.context_pack import build_agent2_context_pack
 from app.agent2.performance_knowledge import attach_live_performance_catalog
 from app.agent2.tool_calling.canary_service import (
     CanaryIngressExecutionError,
+    build_canary_persisted_response_payload,
     build_canary_response_payload,
+    canary_provider_response_payload,
     canary_route_suppresses_delivery,
     deliver_canary_message_if_enabled,
     is_canary_message_delivery_suppressed,
@@ -338,7 +340,9 @@ async def dingtalk_webhook(
     await session.commit()
 
     if not inserted:
-        resp = event.response_payload
+        resp = canary_provider_response_payload(
+            event.response_payload
+        )
         if not resp:
             duplicate_user = await get_active_user_by_dingtalk_id(
                 session,
@@ -509,11 +513,18 @@ async def dingtalk_webhook(
                 if tool_call_canary.handled
                 else dingtalk_text_response(agent2_result.message)
             )
+            persisted_response_payload = (
+                build_canary_persisted_response_payload(
+                    tool_call_canary
+                )
+                if tool_call_canary.handled
+                else response_payload
+            )
             await mark_webhook_event_processed(
                 session,
                 event,
                 report_id=uuid.UUID(agent2_result.report_id) if agent2_result.report_id else None,
-                response_payload=response_payload,
+                response_payload=persisted_response_payload,
                 now=now_in_timezone(settings.timezone),
             )
             await session.commit()
@@ -559,13 +570,16 @@ async def dingtalk_webhook(
         response_payload = build_canary_response_payload(
             failure_outcome
         )
+        persisted_response_payload = (
+            build_canary_persisted_response_payload(failure_outcome)
+        )
         async with session.begin():
             event = await session.merge(event)
             await mark_webhook_event_failed(
                 session,
                 event,
                 error_message=exc.error_type,
-                response_payload=response_payload,
+                response_payload=persisted_response_payload,
                 now=now_in_timezone(settings.timezone),
             )
         if is_canary_message_delivery_suppressed(response_payload):

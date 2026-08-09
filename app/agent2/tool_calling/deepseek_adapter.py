@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field, replace
+from time import perf_counter
 from typing import Any
 
 import httpx
@@ -54,6 +55,7 @@ class DeepSeekToolCallingError(RuntimeError):
         request_attempt_count: int = 0,
         transport_retry_count: int = 0,
         transport_errors: tuple[dict[str, Any], ...] = (),
+        model_elapsed_seconds: float = 0.0,
     ) -> None:
         super().__init__(message)
         self.raw_tool_call_audit = raw_tool_call_audit
@@ -63,6 +65,10 @@ class DeepSeekToolCallingError(RuntimeError):
         self.request_attempt_count = request_attempt_count
         self.transport_retry_count = transport_retry_count
         self.transport_errors = transport_errors
+        self.model_elapsed_seconds = max(
+            0.0,
+            float(model_elapsed_seconds),
+        )
 
 
 class DeepSeekTimeoutError(DeepSeekToolCallingError):
@@ -670,6 +676,7 @@ class DeepSeekToolCallingAdapter:
         tool_schemas: list[dict[str, Any]],
         thinking_enabled: bool,
     ) -> _CompletionResponse:
+        completion_started = perf_counter()
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -716,9 +723,19 @@ class DeepSeekToolCallingAdapter:
                     request_attempt_count=attempt,
                     transport_retry_count=attempt - 1,
                     transport_errors=tuple(transport_errors),
+                    model_elapsed_seconds=round(
+                        max(0.0, perf_counter() - completion_started),
+                        4,
+                    ),
                 ) from exc
         if response is None:
-            raise DeepSeekResponseError("DeepSeek request produced no response")
+            raise DeepSeekResponseError(
+                "DeepSeek request produced no response",
+                model_elapsed_seconds=round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
+            )
         request_attempt_count = len(transport_errors) + 1
         transport_retry_count = len(transport_errors)
         try:
@@ -731,6 +748,10 @@ class DeepSeekToolCallingAdapter:
                 request_attempt_count=request_attempt_count,
                 transport_retry_count=transport_retry_count,
                 transport_errors=tuple(transport_errors),
+                model_elapsed_seconds=round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
             ) from exc
         if not isinstance(message, dict):
             raise DeepSeekResponseError(
@@ -738,6 +759,10 @@ class DeepSeekToolCallingAdapter:
                 request_attempt_count=request_attempt_count,
                 transport_retry_count=transport_retry_count,
                 transport_errors=tuple(transport_errors),
+                model_elapsed_seconds=round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
             )
         canonical_body = json.dumps(
             body,
@@ -759,6 +784,10 @@ class DeepSeekToolCallingAdapter:
                 "request_attempt_count": request_attempt_count,
                 "transport_retry_count": transport_retry_count,
                 "transport_errors": transport_errors,
+                "elapsed_seconds": round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
             },
         )
 
@@ -1067,6 +1096,7 @@ def _with_accumulated_audit(
         request_attempt_count=error.request_attempt_count,
         transport_retry_count=error.transport_retry_count,
         transport_errors=error.transport_errors,
+        model_elapsed_seconds=error.model_elapsed_seconds,
     )
 
 
@@ -1076,10 +1106,16 @@ def _with_canary_turn_state(
     audits: list[RawToolCallAudit],
     model_turns: list[ModelTurnAudit],
 ) -> DeepSeekToolCallingError:
+    failed_completion_count = int(
+        error.request_attempt_count > 0 and not error.model_turns
+    )
     return type(error)(
         str(error),
         raw_tool_call_audit=tuple(audits) + error.raw_tool_call_audit,
-        model_call_count=len(model_turns),
+        model_call_count=max(
+            error.model_call_count,
+            len(model_turns) + failed_completion_count,
+        ),
         model_turns=tuple(model_turns) + error.model_turns,
         request_attempt_count=sum(
             int(turn.response_metadata.get("request_attempt_count", 1))
@@ -1099,6 +1135,11 @@ def _with_canary_turn_state(
             )
         )
         + error.transport_errors,
+        model_elapsed_seconds=round(
+            _model_turn_elapsed_seconds(model_turns)
+            + error.model_elapsed_seconds,
+            4,
+        ),
     )
 
 
@@ -1132,7 +1173,30 @@ def _with_turn_state(
         )
         + error.transport_retry_count,
         transport_errors=prior_transport_errors + error.transport_errors,
+        model_elapsed_seconds=round(
+            _model_turn_elapsed_seconds(model_turns)
+            + error.model_elapsed_seconds,
+            4,
+        ),
     )
+
+
+def _model_turn_elapsed_seconds(
+    model_turns: list[ModelTurnAudit],
+) -> float:
+    elapsed = 0.0
+    for turn in model_turns:
+        try:
+            elapsed += max(
+                0.0,
+                float(
+                    turn.response_metadata.get("elapsed_seconds")
+                    or 0.0
+                ),
+            )
+        except (TypeError, ValueError):
+            continue
+    return elapsed
 
 
 def _model_turn_audit(
