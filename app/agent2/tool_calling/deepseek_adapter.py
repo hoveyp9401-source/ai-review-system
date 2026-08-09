@@ -793,6 +793,8 @@ class DeepSeekToolCallingAdapter:
                 payload["tool_choice"] = "auto"
         if thinking_enabled:
             payload["thinking"] = {"type": "enabled"}
+        if _server_requests_json_object(messages):
+            payload["response_format"] = {"type": "json_object"}
         transport_errors: list[dict[str, Any]] = []
         response: httpx.Response | None = None
         for attempt in range(1, self._max_request_attempts + 1):
@@ -895,6 +897,36 @@ class DeepSeekToolCallingAdapter:
                 ),
             },
         )
+
+
+def _server_requests_json_object(messages: list[dict[str, Any]]) -> bool:
+    """Recognize only the server-owned terminal write protocol."""
+
+    for message in reversed(messages):
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        protocol = payload.get("canary_turn_protocol")
+        if not isinstance(protocol, dict):
+            continue
+        contract = protocol.get("terminal_response_contract")
+        if not isinstance(contract, dict):
+            continue
+        if (
+            protocol.get("final_response_required") is True
+            and protocol.get("write_batch_closed") is True
+            and contract.get("format") == "json_object"
+        ):
+            return True
+    return False
 
 
 def _parse_assistant_turn(message: dict[str, Any]) -> _ParsedAssistantTurn:

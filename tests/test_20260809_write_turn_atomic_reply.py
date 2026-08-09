@@ -4,6 +4,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pytest
+import httpx
 
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
@@ -19,6 +20,7 @@ from app.agent2.tool_calling.deepseek_adapter import (
     DeepSeekToolCallingAdapter,
     DeepSeekTimeoutError,
     _CompletionResponse,
+    _canary_post_write_protocol_message,
 )
 from app.agent2.tool_calling.production_contracts import (
     ProductionRuntimeResult,
@@ -131,6 +133,62 @@ class _BlockedRuntimeSession:
 
     async def rollback_pending(self):
         self.rollback_count += 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_reply_requests_native_json_output() -> None:
+    class CapturingHttpClient:
+        def __init__(self) -> None:
+            self.payload = None
+
+        async def post(self, url, **kwargs):
+            self.payload = kwargs["json"]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "response-1",
+                    "model": "model-1",
+                    "created": 1,
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {
+                                        "reply": "已按原话记入今天的日报。",
+                                        "actual_write": True,
+                                        "operation_outcome": "changed",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                    "usage": {},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    http_client = CapturingHttpClient()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=http_client,
+        model="model-1",
+        timeout_seconds=3.0,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+
+    await adapter._complete(
+        messages=[
+            {"role": "user", "content": "记录今天日报"},
+            _canary_post_write_protocol_message((_changed_receipt(),)),
+        ],
+        tool_schemas=[],
+        thinking_enabled=False,
+    )
+
+    assert http_client.payload["response_format"] == {"type": "json_object"}
 
 
 def _tool_call_completion() -> _CompletionResponse:
