@@ -40,22 +40,21 @@ def test_agent2_manual_blocked_reply_uses_tool_assisted_context_pack():
     )
 
 
-def test_manual_endpoint_ignores_request_source_and_uses_trusted_gray_gate():
+def test_manual_endpoint_uses_the_same_agent2_only_entrypoint():
     source = REPORTS_API.read_text(encoding="utf-8")
     tree = ast.parse(source)
     function = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_manual_should_use_agent2"
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_submit_manual_agent2_if_applicable"
     )
 
     function_source = ast.unparse(function)
-    assert "source_text" not in function_source
-    assert "'agent2' in" not in function_source
-    assert "'legacy'" not in function_source
-    assert "'agent1'" not in function_source
-    assert "'disable_agent2'" not in function_source
-    assert "agent2_daily_enabled_for_user" in function_source
+    assert "resolve_agent2_entrypoint" in function_source
+    assert "decide_runtime_owner" in function_source
+    assert "_manual_should_use_agent2" not in source
+    assert "agent2_daily_enabled_for_user" not in source
 
 
 def test_manual_cognitive_v3_path_executes_only_typed_daily_commands():

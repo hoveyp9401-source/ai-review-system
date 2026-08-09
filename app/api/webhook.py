@@ -98,7 +98,6 @@ from app.agent2.business.policy import BusinessEffectPolicy
 from app.agent2.daily_shadow import evaluate_daily_shadow
 from app.agent2.daily_execution import (
     Agent2DailyExecutionResult,
-    agent2_daily_enabled_for_user,
     agent2_daily_report_version,
     execute_agent2_daily_commands,
 )
@@ -401,13 +400,6 @@ async def dingtalk_webhook(
             return response_payload
 
         performance_service = getattr(request.app.state, "performance_service", None)
-        await _observe_workflow_route(
-            session=session,
-            user=user,
-            incoming=incoming,
-            performance_service=performance_service,
-            settings=settings,
-        )
         if performance_service is not None:
             performance_result = await performance_service.submit_text(
                 session,
@@ -631,13 +623,7 @@ async def _submit_webhook_agent2_if_enabled(
         source_message_id=message_id,
     )
     await persist_runtime_owner_claim(session, entrypoint)
-    runtime_owner = decide_runtime_owner(
-        entrypoint.decision,
-        phase2_control_plane_enabled=bool(
-            getattr(settings, "agent2_business_phase2_enabled", False)
-        ),
-        legacy_agent2_daily_enabled=agent2_daily_enabled_for_user(settings, user),
-    )
+    runtime_owner = decide_runtime_owner(entrypoint.decision)
     phase2_primary = runtime_owner == "agent2_primary"
     phase2_business_context = (
         build_business_command_context(
@@ -661,8 +647,6 @@ async def _submit_webhook_agent2_if_enabled(
             read_only=True,
             command_results=[],
         )
-    if runtime_owner == "agent1":
-        return None
     daily_context = await load_live_daily_context(session, user, settings)
     daily_report = daily_context.report
     report_date = daily_context.report_date

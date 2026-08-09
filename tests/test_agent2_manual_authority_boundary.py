@@ -68,7 +68,7 @@ async def test_public_manual_request_source_never_reaches_agent2_route_decision(
 
 @pytest.mark.parametrize("trusted_route", ("agent1", "agent2_shadow"))
 @pytest.mark.asyncio
-async def test_request_source_cannot_force_agent2_against_trusted_route(
+async def test_historical_non_primary_manual_route_is_blocked(
     monkeypatch: pytest.MonkeyPatch,
     trusted_route: str,
 ) -> None:
@@ -106,7 +106,8 @@ async def test_request_source_cannot_force_agent2_against_trusted_route(
         report_date=None,
     )
 
-    assert response is None
+    assert response is not None
+    assert response["reply_kind"] == "agent2_entrypoint_blocked"
 
 
 @pytest.mark.asyncio

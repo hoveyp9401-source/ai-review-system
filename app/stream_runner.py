@@ -127,7 +127,6 @@ from app.agent2.daily_clarification import (
 )
 from app.agent2.daily_state import set_pending_daily_candidate
 from app.agent2.daily_execution import (
-    agent2_daily_enabled_for_user,
     agent2_daily_report_version,
     agent2_daily_should_fallback_to_legacy,
     execute_agent2_daily_commands,
@@ -1506,13 +1505,7 @@ async def _process_stream_agent2_daily_if_enabled(
         source_message_id=source_message_id,
     )
     await persist_runtime_owner_claim(session, entrypoint)
-    runtime_owner = decide_runtime_owner(
-        entrypoint.decision,
-        phase2_control_plane_enabled=bool(
-            getattr(settings, "agent2_business_phase2_enabled", False)
-        ),
-        legacy_agent2_daily_enabled=agent2_daily_enabled_for_user(settings, user),
-    )
+    runtime_owner = decide_runtime_owner(entrypoint.decision)
     phase2_primary = runtime_owner == "agent2_primary"
     phase2_business_context = (
         build_business_command_context(
@@ -1541,18 +1534,6 @@ async def _process_stream_agent2_daily_if_enabled(
         await session.commit()
         _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
         return "agent2_phase2_entrypoint_blocked"
-    if entrypoint.decision.route == "agent2_shadow":
-        await _evaluate_stream_daily_shadow(
-            session=session,
-            user=user,
-            job=job,
-            performance_service=performance_service,
-            settings=settings,
-            mode_override="protective_gate",
-        )
-        return None
-    if runtime_owner == "agent1":
-        return None
     if phase2_primary and not cognitive_core_v3_enabled(settings):
         reply_text = "当前服务暂时无法处理这条消息，本次没有执行任何业务操作。"
         response_payload = {"msgtype": "text", "text": {"content": reply_text}}

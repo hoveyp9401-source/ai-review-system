@@ -120,10 +120,10 @@ def _control(*, mode: str, canary=(), rollback=False) -> TenantRouteControl:
     )
 
 
-def test_route_control_defaults_to_agent1_until_tenant_is_explicitly_cut_over():
+def test_missing_route_control_is_blocked():
     decision = decide_route(None, tenant_id="tenant-test", user_id="u1")
 
-    assert decision.route == "agent1"
+    assert decision.route == "blocked"
     assert decision.reason == "no_tenant_cutover_control"
 
 
@@ -131,7 +131,7 @@ def test_canary_routes_only_listed_users_to_agent2():
     control = _control(mode="agent2_canary", canary=("u1",))
 
     assert decide_route(control, tenant_id="tenant-test", user_id="u1").route == "agent2_primary"
-    assert decide_route(control, tenant_id="tenant-test", user_id="u2").route == "agent1"
+    assert decide_route(control, tenant_id="tenant-test", user_id="u2").route == "blocked"
 
 
 def test_agent2_primary_failure_never_automatically_falls_back_to_agent1():
@@ -142,9 +142,9 @@ def test_agent2_primary_failure_never_automatically_falls_back_to_agent1():
     explicit = decide_agent2_failure(primary, explicit_rollback_requested=True)
 
     assert implicit.route == "blocked"
-    assert implicit.reason == "agent2_failure_no_automatic_agent1_fallback"
-    assert explicit.route == "agent1"
-    assert explicit.reason == "explicit_audited_emergency_rollback"
+    assert implicit.reason == "agent2_failure_no_agent1_fallback"
+    assert explicit.route == "blocked"
+    assert explicit.reason == "agent2_failure_no_agent1_fallback"
 
 
 def test_party_sql_statements_are_tenant_and_case_scoped_and_use_pg_trgm():

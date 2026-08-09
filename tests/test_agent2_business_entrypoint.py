@@ -95,7 +95,7 @@ async def test_entrypoint_is_fail_closed_without_phase2_flag_or_tenant_allowlist
         source_message_id="message-1",
     )
 
-    assert result.decision.route == "agent1"
+    assert result.decision.route == "blocked"
     assert result.decision.reason == "agent2_business_phase2_disabled"
     assert session.scalar_calls == 0
 
@@ -164,11 +164,11 @@ async def test_missing_tenant_route_control_is_blocked_audited_and_committed():
         source_message_id="message-missing-control",
     )
 
-    assert result.decision.route == "agent1"
+    assert result.decision.route == "blocked"
     audits = [item for item in session.added if isinstance(item, RouteControlAudit)]
     assert len(audits) == 1
     assert audits[0].before_json["route_mode"] == "missing"
-    assert audits[0].after_json["resolved_route"] == "agent1"
+    assert audits[0].after_json["resolved_route"] == "blocked"
     assert await persist_runtime_owner_claim(session, result) is True  # type: ignore[arg-type]
     assert session.commits == 1
 
@@ -247,31 +247,25 @@ def test_tenant_allowlist_parser_is_deterministic_and_deduplicated():
     )
 
 
-def test_phase2_route_control_is_authoritative_over_legacy_agent2_daily_flag():
+def test_historical_non_primary_route_is_blocked():
     owner = decide_runtime_owner(
-        RouteDecision("tenant-test", "agent1", "outside_canary"),
-        phase2_control_plane_enabled=True,
-        legacy_agent2_daily_enabled=True,
+        RouteDecision("tenant-test", "agent1", "historical_route"),
     )
 
-    assert owner == "agent1"
+    assert owner == "blocked"
 
 
-def test_legacy_agent2_daily_is_available_only_when_phase2_control_plane_is_off():
+def test_disabled_phase2_route_is_blocked():
     owner = decide_runtime_owner(
-        RouteDecision("", "agent1", "agent2_business_phase2_disabled"),
-        phase2_control_plane_enabled=False,
-        legacy_agent2_daily_enabled=True,
+        RouteDecision("", "blocked", "agent2_business_phase2_disabled"),
     )
 
-    assert owner == "legacy_agent2_daily"
+    assert owner == "blocked"
 
 
-def test_phase2_primary_claims_the_message_even_if_legacy_daily_flag_is_off():
+def test_phase2_primary_claims_the_message():
     owner = decide_runtime_owner(
         RouteDecision("tenant-test", "agent2_primary", "canary_user"),
-        phase2_control_plane_enabled=True,
-        legacy_agent2_daily_enabled=False,
     )
 
     assert owner == "agent2_primary"
