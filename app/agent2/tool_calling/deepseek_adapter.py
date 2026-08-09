@@ -11,6 +11,12 @@ import httpx
 
 from app.agent2.tool_calling.context import TrustedContext
 from app.agent2.tool_calling.contracts import ExecutionMode, ToolReceipt
+from app.agent2.tool_calling.daily_briefing_reply import (
+    daily_briefing_composer_messages,
+    daily_briefing_reply_retry_instruction,
+    render_daily_briefing_reply,
+    validate_daily_briefing_reply,
+)
 from app.agent2.tool_calling.managed_daily_reply import (
     managed_daily_reply_retry_instruction,
     validate_managed_daily_reply,
@@ -432,6 +438,9 @@ class DeepSeekToolCallingAdapter:
             raise TypeError(
                 "run_canary_turn requires a Canary context and runtime session"
             )
+        briefing_user_question = (
+            "\n".join(user_messages) if user_messages else user_text
+        )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {
@@ -457,6 +466,8 @@ class DeepSeekToolCallingAdapter:
         iterations = 0
         tool_loops = 0
         write_batch_seen = False
+        briefing_fact_batch_seen = False
+        daily_briefing_reply_retry_count = 0
         managed_daily_reply_retry_count = 0
         write_reply_retry_count = 0
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
@@ -499,12 +510,17 @@ class DeepSeekToolCallingAdapter:
                             []
                             if (
                                 write_batch_seen
+                                or briefing_fact_batch_seen
+                                or daily_briefing_reply_retry_count
                                 or managed_daily_reply_retry_count
                                 or write_reply_retry_count
                             )
                             else tool_schemas
                         ),
-                        thinking_enabled=thinking_enabled,
+                        thinking_enabled=(
+                            thinking_enabled
+                            or briefing_fact_batch_seen
+                        ),
                     )
                     model_turns.append(
                         _model_turn_audit(
@@ -519,6 +535,10 @@ class DeepSeekToolCallingAdapter:
                         completion,
                         parsed,
                         allow_usable_direct_text=True,
+                        allow_empty_terminal_for_retry=(
+                            briefing_fact_batch_seen
+                            and daily_briefing_reply_retry_count == 0
+                        ),
                     )
                     if protocol_warning is not None:
                         model_turns[-1] = replace(
@@ -566,25 +586,57 @@ class DeepSeekToolCallingAdapter:
 
                     reply_for_validation = content
                     write_validation_errors: tuple[str, ...] = ()
+                    briefing_validation_errors: tuple[str, ...] = ()
+                    briefing_envelope = None
                     if write_batch_seen:
                         envelope, write_validation_errors = (
                             validate_write_reply(content, tuple(receipts))
                         )
                         if envelope is not None:
                             reply_for_validation = envelope.reply
+                    elif briefing_fact_batch_seen:
+                        (
+                            briefing_envelope,
+                            briefing_validation_errors,
+                        ) = validate_daily_briefing_reply(
+                            content,
+                            tuple(receipts),
+                        )
+                        if briefing_envelope is not None:
+                            reply_for_validation = render_daily_briefing_reply(
+                                briefing_envelope
+                            )
                     managed_validation_errors = (
                         validate_managed_daily_reply(
                             reply_for_validation,
                             tuple(receipts),
                         )
                         if not write_validation_errors
+                        and not briefing_validation_errors
                         else ()
                     )
                     validation_errors = (
                         *write_validation_errors,
+                        *briefing_validation_errors,
                         *managed_validation_errors,
                     )
                     if validation_errors:
+                        validation_metadata = {
+                            "terminal_reply_validation": list(
+                                validation_errors
+                            ),
+                        }
+                        if briefing_fact_batch_seen:
+                            validation_metadata[
+                                "daily_briefing_reply_validation"
+                            ] = list(validation_errors)
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                **validation_metadata,
+                            },
+                        )
                         if write_batch_seen:
                             if write_reply_retry_count == 0:
                                 messages.append(parsed.assistant_message)
@@ -612,6 +664,46 @@ class DeepSeekToolCallingAdapter:
                             raise _with_canary_turn_state(
                                 DeepSeekResponseError(
                                     "write reply failed receipt validation"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            )
+                        if briefing_fact_batch_seen:
+                            if daily_briefing_reply_retry_count < 2:
+                                messages = daily_briefing_composer_messages(
+                                    user_question=briefing_user_question,
+                                    receipts=tuple(receipts),
+                                )
+                                messages.append(
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            daily_briefing_reply_retry_instruction(
+                                                tuple(validation_errors),
+                                                tuple(receipts),
+                                                retry_number=(
+                                                    daily_briefing_reply_retry_count
+                                                    + 1
+                                                ),
+                                            )
+                                        ),
+                                    }
+                                )
+                                model_turns[-1] = replace(
+                                    model_turns[-1],
+                                    response_metadata={
+                                        **model_turns[-1].response_metadata,
+                                        "daily_briefing_reply_validation": list(
+                                            validation_errors
+                                        ),
+                                        "daily_briefing_reply_retry": True,
+                                    },
+                                )
+                                daily_briefing_reply_retry_count += 1
+                                continue
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "daily briefing reply failed evidence validation"
                                 ),
                                 audits=audits,
                                 model_turns=model_turns,
@@ -645,13 +737,17 @@ class DeepSeekToolCallingAdapter:
                                 "managed daily reply failed factual validation"
                             ),
                             audits=audits,
-                            model_turns=model_turns,
-                        )
+                                model_turns=model_turns,
+                            )
 
                     if write_batch_seen:
                         await commit_pending()
                     final_content, model_hash = finalize_canary_content(
-                        content,
+                        (
+                            reply_for_validation
+                            if briefing_envelope is not None
+                            else content
+                        ),
                         tuple(receipts),
                         write_batch_seen=write_batch_seen,
                         personal_memory=context.personal_memory,
@@ -690,7 +786,12 @@ class DeepSeekToolCallingAdapter:
                         audits=audits,
                         model_turns=model_turns,
                     )
-                if managed_daily_reply_retry_count or write_reply_retry_count:
+                if (
+                    briefing_fact_batch_seen
+                    or daily_briefing_reply_retry_count
+                    or managed_daily_reply_retry_count
+                    or write_reply_retry_count
+                ):
                     raise _with_canary_turn_state(
                         DeepSeekResponseError(
                             "a terminal reply retry emitted a tool call"
@@ -764,10 +865,20 @@ class DeepSeekToolCallingAdapter:
                             tuple(receipts)
                         )
                     )
+                current_has_briefing_fact = any(
+                    call.tool_name == "query_daily_briefing_facts"
+                    for call in parsed.tool_calls
+                )
                 model_turns[-1] = replace(
                     model_turns[-1],
                     tool_results=tuple(tool_results),
                 )
+                if current_has_briefing_fact and not current_has_write:
+                    messages = daily_briefing_composer_messages(
+                        user_question=briefing_user_question,
+                        receipts=tuple(receipts),
+                    )
+                    briefing_fact_batch_seen = True
                 tool_loops += 1
                 write_batch_seen = write_batch_seen or current_has_write
         except BaseException:
@@ -922,7 +1033,10 @@ def _server_requests_json_object(messages: list[dict[str, Any]]) -> bool:
             continue
         if (
             protocol.get("final_response_required") is True
-            and protocol.get("write_batch_closed") is True
+            and (
+                protocol.get("write_batch_closed") is True
+                or protocol.get("briefing_fact_batch_closed") is True
+            )
             and contract.get("format") == "json_object"
         ):
             return True
@@ -988,6 +1102,7 @@ def _validate_completion_protocol(
     parsed: _ParsedAssistantTurn,
     *,
     allow_usable_direct_text: bool = False,
+    allow_empty_terminal_for_retry: bool = False,
 ) -> str | None:
     finish_reason = completion.metadata.get("finish_reason")
     if parsed.tool_calls:
@@ -1010,6 +1125,8 @@ def _validate_completion_protocol(
         )
     content = parsed.assistant_message.get("content")
     if not isinstance(content, str) or not content.strip():
+        if allow_empty_terminal_for_retry and isinstance(content, str):
+            return "empty_terminal_response_for_retry"
         raise DeepSeekResponseError("DeepSeek returned an empty terminal response")
     return None
 

@@ -767,7 +767,11 @@ def _serialize_briefing_snapshot(
     views: tuple[TeamSubmissionView, ...],
 ) -> dict[str, Any]:
     members = [
-        _serialize_member_snapshot(view, member)
+        _serialize_member_snapshot(
+            view,
+            member,
+            generated_at=generated_at,
+        )
         for view in views
         for member in view.members
     ]
@@ -789,6 +793,8 @@ def _serialize_briefing_snapshot(
 def _serialize_member_snapshot(
     view: TeamSubmissionView,
     member: MemberRecord,
+    *,
+    generated_at: datetime,
 ) -> dict[str, Any]:
     report = next(
         (
@@ -823,11 +829,27 @@ def _serialize_member_snapshot(
             report.confirmation_type if report is not None else None
         ),
         "submitted_at": (
-            report.submitted_at.isoformat()
+            _iso_in_generation_timezone(
+                report.submitted_at,
+                generated_at,
+            )
             if report is not None and report.submitted_at is not None
             else None
         ),
     }
+
+
+def _iso_in_generation_timezone(
+    value: datetime,
+    generated_at: datetime,
+) -> str:
+    """Show snapshot times on the same clock as the briefing generation."""
+
+    if value.tzinfo is None or generated_at.tzinfo is None:
+        # Do not let the machine's local timezone silently reinterpret legacy
+        # naive values. Preserve those values exactly instead.
+        return value.isoformat()
+    return value.astimezone(generated_at.tzinfo).isoformat()
 
 
 def _aggregate_submission_stats(

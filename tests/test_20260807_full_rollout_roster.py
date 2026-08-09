@@ -21,6 +21,7 @@ from scripts.manage_full_rollout import (
 )
 from scripts.simulate_full_rollout_readonly import (
     EXPECTED_CONFIRMED_TEAM_LEADS,
+    SIMULATED_REPORT_DATE,
     _assert_briefings,
     _assert_roster,
 )
@@ -171,25 +172,72 @@ def test_settings_accept_74_and_reject_more_than_full_roster() -> None:
 
 
 def _briefings_for_confirmed_lead_test() -> dict[str, object]:
+    roster = _rollout_rows()
+
+    def snapshot_rows(team_name: str | None = None) -> list[dict[str, object]]:
+        selected = [
+            row
+            for row in roster
+            if team_name is None or row["team_name"] == team_name
+        ]
+        return [
+            {
+                "member_ref": row["user_id"],
+                "member_name": row["name"],
+                "team_ref": row["team_id"],
+                "team_name": row["team_name"],
+                "classification": "missing",
+                "report_status": None,
+                "confirmation_type": None,
+                "submitted_at": None,
+            }
+            for row in selected
+        ]
+
+    def stats(rows: list[dict[str, object]]) -> dict[str, int]:
+        return {
+            "total": len(rows),
+            "completed": 0,
+            "missing": len(rows),
+            "unknown_responsibility": 0,
+            "exempt": 0,
+        }
+
     team_messages = []
     for team_name in CHILD_TEAM_COUNTS:
         lead_name = EXPECTED_CONFIRMED_TEAM_LEADS.get(
             team_name,
             f"{team_name}负责人",
         )
+        team_rows = snapshot_rows(team_name)
         team_messages.append(
             {
                 "team_name": team_name,
                 "target_count": 1,
                 "recipients": [{"name": lead_name}],
+                "stats": stats(team_rows),
+                "briefing_snapshot": {
+                    "scope": "team",
+                    "report_date": SIMULATED_REPORT_DATE.isoformat(),
+                    "generated_at": "2026-08-08T09:00:00+08:00",
+                    "members": team_rows,
+                },
                 "text": "填报概览\n需要负责人关注\n关键进展\n重点计划\n填报质量提示",
             }
         )
+    department_rows = snapshot_rows()
     return {
         "team_messages": team_messages,
         "department_message": {
             "department_name": "法务合约中心",
             "recipients": [{"name": "赵卫中"}, {"name": "朱佳佳"}],
+            "stats": stats(department_rows),
+            "briefing_snapshot": {
+                "scope": "department",
+                "report_date": SIMULATED_REPORT_DATE.isoformat(),
+                "generated_at": "2026-08-08T09:00:00+08:00",
+                "members": department_rows,
+            },
             "text": "填报概览\n需要负责人关注\n关键进展\n重点计划\n填报质量提示",
         },
     }

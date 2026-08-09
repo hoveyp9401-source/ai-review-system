@@ -316,6 +316,7 @@ class ProductionDailyExecutor:
                     team_name=arguments.team_name,
                 ),
                 now=self._context.now,
+                timezone=self._context.principal.timezone,
             )
         except DailyBriefingFactAmbiguous as exc:
             return self._daily_briefing_fact_read_outcome(

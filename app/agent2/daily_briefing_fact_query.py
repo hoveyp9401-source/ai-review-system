@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Protocol
 from uuid import UUID
-import unicodedata
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
 from app.legal_daily_dashboard.domain import DailyReportRecord, MemberRecord
 from app.legal_daily_dashboard.sql_repository import SqlDashboardRepository
 from app.models import ReportInteractionEvent
-
 
 _BRIEFING_ACTIONS = (
     "daily_briefing_sent",
@@ -93,6 +93,7 @@ class DailyBriefingFactQuery:
         actor_user_id: str,
         request: DailyBriefingFactQueryRequest,
         now: datetime,
+        timezone: str,
     ) -> dict[str, Any]:
         del now
         source = await self._repository.load_source(
@@ -142,7 +143,11 @@ class DailyBriefingFactQuery:
         )
         events = tuple(sorted(events, key=lambda item: item.created_at))
         recorded = [
-            _safe_event(event, target_member=target_member)
+            _safe_event(
+                event,
+                target_member=target_member,
+                timezone=timezone,
+            )
             for event in events
         ]
         limits: list[str] = []
@@ -154,10 +159,12 @@ class DailyBriefingFactQuery:
             source.reports,
             target_member=target_member,
             report_date=request.report_date,
+            timezone=timezone,
         )
         return {
             "query_kind": "daily_briefing_facts",
             "report_date": request.report_date.isoformat(),
+            "timezone": timezone,
             "target_member": (
                 _safe_member(target_member)
                 if target_member is not None
@@ -361,11 +368,12 @@ def _safe_event(
     event: DailyBriefingFactEvent,
     *,
     target_member: MemberRecord | None,
+    timezone: str,
 ) -> dict[str, Any]:
     snapshot = event.briefing_snapshot
     member_snapshot = _snapshot_member(snapshot, target_member)
     return {
-        "sent_at": event.created_at.isoformat(),
+        "sent_at": _local_iso(event.created_at, timezone),
         "scope": event.scope,
         "team_name": event.team_name or None,
         "department_name": event.department_name or None,
@@ -375,7 +383,10 @@ def _safe_event(
         "message_text": event.message_text,
         "snapshot_available": snapshot is not None,
         "snapshot_generated_at": (
-            str(snapshot.get("generated_at") or "") or None
+            _local_iso_text(
+                snapshot.get("generated_at"),
+                timezone,
+            )
             if snapshot is not None
             else None
         ),
@@ -423,6 +434,7 @@ def _current_submission(
     *,
     target_member: MemberRecord | None,
     report_date: date,
+    timezone: str,
 ) -> dict[str, Any] | None:
     if target_member is None:
         return None
@@ -449,11 +461,35 @@ def _current_submission(
         "confirmation_type": report.confirmation_type,
         "confirmed_by_user": report.confirmed_by_user,
         "submitted_at": (
-            report.submitted_at.isoformat()
+            _local_iso(report.submitted_at, timezone)
             if report.submitted_at is not None
             else None
         ),
     }
+
+
+def _local_iso(value: datetime, timezone: str) -> str:
+    try:
+        zone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo("Asia/Shanghai")
+    # PostgreSQL timestamptz values are timezone-aware. The UTC attachment is
+    # only a fail-safe for old fixtures/rows that lost their tzinfo metadata.
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(zone).isoformat()
+
+
+def _local_iso_text(value: object, timezone: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        # Preserve the recorded evidence when an old snapshot contains a
+        # non-standard timestamp; do not invent a corrected value.
+        return text
+    return _local_iso(parsed, timezone)
 
 
 def _safe_member(member: MemberRecord) -> dict[str, str]:

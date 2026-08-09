@@ -24,7 +24,6 @@ from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
 from app.models import DailyReport, User, WebhookEvent
 
-
 AUDIT_USER_ID = str(os.getenv("AUDIT_USER_ID", "")).strip()
 SOURCE_DATE = date.fromisoformat(
     str(os.getenv("AUDIT_SOURCE_DATE", "2026-08-07"))
@@ -268,6 +267,34 @@ def safe_model_failure(payload: dict[str, object]) -> dict[str, object]:
                     if isinstance(turn.get("response_metadata"), dict)
                     else None
                 ),
+                "daily_briefing_reply_validation": (
+                    turn.get("response_metadata", {}).get(
+                        "daily_briefing_reply_validation"
+                    )
+                    if isinstance(turn.get("response_metadata"), dict)
+                    else None
+                ),
+                "daily_briefing_reply_retry": (
+                    turn.get("response_metadata", {}).get(
+                        "daily_briefing_reply_retry"
+                    )
+                    if isinstance(turn.get("response_metadata"), dict)
+                    else None
+                ),
+                "daily_briefing_reply_review": (
+                    turn.get("response_metadata", {}).get(
+                        "daily_briefing_reply_review"
+                    )
+                    if isinstance(turn.get("response_metadata"), dict)
+                    else None
+                ),
+                "terminal_reply_validation": (
+                    turn.get("response_metadata", {}).get(
+                        "terminal_reply_validation"
+                    )
+                    if isinstance(turn.get("response_metadata"), dict)
+                    else None
+                ),
                 "response_shape": safe_terminal_shape(
                     turn.get("raw_assistant_message")
                 ),
@@ -382,11 +409,18 @@ async def run_case(
         await session.flush()
         source_message_id = f"full-audit-{name}-{uuid4()}"
         model_failures: list[dict[str, object]] = []
+        model_audits: list[dict[str, object]] = []
         original_audit_recorder = canary_service._record_model_audit_safely
 
         def capture_model_audit(payload):
-            if isinstance(payload, dict) and payload.get("status") == "failed":
-                model_failures.append(safe_model_failure(payload))
+            if isinstance(payload, dict):
+                safe_audit = {
+                    "status": payload.get("status"),
+                    **safe_model_failure(payload),
+                }
+                model_audits.append(safe_audit)
+                if payload.get("status") == "failed":
+                    model_failures.append(safe_audit)
             original_audit_recorder(payload)
 
         canary_service._record_model_audit_safely = capture_model_audit
@@ -433,6 +467,7 @@ async def run_case(
             ),
             "model_elapsed_seconds": float(outcome.model_elapsed_seconds),
             "model_result_status": outcome.model_result_status,
+            "model_audits": model_audits,
             "tool_status_counts": {
                 "success": int(outcome.tool_success_count),
                 "no_op": int(outcome.tool_no_op_count),
@@ -567,9 +602,63 @@ async def run_case(
                 if isinstance(payload, dict)
                 for limit in payload.get("evidence_limits", [])
             ]
+            recorded_events = [
+                event
+                for payload in briefing_fact_payloads
+                if isinstance(payload, dict)
+                for event in payload.get("recorded_briefings", [])
+                if isinstance(event, dict)
+            ]
+            recorded_message_texts = [
+                str(event.get("message_text") or "")
+                for event in recorded_events
+                if str(event.get("message_text") or "")
+            ]
+            quoted_fragments = re.findall(r"“([^”]+)”", reply)
+            recorded_quote_grounded = any(
+                quote in recorded_text
+                for quote in quoted_fragments
+                for recorded_text in recorded_message_texts
+            )
+            premise_corrected = (
+                "系统保存的这份晨报原文与问题中的情况不一致。"
+                in reply
+            )
+            recorded_times_localized = bool(recorded_events) and all(
+                _same_utc_offset(
+                    str(event.get("sent_at") or ""),
+                    now,
+                )
+                for event in recorded_events
+            )
+            reply_uses_local_time = "UTC" not in reply and "01:00" not in reply
+            submission_overclaim = bool(
+                re.search(
+                    r"(?:庞浩|你|您).{0,16}"
+                    r"(?:被|已)?(?:列入|列为|归入).{0,6}(?:已交|已提交)|"
+                    r"(?:被|已)(?:列入|列为|归入).{0,6}(?:已交|已提交)名单",
+                    reply,
+                )
+            )
             speculative = bool(
                 re.search(
                     r"快照.*(之后|延迟|时间差|尚未提交)|提交.*晚于.*晨报|统计.*延迟|统计.*早于.*提交|统计已经跑完",
+                    reply,
+                )
+            )
+            speculative = speculative or bool(
+                re.search(
+                    r"(可能|也许|或许|推测|猜测|会不会|是不是|或者|或是)"
+                    r".{0,80}"
+                    r"(原因|导致|因为|由于|同一份|版本|转发|误解|偏差|"
+                    r"顺序|先后|延迟|故障|抓取)",
+                    reply,
+                )
+            )
+            speculative = speculative or bool(
+                re.search(
+                    r"(说明|表明).{0,80}(晨报生成时|生成时|当时)"
+                    r".{0,80}(已提交|未提交|提交状态)",
                     reply,
                 )
             )
@@ -580,16 +669,7 @@ async def run_case(
             )
             limitation_explained = (
                 not evidence_limits
-                or any(
-                    marker in reply
-                    for marker in (
-                        "无法确认",
-                        "不能确认",
-                        "没有保存",
-                        "缺少",
-                        "证据不足",
-                    )
-                )
+                or all(limit in reply for limit in evidence_limits)
             )
             result["expected"] = "confirm facts but do not invent an incident cause"
             result["speculative_cause"] = speculative
@@ -597,16 +677,28 @@ async def run_case(
             result["briefing_fact_receipt_count"] = len(
                 briefing_receipts
             )
+            result["total_receipt_count"] = len(receipts)
             result["evidence_limit_count"] = len(evidence_limits)
             result["limitation_explained"] = limitation_explained
+            result["premise_corrected_from_recorded_copy"] = premise_corrected
+            result["recorded_quote_grounded"] = recorded_quote_grounded
+            result["recorded_times_localized"] = recorded_times_localized
+            result["reply_uses_local_time"] = reply_uses_local_time
+            result["submission_overclaim"] = submission_overclaim
             result["passed"] = bool(
                 not outcome.actual_write
                 and len(briefing_receipts) == 1
+                and len(receipts) == 1
                 and briefing_receipts[0].status == "success"
                 and not briefing_receipts[0].changed
                 and not speculative
                 and not incomplete_reply
                 and limitation_explained
+                and premise_corrected
+                and recorded_quote_grounded
+                and recorded_times_localized
+                and reply_uses_local_time
+                and not submission_overclaim
                 and not result["raw_error_exposed"]
             )
         await session.rollback()
@@ -631,6 +723,14 @@ async def run_case(
             and report_snapshot(restored_target) == target_production_before
         )
     return result
+
+
+def _same_utc_offset(value: str, expected: datetime) -> bool:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.utcoffset() == expected.utcoffset()
 
 
 async def main() -> None:

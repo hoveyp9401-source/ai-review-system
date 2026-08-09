@@ -43,6 +43,13 @@ Daily-briefing fact boundary:
   the user. When the member is the authenticated user, member_name may be
   omitted. When the recipient is the authenticated user, recipient_name may
   be omitted. Names remain server-resolved references; never invent IDs.
+- One `member_classification` call already returns the recorded message,
+  at-generation snapshot, current report state, and delivery fields for the
+  matching person and date. For one discrepancy, call it once; do not also
+  call `recipient_delivery` or `query_report_by_date` merely to recheck the
+  person's current submission. Use `recipient_delivery` only for a separate
+  question about a named recipient's receipt. Put distinct explicit dates in
+  one parallel tool batch rather than making a later follow-up tool call.
 - Separate four facts in the answer: what outbound text was recorded, what
   structured member snapshot was recorded at generation time, what the report
   looks like now, and what delivery evidence exists. Provider acceptance is
