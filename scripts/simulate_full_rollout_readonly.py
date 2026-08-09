@@ -440,6 +440,55 @@ def _assert_briefings(briefings: dict[str, object]) -> dict[str, object]:
     if department_recipients != EXPECTED_DEPARTMENT_RECIPIENTS:
         raise AssertionError(sorted(department_recipients))
 
+    team_snapshot_refs: set[str] = set()
+    for message in team_messages:
+        snapshot_rows = _assert_briefing_snapshot(
+            message,
+            expected_scope="team",
+        )
+        snapshot_refs = {
+            str(row.get("member_ref") or "") for row in snapshot_rows
+        }
+        if team_snapshot_refs & snapshot_refs:
+            raise AssertionError("a member appears in more than one team snapshot")
+        team_snapshot_refs.update(snapshot_refs)
+
+    department_snapshot_rows = _assert_briefing_snapshot(
+        department_message,
+        expected_scope="department",
+    )
+    department_snapshot_refs = {
+        str(row.get("member_ref") or "")
+        for row in department_snapshot_rows
+    }
+    if len(team_snapshot_refs) != CHILD_ROSTER_COUNT:
+        raise AssertionError(
+            {"unexpected_team_snapshot_member_count": len(team_snapshot_refs)}
+        )
+    if len(department_snapshot_refs) != ROLLOUT_COUNT:
+        raise AssertionError(
+            {
+                "unexpected_department_snapshot_member_count": len(
+                    department_snapshot_refs
+                )
+            }
+        )
+    if not team_snapshot_refs < department_snapshot_refs:
+        raise AssertionError(
+            "the department snapshot must contain every team member and center direct members"
+        )
+    center_snapshot_members = [
+        row
+        for row in department_snapshot_rows
+        if str(row.get("member_ref") or "") not in team_snapshot_refs
+    ]
+    if {
+        str(row.get("member_name") or "") for row in center_snapshot_members
+    } != EXPECTED_CENTER_LEVEL_MEMBERS:
+        raise AssertionError(
+            "the department snapshot does not contain the expected center direct members"
+        )
+
     messages = [*team_messages, department_message]
     part_counts = []
     for message in messages:
@@ -458,6 +507,12 @@ def _assert_briefings(briefings: dict[str, object]) -> dict[str, object]:
         "department_name": department_message["department_name"],
         "briefing_message_count": len(messages),
         "briefing_part_count": sum(part_counts),
+        "team_snapshot_member_count": len(team_snapshot_refs),
+        "department_snapshot_member_count": len(department_snapshot_refs),
+        "center_direct_snapshot_members": sorted(
+            str(row.get("member_name") or "")
+            for row in center_snapshot_members
+        ),
         "briefing_content_sections_checked": [
             "填报概览",
             "需要负责人关注",
@@ -466,6 +521,81 @@ def _assert_briefings(briefings: dict[str, object]) -> dict[str, object]:
             "填报质量提示",
         ],
     }
+
+
+def _assert_briefing_snapshot(
+    message: dict[str, object],
+    *,
+    expected_scope: str,
+) -> list[dict[str, object]]:
+    snapshot = message.get("briefing_snapshot")
+    if not isinstance(snapshot, dict):
+        raise AssertionError("briefing snapshot is missing")
+    if snapshot.get("scope") != expected_scope:
+        raise AssertionError(
+            {
+                "unexpected_briefing_snapshot_scope": snapshot.get("scope"),
+                "expected": expected_scope,
+            }
+        )
+    if snapshot.get("report_date") != SIMULATED_REPORT_DATE.isoformat():
+        raise AssertionError(
+            {"unexpected_briefing_snapshot_date": snapshot.get("report_date")}
+        )
+    if not str(snapshot.get("generated_at") or ""):
+        raise AssertionError("briefing snapshot generation time is missing")
+    rows = snapshot.get("members")
+    if not isinstance(rows, list) or not rows:
+        raise AssertionError("briefing snapshot members are missing")
+    if any(not isinstance(row, dict) for row in rows):
+        raise AssertionError("briefing snapshot contains an invalid member row")
+    typed_rows = [dict(row) for row in rows]
+    member_refs = [str(row.get("member_ref") or "") for row in typed_rows]
+    if not all(member_refs) or len(member_refs) != len(set(member_refs)):
+        raise AssertionError("briefing snapshot member references are missing or duplicated")
+    required_text_fields = ("member_name", "team_ref", "team_name")
+    if any(
+        not all(str(row.get(field) or "") for field in required_text_fields)
+        for row in typed_rows
+    ):
+        raise AssertionError("briefing snapshot member identity is incomplete")
+    allowed_classifications = {
+        "submitted",
+        "pending_confirmation",
+        "missing",
+        "responsibility_unknown",
+        "exempt",
+    }
+    classifications = [
+        str(row.get("classification") or "") for row in typed_rows
+    ]
+    if any(value not in allowed_classifications for value in classifications):
+        raise AssertionError(
+            {"unexpected_briefing_classifications": sorted(set(classifications))}
+        )
+    stats = message.get("stats")
+    if not isinstance(stats, dict):
+        raise AssertionError("briefing statistics are missing")
+    if len(typed_rows) != int(stats.get("total") or 0):
+        raise AssertionError(
+            {
+                "snapshot_member_count": len(typed_rows),
+                "briefing_total": stats.get("total"),
+            }
+        )
+    if classifications.count("submitted") != int(stats.get("completed") or 0):
+        raise AssertionError("briefing snapshot completed count does not match its text facts")
+    if classifications.count("missing") != int(stats.get("missing") or 0):
+        raise AssertionError("briefing snapshot missing count does not match its text facts")
+    if classifications.count("responsibility_unknown") != int(
+        stats.get("unknown_responsibility") or 0
+    ):
+        raise AssertionError(
+            "briefing snapshot responsibility count does not match its text facts"
+        )
+    if classifications.count("exempt") != int(stats.get("exempt") or 0):
+        raise AssertionError("briefing snapshot exemption count does not match its text facts")
+    return typed_rows
 
 
 def _csv_values(raw: str) -> tuple[str, ...]:
