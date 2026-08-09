@@ -342,13 +342,9 @@ class SandboxDailyExecutor:
             arguments.source_date_expression,
             arguments.proposed_source_date,
         )
-        source_id = str(arguments.report_id)
-        if source_id != self._report_id(source_date):
-            raise SandboxExecutionError("SOURCE_REPORT_DATE_MISMATCH")
-        source = await self._versioned_report(
-            source_id,
-            arguments.expected_version,
-        )
+        source_id = self._report_id(source_date)
+        source = await self._owned_report(source_id, required=True)
+        source_version = int(source["version"])
         target_date = self._today()
         target_id = self._report_id(target_date)
         target = await self._owned_report(target_id, required=False)
@@ -393,7 +389,7 @@ class SandboxDailyExecutor:
                         "provenance": {
                             "kind": "sandbox_copy_previous",
                             "source_report_id": source_id,
-                            "source_report_version": arguments.expected_version,
+                            "source_report_version": source_version,
                             "source_item_id": source_item["item_id"],
                         },
                         "created_at": self._now(),

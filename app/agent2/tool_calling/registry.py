@@ -482,14 +482,15 @@ TOOL_REGISTRY = MappingProxyType(
         ),
         "copy_previous_to_today": _definition(
             "copy_previous_to_today",
-            "Copy a trusted owned previous report into today only when report_id and "
-            "expected_version match the server-resolved source date and current source snapshot. "
+            "Copy the authenticated user's complete report from the model-resolved source date "
+            "into today. The model supplies only the source-date meaning; the server binds the "
+            "owned source report, its current version, and today's target report. "
             "When the same "
             "user request also adds a new independent item, pair this call with add_daily_items "
             "in the same initial write batch against the same trusted pre-write today snapshot. "
             "In shadow this does not produce an intermediate trusted version.",
             CopyPreviousToTodayArgs, "write", "medium", _OWNER_WRITE,
-            "trusted_previous_report_version_and_today_owner_report",
+            "server_resolved_source_and_today_owner_reports",
             "server_source_expression_and_server_today",
             idempotency=_WRITE_KEY, transaction=_ATOMIC,
             transaction_target="today_report",

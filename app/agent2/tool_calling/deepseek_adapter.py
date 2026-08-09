@@ -33,6 +33,12 @@ from app.agent2.tool_calling.runtime import (
     TurnExecutionPlan,
     merge_turn_plans,
 )
+from app.agent2.tool_calling.write_reply import (
+    model_safe_user_facts,
+    validate_write_reply,
+    write_reply_protocol,
+    write_reply_retry_instruction,
+)
 
 _TEXTUAL_TOOL_PROTOCOL_MARKERS = (
     "<｜DSML｜tool_calls",
@@ -452,222 +458,321 @@ class DeepSeekToolCallingAdapter:
         tool_loops = 0
         write_batch_seen = False
         managed_daily_reply_retry_count = 0
+        write_reply_retry_count = 0
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
-        while True:
-            iterations += 1
-            try:
-                completion = await self._complete(
-                    messages,
-                    tool_schemas=(
-                        []
-                        if (
-                            write_batch_seen
-                            or managed_daily_reply_retry_count
-                        )
-                        else tool_schemas
-                    ),
-                    thinking_enabled=thinking_enabled,
-                )
-                model_turns.append(
-                    _model_turn_audit(
-                        iterations,
-                        completion.message,
-                        response_metadata=completion.metadata,
-                    )
-                )
-                parsed = _parse_assistant_turn(completion.message)
-                audits.extend(parsed.audit)
-                protocol_warning = _validate_completion_protocol(
-                    completion,
-                    parsed,
-                    allow_usable_direct_text=True,
-                )
-                if protocol_warning is not None:
-                    model_turns[-1] = replace(
-                        model_turns[-1],
-                        response_metadata={
-                            **model_turns[-1].response_metadata,
-                            "protocol_warning": protocol_warning,
-                        },
-                    )
-            except DeepSeekToolCallingError as exc:
-                raise _with_canary_turn_state(
-                    exc,
-                    audits=audits,
-                    model_turns=model_turns,
-                ) from exc
+        async def rollback_pending() -> None:
+            if not runtime_results or not runtime_results[-1].transaction_pending:
+                return
+            rollback = getattr(runtime_session, "rollback_pending", None)
+            if rollback is not None:
+                await rollback()
 
-            if not parsed.tool_calls:
-                content = parsed.assistant_message.get("content")
-                if not isinstance(content, str):
-                    raise _with_canary_turn_state(
-                        DeepSeekResponseError(
-                            "assistant response has neither tool calls nor text content"
-                        ),
-                        audits=audits,
-                        model_turns=model_turns,
-                    )
-                if any(marker in content for marker in _TEXTUAL_TOOL_PROTOCOL_MARKERS):
-                    error = (
-                        ToolCallsAfterWriteBatchError(
-                            "textual tool protocol appeared after the write batch closed"
-                        )
-                        if write_batch_seen
-                        else MalformedToolCallError(
-                            "textual tool protocol is not a native Tool Call"
-                        )
-                    )
-                    raise _with_canary_turn_state(
-                        error,
-                        audits=audits,
-                        model_turns=model_turns,
-                    )
-                validation_errors = validate_managed_daily_reply(
-                    content,
-                    tuple(receipts),
+        async def commit_pending() -> None:
+            if not runtime_results or not runtime_results[-1].transaction_pending:
+                return
+            commit = getattr(runtime_session, "commit_pending", None)
+            if commit is None:
+                raise ProductionRuntimeExecutionError(
+                    "production runtime cannot finalize a pending turn"
                 )
-                if validation_errors:
-                    if managed_daily_reply_retry_count == 0:
-                        messages.append(parsed.assistant_message)
-                        messages.append(
-                            {
-                                "role": "system",
-                                "content": (
-                                    managed_daily_reply_retry_instruction(
-                                        validation_errors
-                                    )
-                                ),
-                            }
+            committed = await commit()
+            if (
+                not isinstance(committed, ProductionRuntimeResult)
+                or committed.status != "success"
+                or committed.transaction_pending
+                or not committed.committed_to_outer_transaction
+                or committed.receipts != runtime_results[-1].receipts
+            ):
+                raise ProductionRuntimeExecutionError(
+                    "production runtime returned an invalid finalization result"
+                )
+            runtime_results[-1] = committed
+
+        try:
+            while True:
+                iterations += 1
+                try:
+                    completion = await self._complete(
+                        messages,
+                        tool_schemas=(
+                            []
+                            if (
+                                write_batch_seen
+                                or managed_daily_reply_retry_count
+                                or write_reply_retry_count
+                            )
+                            else tool_schemas
+                        ),
+                        thinking_enabled=thinking_enabled,
+                    )
+                    model_turns.append(
+                        _model_turn_audit(
+                            iterations,
+                            completion.message,
+                            response_metadata=completion.metadata,
                         )
+                    )
+                    parsed = _parse_assistant_turn(completion.message)
+                    audits.extend(parsed.audit)
+                    protocol_warning = _validate_completion_protocol(
+                        completion,
+                        parsed,
+                        allow_usable_direct_text=True,
+                    )
+                    if protocol_warning is not None:
                         model_turns[-1] = replace(
                             model_turns[-1],
                             response_metadata={
                                 **model_turns[-1].response_metadata,
-                                "managed_daily_reply_validation": (
-                                    list(validation_errors)
-                                ),
-                                "managed_daily_reply_retry": True,
+                                "protocol_warning": protocol_warning,
                             },
                         )
-                        managed_daily_reply_retry_count += 1
-                        continue
+                except DeepSeekToolCallingError as exc:
                     raise _with_canary_turn_state(
-                        DeepSeekResponseError(
-                            "managed daily reply failed factual validation"
+                        exc,
+                        audits=audits,
+                        model_turns=model_turns,
+                    ) from exc
+
+                if not parsed.tool_calls:
+                    content = parsed.assistant_message.get("content")
+                    if not isinstance(content, str):
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "assistant response has neither tool calls nor text content"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+                    if any(
+                        marker in content
+                        for marker in _TEXTUAL_TOOL_PROTOCOL_MARKERS
+                    ):
+                        error = (
+                            ToolCallsAfterWriteBatchError(
+                                "textual tool protocol appeared after the write batch closed"
+                            )
+                            if write_batch_seen
+                            else MalformedToolCallError(
+                                "textual tool protocol is not a native Tool Call"
+                            )
+                        )
+                        raise _with_canary_turn_state(
+                            error,
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+
+                    reply_for_validation = content
+                    write_validation_errors: tuple[str, ...] = ()
+                    if write_batch_seen:
+                        envelope, write_validation_errors = (
+                            validate_write_reply(content, tuple(receipts))
+                        )
+                        if envelope is not None:
+                            reply_for_validation = envelope.reply
+                    managed_validation_errors = (
+                        validate_managed_daily_reply(
+                            reply_for_validation,
+                            tuple(receipts),
+                        )
+                        if not write_validation_errors
+                        else ()
+                    )
+                    validation_errors = (
+                        *write_validation_errors,
+                        *managed_validation_errors,
+                    )
+                    if validation_errors:
+                        if write_batch_seen:
+                            if write_reply_retry_count == 0:
+                                messages.append(parsed.assistant_message)
+                                messages.append(
+                                    {
+                                        "role": "system",
+                                        "content": write_reply_retry_instruction(
+                                            tuple(validation_errors),
+                                            tuple(receipts),
+                                        ),
+                                    }
+                                )
+                                model_turns[-1] = replace(
+                                    model_turns[-1],
+                                    response_metadata={
+                                        **model_turns[-1].response_metadata,
+                                        "write_reply_validation": list(
+                                            validation_errors
+                                        ),
+                                        "write_reply_retry": True,
+                                    },
+                                )
+                                write_reply_retry_count += 1
+                                continue
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "write reply failed receipt validation"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            )
+                        if managed_daily_reply_retry_count == 0:
+                            messages.append(parsed.assistant_message)
+                            messages.append(
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        managed_daily_reply_retry_instruction(
+                                            tuple(validation_errors)
+                                        )
+                                    ),
+                                }
+                            )
+                            model_turns[-1] = replace(
+                                model_turns[-1],
+                                response_metadata={
+                                    **model_turns[-1].response_metadata,
+                                    "managed_daily_reply_validation": list(
+                                        validation_errors
+                                    ),
+                                    "managed_daily_reply_retry": True,
+                                },
+                            )
+                            managed_daily_reply_retry_count += 1
+                            continue
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "managed daily reply failed factual validation"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+
+                    if write_batch_seen:
+                        await commit_pending()
+                    final_content, model_hash = finalize_canary_content(
+                        content,
+                        tuple(receipts),
+                        write_batch_seen=write_batch_seen,
+                        personal_memory=context.personal_memory,
+                    )
+                    return DeepSeekCanaryResult(
+                        final_content=final_content,
+                        model_content_sha256=model_hash,
+                        iterations=iterations,
+                        raw_tool_call_audit=tuple(audits),
+                        receipts=tuple(receipts),
+                        runtime_results=tuple(runtime_results),
+                        model_turns=tuple(model_turns),
+                        request_attempt_count=sum(
+                            int(
+                                item.response_metadata.get(
+                                    "request_attempt_count", 1
+                                )
+                            )
+                            for item in model_turns
+                        ),
+                        transport_retry_count=sum(
+                            int(
+                                item.response_metadata.get(
+                                    "transport_retry_count", 0
+                                )
+                            )
+                            for item in model_turns
+                        ),
+                    )
+
+                if tool_loops >= self._max_tool_loops:
+                    raise _with_canary_turn_state(
+                        MaxToolLoopsExceeded(
+                            "maximum tool-call loops exceeded"
                         ),
                         audits=audits,
                         model_turns=model_turns,
                     )
-                final_content, model_hash = finalize_canary_content(
-                    content,
-                    tuple(receipts),
-                    write_batch_seen=write_batch_seen,
-                    personal_memory=context.personal_memory,
-                )
-                return DeepSeekCanaryResult(
-                    final_content=final_content,
-                    model_content_sha256=model_hash,
-                    iterations=iterations,
-                    raw_tool_call_audit=tuple(audits),
-                    receipts=tuple(receipts),
-                    runtime_results=tuple(runtime_results),
-                    model_turns=tuple(model_turns),
-                    request_attempt_count=sum(
-                        int(
-                            item.response_metadata.get(
-                                "request_attempt_count", 1
-                            )
-                        )
-                        for item in model_turns
-                    ),
-                    transport_retry_count=sum(
-                        int(
-                            item.response_metadata.get(
-                                "transport_retry_count", 0
-                            )
-                        )
-                        for item in model_turns
-                    ),
-                )
+                if managed_daily_reply_retry_count or write_reply_retry_count:
+                    raise _with_canary_turn_state(
+                        DeepSeekResponseError(
+                            "a terminal reply retry emitted a tool call"
+                        ),
+                        audits=audits,
+                        model_turns=model_turns,
+                    )
+                if write_batch_seen:
+                    raise _with_canary_turn_state(
+                        ToolCallsAfterWriteBatchError(
+                            "a user turn may contain only one complete write-tool batch"
+                        ),
+                        audits=audits,
+                        model_turns=model_turns,
+                    )
+                try:
+                    _reject_repeated_calls(
+                        parsed.tool_calls,
+                        seen_ids=seen_ids,
+                        seen_fingerprints=seen_fingerprints,
+                        audit=(),
+                    )
+                except DeepSeekToolCallingError as exc:
+                    raise _with_canary_turn_state(
+                        exc,
+                        audits=audits,
+                        model_turns=model_turns,
+                    ) from exc
 
-            if tool_loops >= self._max_tool_loops:
-                raise _with_canary_turn_state(
-                    MaxToolLoopsExceeded(
-                        "maximum tool-call loops exceeded"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
+                current_has_write = any(
+                    TOOL_REGISTRY[call.tool_name].read_or_write == "write"
+                    for call in parsed.tool_calls
                 )
-            if managed_daily_reply_retry_count:
-                raise _with_canary_turn_state(
-                    DeepSeekResponseError(
-                        "managed daily reply retry emitted a tool call"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
+                messages.append(parsed.assistant_message)
+                runtime_result = (
+                    await runtime_session.execute(
+                        parsed.tool_calls,
+                        defer_finalization=True,
+                    )
+                    if current_has_write
+                    else await runtime_session.execute(parsed.tool_calls)
                 )
-            if write_batch_seen:
-                raise _with_canary_turn_state(
-                    ToolCallsAfterWriteBatchError(
-                        "a user turn may contain only one complete write-tool batch"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
-                )
-            try:
-                _reject_repeated_calls(
+                if (
+                    not isinstance(runtime_result, ProductionRuntimeResult)
+                    or runtime_result.status == "failed"
+                    or len(runtime_result.receipts) != len(parsed.tool_calls)
+                ):
+                    code = (
+                        runtime_result.error_code
+                        if isinstance(runtime_result, ProductionRuntimeResult)
+                        else "INVALID_PRODUCTION_RUNTIME_RESULT"
+                    )
+                    raise _with_canary_turn_state(
+                        ProductionRuntimeExecutionError(
+                            f"production runtime failed closed: {code}"
+                        ),
+                        audits=audits,
+                        model_turns=model_turns,
+                    )
+                runtime_results.append(runtime_result)
+                receipts.extend(runtime_result.receipts)
+                tool_results = _canary_tool_result_messages(
                     parsed.tool_calls,
-                    seen_ids=seen_ids,
-                    seen_fingerprints=seen_fingerprints,
-                    audit=(),
+                    runtime_result.receipts,
+                    write_batch_closed=current_has_write,
                 )
-            except DeepSeekToolCallingError as exc:
-                raise _with_canary_turn_state(
-                    exc,
-                    audits=audits,
-                    model_turns=model_turns,
-                ) from exc
-
-            current_has_write = any(
-                TOOL_REGISTRY[call.tool_name].read_or_write == "write"
-                for call in parsed.tool_calls
-            )
-            messages.append(parsed.assistant_message)
-            runtime_result = await runtime_session.execute(parsed.tool_calls)
-            if (
-                not isinstance(runtime_result, ProductionRuntimeResult)
-                or runtime_result.status == "failed"
-                or len(runtime_result.receipts) != len(parsed.tool_calls)
-            ):
-                code = (
-                    runtime_result.error_code
-                    if isinstance(runtime_result, ProductionRuntimeResult)
-                    else "INVALID_PRODUCTION_RUNTIME_RESULT"
+                messages.extend(tool_results)
+                if current_has_write:
+                    messages.append(
+                        _canary_post_write_protocol_message(
+                            tuple(receipts)
+                        )
+                    )
+                model_turns[-1] = replace(
+                    model_turns[-1],
+                    tool_results=tuple(tool_results),
                 )
-                raise _with_canary_turn_state(
-                    ProductionRuntimeExecutionError(
-                        f"production runtime failed closed: {code}"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
-                )
-            runtime_results.append(runtime_result)
-            receipts.extend(runtime_result.receipts)
-            tool_results = _canary_tool_result_messages(
-                parsed.tool_calls,
-                runtime_result.receipts,
-                write_batch_closed=current_has_write,
-            )
-            messages.extend(tool_results)
-            if current_has_write:
-                messages.append(_canary_post_write_protocol_message())
-            model_turns[-1] = replace(
-                model_turns[-1],
-                tool_results=tuple(tool_results),
-            )
-            tool_loops += 1
-            write_batch_seen = write_batch_seen or current_has_write
+                tool_loops += 1
+                write_batch_seen = write_batch_seen or current_has_write
+        except BaseException:
+            await rollback_pending()
+            raise
 
     async def _complete(
         self,
@@ -1031,6 +1136,7 @@ def _canary_tool_result_messages(
             "execution_mode": ExecutionMode.CANARY_EXECUTE.value,
             "final_response_required": True,
             "final_response_source": "safe_user_facts_only",
+            "terminal_response_contract": write_reply_protocol(receipts),
             "further_tool_calls_allowed": False,
             "same_turn_pending_confirmation_allowed": False,
             "write_batch_closed": True,
@@ -1044,7 +1150,11 @@ def _canary_tool_result_messages(
             "tool_call_id": call.tool_call_id,
             "content": json.dumps(
                 {
-                    "safe_user_facts": receipt.safe_user_facts,
+                    "safe_user_facts": (
+                        model_safe_user_facts(receipt)
+                        if write_batch_closed
+                        else receipt.safe_user_facts
+                    ),
                     **(
                         {"turn_protocol": turn_protocol}
                         if turn_protocol
@@ -1060,7 +1170,9 @@ def _canary_tool_result_messages(
     ]
 
 
-def _canary_post_write_protocol_message() -> dict[str, str]:
+def _canary_post_write_protocol_message(
+    receipts: tuple[ToolReceipt, ...],
+) -> dict[str, str]:
     return {
         "role": "system",
         "content": json.dumps(
@@ -1069,7 +1181,9 @@ def _canary_post_write_protocol_message() -> dict[str, str]:
                     "execution_mode": ExecutionMode.CANARY_EXECUTE.value,
                     "final_response_required": True,
                     "final_response_source": "safe_user_facts_only",
-                    "deterministic_write_reply": True,
+                    "terminal_response_contract": write_reply_protocol(
+                        receipts
+                    ),
                     "further_tool_calls_allowed": False,
                     "native_or_textual_tool_calls_allowed": False,
                     "same_turn_pending_confirmation_allowed": False,

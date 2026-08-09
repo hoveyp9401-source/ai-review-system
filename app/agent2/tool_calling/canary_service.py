@@ -971,6 +971,17 @@ def _select_trusted_read_response(
 ) -> str:
     """Allow natural wording only when it remains inside trusted facts."""
 
+    if any(
+        (
+            definition := TOOL_REGISTRY.get(
+                str(getattr(receipt, "tool_name", "") or "")
+            )
+        )
+        is not None
+        and definition.read_or_write == "write"
+        for receipt in receipts
+    ):
+        return str(model_content or "").strip()
     performance = _model_composable_performance_facts(
         receipts
     )

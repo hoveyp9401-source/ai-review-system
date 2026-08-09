@@ -284,8 +284,6 @@ class MoveDailyItemsArgs(_VersionedItemTarget):
 
 
 class CopyPreviousToTodayArgs(StrictContract):
-    report_id: UUID
-    expected_version: int = Field(ge=0)
     source_date_expression: DateExpression
     proposed_source_date: date
 

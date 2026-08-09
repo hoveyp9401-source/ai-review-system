@@ -235,6 +235,21 @@ class ShadowCallBinder:
                 "trusted_previous_report_version_and_today_owner_report",
             }:
                 report = self._context.today_report
+            if (
+                definition.object_binding_policy
+                == "server_resolved_source_and_today_owner_reports"
+                and source_report is None
+            ):
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "SOURCE_REPORT_NOT_FOUND",
+                    safe_user_facts={
+                        "source_report_date": (
+                            source_resolution.resolved_date.isoformat()
+                        ),
+                    },
+                )
         if definition.object_binding_policy == "server_today_owner_report":
             report = self._context.today_report
 

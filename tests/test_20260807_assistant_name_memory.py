@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -130,7 +132,14 @@ def test_assistant_name_write_has_grounded_acknowledgement() -> None:
     )
 
     content, _ = finalize_canary_content(
-        "untrusted model success prose",
+        json.dumps(
+            {
+                "reply": "好，以后我就叫“兼爱”。",
+                "actual_write": True,
+                "operation_outcome": "changed",
+            },
+            ensure_ascii=False,
+        ),
         (receipt,),
         write_batch_seen=True,
     )

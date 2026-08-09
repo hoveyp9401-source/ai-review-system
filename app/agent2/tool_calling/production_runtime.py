@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import logging
@@ -80,6 +80,12 @@ class _PreparedCall:
     operation_fingerprint: str
 
 
+@dataclass(frozen=True)
+class _PendingExecution:
+    transaction: Any
+    committed_result: ProductionRuntimeResult
+
+
 class ProductionRuntime:
     """Canary-only Registry executor; it has no LLM or message sender."""
 
@@ -155,13 +161,25 @@ class ProductionRuntimeSession:
         self._source_text_hash = source_text_hash
         self._binder = binder
         self._date_resolver = date_resolver
+        self._pending_execution: _PendingExecution | None = None
 
     async def execute(
         self,
         tool_calls: tuple[NativeToolCall, ...],
         *,
         commit_to_outer_transaction: bool = True,
+        defer_finalization: bool = False,
     ) -> ProductionRuntimeResult:
+        if self._pending_execution is not None:
+            return ProductionRuntimeResult(
+                status="failed",
+                error_code="PENDING_TRANSACTION_REQUIRES_FINALIZATION",
+            )
+        if defer_finalization and not commit_to_outer_transaction:
+            return ProductionRuntimeResult(
+                status="failed",
+                error_code="INVALID_TRANSACTION_FINALIZATION_MODE",
+            )
         if not isinstance(tool_calls, tuple) or not tool_calls or any(
             not isinstance(call, NativeToolCall) for call in tool_calls
         ):
@@ -340,10 +358,6 @@ class ProductionRuntimeSession:
                     generated.append(receipt)
                 receipts = tuple(generated)
 
-            if commit_to_outer_transaction:
-                await nested.commit()
-            else:
-                await nested.rollback()
             successful_ids = frozenset(
                 call.tool_call_id
                 for call, receipt in zip(tool_calls, receipts, strict=True)
@@ -354,38 +368,49 @@ class ProductionRuntimeSession:
                 [item.bound for item in prepared],
                 successful_ids,
             )
-            return ProductionRuntimeResult(
+            committed_result = ProductionRuntimeResult(
                 status="success",
                 receipts=receipts,
                 transaction_opened=True,
-                committed_to_outer_transaction=commit_to_outer_transaction,
-                rolled_back=not commit_to_outer_transaction,
+                committed_to_outer_transaction=True,
+                rolled_back=False,
                 handler_call_count=handler_call_count,
-                business_write_count=(
-                    business_write_count
-                    if commit_to_outer_transaction
-                    else 0
-                ),
-                pending_write_count=(
-                    pending_write_count
-                    if commit_to_outer_transaction
-                    else 0
-                ),
-                memory_write_count=(
-                    memory_write_count
-                    if commit_to_outer_transaction
-                    else 0
-                ),
-                memory_audit_write_count=(
-                    memory_audit_write_count
-                    if commit_to_outer_transaction
-                    else 0
-                ),
+                business_write_count=business_write_count,
+                pending_write_count=pending_write_count,
+                memory_write_count=memory_write_count,
+                memory_audit_write_count=memory_audit_write_count,
                 receipt_write_count=(
-                    len(receipts)
-                    if commit_to_outer_transaction and handler_call_count
-                    else 0
+                    len(receipts) if handler_call_count else 0
                 ),
+            )
+            if defer_finalization:
+                self._pending_execution = _PendingExecution(
+                    transaction=nested,
+                    committed_result=committed_result,
+                )
+                return replace(
+                    committed_result,
+                    transaction_pending=True,
+                    committed_to_outer_transaction=False,
+                    business_write_count=0,
+                    pending_write_count=0,
+                    memory_write_count=0,
+                    memory_audit_write_count=0,
+                    receipt_write_count=0,
+                )
+            if commit_to_outer_transaction:
+                await nested.commit()
+                return committed_result
+            await nested.rollback()
+            return replace(
+                committed_result,
+                committed_to_outer_transaction=False,
+                rolled_back=True,
+                business_write_count=0,
+                pending_write_count=0,
+                memory_write_count=0,
+                memory_audit_write_count=0,
+                receipt_write_count=0,
             )
         except Exception as exc:
             if nested.is_active:
@@ -406,6 +431,30 @@ class ProductionRuntimeSession:
                 rolled_back=True,
                 handler_call_count=handler_call_count,
             )
+
+    async def commit_pending(self) -> ProductionRuntimeResult:
+        pending = self._pending_execution
+        if pending is None:
+            raise ProductionExecutionError("PENDING_TRANSACTION_REQUIRED")
+        try:
+            await pending.transaction.commit()
+        except Exception:
+            if pending.transaction.is_active:
+                await pending.transaction.rollback()
+            raise
+        finally:
+            self._pending_execution = None
+        return pending.committed_result
+
+    async def rollback_pending(self) -> None:
+        pending = self._pending_execution
+        if pending is None:
+            return
+        try:
+            if pending.transaction.is_active:
+                await pending.transaction.rollback()
+        finally:
+            self._pending_execution = None
 
     async def _lock_turn(self) -> None:
         principal = self._context.principal
