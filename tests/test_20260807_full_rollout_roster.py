@@ -45,13 +45,17 @@ def _rollout_rows() -> list[dict[str, object]]:
         CHILD_TEAM_COUNTS.items(), start=1
     ):
         team_id = f"child-team-{team_number}"
-        for _ in range(count):
+        for member_index in range(count):
             index += 1
+            member_name = f"子部门成员{index}"
+            confirmed_lead = EXPECTED_CONFIRMED_TEAM_LEADS.get(team_name)
+            if member_index == 0 and confirmed_lead:
+                member_name = confirmed_lead
             rows.append(
                 {
                     "user_id": f"user-{index}",
-                    "name": f"子部门成员{index}",
-                    "user_name": f"子部门成员{index}",
+                    "name": member_name,
+                    "user_name": member_name,
                     "active": False,
                     "dingtalk_user_id": f"ding-{index}",
                     "user_team_id": team_id,

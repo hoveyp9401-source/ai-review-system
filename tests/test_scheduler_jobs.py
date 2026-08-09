@@ -1,7 +1,7 @@
 from datetime import date
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -217,6 +217,77 @@ async def test_reminder_dry_run_does_not_send(monkeypatch):
     assert result["would_send"] == 1
     assert result["skipped_real_users"] == 0
     assert result["dry_run_messages"][0]["target_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reminder_scope_excludes_active_accounts_outside_formal_roster(monkeypatch):
+    class Team:
+        name = "Team A"
+        dingtalk_webhook_url = ""
+        dingtalk_webhook_secret = None
+
+        def __hash__(self):
+            return id(self)
+
+    roster_user = _user("Roster User")
+    roster_user.team = Team()
+    outside_user = _user("Outside User")
+    outside_user.id = UUID("20000000-0000-0000-0000-000000000099")
+    outside_user.dingtalk_user_id = "outside-user"
+    outside_user.team = Team()
+
+    async def fake_list_missing_users(session, report_date):
+        return [roster_user, outside_user]
+
+    async def fake_load_roster(*_args, **_kwargs):
+        return SimpleNamespace(
+            user_ids=(str(roster_user.id),),
+            dingtalk_user_ids=(roster_user.dingtalk_user_id,),
+            member_count=1,
+            members=(
+                SimpleNamespace(
+                    user_id=str(roster_user.id),
+                    user_name=roster_user.name,
+                    dingtalk_user_id=roster_user.dingtalk_user_id,
+                ),
+            ),
+        )
+
+    async def fake_load_reports_by_user(session, report_date, user_ids):
+        assert user_ids == [roster_user.id]
+        return {}
+
+    class Robot:
+        def has_enterprise_app(self):
+            return True
+
+    monkeypatch.setattr(jobs, "list_missing_users", fake_list_missing_users)
+    monkeypatch.setattr(
+        jobs,
+        "load_formal_legal_daily_roster",
+        fake_load_roster,
+        raising=False,
+    )
+    monkeypatch.setattr(jobs, "_load_reports_by_user", fake_load_reports_by_user)
+
+    result = await remind_missing_reports(
+        SimpleNamespace(),
+        SimpleNamespace(
+            timezone="Asia/Shanghai",
+            legal_daily_dashboard_tenant_id="legal-daily-production-v1",
+            dingtalk_default_robot_webhook="",
+            dingtalk_default_robot_secret="",
+            reminder_send_enabled=False,
+            reminder_dry_run=True,
+            reminder_test_user_ids="user-1",
+        ),
+        Robot(),
+        date(2026, 8, 9),
+        dry_run=True,
+    )
+
+    assert result["target_users"] == 1
+    assert result["skipped_real_users"] == 0
 
 
 async def _run_first_reminder_dry_run(monkeypatch, report, *, reminder_kind="daily"):

@@ -1104,12 +1104,12 @@ async def test_sql_report_insight_repository_filters_by_report_team_id():
 
 
 @pytest.mark.asyncio
-async def test_sql_repository_adds_current_complete_roster_users_without_activating_them(
+async def test_sql_repository_uses_only_the_formal_roster_and_keeps_center_direct_members(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    active_user = SimpleNamespace(
+    outside_user = SimpleNamespace(
         id=UUID("20000000-0000-0000-0000-000000000001"),
-        name="已启用成员",
+        name="名单外启用账号",
         team_id=UUID("10000000-0000-0000-0000-000000000001"),
         active=True,
     )
@@ -1119,13 +1119,31 @@ async def test_sql_repository_adds_current_complete_roster_users_without_activat
         team_id=UUID("10000000-0000-0000-0000-000000000002"),
         active=False,
     )
+    center_user = SimpleNamespace(
+        id=UUID("20000000-0000-0000-0000-000000000003"),
+        name="赵卫中",
+        team_id=UUID("10000000-0000-0000-0000-000000000003"),
+        active=True,
+    )
 
     async def fake_get_active_users(_session):
-        return [active_user]
+        return [outside_user]
 
     monkeypatch.setattr(
         "app.agent2.report_insights.get_active_users",
         fake_get_active_users,
+    )
+
+    async def fake_load_roster(*_args, **_kwargs):
+        return SimpleNamespace(
+            user_ids=(str(roster_user.id), str(center_user.id)),
+            team_ids=(str(roster_user.team_id), str(center_user.team_id)),
+            member_count=2,
+        )
+
+    monkeypatch.setattr(
+        "app.agent2.report_insights.load_formal_legal_daily_roster",
+        fake_load_roster,
     )
 
     class _Scalars:
@@ -1148,9 +1166,7 @@ async def test_sql_repository_adds_current_complete_roster_users_without_activat
 
         async def execute(self, statement, params=None):
             self.calls.append((statement, params))
-            if len(self.calls) == 1:
-                return _Result([active_user.id, roster_user.id])
-            return _Result([active_user, roster_user])
+            return _Result([roster_user, center_user])
 
     session = _Session()
     users = await SqlReportInsightRepository(
@@ -1159,17 +1175,75 @@ async def test_sql_repository_adds_current_complete_roster_users_without_activat
         roster_tenant_id="legal-daily-production-v1",
     ).list_users()
 
-    assert [user.id for user in users] == [active_user.id, roster_user.id]
+    assert [user.id for user in users] == [roster_user.id, center_user.id]
     assert roster_user.active is False
-    roster_query = str(session.calls[0][0])
-    assert "legal_daily_team_memberships" in roster_query
-    assert "memberships.data_complete IS TRUE" in roster_query
-    assert "team.active IS TRUE" in roster_query
-    assert "roster_user.team_id = memberships.team_id" in roster_query
-    assert session.calls[0][1] == {
-        "tenant_id": "legal-daily-production-v1",
-        "roster_date": date(2026, 8, 6),
-    }
+    assert center_user.name == "赵卫中"
+    user_query = str(session.calls[0][0])
+    assert "users.id IN" in user_query
+    assert "WHERE users.active" not in user_query
+
+
+@pytest.mark.asyncio
+async def test_sql_repository_includes_center_holder_for_department_scope(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    child_team_id = UUID("10000000-0000-0000-0000-000000000002")
+    center_team_id = UUID("10000000-0000-0000-0000-000000000003")
+    child_team = SimpleNamespace(
+        id=child_team_id,
+        name="法务二部",
+        department_name="法务合约中心",
+        code="monthly-law-2",
+        active=True,
+    )
+    center_team = SimpleNamespace(
+        id=center_team_id,
+        name="法务合约中心（中心层级）",
+        department_name="法务合约中心",
+        code="legal-center",
+        active=False,
+    )
+
+    async def fake_load_roster(*_args, **_kwargs):
+        return SimpleNamespace(
+            user_ids=(),
+            team_ids=(str(child_team_id), str(center_team_id)),
+            member_count=0,
+        )
+
+    monkeypatch.setattr(
+        "app.agent2.report_insights.load_formal_legal_daily_roster",
+        fake_load_roster,
+    )
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [child_team, center_team]
+
+    class _Session:
+        statement = None
+
+        async def execute(self, statement):
+            self.statement = statement
+            return _Result()
+
+    session = _Session()
+    teams = await SqlReportInsightRepository(
+        session,
+        roster_date=date(2026, 8, 6),
+        roster_tenant_id="legal-daily-production-v1",
+    ).list_teams()
+
+    assert [team.name for team in teams] == [
+        "法务二部",
+        "法务合约中心（中心层级）",
+    ]
+    compiled = str(session.statement)
+    assert "teams.id IN" in compiled
+    assert "WHERE teams.active" not in compiled
 
 
 @pytest.mark.asyncio

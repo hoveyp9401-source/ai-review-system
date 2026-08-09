@@ -7,7 +7,7 @@ from difflib import SequenceMatcher
 from typing import Any, Protocol, Sequence
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.agent2.context_pack import KnowledgeEvidenceFrame
@@ -18,7 +18,11 @@ from app.agent2.fact_permissions import (
 )
 from app.agent2.report_insight_query import StructuredReportInsightQuery
 from app.config import get_settings
-from app.models import User
+from app.legal_daily_roster import (
+    FormalLegalDailyRoster,
+    load_formal_legal_daily_roster,
+)
+from app.models import Team, User
 from app.repositories import (
     count_daily_reports_by_status,
     get_active_teams,
@@ -182,66 +186,71 @@ class SqlReportInsightRepository:
         self.session = session
         self.roster_date = roster_date
         self.roster_tenant_id = str(roster_tenant_id or "").strip()
+        self._formal_roster: FormalLegalDailyRoster | None = None
 
     async def list_users(self) -> Sequence[Any]:
-        active_users = tuple(await get_active_users(self.session))
         if self.roster_date is None or not self.roster_tenant_id:
-            return active_users
-
-        roster_user_ids = tuple(
-            (
-                await self.session.execute(
-                    text(
-                        """
-                        SELECT DISTINCT memberships.user_id
-                        FROM legal_daily_team_memberships memberships
-                        JOIN teams team ON team.id = memberships.team_id
-                        JOIN users roster_user ON roster_user.id = memberships.user_id
-                        WHERE memberships.tenant_id = :tenant_id
-                          AND memberships.effective_from <= :roster_date
-                          AND (
-                              memberships.effective_to IS NULL
-                              OR memberships.effective_to >= :roster_date
-                          )
-                          AND memberships.data_complete IS TRUE
-                          AND team.active IS TRUE
-                          AND roster_user.team_id = memberships.team_id
-                        ORDER BY memberships.user_id
-                        """
-                    ),
-                    {
-                        "tenant_id": self.roster_tenant_id,
-                        "roster_date": self.roster_date,
-                    },
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if not roster_user_ids:
-            return active_users
-
-        roster_users = tuple(
+            return tuple(await get_active_users(self.session))
+        roster = await self._load_formal_roster()
+        database_user_ids = _database_user_ids(roster.user_ids)
+        if len(database_user_ids) != roster.member_count:
+            raise RuntimeError("formal roster contains an invalid user identifier")
+        users = tuple(
             (
                 await self.session.execute(
                     select(User)
                     .options(selectinload(User.team))
-                    .where(User.id.in_(roster_user_ids))
+                    .where(User.id.in_(database_user_ids))
                     .order_by(User.team_id, User.name)
                 )
             )
             .scalars()
             .all()
         )
-        merged: dict[str, Any] = {}
-        for user in (*active_users, *roster_users):
-            user_id = str(_value(user, "id") or _value(user, "user_id") or "")
-            if user_id:
-                merged[user_id] = user
-        return tuple(merged.values())
+        loaded_user_ids = {
+            str(_value(user, "id") or _value(user, "user_id") or "")
+            for user in users
+        }
+        if len(users) != roster.member_count or loaded_user_ids != set(roster.user_ids):
+            raise RuntimeError("report query users do not match the formal roster")
+        return users
 
     async def list_teams(self) -> Sequence[Any]:
-        return await get_active_teams(self.session)
+        if self.roster_date is None or not self.roster_tenant_id:
+            return await get_active_teams(self.session)
+        roster = await self._load_formal_roster()
+        database_team_ids = _database_ids(roster.team_ids)
+        if len(database_team_ids) != len(roster.team_ids):
+            raise RuntimeError("formal roster contains an invalid team identifier")
+        teams = tuple(
+            (
+                await self.session.execute(
+                    select(Team)
+                    .where(Team.id.in_(database_team_ids))
+                    .order_by(Team.active.desc(), Team.name)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        loaded_team_ids = {
+            str(_value(team, "id") or _value(team, "team_id") or "")
+            for team in teams
+        }
+        if len(teams) != len(roster.team_ids) or loaded_team_ids != set(roster.team_ids):
+            raise RuntimeError("report query teams do not match the formal roster")
+        return teams
+
+    async def _load_formal_roster(self) -> FormalLegalDailyRoster:
+        if self._formal_roster is None:
+            if self.roster_date is None or not self.roster_tenant_id:
+                raise RuntimeError("formal roster scope is not configured")
+            self._formal_roster = await load_formal_legal_daily_roster(
+                self.session,
+                tenant_id=self.roster_tenant_id,
+                on_date=self.roster_date,
+            )
+        return self._formal_roster
 
     async def count_reports(
         self,

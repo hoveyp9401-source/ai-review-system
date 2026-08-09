@@ -21,18 +21,13 @@ from app.agent2.tool_calling.canary_store import (
 from app.agent2.tool_calling.registry import runtime_registry_contract_digest
 from app.config import get_settings
 from app.db import AsyncSessionLocal, engine
-
-
-EXPECTED_ROSTER_COUNT = 74
-EXPECTED_CHILD_TEAMS = {
-    "法务一部",
-    "法务二部",
-    "法务三部",
-    "法务四部",
-    "法务五部",
-    "法务六部",
-    "综合管理部",
-}
+from app.legal_daily_roster import (
+    FORMAL_CENTER_MEMBER_NAMES,
+    FORMAL_CENTER_TEAM_CODE,
+    FORMAL_CHILD_TEAM_NAMES as EXPECTED_CHILD_TEAMS,
+    FORMAL_CONFIRMED_CHILD_PLACEMENTS,
+    FORMAL_ROSTER_MEMBER_COUNT as EXPECTED_ROSTER_COUNT,
+)
 
 
 def _args() -> argparse.Namespace:
@@ -98,6 +93,7 @@ async def _roster_user_ids(session, tenant_id: str) -> set[str]:
                 """
                 SELECT
                     users.id::text AS user_id,
+                    users.name AS user_name,
                     teams.name AS team_name,
                     teams.code AS team_code,
                     teams.active AS team_active
@@ -110,11 +106,17 @@ async def _roster_user_ids(session, tenant_id: str) -> set[str]:
                       memberships.effective_to IS NULL
                       OR memberships.effective_to >= CURRENT_DATE
                   )
-                  AND (teams.active IS TRUE OR teams.code = 'legal-center')
+                  AND (
+                      teams.active IS TRUE
+                      OR teams.code = :center_team_code
+                  )
                 ORDER BY users.id
                 """
             ),
-            {"tenant_id": tenant_id},
+            {
+                "tenant_id": tenant_id,
+                "center_team_code": FORMAL_CENTER_TEAM_CODE,
+            },
         )
     ).mappings().all()
     if len(rows) != EXPECTED_ROSTER_COUNT:
@@ -132,11 +134,21 @@ async def _roster_user_ids(session, tenant_id: str) -> set[str]:
     center_direct = [
         row
         for row in rows
-        if str(row["team_code"] or "") == "legal-center"
+        if str(row["team_code"] or "") == FORMAL_CENTER_TEAM_CODE
         and not bool(row["team_active"])
     ]
-    if len(center_direct) != 2:
-        raise AssertionError(f"center direct count is {len(center_direct)}")
+    if {str(row["user_name"]) for row in center_direct} != FORMAL_CENTER_MEMBER_NAMES:
+        raise AssertionError("center-direct members changed")
+    team_by_member_name = {
+        str(row["user_name"]): str(row["team_name"])
+        for row in rows
+        if bool(row["team_active"])
+    }
+    if any(
+        team_by_member_name.get(member_name) != expected_team_name
+        for member_name, expected_team_name in FORMAL_CONFIRMED_CHILD_PLACEMENTS.items()
+    ):
+        raise AssertionError("confirmed child-department placements changed")
     return user_ids
 
 

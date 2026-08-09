@@ -16,6 +16,10 @@ from app.agent2.memory.module import (
 )
 from app.agent2.memory.postgres import PersonalMemoryRecord
 from app.config import Settings
+from app.legal_daily_roster import (
+    formal_roster_user_ids_for_exact_scope,
+    load_formal_legal_daily_roster,
+)
 from app.models import DailyReport, ReportInteractionEvent, User
 from app.repositories import list_missing_users
 from app.services.dingtalk import DingTalkDeliveryError, DingTalkRobotClient
@@ -62,7 +66,26 @@ async def remind_missing_reports(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     missing_users = await list_missing_users(session, report_date)
+    roster_tenant_id = str(
+        getattr(settings, "legal_daily_dashboard_tenant_id", "") or ""
+    ).strip()
+    formal_roster = None
+    if roster_tenant_id:
+        formal_roster = await load_formal_legal_daily_roster(
+            session,
+            tenant_id=roster_tenant_id,
+            on_date=report_date,
+        )
+        formal_user_ids = set(formal_roster.user_ids)
+        missing_users = [
+            user for user in missing_users if str(getattr(user, "id", "")) in formal_user_ids
+        ]
     test_user_ids = _configured_test_user_ids(settings)
+    if formal_roster is not None:
+        formal_roster_user_ids_for_exact_scope(
+            formal_roster,
+            test_user_ids,
+        )
     target_users, skipped_real_users = _partition_reminder_users(missing_users, test_user_ids)
     requested_dry_run = bool(dry_run or getattr(settings, "reminder_dry_run", True))
     send_enabled = bool(getattr(settings, "reminder_send_enabled", False))
@@ -585,9 +608,7 @@ async def ensure_daily_submission_obligations(
 ) -> dict[str, Any]:
     """Persist the server-owned submission scope used by management reads."""
 
-    configured_user_ids = sorted(
-        _configured_test_user_ids(settings)
-    )
+    configured_user_ids = _configured_test_user_ids(settings)
     tenant_id = str(
         getattr(
             settings,
@@ -603,6 +624,17 @@ async def ensure_daily_submission_obligations(
             "inserted": 0,
             "effective_obligations": 0,
         }
+    formal_roster = await load_formal_legal_daily_roster(
+        session,
+        tenant_id=tenant_id,
+        on_date=report_date,
+    )
+    roster_user_ids = sorted(
+        formal_roster_user_ids_for_exact_scope(
+            formal_roster,
+            configured_user_ids,
+        )
+    )
     deadline_at = datetime.combine(
         report_date + timedelta(days=1),
         time(9),
@@ -612,7 +644,7 @@ async def ensure_daily_submission_obligations(
         "tenant_id": tenant_id,
         "report_date": report_date,
         "deadline_at": deadline_at,
-        "configured_user_ids": configured_user_ids,
+        "configured_user_ids": roster_user_ids,
     }
     inserted = (
         await session.execute(
@@ -645,7 +677,7 @@ async def ensure_daily_submission_obligations(
                     TRUE,
                     '',
                     :deadline_at,
-                    'scheduler_test_allowlist',
+                    'formal_legal_daily_roster',
                     TRUE
                 FROM users
                 JOIN LATERAL (
@@ -706,6 +738,10 @@ async def ensure_daily_submission_obligations(
             )
         ).scalar_one()
     )
+    if effective_obligations != formal_roster.member_count:
+        raise RuntimeError(
+            "daily submission obligations do not exactly match the formal roster"
+        )
     return {
         "report_date": report_date.isoformat(),
         "configured_identifiers": len(configured_user_ids),

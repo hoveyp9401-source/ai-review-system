@@ -16,6 +16,15 @@ from app.legal_daily_dashboard.domain import (
     SubmissionObligation,
 )
 from app.legal_daily_dashboard.sql_repository import SqlDashboardRepository
+from app.legal_daily_roster import (
+    FORMAL_CENTER_MEMBER_NAMES as EXPECTED_CENTER_LEVEL_MEMBERS,
+    FORMAL_CENTER_TEAM_CODE as CENTER_LEVEL_TEAM_CODE,
+    FORMAL_CHILD_MEMBER_COUNT as CHILD_ROSTER_COUNT,
+    FORMAL_CHILD_TEAM_NAMES as EXPECTED_TEAMS,
+    FORMAL_CONFIRMED_TEAM_LEADS as EXPECTED_CONFIRMED_TEAM_LEADS,
+    FORMAL_PARENT_DEPARTMENT as EXPECTED_DEPARTMENT,
+    FORMAL_ROSTER_MEMBER_COUNT as ROLLOUT_COUNT,
+)
 from app.scheduler.runner import (
     DAILY_BRIEFING_SAFE_MESSAGE_CHARS,
     _daily_briefing_report_date,
@@ -29,25 +38,7 @@ from app.services.management_daily_briefing import (
 
 SIMULATED_REPORT_DATE = date(2026, 8, 7)
 SIMULATED_SEND_DATE = date(2026, 8, 8)
-EXPECTED_TEAMS = {
-    "法务一部",
-    "法务二部",
-    "法务三部",
-    "法务四部",
-    "法务五部",
-    "法务六部",
-    "综合管理部",
-}
-EXPECTED_DEPARTMENT = "法务合约中心"
 EXPECTED_DEPARTMENT_RECIPIENTS = {"赵卫中", "朱佳佳"}
-ROLLOUT_COUNT = 74
-CHILD_ROSTER_COUNT = 72
-CENTER_LEVEL_TEAM_CODE = "legal-center"
-EXPECTED_CENTER_LEVEL_MEMBERS = {"赵卫中", "朱佳佳"}
-EXPECTED_CONFIRMED_TEAM_LEADS = {
-    "法务二部": "丁益明",
-    "法务四部": "薛旭",
-}
 
 
 async def main() -> None:

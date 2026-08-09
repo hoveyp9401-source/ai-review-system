@@ -9,6 +9,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
+from app.legal_daily_roster import (
+    FORMAL_ROSTER_EFFECTIVE_DATE,
+    FormalLegalDailyRoster,
+    load_formal_legal_daily_roster,
+)
 from app.legal_daily_dashboard.domain import (
     DailyReportRecord,
     DashboardRecords,
@@ -73,6 +78,11 @@ class ManagementDailyBriefingService:
         if not tenant_id:
             raise ValueError("legal_daily_dashboard_tenant_id is required")
 
+        formal_roster = await load_formal_legal_daily_roster(
+            session,
+            tenant_id=tenant_id,
+            on_date=report_date,
+        )
         repository = SqlDashboardRepository(session)
         teams = await repository.list_teams(
             tenant_id=tenant_id,
@@ -84,6 +94,7 @@ class ManagementDailyBriefingService:
             start_date=report_date,
             end_date=report_date,
         )
+        _validate_briefing_roster(records, formal_roster=formal_roster)
         recipients, recipient_warnings = await _load_recipients(
             session,
             tenant_id=tenant_id,
@@ -106,6 +117,47 @@ class ManagementDailyBriefingService:
             records=records,
             recipients=(*recipients, *cc_recipients),
             recipient_warnings=(*recipient_warnings, *cc_warnings),
+        )
+
+
+def _validate_briefing_roster(
+    records: DashboardRecords,
+    *,
+    formal_roster: FormalLegalDailyRoster,
+) -> None:
+    record_members = {
+        member.ref: (member.name, member.team_ref)
+        for member in records.members
+    }
+    formal_members = {
+        member.user_id: (member.user_name, member.team_id)
+        for member in formal_roster.members
+    }
+    if len(record_members) != len(records.members) or record_members != formal_members:
+        raise RuntimeError(
+            "management briefing members and teams do not exactly match the formal roster"
+        )
+    if formal_roster.on_date < FORMAL_ROSTER_EFFECTIVE_DATE:
+        return
+    obligations = tuple(
+        obligation
+        for obligation in records.obligations
+        if obligation.report_date == formal_roster.on_date
+    )
+    obligation_scope = {
+        obligation.member_ref: (obligation.team_ref, obligation.data_complete)
+        for obligation in obligations
+    }
+    expected_obligation_scope = {
+        member.user_id: (member.team_id, True)
+        for member in formal_roster.members
+    }
+    if (
+        len(obligation_scope) != len(obligations)
+        or obligation_scope != expected_obligation_scope
+    ):
+        raise RuntimeError(
+            "management briefing obligations do not exactly match the formal roster"
         )
 
 

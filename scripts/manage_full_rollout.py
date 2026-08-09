@@ -20,27 +20,18 @@ from app.agent2.tool_calling.canary_store import (
 from app.agent2.tool_calling.registry import runtime_registry_contract_digest
 from app.config import get_settings
 from app.db import AsyncSessionLocal
+from app.legal_daily_roster import (
+    FORMAL_CENTER_MEMBER_NAMES as EXPECTED_CENTER_LEVEL_MEMBERS,
+    FORMAL_CENTER_TEAM_CODE as CENTER_LEVEL_TEAM_CODE,
+    FORMAL_CHILD_MEMBER_COUNT as CHILD_ROSTER_COUNT,
+    FORMAL_CHILD_TEAM_NAMES as EXPECTED_CHILD_TEAMS,
+    FORMAL_CONFIRMED_CHILD_PLACEMENTS,
+    FORMAL_PARENT_DEPARTMENT as PARENT_DEPARTMENT,
+    FORMAL_ROSTER_MEMBER_COUNT as ROLLOUT_COUNT,
+)
 from app.models import User
 
 
-ROLLOUT_COUNT = 74
-CHILD_ROSTER_COUNT = 72
-PARENT_DEPARTMENT = "\u6cd5\u52a1\u5408\u7ea6\u4e2d\u5fc3"
-CENTER_LEVEL_TEAM_CODE = "legal-center"
-EXPECTED_CENTER_LEVEL_MEMBERS = frozenset(
-    {"\u8d75\u536b\u4e2d", "\u6731\u4f73\u4f73"}
-)
-EXPECTED_CHILD_TEAMS = frozenset(
-    {
-        "\u6cd5\u52a1\u4e00\u90e8",
-        "\u6cd5\u52a1\u4e8c\u90e8",
-        "\u6cd5\u52a1\u4e09\u90e8",
-        "\u6cd5\u52a1\u56db\u90e8",
-        "\u6cd5\u52a1\u4e94\u90e8",
-        "\u6cd5\u52a1\u516d\u90e8",
-        "\u7efc\u5408\u7ba1\u7406\u90e8",
-    }
-)
 ACTOR = "codex-full-rollout"
 REASON = "Enable the verified 74-person legal-center Agent2 rollout"
 
@@ -407,6 +398,15 @@ def _validate_roster(rows) -> None:
         )
     if len(center_rows) != len(EXPECTED_CENTER_LEVEL_MEMBERS):
         raise RuntimeError("center-level roster contains duplicate memberships")
+    team_by_member_name = {
+        str(row["name"]): str(row["team_name"])
+        for row in child_rows
+    }
+    if any(
+        team_by_member_name.get(member_name) != expected_team_name
+        for member_name, expected_team_name in FORMAL_CONFIRMED_CHILD_PLACEMENTS.items()
+    ):
+        raise RuntimeError("confirmed child-department placements changed")
 
 
 async def main() -> None:
