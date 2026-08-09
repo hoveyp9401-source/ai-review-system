@@ -183,3 +183,44 @@ def test_live_webhook_does_not_invoke_the_historical_shadow_observer():
 def test_canary_control_store_does_not_offer_agent1_rollback():
     assert not hasattr(ToolCallCanaryControlRepository, "rollback_to_agent1")
     assert hasattr(ToolCallCanaryControlRepository, "disable_runtime_fail_closed")
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "app/stream_runner.py",
+        "app/api/reports.py",
+        "app/agent2/daily_execution.py",
+    ),
+)
+def test_production_code_contains_no_legacy_daily_fallback_symbol(relative_path):
+    source = (ROOT / relative_path).read_text(encoding="utf-8")
+
+    assert "agent2_daily_should_fallback_to_legacy" not in source
+    assert "falling back to legacy" not in source
+
+
+def test_production_modules_do_not_define_unused_legacy_gate_entrypoints():
+    webhook_source = (ROOT / "app/api/webhook.py").read_text(encoding="utf-8")
+    stream_source = (ROOT / "app/stream_runner.py").read_text(encoding="utf-8")
+
+    assert "async def _evaluate_legacy_daily_gate" not in webhook_source
+    assert "async def _observe_workflow_route" not in webhook_source
+    assert "async def _evaluate_stream_legacy_daily_gate" not in stream_source
+
+
+def test_manual_agent2_route_never_returns_a_bare_none_to_an_old_caller():
+    tree = ast.parse((ROOT / "app/api/reports.py").read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_submit_manual_agent2_if_applicable"
+    )
+
+    bare_none_returns = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Return) and node.value is None
+    ]
+    assert bare_none_returns == []

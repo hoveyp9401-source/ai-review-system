@@ -17,7 +17,6 @@ from app.agent2.daily_execution import (
     _should_block_historical_daily_mutation_after_cutoff,
     _write_message,
     agent2_daily_enabled_for_user,
-    agent2_daily_should_fallback_to_legacy,
     apply_commands_to_snapshot,
 )
 from app.agent2.daily_state import PENDING_DAILY_CANDIDATE_KEY
@@ -622,18 +621,6 @@ def test_apply_unresolved_structural_edit_does_not_append_raw_text():
     assert result.actions[0]["reason"] in {"unsupported_edit", "merge_indices_unresolved"}
 
 
-def test_agent2_unresolved_edit_does_not_fallback_to_legacy():
-    actions = [{"operation": "edit", "reason": "delete_indices_unresolved", "changed": False}]
-
-    assert agent2_daily_should_fallback_to_legacy(actions) is False
-
-
-def test_agent2_unsupported_edit_does_not_fallback_to_legacy():
-    actions = [{"operation": "edit", "reason": "unsupported_edit", "changed": False}]
-
-    assert agent2_daily_should_fallback_to_legacy(actions) is False
-
-
 def test_no_change_message_explains_unresolved_item_index():
     message = _no_change_message([{"operation": "edit", "reason": "replace_indices_unresolved"}])
 
@@ -682,7 +669,6 @@ def test_apply_delete_out_of_range_stays_in_agent2_no_change():
     assert result.changed is False
     assert result.today_work == ["合同审核", "函件起草"]
     assert result.actions[0]["reason"] == "delete_indices_unresolved"
-    assert agent2_daily_should_fallback_to_legacy(result.actions) is False
 
 
 def test_apply_edit_merges_loose_delimited_local_indices():

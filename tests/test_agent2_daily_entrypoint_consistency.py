@@ -157,12 +157,11 @@ def test_enabled_cognitive_v3_does_not_fall_through_when_llm_client_is_missing(r
     assert "if cognitive_core_v3_enabled(settings) and llm_client is not None:" not in source
 
 
-def test_webhook_agent2_runs_before_legacy_daily_gate():
+def test_webhook_defines_no_legacy_daily_gate():
     source = (Path(__file__).parents[1] / "app/api/webhook.py").read_text(encoding="utf-8")
 
-    assert source.index("agent2_result = await _submit_webhook_agent2_if_enabled(") < source.index(
-        "gate_decision = await _evaluate_legacy_daily_gate("
-    )
+    assert "_evaluate_legacy_daily_gate" not in source
+    assert "_observe_workflow_route" not in source
 
 
 @pytest.mark.parametrize("relative_path", ("app/stream_runner.py", "app/api/webhook.py"))

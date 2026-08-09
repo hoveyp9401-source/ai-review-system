@@ -10,7 +10,6 @@ from typing import Any, Iterable
 from app.agent2.daily_execution import (
     DailyCommandApplication,
     _attach_agent2_edit_memory,
-    agent2_daily_should_fallback_to_legacy,
     apply_commands_to_snapshot,
 )
 from app.agent2.contract_invariants import evaluate_cognitive_invariants
@@ -107,11 +106,7 @@ def replay_daily_execution_case(case: DialogueCase, *, mode: str = "protective_g
                 previous_report=previous_report,
                 section_status=state.section_status,
             )
-            if agent2_daily_should_fallback_to_legacy(application.actions):
-                execution_status = "fallback_to_legacy"
-                fallback_to_legacy = True
-                block_reason = "daily execution requested legacy fallback"
-            elif application.read_only:
+            if application.read_only:
                 execution_status = "read_only"
             elif application.changed:
                 execution_status = "agent2_direct_write"

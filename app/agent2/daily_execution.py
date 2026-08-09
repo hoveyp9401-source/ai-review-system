@@ -664,13 +664,6 @@ def apply_commands_to_snapshot(
     )
 
 
-def agent2_daily_should_fallback_to_legacy(actions: list[dict[str, Any]]) -> bool:
-    # Once Agent2 has claimed a daily-report edit, unresolved targets should be
-    # handled as a clear no-change result instead of handing the turn back to
-    # the legacy daily writer, which may guess and write the wrong thing.
-    return False
-
-
 def _apply_edit_command(
     *,
     today_work: list[str],

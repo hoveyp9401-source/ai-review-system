@@ -58,7 +58,6 @@ from app.agent2.turn_runtime import (
 from app.agent2.daily_execution import (
     Agent2DailyExecutionResult,
     agent2_daily_report_version,
-    agent2_daily_should_fallback_to_legacy,
     execute_agent2_daily_commands,
 )
 from app.agent2.daily_shadow import DailyShadowEvaluation, evaluate_daily_shadow
@@ -193,7 +192,7 @@ async def _submit_manual_agent2_if_applicable(
     llm_client: Any | None = None,
     message_id: str = "",
     conversation_id: str = "",
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     settings = get_settings()
     received_at = now_in_timezone(getattr(user, "timezone", None) or settings.timezone)
     entrypoint = await resolve_agent2_entrypoint(
@@ -586,7 +585,12 @@ async def _submit_manual_agent2_if_applicable(
 
     commands = list(shadow.commands)
     if not commands:
-        return None
+        return _manual_route_blocked_response(
+            existing,
+            target_report_date,
+            message="Agent2未形成可执行命令，本次没有写入任何内容。",
+            reply_kind="agent2_no_executable_command",
+        )
     report_for_version = existing
     result = await execute_agent2_daily_commands(
         session,
@@ -599,8 +603,6 @@ async def _submit_manual_agent2_if_applicable(
         message_id=message_id,
         expected_report_version=agent2_daily_report_version(report_for_version),
     )
-    if agent2_daily_should_fallback_to_legacy(result.command_results):
-        return None
     return _agent2_result_manual_response(result)
 
 

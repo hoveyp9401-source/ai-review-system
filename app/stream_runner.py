@@ -128,7 +128,6 @@ from app.agent2.daily_clarification import (
 from app.agent2.daily_state import set_pending_daily_candidate
 from app.agent2.daily_execution import (
     agent2_daily_report_version,
-    agent2_daily_should_fallback_to_legacy,
     execute_agent2_daily_commands,
 )
 from app.agent2.daily_shadow import evaluate_daily_shadow
@@ -144,7 +143,6 @@ from app.agent2.outcome_adapters import (
     periodic_execution_outcomes,
     text_outcome,
 )
-from app.workflows.gate import GateDecision
 from app.workflows.daily_context import (
     daily_active_task_from_report,
     load_live_daily_context,
@@ -1221,24 +1219,6 @@ async def _reply_with_observability(
         )
 
 
-async def _evaluate_stream_legacy_daily_gate(
-    *,
-    session: Any,
-    user: Any,
-    job: StreamJob,
-    performance_service: PerformanceTaskService,
-    settings: Settings,
-) -> GateDecision:
-    _, shadow, _, _ = await _evaluate_stream_daily_shadow(
-        session=session,
-        user=user,
-        job=job,
-        performance_service=performance_service,
-        settings=settings,
-    )
-    return shadow.gate_decision
-
-
 async def _evaluate_stream_daily_shadow(
     *,
     session: Any,
@@ -2181,7 +2161,9 @@ async def _process_stream_agent2_daily_if_enabled(
             raise RuntimeError("Agent2 Phase 2 primary cannot execute shadow daily commands")
         commands = list(shadow.commands)
         if not commands:
-            return None
+            raise RuntimeError(
+                "non-primary Agent2 route produced no executable daily command"
+            )
         processed_command_names = [command.operation for command in commands]
 
         result = await asyncio.wait_for(
@@ -2197,9 +2179,6 @@ async def _process_stream_agent2_daily_if_enabled(
             ),
             timeout=settings.stream_processing_timeout_seconds,
         )
-        if _agent2_daily_should_fallback_to_legacy(result.command_results):
-            logger.info("agent2 daily edit unresolved, falling back to legacy user_id=%s actions=%s", user.id, result.command_results)
-            return None
     reply_message = result.message
     if phase2_primary and cognitive_v3 is not None:
         outcomes = daily_execution_outcomes(
@@ -2289,10 +2268,6 @@ async def _process_stream_agent2_daily_if_enabled(
         processed_command_names,
     )
     return "agent2_cognitive_v3_processed" if v3_execution_result is not None else "agent2_daily_processed"
-
-
-def _agent2_daily_should_fallback_to_legacy(actions: list[dict[str, Any]]) -> bool:
-    return agent2_daily_should_fallback_to_legacy(actions)
 
 
 def _store_pending_daily_candidate(

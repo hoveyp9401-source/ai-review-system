@@ -31,10 +31,7 @@ from app.services.dingtalk import (
 from app.services.dingtalk_crypto import DingTalkCallbackCrypto
 from app.services.performance_service import (
     NO_ACTIVE_PERFORMANCE_TASK_MESSAGE,
-    PERFORMANCE_PENDING_CONFIRMATION,
-    is_performance_reply_candidate,
     looks_like_performance_reply_template,
-    submission_metrics,
 )
 from app.services.report_service import DailyReportService
 from app.utils.dingtalk_text import format_dingtalk_plain_text
@@ -105,7 +102,6 @@ from app.agent2.typed_daily_executor import execute_typed_agent2_daily_commands
 from app.agent2.report_sql_executor import (
     execute_periodic_report_commands,
 )
-from app.agent2.workflow_audit import create_agent2_workflow_audit_event
 from app.agent2.operation_outcomes import OutcomeReplyComposer
 from app.agent2.operation_outcome_store import persist_operation_outcomes
 from app.agent2.outcome_adapters import (
@@ -114,12 +110,7 @@ from app.agent2.outcome_adapters import (
     periodic_execution_outcomes,
     text_outcome,
 )
-from app.workflows.intake import (
-    ActiveWorkflowTask,
-    IncomingMessageEnvelope,
-    WORKFLOW_MONTHLY_REPORT,
-)
-from app.workflows.gate import GateDecision
+from app.workflows.intake import IncomingMessageEnvelope
 from app.workflows.daily_context import (
     build_live_daily_active_task,
     daily_active_task_from_report,
@@ -1185,103 +1176,3 @@ async def _submit_webhook_agent2_if_enabled(
         message_id=message_id,
         expected_report_version=agent2_daily_report_version(daily_report),
     )
-
-
-async def _observe_workflow_route(
-    *,
-    session: AsyncSession,
-    user: Any,
-    incoming: Any,
-    performance_service: Any,
-    settings: Settings,
-) -> None:
-    await _evaluate_legacy_daily_gate(
-        session=session,
-        user=user,
-        incoming=incoming,
-        performance_service=performance_service,
-        settings=settings,
-        observe_only_log=True,
-    )
-
-
-async def _evaluate_legacy_daily_gate(
-    *,
-    session: AsyncSession,
-    user: Any,
-    incoming: Any,
-    performance_service: Any,
-    settings: Settings,
-    observe_only_log: bool = False,
-) -> GateDecision:
-    active_tasks: list[ActiveWorkflowTask] = []
-    if performance_service is not None:
-        try:
-            active_submission = await performance_service.get_active_submission(session, user.id)
-            if active_submission is not None:
-                metrics = submission_metrics(active_submission)
-                responses = list(active_submission.responses_json or [])
-                reply_candidate = is_performance_reply_candidate(
-                    metrics=metrics,
-                    responses=responses,
-                    raw_input=incoming.text,
-                    status=active_submission.status,
-                )
-                active_tasks.append(
-                    ActiveWorkflowTask(
-                        workflow=WORKFLOW_MONTHLY_REPORT,
-                        task_id=str(active_submission.task_id),
-                        status=str(active_submission.status or ""),
-                        reply_candidate=reply_candidate,
-                        awaiting_confirmation=active_submission.status == PERFORMANCE_PENDING_CONFIRMATION,
-                        reason="performance submission is active",
-                        metadata={"submission_id": str(active_submission.id)},
-                    )
-                )
-        except Exception as exc:
-            _log_runtime_failure(
-                "workflow_route_performance_task_lookup_skipped", exc
-            )
-
-    try:
-        daily_task = await build_live_daily_active_task(session, user, settings)
-        if daily_task is not None:
-            active_tasks.append(daily_task)
-    except Exception as exc:
-        _log_runtime_failure("workflow_route_daily_task_lookup_skipped", exc)
-
-    envelope = IncomingMessageEnvelope(
-        sender_id=str(getattr(user, "id", "") or ""),
-        sender_name=str(getattr(user, "name", "") or ""),
-        dingtalk_user_id=str(getattr(incoming, "dingtalk_user_id", "") or ""),
-        source=str(getattr(incoming, "source", "") or ""),
-        raw_text=str(getattr(incoming, "text", "") or ""),
-        message_id=str(getattr(incoming, "message_id", "") or ""),
-        conversation_id=str(getattr(incoming, "conversation_id", "") or ""),
-        active_tasks=tuple(active_tasks),
-    )
-    mode = "observe_only" if observe_only_log else getattr(settings, "workflow_intake_mode", "observe_only")
-    shadow = evaluate_daily_shadow(envelope, mode=mode)
-    gate_decision = shadow.gate_decision
-    observation = envelope.observation_base()
-    summary = shadow.summary()
-    logger.info(
-        "workflow_shadow_observation source_message_hash=%s selected_workflow=%s "
-        "command_count=%d adapter_result_count=%d block_legacy_daily=%s",
-        str(observation.get("raw_text_hash") or ""),
-        str(getattr(shadow.route, "workflow", "") or ""),
-        int(summary.get("command_count") or 0),
-        int(summary.get("adapter_result_count") or 0),
-        bool(gate_decision.block_legacy_daily),
-    )
-    await create_agent2_workflow_audit_event(
-        session=session,
-        user=user,
-        incoming=incoming,
-        settings=settings,
-        envelope=envelope,
-        shadow=shadow,
-        mode=mode,
-        observe_only_log=observe_only_log,
-    )
-    return gate_decision
