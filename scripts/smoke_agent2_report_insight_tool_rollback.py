@@ -72,6 +72,11 @@ CASES = (
         ("query_report_insights",),
     ),
     (
+        "organization_unclosed_recent_30_days",
+        "看下综合管理部最近30天没闭环的工作。",
+        ("query_report_insights",),
+    ),
+    (
         "weng_previous_week_unclosed",
         "看下翁亚兰上周的未闭环",
         ("query_report_insights",),
@@ -209,6 +214,82 @@ async def main() -> None:
                     outcome.message
                 )
                 assert "11 项" not in outcome.message
+            if case_name == "organization_unclosed":
+                insight_facts = (
+                    receipts[0]
+                    .safe_user_facts.get("report_insight", {})
+                    .get("facts", {})
+                )
+                if insight_facts.get("needs_time_scope") is True:
+                    assert insight_facts.get("period_type") == "unspecified"
+                    assert insight_facts.get("unclosed_items") == []
+                    assert int(
+                        insight_facts.get("unclosed_items_withheld_count") or 0
+                    ) == int(insight_facts.get("unclosed_count") or 0)
+                    compact_reply = re.sub(r"\s+", "", outcome.message)
+                    assert all(
+                        option in compact_reply
+                        for option in ("最近7天", "最近30天", "全部历史")
+                    ), outcome.message
+                    assert not any(
+                        label in outcome.message
+                        for label in (
+                            "已闭环",
+                            "跟进中",
+                            "进行中",
+                            "待核实",
+                            "无法判断",
+                        )
+                    ), outcome.message
+            if case_name == "person_unclosed":
+                insight_facts = (
+                    receipts[0]
+                    .safe_user_facts.get("report_insight", {})
+                    .get("facts", {})
+                )
+                assert insight_facts.get("period_type") == "unspecified"
+                if insight_facts.get("needs_time_scope") is True:
+                    assert insight_facts.get("unclosed_items") == []
+                    compact_reply = re.sub(r"\s+", "", outcome.message)
+                    assert all(
+                        option in compact_reply
+                        for option in ("最近7天", "最近30天", "全部历史")
+                    ), outcome.message
+                    assert not any(
+                        label in outcome.message
+                        for label in (
+                            "已闭环",
+                            "跟进中",
+                            "进行中",
+                            "待核实",
+                            "无法判断",
+                        )
+                    ), outcome.message
+            if case_name == "organization_unclosed_recent_30_days":
+                insight_facts = (
+                    receipts[0]
+                    .safe_user_facts.get("report_insight", {})
+                    .get("facts", {})
+                )
+                assert insight_facts.get("period_type") == "recent_30_days"
+                assert insight_facts.get("period_start") == "2026-07-11"
+                assert insight_facts.get("period_end") == "2026-08-09"
+                assert insight_facts.get("needs_time_scope") is False
+                if insight_facts.get("unclosed_preview_truncated") is True:
+                    compact_reply = re.sub(r"\s+", "", outcome.message)
+                    total = int(insight_facts.get("unclosed_count") or 0)
+                    preview = int(
+                        insight_facts.get("unclosed_preview_count") or 0
+                    )
+                    remaining = int(
+                        insight_facts.get("unclosed_remaining_count") or 0
+                    )
+                    assert f"共{total}项" in compact_reply, outcome.message
+                    assert f"前{preview}项" in compact_reply, outcome.message
+                    assert str(remaining) in compact_reply and any(
+                        label in compact_reply
+                        for label in ("另有", "剩余", "其余", "还有", "未展开")
+                    ), outcome.message
             if case_name == "department_attention":
                 insight_facts = (
                     receipts[0]

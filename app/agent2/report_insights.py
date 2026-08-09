@@ -28,6 +28,12 @@ from app.repositories import (
 
 
 REPORT_INSIGHT_SOURCE_TYPE = "daily_report_insight"
+UNCLOSED_SCOPE_CLARIFICATION_THRESHOLD = 20
+UNCLOSED_SCOPE_PERIOD_OPTIONS = (
+    "recent_7_days",
+    "recent_30_days",
+    "all_history",
+)
 
 
 class ReportInsightRepository(Protocol):
@@ -742,9 +748,26 @@ class ReportInsightModule:
             plan_start_date=plan_start_date,
             plan_end_date=plan_end_date,
         )
-        unclosed_items = list(followup_analysis.no_followup_items)
+        preview_limit = 20
+        presentation = _build_unclosed_presentation(
+            followup_analysis,
+            reports=reports,
+            period_type=period_type,
+            preview_limit=preview_limit,
+        )
+        unclosed_items = list(presentation.unclosed_items)
+        needs_time_scope = presentation.needs_time_scope
+        history_start = presentation.history_start
+        preview_count = presentation.preview_count
+        preview_truncated = presentation.preview_truncated
         scope_text = "日报" if permission_team_ids is None else "可查看范围内日报"
-        if plan_start_date is not None and plan_end_date is not None:
+        if needs_time_scope:
+            opening = (
+                f"已核对 {history_start or '现有首份日报'} 至 {current_date.isoformat()} 的"
+                f"{scope_text}，{target_name}共有 {len(unclosed_items)} 项计划未找到后续"
+                "工作记录；明细较多，需要先确定查看时间范围。"
+            )
+        elif plan_start_date is not None and plan_end_date is not None:
             opening = (
                 f"根据 {plan_start_date.isoformat()} 至 {plan_end_date.isoformat()} 的工作计划，"
                 f"并核对截至 {current_date.isoformat()} 的后续“今日工作”，"
@@ -756,23 +779,33 @@ class ReportInsightModule:
                 f"{target_name}共有 {len(unclosed_items)} 项计划未找到后续工作记录。"
             )
         lines = [opening]
-        if unclosed_items:
+        if needs_time_scope:
+            lines.append("可继续查看最近7天、最近30天或全部历史。")
+        elif unclosed_items:
+            if preview_truncated:
+                lines.append(
+                    f"以下展示前{preview_count}项（共{len(unclosed_items)}项）："
+                )
             lines.extend(
-                _unclosed_numbered_lines(unclosed_items, include_user=False, limit=20)
+                _unclosed_numbered_lines(
+                    unclosed_items,
+                    include_user=False,
+                    limit=preview_limit,
+                )
             )
         else:
             lines.append("- 暂未发现没有后续工作记录的计划。")
-        if followup_analysis.in_progress_items:
+        if not needs_time_scope and followup_analysis.in_progress_items:
             lines.append(
                 f"另有 {len(followup_analysis.in_progress_items)} 项已在后续日报中继续跟进，"
                 "未计入上述数字。"
             )
-        if followup_analysis.mentioned_items:
+        if not needs_time_scope and followup_analysis.mentioned_items:
             lines.append(
                 f"另有 {len(followup_analysis.mentioned_items)} 项已有后续工作记录，"
                 "未计入上述数字。"
             )
-        if followup_analysis.pending_evidence_items:
+        if not needs_time_scope and followup_analysis.pending_evidence_items:
             lines.append(
                 f"另有 {len(followup_analysis.pending_evidence_items)} 项在计划后没有可用于核对的"
                 "后续日报，暂无法判断。"
@@ -793,26 +826,20 @@ class ReportInsightModule:
                 "scope_label": target_name,
                 "target_user_ids": [target_id],
                 "permission_scope_team_ids": sorted(permission_team_ids or ()),
-                "history_start": _first_report_date(reports),
+                "history_start": history_start,
                 "history_end": current_date.isoformat(),
                 "period_type": period_type,
+                "evaluated_period_type": (
+                    "all_history" if period_type == "unspecified" else period_type
+                ),
                 "period_start": plan_start_date.isoformat()
                 if plan_start_date
-                else _first_report_date(reports),
+                else history_start,
                 "period_end": plan_end_date.isoformat()
                 if plan_end_date
                 else current_date.isoformat(),
                 "report_count": len(reports),
-                "unclosed_count": len(unclosed_items),
-                "unclosed_items": unclosed_items,
-                "followed_up_count": followup_analysis.followed_up_count,
-                "in_progress_count": len(followup_analysis.in_progress_items),
-                "completed_count": len(followup_analysis.completed_items),
-                "pending_evidence_count": len(followup_analysis.pending_evidence_items),
-                "in_progress_items": list(followup_analysis.in_progress_items),
-                "pending_evidence_items": list(
-                    followup_analysis.pending_evidence_items
-                ),
+                **presentation.fact_fields(),
                 "closure_rule": "later_today_work_mentions_same_item",
                 "permission_allowed": True,
             },
@@ -928,11 +955,28 @@ class ReportInsightModule:
             plan_start_date=plan_start_date,
             plan_end_date=plan_end_date,
         )
-        unclosed_items = list(followup_analysis.no_followup_items)
+        preview_limit = 30
+        presentation = _build_unclosed_presentation(
+            followup_analysis,
+            reports=reports,
+            period_type=period_type,
+            preview_limit=preview_limit,
+        )
+        unclosed_items = list(presentation.unclosed_items)
+        needs_time_scope = presentation.needs_time_scope
+        history_start = presentation.history_start
+        preview_count = presentation.preview_count
+        preview_truncated = presentation.preview_truncated
         target_user_ids = sorted(
             {str(_value(report, "user_id") or "") for report in reports}
         )
-        if plan_start_date is not None and plan_end_date is not None:
+        if needs_time_scope:
+            opening = (
+                f"已核对 {history_start or '现有首份日报'} 至 {current_date.isoformat()} 的"
+                f"可查看日报，{scope_label}共有 {len(unclosed_items)} 项计划未找到后续"
+                "工作记录；明细较多，需要先确定查看时间范围。"
+            )
+        elif plan_start_date is not None and plan_end_date is not None:
             opening = (
                 f"根据 {plan_start_date.isoformat()} 至 {plan_end_date.isoformat()} 的工作计划，"
                 f"并核对截至 {current_date.isoformat()} 的后续部门成员“今日工作”，"
@@ -944,23 +988,33 @@ class ReportInsightModule:
                 f"{scope_label}共有 {len(unclosed_items)} 项计划未找到后续工作记录。"
             )
         lines = [opening]
-        if unclosed_items:
+        if needs_time_scope:
+            lines.append("可继续查看最近7天、最近30天或全部历史。")
+        elif unclosed_items:
+            if preview_truncated:
+                lines.append(
+                    f"以下展示前{preview_count}项（共{len(unclosed_items)}项）："
+                )
             lines.extend(
-                _unclosed_numbered_lines(unclosed_items, include_user=True, limit=30)
+                _unclosed_numbered_lines(
+                    unclosed_items,
+                    include_user=True,
+                    limit=preview_limit,
+                )
             )
         else:
             lines.append("- 暂未发现没有后续工作记录的计划。")
-        if followup_analysis.in_progress_items:
+        if not needs_time_scope and followup_analysis.in_progress_items:
             lines.append(
                 f"另有 {len(followup_analysis.in_progress_items)} 项已由部门成员在后续日报中继续跟进，"
                 "未计入上述数字。"
             )
-        if followup_analysis.mentioned_items:
+        if not needs_time_scope and followup_analysis.mentioned_items:
             lines.append(
                 f"另有 {len(followup_analysis.mentioned_items)} 项已有部门后续工作记录，"
                 "未计入上述数字。"
             )
-        if followup_analysis.pending_evidence_items:
+        if not needs_time_scope and followup_analysis.pending_evidence_items:
             lines.append(
                 f"另有 {len(followup_analysis.pending_evidence_items)} 项在计划后没有可用于核对的"
                 "后续日报，暂无法判断。"
@@ -981,26 +1035,20 @@ class ReportInsightModule:
                 "scope_label": scope_label,
                 "target_team_ids": target_team_ids,
                 "target_user_ids": target_user_ids,
-                "history_start": _first_report_date(reports),
+                "history_start": history_start,
                 "history_end": current_date.isoformat(),
                 "period_type": period_type,
+                "evaluated_period_type": (
+                    "all_history" if period_type == "unspecified" else period_type
+                ),
                 "period_start": plan_start_date.isoformat()
                 if plan_start_date
-                else _first_report_date(reports),
+                else history_start,
                 "period_end": plan_end_date.isoformat()
                 if plan_end_date
                 else current_date.isoformat(),
                 "report_count": len(reports),
-                "unclosed_count": len(unclosed_items),
-                "unclosed_items": unclosed_items,
-                "followed_up_count": followup_analysis.followed_up_count,
-                "in_progress_count": len(followup_analysis.in_progress_items),
-                "completed_count": len(followup_analysis.completed_items),
-                "pending_evidence_count": len(followup_analysis.pending_evidence_items),
-                "in_progress_items": list(followup_analysis.in_progress_items),
-                "pending_evidence_items": list(
-                    followup_analysis.pending_evidence_items
-                ),
+                **presentation.fact_fields(),
                 "closure_rule": "later_department_today_work_mentions_same_item",
                 "permission_allowed": True,
             },
@@ -1490,10 +1538,12 @@ def _report_insight_period_bounds(
     *,
     current_date: date,
 ) -> tuple[date | None, date | None]:
-    if period_type == "all_history":
+    if period_type in {"all_history", "unspecified"}:
         return None, None
     if period_type == "recent_7_days":
         return current_date - timedelta(days=6), current_date
+    if period_type == "recent_30_days":
+        return current_date - timedelta(days=29), current_date
     current_week_start = current_date - timedelta(days=current_date.weekday())
     if period_type == "current_week":
         return current_week_start, current_date
@@ -1666,6 +1716,100 @@ class _PlanFollowupAnalysis:
             + len(self.mentioned_items)
             + len(self.completed_items)
         )
+
+
+@dataclass(frozen=True)
+class _UnclosedPresentation:
+    analysis: _PlanFollowupAnalysis
+    unclosed_items: tuple[dict[str, Any], ...]
+    history_start: str
+    needs_time_scope: bool
+    preview_count: int
+    preview_truncated: bool
+
+    def fact_fields(self) -> dict[str, Any]:
+        total = len(self.unclosed_items)
+        fields: dict[str, Any] = {
+            "unclosed_count": total,
+            "unclosed_items": (
+                [] if self.needs_time_scope else list(self.unclosed_items)
+            ),
+            "unclosed_items_withheld_count": (
+                total if self.needs_time_scope else 0
+            ),
+            "unclosed_preview_count": self.preview_count,
+            "unclosed_preview_truncated": self.preview_truncated,
+            "unclosed_remaining_count": (
+                total - self.preview_count if self.preview_truncated else 0
+            ),
+            "classification_counts_withheld_for_scope_choice": (
+                self.needs_time_scope
+            ),
+            "needs_time_scope": self.needs_time_scope,
+            "available_period_types": (
+                list(UNCLOSED_SCOPE_PERIOD_OPTIONS)
+                if self.needs_time_scope
+                else []
+            ),
+        }
+        if not self.needs_time_scope:
+            fields.update(
+                {
+                    "followed_up_count": self.analysis.followed_up_count,
+                    "in_progress_count": len(self.analysis.in_progress_items),
+                    "completed_count": len(self.analysis.completed_items),
+                    "pending_evidence_count": len(
+                        self.analysis.pending_evidence_items
+                    ),
+                    "in_progress_items": list(self.analysis.in_progress_items),
+                    "pending_evidence_items": list(
+                        self.analysis.pending_evidence_items
+                    ),
+                }
+            )
+        return fields
+
+
+def _build_unclosed_presentation(
+    analysis: _PlanFollowupAnalysis,
+    *,
+    reports: Sequence[Any],
+    period_type: str,
+    preview_limit: int,
+) -> _UnclosedPresentation:
+    unclosed_items = tuple(analysis.no_followup_items)
+    needs_time_scope = _unclosed_scope_requires_clarification(
+        analysis,
+        period_type=period_type,
+    )
+    preview_count = (
+        0 if needs_time_scope else min(len(unclosed_items), preview_limit)
+    )
+    return _UnclosedPresentation(
+        analysis=analysis,
+        unclosed_items=unclosed_items,
+        history_start=_first_report_date(reports),
+        needs_time_scope=needs_time_scope,
+        preview_count=preview_count,
+        preview_truncated=(
+            not needs_time_scope and len(unclosed_items) > preview_limit
+        ),
+    )
+
+
+def _unclosed_scope_requires_clarification(
+    analysis: _PlanFollowupAnalysis,
+    *,
+    period_type: str,
+) -> bool:
+    if period_type != "unspecified":
+        return False
+    detailed_item_count = (
+        len(analysis.no_followup_items)
+        + len(analysis.in_progress_items)
+        + len(analysis.pending_evidence_items)
+    )
+    return detailed_item_count > UNCLOSED_SCOPE_CLARIFICATION_THRESHOLD
 
 
 def _plan_followup_analysis(

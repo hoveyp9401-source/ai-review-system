@@ -16,7 +16,14 @@ REPORT_INSIGHT_QUERY_KINDS = frozenset(
 )
 REPORT_INSIGHT_SCOPE_TYPES = frozenset({"person", "organization"})
 REPORT_INSIGHT_PERIOD_TYPES = frozenset(
-    {"all_history", "recent_7_days", "current_week", "previous_week"}
+    {
+        "unspecified",
+        "all_history",
+        "recent_7_days",
+        "recent_30_days",
+        "current_week",
+        "previous_week",
+    }
 )
 REPORT_INSIGHT_STATUS_FILTERS = frozenset({"all_saved", "completed"})
 
@@ -53,7 +60,7 @@ class StructuredReportInsightQuery:
         if self.query_kind == "recent_work":
             if self.scope_type != "person":
                 raise ValueError("recent work requires a person scope")
-            if self.period_type == "all_history":
+            if self.period_type in {"all_history", "unspecified"}:
                 raise ValueError("recent work requires a bounded period")
         if self.query_kind in {"period_work", "recent_attention"} and self.scope_type != "organization":
             raise ValueError("organization insight requires an organization scope")
@@ -95,4 +102,3 @@ def report_insight_query_from_command(command: Any) -> StructuredReportInsightQu
     if not isinstance(attributes, Mapping) or str(attributes.get("topic") or "") != REPORT_INSIGHT_TOPIC:
         return None
     return StructuredReportInsightQuery.from_entity_payload(entities[0])
-

@@ -78,6 +78,18 @@ Daily-report read-tool boundary:
 - Preserve the tool's classification of unclosed work: "no later work record",
   "followed up/in progress", and "insufficient later reports" are different.
   Never turn all three into a definitive claim that work is unfinished.
+- For `unclosed_work`, use `period_type=unspecified` when the current user
+  message gives no time range, `period_type=recent_30_days` for 最近一个月 or
+  最近30天, and `period_type=all_history` only when the user explicitly asks for
+  全部历史 or 至今全部. If the returned facts contain `needs_time_scope=true`,
+  mention only `unclosed_count`, the evaluated date range and the three scope
+  choices, then由你自然追问 whether to inspect 最近7天、最近30天 or 全部历史.
+  Do not mention report count or any other classification count, and do not
+  invent or list withheld items.
+- If `unclosed_preview_truncated=true` after the user chose a time range, state
+  the exact `unclosed_count`, label the visible list as the first
+  `unclosed_preview_count` items, and state `unclosed_remaining_count`. Never
+  present the preview count as if it were the full result.
 - When rendering report-insight items, use exactly one visible numbering layer.
   Do not invent internal item IDs, nested numbering, or a user preference to
   explain numbering.

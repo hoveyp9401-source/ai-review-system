@@ -222,8 +222,10 @@ class QueryReportInsightsArgs(StrictContract):
     scope_type: Literal["person", "organization"]
     scope_name: Annotated[str, Field(min_length=1, max_length=256)]
     period_type: Literal[
+        "unspecified",
         "all_history",
         "recent_7_days",
+        "recent_30_days",
         "current_week",
         "previous_week",
     ]
@@ -242,7 +244,10 @@ class QueryReportInsightsArgs(StrictContract):
                 "status_filter=completed is valid only for report_count"
             )
         if self.query_kind == "recent_work":
-            if self.scope_type != "person" or self.period_type == "all_history":
+            if self.scope_type != "person" or self.period_type in {
+                "all_history",
+                "unspecified",
+            }:
                 raise ValueError(
                     "recent_work requires person scope and a bounded period"
                 )
