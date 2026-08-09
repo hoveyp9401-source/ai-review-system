@@ -43,6 +43,18 @@ def _args() -> argparse.Namespace:
         choices=("check", "activate", "restore"),
     )
     parser.add_argument("--backup-path", type=Path, required=True)
+    parser.add_argument(
+        "--release-key",
+        default="agent2-stability-v19-20260808",
+        help="Unique release key used for append-only control audit IDs.",
+    )
+    parser.add_argument(
+        "--reason",
+        default=(
+            "activate Agent2 managed-query, scheduler, and "
+            "conversation stability release"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -194,11 +206,8 @@ async def main() -> None:
                 target_by_key = {
                     row.control_key: candidate for row in controls
                 }
-                change_prefix = "agent2-stability-v19-20260808"
-                reason = (
-                    "activate Agent2 managed-query, scheduler, and "
-                    "conversation stability release"
-                )
+                change_prefix = args.release_key
+                reason = args.reason
             elif args.mode == "restore":
                 assert backup_payload is not None
                 backup_rows = backup_payload.get("controls")
@@ -215,8 +224,10 @@ async def main() -> None:
                 }
                 if set(target_by_key) != {row.control_key for row in controls}:
                     raise AssertionError("control backup scope does not match")
-                change_prefix = "agent2-stability-v19-rollback-20260808"
-                reason = "restore Agent2 control contract after v19 release rollback"
+                change_prefix = f"{args.release_key}-rollback"
+                reason = (
+                    f"restore Agent2 control contract after {args.release_key} rollback"
+                )
             else:
                 target_by_key = {
                     row.control_key: candidate for row in controls
