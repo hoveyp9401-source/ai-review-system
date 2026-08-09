@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -12,6 +13,7 @@ from app.agent2.memory.postgres import (
     PersonalMemoryAuditRecord,
     PersonalMemoryRecord,
 )
+from app.agent2.tool_calling import canary_service
 from app.agent2.tool_calling.canary_config import (
     CANARY_MODEL_NAME,
     canary_prompt_sha256,
@@ -27,11 +29,27 @@ from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
 from app.models import User
 
-
 WANG_DINGTALK_ID = "66527"
 PANG_DINGTALK_ID = "40842"
 ASSISTANT_NAME_KEY = "assistant.preferred_name"
 USER_SALUTATION_KEY = "response.preferred_salutation"
+CORRECTION_REPEATS = max(
+    1,
+    int(os.getenv("ASSISTANT_NAME_CORRECTION_REPEATS", "1")),
+)
+NEGATIVE_REPEATS = max(
+    1,
+    int(os.getenv("ASSISTANT_NAME_NEGATIVE_REPEATS", "1")),
+)
+NAMING_INVITATION_MARKERS = (
+    "给我重新起名字",
+    "给我起名字",
+    "如果你希望以后叫我",
+    "如果你想叫我",
+    "如果哪天你也想叫我",
+    "可以直接告诉我，我可以记住",
+    "我会记住这个偏好",
+)
 
 
 async def _counts(session) -> dict[str, int]:
@@ -94,36 +112,82 @@ async def _turn(
     now,
 ) -> dict[str, object]:
     source_message_id = f"rollback-assistant-name-{uuid4()}"
-    outcome = await process_tool_call_canary_ingress(
-        session,
-        user=user,
-        dingtalk_user_id=user.dingtalk_user_id,
-        user_text=text,
-        source_channel="rollback_assistant_name_smoke",
-        conversation_id=conversation_id,
-        source_message_id=source_message_id,
-        settings=settings,
-        llm_client=llm_client,
-        now=now,
-    )
+    model_audits: list[dict[str, object]] = []
+    original_audit_recorder = canary_service._record_model_audit_safely
+
+    def capture_model_audit(payload):
+        if isinstance(payload, dict):
+            turns = payload.get("model_turns")
+            model_audits.append(
+                {
+                    "status": payload.get("status"),
+                    "error_type": payload.get("error_type"),
+                    "error_message": payload.get("error_message"),
+                    "turns": [
+                        {
+                            "iteration": turn.get("iteration"),
+                            "response_metadata": turn.get("response_metadata"),
+                            "raw_assistant_message": turn.get(
+                                "raw_assistant_message"
+                            ),
+                        }
+                        for turn in turns
+                        if isinstance(turn, dict)
+                    ]
+                    if isinstance(turns, list)
+                    else [],
+                }
+            )
+        original_audit_recorder(payload)
+
+    canary_service._record_model_audit_safely = capture_model_audit
+    try:
+        outcome = await process_tool_call_canary_ingress(
+            session,
+            user=user,
+            dingtalk_user_id=user.dingtalk_user_id,
+            user_text=text,
+            source_channel="rollback_assistant_name_smoke",
+            conversation_id=conversation_id,
+            source_message_id=source_message_id,
+            settings=settings,
+            llm_client=llm_client,
+            now=now,
+        )
+    finally:
+        canary_service._record_model_audit_safely = original_audit_recorder
     await session.flush()
     receipts = await _receipts(session, source_message_id)
-    assert outcome.owner == "tool_call_core", outcome
-    assert outcome.handled is True, outcome
     assert not any(
-        receipt.target_type == "daily_report" for receipt in receipts
+        receipt.target_type == "daily_report" and receipt.changed
+        for receipt in receipts
     ), receipts
-    return {
+    result = {
         "text": text,
+        "owner": outcome.owner,
+        "reason": outcome.reason,
         "reply": outcome.message,
         "actual_write": outcome.actual_write,
         "tools": [receipt.tool_name for receipt in receipts],
+        "receipts": [
+            {
+                "tool": receipt.tool_name,
+                "target_type": receipt.target_type,
+                "changed": receipt.changed,
+                "status": receipt.status,
+            }
+            for receipt in receipts
+        ],
         "memory_keys": [
             receipt.safe_user_facts.get("memory_key")
             for receipt in receipts
             if receipt.target_type == "personal_memory"
         ],
+        "model_audits": model_audits,
     }
+    assert outcome.owner == "tool_call_core", result
+    assert outcome.handled is True, result
+    return result
 
 
 async def main() -> None:
@@ -194,7 +258,6 @@ async def main() -> None:
             control.model_name = CANARY_MODEL_NAME
         await session.flush()
 
-        correction_conversation = f"rollback-wang-correction-{uuid4()}"
         salutation_row = await session.scalar(
             select(PersonalMemoryRecord).where(
                 PersonalMemoryRecord.user_id == wang.id,
@@ -217,24 +280,31 @@ async def main() -> None:
             }
         )
 
-        corrected = await _turn(
-            session,
-            user=wang,
-            text="不是，是你叫兼爱，我叫王喜",
-            conversation_id=correction_conversation,
-            settings=settings,
-            llm_client=llm_client,
-            now=now,
-        )
-        results.append(corrected)
-        assert ASSISTANT_NAME_KEY in corrected["memory_keys"], corrected
-        assert USER_SALUTATION_KEY in corrected["memory_keys"], corrected
-        assert await _memory_value(
-            session, wang.id, ASSISTANT_NAME_KEY
-        ) == {"name": "兼爱"}
-        assert await _memory_value(
-            session, wang.id, USER_SALUTATION_KEY
-        ) == {"salutation": "王喜"}
+        for repeat_index in range(CORRECTION_REPEATS):
+            if repeat_index:
+                salutation_row.value_json = {"salutation": "兼爱"}
+                salutation_row.version += 1
+                salutation_row.updated_at = now
+                await session.flush()
+            corrected = await _turn(
+                session,
+                user=wang,
+                text="不是，是你叫兼爱，我叫王喜",
+                conversation_id=f"rollback-wang-correction-{uuid4()}",
+                settings=settings,
+                llm_client=llm_client,
+                now=now,
+            )
+            corrected["correction_repeat"] = repeat_index + 1
+            results.append(corrected)
+            assert ASSISTANT_NAME_KEY in corrected["memory_keys"], corrected
+            assert USER_SALUTATION_KEY in corrected["memory_keys"], corrected
+            assert await _memory_value(
+                session, wang.id, ASSISTANT_NAME_KEY
+            ) == {"name": "兼爱"}
+            assert await _memory_value(
+                session, wang.id, USER_SALUTATION_KEY
+            ) == {"salutation": "王喜"}
 
         fresh_wang_conversation = f"rollback-wang-fresh-{uuid4()}"
         named = await _turn(
@@ -274,6 +344,54 @@ async def main() -> None:
         results.append(default_name)
         assert "小律" in str(default_name["reply"]), default_name
         assert "兼爱" not in str(default_name["reply"]), default_name
+
+        for negative_repeat in range(NEGATIVE_REPEATS):
+            for text in (
+                "小绿，帮我查一下今天的日报",
+                "谢谢小绿",
+                "别人叫它小绿",
+                "你叫小绿吗？",
+            ):
+                negative = await _turn(
+                    session,
+                    user=pang,
+                    text=text,
+                    conversation_id=f"rollback-pang-negative-{uuid4()}",
+                    settings=settings,
+                    llm_client=llm_client,
+                    now=now,
+                )
+                negative["negative_repeat"] = negative_repeat + 1
+                results.append(negative)
+                assert ASSISTANT_NAME_KEY not in negative["memory_keys"], negative
+                assert not any(
+                    marker in str(negative["reply"])
+                    for marker in NAMING_INVITATION_MARKERS
+                ), negative
+                assert await _memory_value(
+                    session,
+                    pang.id,
+                    ASSISTANT_NAME_KEY,
+                ) is None
+
+        explicitly_named = await _turn(
+            session,
+            user=pang,
+            text="以后你就叫小绿",
+            conversation_id=f"rollback-pang-positive-{uuid4()}",
+            settings=settings,
+            llm_client=llm_client,
+            now=now,
+        )
+        results.append(explicitly_named)
+        assert ASSISTANT_NAME_KEY in explicitly_named["memory_keys"], (
+            explicitly_named
+        )
+        assert await _memory_value(
+            session,
+            pang.id,
+            ASSISTANT_NAME_KEY,
+        ) == {"name": "小绿"}
 
         await session.rollback()
 

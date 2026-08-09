@@ -48,13 +48,13 @@ from app.agent2.tool_calling.canary_metrics import (
 )
 from app.agent2.tool_calling.canary_store import ToolCallCanaryControl
 from app.agent2.tool_calling.context import CANARY_STATE_NAMESPACE
+from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
 from app.agent2.tool_calling.deepseek_adapter import (
     DeepSeekToolCallingAdapter,
 )
 from app.agent2.tool_calling.production_contracts import (
     ProductionExecutionCapability,
 )
-from app.agent2.tool_calling.production_daily_executor import source_text_hash
 from app.agent2.tool_calling.production_runtime import ProductionRuntime
 from app.agent2.tool_calling.production_store import ProductionContextStore
 from app.agent2.tool_calling.receipt_reply import (
@@ -633,6 +633,7 @@ async def process_tool_call_canary_ingress(
         user_text=user_text,
         user_messages=user_messages,
     )
+    current_turn_source = CurrentTurnSource(ordered_user_messages)
     canonical_conversation_id = (
         conversation_id.strip()
         or f"dingtalk:{source_channel}:{dingtalk_user_id}"
@@ -766,9 +767,8 @@ async def process_tool_call_canary_ingress(
             context=context,
             capability=resolution.capability,
             source_channel=source_channel,
-            source_text_hash=source_text_hash(
-                _canonical_user_input(ordered_user_messages)
-            ),
+            source_text_hash=current_turn_source.sha256,
+            current_turn_source=current_turn_source,
         )
         adapter = DeepSeekToolCallingAdapter(
             http_client=llm_client.native_http_client,
@@ -3590,20 +3590,6 @@ def _ordered_user_messages(
     if any(not value.strip() for value in normalized):
         raise ValueError("user input cannot contain empty fragments")
     return normalized
-
-
-def _canonical_user_input(user_messages: tuple[str, ...]) -> str:
-    return json.dumps(
-        {
-            "ordered_user_messages": [
-                {"sequence": index, "content": value}
-                for index, value in enumerate(user_messages, start=1)
-            ]
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
 
 
 def _runtime_attestation(settings: object) -> CanaryRuntimeAttestation:

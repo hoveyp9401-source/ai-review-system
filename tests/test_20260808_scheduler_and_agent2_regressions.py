@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,10 +74,30 @@ def test_agent2_contract_carries_model_decided_empty_field_without_phrase_rules(
         date_expression="today",
         proposed_date=date(2026, 8, 8),
         items=(
-            {"field": "today_work", "content": "完成合同审核"},
-            {"field": "tomorrow_plan", "content": "继续跟进案件"},
+            {
+                "field": "today_work",
+                "content": "完成合同审核",
+                "source_evidence": {
+                    "source_message_index": 1,
+                },
+            },
+            {
+                "field": "tomorrow_plan",
+                "content": "继续跟进案件",
+                "source_evidence": {
+                    "source_message_index": 1,
+                },
+            },
         ),
         acknowledged_empty_fields=("problems",),
+        empty_field_evidence=(
+            {
+                "field": "problems",
+                "source_evidence": {
+                    "source_message_index": 1,
+                },
+            },
+        ),
     )
 
     assert arguments.acknowledged_empty_fields == ("problems",)

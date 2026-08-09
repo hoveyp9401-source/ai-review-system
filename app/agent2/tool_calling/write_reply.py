@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agent2.tool_calling.contracts import ReceiptStatus, ToolReceipt
 
-
 WriteOperationOutcome = Literal[
     "changed",
     "partial",
@@ -104,6 +103,14 @@ def write_reply_protocol(
         "rules": [
             "Return one JSON object and nothing else.",
             "Compose reply naturally; do not expose internal codes or identifiers.",
+            (
+                "Copy expected_actual_write and expected_operation_outcome exactly; "
+                "these are server-computed fields, not values for the model to infer."
+            ),
+            (
+                "A no-op alongside a successful change is still the server-provided "
+                "aggregate outcome, not automatically partial."
+            ),
             "Do not claim a write unless expected_actual_write is true.",
             "For partial, state separately what succeeded and what did not.",
             "Do not call another tool in this user turn.",
@@ -148,16 +155,20 @@ def write_reply_retry_instruction(
     errors: tuple[str, ...],
     receipts: tuple[ToolReceipt, ...],
 ) -> str:
+    required_exact_fields = {
+        "actual_write": any(receipt.changed for receipt in receipts),
+        "operation_outcome": expected_write_outcome(receipts),
+    }
     return json.dumps(
         {
             "write_reply_retry": {
                 "validation_errors": list(errors),
-                "terminal_response_contract": write_reply_protocol(
-                    receipts
-                ),
+                "required_exact_fields": required_exact_fields,
                 "instruction": (
-                    "Regenerate only the terminal JSON object from the supplied "
-                    "safe_user_facts. Do not call tools."
+                    "Return exactly one terminal JSON object. Copy "
+                    "required_exact_fields unchanged into it. Compose only the "
+                    "non-empty reply from the existing safe_user_facts. Do not "
+                    "call tools. Do not return blank text or omit any field."
                 ),
             }
         },

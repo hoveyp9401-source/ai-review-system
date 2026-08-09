@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from enum import StrEnum
-from typing import Any, Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -47,6 +47,31 @@ PersonalMemoryKey = Literal[
     "report.show_updated_snapshot",
     "report.show_item_numbers",
 ]
+
+
+class CurrentUserMessageEvidence(StrictContract):
+    source_message_index: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=20,
+            description=(
+                "One-based sequence of the current user_message or current "
+                "ordered user_messages fragment that supplies this value."
+            ),
+        ),
+    ]
+
+
+class PersonalMemorySourceEvidence(CurrentUserMessageEvidence):
+    intent: Literal[
+        "explicit_preference",
+        "explicit_remember_request",
+        "assistant_name_assignment",
+        "assistant_name_correction",
+        "user_salutation_assignment",
+        "user_salutation_correction",
+    ]
 
 
 class QueryTodayReportArgs(StrictContract):
@@ -274,6 +299,12 @@ class QueryDefendantPerformanceArgs(StrictContract):
 class DailyItemInput(StrictContract):
     field: ReportField
     content: NonEmptyText
+    source_evidence: CurrentUserMessageEvidence
+
+
+class DailyEmptyFieldEvidence(StrictContract):
+    field: ReportField
+    source_evidence: CurrentUserMessageEvidence
 
 
 class AddDailyItemsArgs(StrictContract):
@@ -281,6 +312,10 @@ class AddDailyItemsArgs(StrictContract):
     proposed_date: date
     items: tuple[DailyItemInput, ...] = Field(default=(), max_length=30)
     acknowledged_empty_fields: tuple[ReportField, ...] = Field(
+        default=(),
+        max_length=3,
+    )
+    empty_field_evidence: tuple[DailyEmptyFieldEvidence, ...] = Field(
         default=(),
         max_length=3,
     )
@@ -297,6 +332,15 @@ class AddDailyItemsArgs(StrictContract):
             set(self.acknowledged_empty_fields)
         ):
             raise ValueError("explicitly empty fields must be unique")
+        evidence_fields = tuple(
+            item.field for item in self.empty_field_evidence
+        )
+        if len(evidence_fields) != len(set(evidence_fields)):
+            raise ValueError("empty-field evidence must be unique by field")
+        if set(evidence_fields) != set(self.acknowledged_empty_fields):
+            raise ValueError(
+                "every explicitly empty field requires matching current-message evidence"
+            )
         item_fields = {item.field for item in self.items}
         if item_fields.intersection(self.acknowledged_empty_fields):
             raise ValueError(
@@ -374,6 +418,7 @@ class RememberPersonalMemoryArgs(StrictContract):
         | OutputFormatPreferenceValue
         | PreferredSalutationValue
     )
+    source_evidence: PersonalMemorySourceEvidence
 
     @model_validator(mode="after")
     def value_must_match_the_selected_key(
@@ -384,6 +429,40 @@ class RememberPersonalMemoryArgs(StrictContract):
             self.memory_key,
             self.value,
         )
+        assistant_name_intents = {
+            "assistant_name_assignment",
+            "assistant_name_correction",
+        }
+        user_salutation_intents = {
+            "user_salutation_assignment",
+            "user_salutation_correction",
+        }
+        preference_intents = {
+            "explicit_preference",
+            "explicit_remember_request",
+        }
+        intent = self.source_evidence.intent
+        if (
+            self.memory_key == "assistant.preferred_name"
+            and intent not in assistant_name_intents
+        ):
+            raise ValueError(
+                "assistant name memory requires assistant-role assignment evidence"
+            )
+        if (
+            self.memory_key == "response.preferred_salutation"
+            and intent not in user_salutation_intents
+        ):
+            raise ValueError(
+                "user salutation memory requires user-role assignment evidence"
+            )
+        if self.memory_key not in {
+            "assistant.preferred_name",
+            "response.preferred_salutation",
+        } and intent not in preference_intents:
+            raise ValueError(
+                "response preference memory requires explicit preference evidence"
+            )
         return self
 
 

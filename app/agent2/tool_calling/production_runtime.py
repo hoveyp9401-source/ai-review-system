@@ -1,25 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import hashlib
 import json
 import logging
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import select, text
 
+from app.agent2.tool_calling.canary_store import ToolCallCanaryControl
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedContext,
     TrustedReportSnapshot,
 )
-from app.agent2.tool_calling.canary_store import ToolCallCanaryControl
 from app.agent2.tool_calling.contracts import (
     ExecutionMode,
     ReceiptStatus,
     ToolReceipt,
 )
+from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
 from app.agent2.tool_calling.production_contracts import (
     ProductionExecutionCapability,
     ProductionRuntimeResult,
@@ -30,13 +31,13 @@ from app.agent2.tool_calling.production_daily_executor import (
     ProductionHandlerOutcome,
 )
 from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
-from app.agent2.tool_calling.production_memory_executor import (
-    ProductionPersonalMemoryExecutor,
-)
 from app.agent2.tool_calling.production_memory_evidence import (
     is_personal_memory_call,
     personal_memory_evidence_matches,
     personal_memory_safe_user_facts,
+)
+from app.agent2.tool_calling.production_memory_executor import (
+    ProductionPersonalMemoryExecutor,
 )
 from app.agent2.tool_calling.production_performance_executor import (
     ProductionPerformanceExecutor,
@@ -61,7 +62,6 @@ from app.agent2.tool_calling.validation import (
     NativeToolCall,
     ShadowCallBinder,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,12 @@ class ProductionRuntime:
         capability: ProductionExecutionCapability,
         source_channel: str,
         source_text_hash: str,
+        current_turn_source: CurrentTurnSource,
     ) -> "ProductionRuntimeSession":
+        if current_turn_source.sha256 != source_text_hash:
+            raise ProductionCapabilityError(
+                "CURRENT_TURN_SOURCE_HASH_MISMATCH"
+            )
         _validate_capability(
             context=context,
             capability=capability,
@@ -131,6 +136,7 @@ class ProductionRuntime:
                 self._date_resolver,
                 read_port,
                 execution_mode=ExecutionMode.CANARY_EXECUTE,
+                current_turn_source=current_turn_source,
             ),
             date_resolver=self._date_resolver,
         )

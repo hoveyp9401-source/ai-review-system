@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Literal, Mapping
 
 from pydantic import BaseModel, ValidationError
 
+from app.agent2.tool_calling import production_handlers
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
     CompletePreviousPlanArgs,
@@ -22,9 +23,9 @@ from app.agent2.tool_calling.contracts import (
     QueryDailyBriefingFactsArgs,
     QueryDefendantPerformanceArgs,
     QueryManagedDailyReportsArgs,
-    QueryReportInsightsArgs,
     QueryPersonalMemoryArgs,
     QueryReportByDateArgs,
+    QueryReportInsightsArgs,
     QueryTodayReportArgs,
     RememberPersonalMemoryArgs,
     RequestClearReportArgs,
@@ -42,15 +43,15 @@ from app.agent2.tool_calling.handlers import (
     simulate_query,
     simulate_request_clear,
 )
-from app.agent2.tool_calling.memory_handlers import (
-    simulate_memory_forget,
-    simulate_memory_query,
-    simulate_memory_remember,
-)
 from app.agent2.tool_calling.managed_daily_handlers import (
     simulate_daily_briefing_fact_query,
     simulate_managed_daily_query,
     simulate_report_insight_query,
+)
+from app.agent2.tool_calling.memory_handlers import (
+    simulate_memory_forget,
+    simulate_memory_query,
+    simulate_memory_remember,
 )
 from app.agent2.tool_calling.performance_handlers import (
     simulate_defendant_performance_query,
@@ -71,8 +72,6 @@ from app.agent2.tool_calling.sandbox_handlers import (
     execute_remember_personal_memory,
     execute_request_clear_report,
 )
-from app.agent2.tool_calling import production_handlers
-
 
 ReadOrWrite = Literal["read", "write"]
 RiskLevel = Literal["low", "medium", "high"]
@@ -452,21 +451,37 @@ TOOL_REGISTRY = MappingProxyType(
         "add_daily_items": _definition(
             "add_daily_items",
             "Propose independent asserted entries about the authenticated user's actual completed "
-            "work, current problem or risk, or definite plan. Do not use for a negated event, "
-            "condition or hypothesis, quoted, attributed, or source-reported content, or a "
-            "question unless the user explicitly asks to record that exact negative state, "
-            "risk, or plan. Use one complete items array for all explicitly supplied daily-report "
+            "work, current problem or risk, or definite plan. Do not turn a negated event, "
+            "condition, hypothesis, quotation, attribution, source report, or question into the "
+            "user's own asserted fact. However, when the user's reported work is attending, "
+            "recording, communicating, or summarizing a meeting or source, preserve the "
+            "explicitly supplied attributed details as attributed content instead of discarding "
+            "them or converting them into the user's own claim. Use one complete items array for "
+            "all explicitly supplied daily-report "
             "fields and independent matters. When the current user_message semantically and "
             "unambiguously states that a specific report field intentionally has no content, put "
             "that field in acknowledged_empty_fields instead of inventing or storing a textual "
             "item. This semantic choice belongs to the model; never derive it from a keyword list "
             "or from an omitted field. Every proposed item or empty-field acknowledgement must "
-            "come from the current "
+            "carry source evidence with a one-based current-message index; the server binds that "
+            "index to the original current-message text. Every acknowledged empty field must also "
+            "have one "
+            "matching empty_field_evidence entry. Evidence never comes from conversation history. "
+            "For quoted source text, do not copy quotation delimiters into source evidence. Never "
+            "normalize curly quotation marks into "
+            "unescaped ASCII double quotes. Preserve attribution in content with safe wording "
+            "such as a colon when needed. "
+            "The proposed meaning must come from the current "
             "user_message or one uniquely adopted, immediately preceding user-authored report "
             "draft that the current user_message explicitly binds to the target report. Never "
             "write report content from history alone. Every independently asserted matter, "
-            "whether general or specific, must be represented. Professional wording "
-            "cleanup must not omit, add, or change meaning. Contingent possibilities are not "
+            "whether general or specific, must be represented. Review every ordered current-message "
+            "fragment and every numbered or punctuation-separated assertion semantically before "
+            "calling the tool. Do not collapse detailed source content into a headline. "
+            "Professional wording cleanup must preserve actors, dates, deadlines, quantities, "
+            "alternatives, attribution, and explicitly named subjects; it must not omit, add, or "
+            "change meaning. If the intended split or destination field is uncertain, ask naturally "
+            "before calling the tool. Contingent possibilities are not "
             "asserted facts or definite plans. A target field defined as identical to another "
             "field must contain the referenced concrete items, not a relational placeholder. "
             "A stated current problem and its related future response are separate matters. "
@@ -638,7 +653,12 @@ TOOL_REGISTRY = MappingProxyType(
             "preference; do not infer one from their legal name or from another person's text. "
             "An assistant name explicitly assigned by this user is also allowed under "
             "assistant.preferred_name. Keep it separate from response.preferred_salutation, "
-            "and never advertise or solicit this naming ability. When the current user_message "
+            "and never advertise or solicit this naming ability. Every call must carry "
+            "source_evidence containing the one-based current-message index and an intent whose "
+            "assistant/user role matches memory_key. For assistant names and user salutations, the "
+            "stored value itself must appear in that server-bound current message. A vocative, "
+            "thanks, question, or third-party quotation is not an assignment. "
+            "When the current user_message "
             "explicitly contrasts both roles (the assistant's name and the user's form of "
             "address), call this tool separately for both keys even if either value already "
             "appears configured; the server will safely return no-op for an unchanged value.",

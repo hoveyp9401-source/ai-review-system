@@ -1,10 +1,10 @@
-from datetime import datetime
 import json
+from datetime import datetime
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-import pytest
 import httpx
+import pytest
 
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
@@ -17,10 +17,12 @@ from app.agent2.tool_calling.contracts import (
     ToolReceipt,
 )
 from app.agent2.tool_calling.deepseek_adapter import (
-    DeepSeekToolCallingAdapter,
+    DeepSeekResponseError,
     DeepSeekTimeoutError,
-    _CompletionResponse,
+    DeepSeekToolCallingAdapter,
+    MalformedToolCallError,
     _canary_post_write_protocol_message,
+    _CompletionResponse,
 )
 from app.agent2.tool_calling.production_contracts import (
     ProductionRuntimeResult,
@@ -28,6 +30,7 @@ from app.agent2.tool_calling.production_contracts import (
 from app.agent2.tool_calling.write_reply import (
     expected_write_outcome,
     validate_write_reply,
+    write_reply_retry_instruction,
 )
 
 
@@ -66,6 +69,22 @@ def _changed_receipt() -> ToolReceipt:
         },
         execution_mode=ExecutionMode.CANARY_EXECUTE,
     )
+
+
+def test_write_reply_retry_exposes_server_fields_as_exact_copy_values() -> None:
+    instruction = json.loads(
+        write_reply_retry_instruction(
+            ("operation_outcome does not match server receipts",),
+            (_changed_receipt(),),
+        )
+    )["write_reply_retry"]
+
+    assert instruction["required_exact_fields"] == {
+        "actual_write": True,
+        "operation_outcome": "changed",
+    }
+    assert "Copy required_exact_fields unchanged" in instruction["instruction"]
+    assert "Do not return blank text" in instruction["instruction"]
 
 
 def _blocked_receipt() -> ToolReceipt:
@@ -108,8 +127,10 @@ class _DeferredRuntimeSession:
     def __init__(self) -> None:
         self.commit_count = 0
         self.rollback_count = 0
+        self.execute_count = 0
 
     async def execute(self, calls, *, defer_finalization):
+        self.execute_count += 1
         assert defer_finalization is True
         assert len(calls) == 1
         return ProductionRuntimeResult(
@@ -233,6 +254,9 @@ def _tool_call_completion() -> _CompletionResponse:
                                     {
                                         "field": "today_work",
                                         "content": "虚构测试事项",
+                                        "source_evidence": {
+                                            "source_message_index": 1,
+                                        },
                                     }
                                 ],
                             },
@@ -244,6 +268,300 @@ def _tool_call_completion() -> _CompletionResponse:
         },
         metadata={"finish_reason": "tool_calls"},
     )
+
+
+def _malformed_tool_call_completion() -> _CompletionResponse:
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "malformed-call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "add_daily_items",
+                        "arguments": (
+                            '{"date_expression":"今天","items":['
+                            '{"content":"老板说"要么降薪，要么裁员""}]}'
+                        ),
+                    },
+                }
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_malformed_pre_execution_tool_json_gets_one_model_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _malformed_tool_call_completion(),
+            _tool_call_completion(),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已经按你的原话记录到今天的日报。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    captured_messages = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del tool_schemas, thinking_enabled
+        captured_messages.append(tuple(messages))
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="今天完成了虚构测试事项",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+    assert result.iterations == 3
+    assert any(
+        message.get("role") == "system"
+        and "重新生成一次合法的原生工具调用" in str(message.get("content"))
+        for message in captured_messages[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_second_malformed_tool_json_fails_closed_without_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _malformed_tool_call_completion(),
+            _malformed_tool_call_completion(),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(MalformedToolCallError):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="今天完成了虚构测试事项",
+            context=_context(),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_terminal_after_pending_write_gets_one_json_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _tool_call_completion(),
+            _CompletionResponse(
+                message={"role": "assistant", "content": "   "},
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已经按你的原话记录到今天的日报。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="今天完成了虚构测试事项",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == "已经按你的原话记录到今天的日报。"
+    assert result.iterations == 3
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_write_gets_two_bounded_terminal_json_repairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _tool_call_completion(),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已记录。",
+                            "actual_write": True,
+                            "operation_outcome": "partial",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={"role": "assistant", "content": "   "},
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已经按你的原话记录到今天的日报。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="今天完成了虚构测试事项",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 4
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_third_empty_terminal_after_pending_write_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _tool_call_completion(),
+            _CompletionResponse(
+                message={"role": "assistant", "content": "   "},
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={"role": "assistant", "content": "\n"},
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={"role": "assistant", "content": "\t"},
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(DeepSeekResponseError):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="今天完成了虚构测试事项",
+            context=_context(),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 1
 
 
 @pytest.mark.asyncio

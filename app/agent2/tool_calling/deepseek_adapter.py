@@ -470,6 +470,7 @@ class DeepSeekToolCallingAdapter:
         daily_briefing_reply_retry_count = 0
         managed_daily_reply_retry_count = 0
         write_reply_retry_count = 0
+        tool_argument_repair_count = 0
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
         async def rollback_pending() -> None:
@@ -536,8 +537,14 @@ class DeepSeekToolCallingAdapter:
                         parsed,
                         allow_usable_direct_text=True,
                         allow_empty_terminal_for_retry=(
-                            briefing_fact_batch_seen
-                            and daily_briefing_reply_retry_count == 0
+                            (
+                                briefing_fact_batch_seen
+                                and daily_briefing_reply_retry_count == 0
+                            )
+                            or (
+                                write_batch_seen
+                                and write_reply_retry_count < 2
+                            )
                         ),
                     )
                     if protocol_warning is not None:
@@ -548,6 +555,34 @@ class DeepSeekToolCallingAdapter:
                                 "protocol_warning": protocol_warning,
                             },
                         )
+                except (
+                    MalformedToolCallError,
+                    InvalidNativeToolArgumentsError,
+                ) as exc:
+                    if (
+                        tool_argument_repair_count == 0
+                        and not write_batch_seen
+                        and not briefing_fact_batch_seen
+                    ):
+                        audits.extend(exc.raw_tool_call_audit)
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "pre_execution_tool_argument_repair": True,
+                                "tool_argument_error_type": type(exc).__name__,
+                            },
+                        )
+                        messages.append(
+                            _pre_execution_tool_argument_repair_message()
+                        )
+                        tool_argument_repair_count += 1
+                        continue
+                    raise _with_canary_turn_state(
+                        exc,
+                        audits=audits,
+                        model_turns=model_turns,
+                    ) from exc
                 except DeepSeekToolCallingError as exc:
                     raise _with_canary_turn_state(
                         exc,
@@ -638,8 +673,9 @@ class DeepSeekToolCallingAdapter:
                             },
                         )
                         if write_batch_seen:
-                            if write_reply_retry_count == 0:
-                                messages.append(parsed.assistant_message)
+                            if write_reply_retry_count < 2:
+                                if content.strip():
+                                    messages.append(parsed.assistant_message)
                                 messages.append(
                                     {
                                         "role": "system",
@@ -1269,6 +1305,21 @@ def _post_write_protocol_message() -> dict[str, str]:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+        ),
+    }
+
+
+def _pre_execution_tool_argument_repair_message() -> dict[str, str]:
+    return {
+        "role": "system",
+        "content": (
+            "上一条原生工具调用尚未执行，也没有产生任何写入。其 arguments "
+            "不是合法 JSON 或未满足当前工具结构。请重新读取当前用户消息与当前工具 "
+            "schema，重新生成一次合法的原生工具调用。所有字符串必须正确 JSON 转义，"
+            "所有必填来源凭证必须完整。source_evidence 只填写必填的 "
+            "source_message_index，不要复制原文或引号。不要把中文弯引号改成英文双引号。"
+            "日报 content 可用冒号保留引述归属，不要把未转义引号放进 JSON 字符串。"
+            "不要改用文本描述工具调用，也不要假称已经执行。"
         ),
     }
 

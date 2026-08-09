@@ -73,6 +73,10 @@ def test_remember_contract_accepts_assistant_name_only_for_assistant_key() -> No
         {
             "memory_key": "assistant.preferred_name",
             "value": {"name": "兼爱"},
+            "source_evidence": {
+                "source_message_index": 1,
+                "intent": "assistant_name_assignment",
+            },
         }
     )
 
@@ -84,6 +88,10 @@ def test_remember_contract_accepts_assistant_name_only_for_assistant_key() -> No
             {
                 "memory_key": "assistant.preferred_name",
                 "value": {"salutation": "兼爱"},
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "intent": "assistant_name_assignment",
+                },
             }
         )
     with pytest.raises(ValidationError):
@@ -91,6 +99,10 @@ def test_remember_contract_accepts_assistant_name_only_for_assistant_key() -> No
             {
                 "memory_key": "response.preferred_salutation",
                 "value": {"name": "兼爱"},
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "intent": "user_salutation_assignment",
+                },
             }
         )
 
@@ -101,11 +113,14 @@ def test_prompt_keeps_default_and_personal_assistant_names_separate() -> None:
     assert "Your default name is 小律" in prompt
     assert "Never use it to address the user" in prompt
     assert "Never copy one into the other" in prompt
-    assert "Do not advertise this naming ability" in prompt
     assert 'memory_key="assistant.preferred_name"' in prompt
     assert "You MUST call `remember_personal_memory` once" in prompt
     assert "never skip" in prompt
     assert "either call based on your own assumption" in prompt
+    assert "A terminal acknowledgement is never a substitute" in prompt
+    assert "Never advertise or invite assistant naming" in prompt
+    assert "answer only the current question without extending an invitation" in prompt
+    assert "非明确赋名时，只回答用户当下的问题" in prompt
     assert 'do not say "谢谢王喜的鼓励"' in prompt
 
 

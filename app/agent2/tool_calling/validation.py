@@ -9,6 +9,10 @@ from zoneinfo import ZoneInfo
 from app.agent2.memory import TrustedPersonalMemory
 from app.agent2.tool_calling.context import TrustedContext, TrustedReportSnapshot
 from app.agent2.tool_calling.contracts import ExecutionMode, ReceiptStatus, ToolReceipt
+from app.agent2.tool_calling.current_turn_source import (
+    CurrentTurnSource,
+    CurrentTurnSourceEvidenceError,
+)
 from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     ToolArgumentsValidationError,
@@ -88,11 +92,13 @@ class ShadowCallBinder:
         report_read_port: TrustedReportReadPort | None,
         *,
         execution_mode: ExecutionMode = ExecutionMode.SHADOW_PROPOSAL,
+        current_turn_source: CurrentTurnSource | None = None,
     ) -> None:
         self._context = context
         self._date_resolver = date_resolver
         self._report_read_port = report_read_port
         self._execution_mode = execution_mode
+        self._current_turn_source = current_turn_source
         self._session_reports: dict[UUID, TrustedReportSnapshot] = {}
         self._batch_reports_by_date: dict[date, TrustedReportSnapshot] = {}
 
@@ -158,6 +164,18 @@ class ShadowCallBinder:
                 "INVALID_TOOL_ARGUMENTS",
                 validation_errors=exc.errors,
             )
+        if self._current_turn_source is not None:
+            try:
+                self._current_turn_source.validate_tool_arguments(
+                    call.tool_name,
+                    arguments,
+                )
+            except CurrentTurnSourceEvidenceError as exc:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    exc.code,
+                )
         definition = TOOL_REGISTRY[call.tool_name]
         if self._execution_mode not in definition.enabled_modes:
             return None, failure_receipt(

@@ -102,6 +102,14 @@ def forced_atomic_failure_llm() -> _StaticLlmClient:
                                                 "acknowledged_empty_fields": [
                                                     "today_work"
                                                 ],
+                                                "empty_field_evidence": [
+                                                    {
+                                                        "field": "today_work",
+                                                        "source_evidence": {
+                                                            "source_message_index": 1,
+                                                        },
+                                                    }
+                                                ],
                                             },
                                             ensure_ascii=False,
                                         ),
@@ -222,13 +230,21 @@ def safe_terminal_shape(raw_message: object) -> dict[str, object]:
     tool_calls = raw_message.get("tool_calls")
     if tool_calls:
         names = []
+        raw_argument_previews = []
         for item in tool_calls if isinstance(tool_calls, list) else []:
             if not isinstance(item, dict):
                 continue
             function = item.get("function")
             if isinstance(function, dict):
                 names.append(str(function.get("name") or ""))
-        return {"kind": "tool_calls", "tool_names": names}
+                raw_argument_previews.append(
+                    str(function.get("arguments") or "")[:2000]
+                )
+        return {
+            "kind": "tool_calls",
+            "tool_names": names,
+            "raw_argument_previews": raw_argument_previews,
+        }
     if not isinstance(content, str):
         return {"kind": "no_text"}
     try:
@@ -327,6 +343,8 @@ async def run_case(
     now: datetime,
     mode: str,
     history: tuple[str, str] | None = None,
+    required_written_fragments: tuple[str, ...] = (),
+    required_empty_fields: tuple[str, ...] = (),
 ) -> dict[str, object]:
     settings = get_settings()
     case_now = (
@@ -380,6 +398,7 @@ async def run_case(
             "forced_atomic_failure",
             "conditional",
             "quote",
+            "source_fidelity",
         }:
             clear_report(target_report)
             tested_report = target_report
@@ -572,15 +591,45 @@ async def run_case(
                 and after == prepared_before
                 and not result["raw_error_exposed"]
             )
-        elif mode == "quote":
-            result["expected"] = "accept quoted content without asking user to repeat"
-            written_text = "\n".join(str(item) for item in after["today_work"])
-            quote_preserved = "降薪" in written_text and "裁员" in written_text
-            result["quoted_meaning_preserved"] = quote_preserved
+        elif mode in {"quote", "source_fidelity"}:
+            result["expected"] = (
+                "preserve every required source detail without asking the user to repeat"
+            )
+            written_text = "\n".join(
+                str(item)
+                for field in ("today_work", "problems", "tomorrow_plan")
+                for item in after[field]
+            )
+            missing_fragments = [
+                fragment
+                for fragment in required_written_fragments
+                if fragment not in written_text
+            ]
+            missing_empty_fields = [
+                field
+                for field in required_empty_fields
+                if not bool(
+                    after["section_status"].get(
+                        f"{field}_acknowledged_empty"
+                    )
+                )
+            ]
+            result["written_today_work"] = list(after["today_work"])
+            result["written_report_fields"] = {
+                field: list(after[field])
+                for field in ("today_work", "problems", "tomorrow_plan")
+            }
+            result["required_written_fragments"] = list(
+                required_written_fragments
+            )
+            result["missing_written_fragments"] = missing_fragments
+            result["required_empty_fields"] = list(required_empty_fields)
+            result["missing_empty_fields"] = missing_empty_fields
             result["passed"] = bool(
                 outcome.actual_write
                 and after != prepared_before
-                and quote_preserved
+                and not missing_fragments
+                and not missing_empty_fields
                 and not result["raw_error_exposed"]
                 and "再发一次" not in reply
             )
@@ -827,11 +876,15 @@ async def main() -> None:
             "name": "quoted_content_short_curly",
             "text": "今天记录经营会，老板原话是“要么降薪，要么裁员”；风险暂无；明天继续跟进降本方案。",
             "mode": "quote",
+            "required_written_fragments": ("降薪", "裁员"),
+            "required_empty_fields": ("problems",),
         },
         {
             "name": "quoted_content_short_ascii",
             "text": "今天记录经营会，老板原话是\"要么降薪，要么裁员\"；风险暂无；明天继续跟进降本方案。",
             "mode": "quote",
+            "required_written_fragments": ("降薪", "裁员"),
+            "required_empty_fields": ("problems",),
         },
         {
             "name": "quoted_content_long",
@@ -843,6 +896,88 @@ async def main() -> None:
                 "和海外项目。今天内容的核心一是人才，二是降成本。风险暂无，明天继续跟进。"
             ),
             "mode": "quote",
+            "required_written_fragments": (
+                "八月底",
+                "招聘",
+                "人员储备",
+                "9.1",
+                "14",
+                "降薪",
+                "裁员",
+                "施工成本",
+                "海外项目",
+                "人才",
+                "降成本",
+            ),
+            "required_empty_fields": ("problems",),
+        },
+        {
+            "name": "long_voice_unquoted_details",
+            "text": (
+                "今天下午参加经营管理会议，第一项是人才培养，各部门负责人要在八月底前"
+                "完成招聘或明确内部人员储备；第二项是成本，行政成本从9.1升到14点几，"
+                "还讨论了施工成本和海外项目。风险是降本措施还没明确，明天继续梳理。"
+            ),
+            "mode": "source_fidelity",
+            "required_written_fragments": (
+                "八月底",
+                "招聘",
+                "人员储备",
+                "9.1",
+                "14",
+                "施工成本",
+                "海外项目",
+                "降本措施",
+                "继续梳理",
+            ),
+        },
+        {
+            "name": "numbered_daily_items",
+            "text": (
+                "今天工作：1.完成合同模板复核；2.和法务三部沟通印章权限；"
+                "3.整理海外项目台账。问题：费用口径尚未统一。明天计划：跟财务确认口径。"
+            ),
+            "mode": "source_fidelity",
+            "required_written_fragments": (
+                "合同模板",
+                "法务三部",
+                "印章权限",
+                "海外项目",
+                "费用口径",
+                "财务",
+            ),
+        },
+        {
+            "name": "explicit_verbatim_daily_item",
+            "text": (
+                "请原样记录今天工作：各部门负责人须在8月31日前完成招聘，"
+                "否则必须明确内部人员储备，不要概括。风险暂无，明天继续跟进。"
+            ),
+            "mode": "source_fidelity",
+            "required_written_fragments": (
+                "8月31日",
+                "招聘",
+                "内部人员储备",
+                "继续跟进",
+            ),
+            "required_empty_fields": ("problems",),
+        },
+        {
+            "name": "explicit_summary_permission",
+            "text": (
+                "今天参加经营会，会上讨论了人才储备、施工成本和海外项目，"
+                "细节不用逐字保留，请概括成一项工作。风险暂无，明天跟进会议事项。"
+            ),
+            "mode": "source_fidelity",
+            "required_written_fragments": (
+                "经营会",
+                "人才储备",
+                "施工成本",
+                "海外项目",
+                "跟进",
+                "会议",
+            ),
+            "required_empty_fields": ("problems",),
         },
         {
             "name": "incident_cause_1",
