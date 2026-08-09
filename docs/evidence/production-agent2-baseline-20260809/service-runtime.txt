@@ -1,0 +1,29 @@
+MainPID=3191244
+NRestarts=3
+ExecStart={ path=/home/ai_review_tunnel/ai-review-system/venv/bin/python ; argv[]=/home/ai_review_tunnel/ai-review-system/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 ; ignore_errors=no ; start_time=[Sat 2026-08-08 12:35:04 CST] ; stop_time=[n/a] ; pid=3191244 ; code=(null) ; status=0/0 }
+WorkingDirectory=/home/ai_review_tunnel/releases/current
+Id=ai-review-api.service
+ActiveState=active
+SubState=running
+FragmentPath=/etc/systemd/system/ai-review-api.service
+ActiveEnterTimestamp=Sat 2026-08-08 12:35:04 CST
+
+MainPID=3191242
+NRestarts=3
+ExecStart={ path=/home/ai_review_tunnel/ai-review-system/venv/bin/python ; argv[]=/home/ai_review_tunnel/ai-review-system/venv/bin/python -m app.stream_runner ; ignore_errors=no ; start_time=[Sat 2026-08-08 12:35:03 CST] ; stop_time=[n/a] ; pid=3191242 ; code=(null) ; status=0/0 }
+WorkingDirectory=/home/ai_review_tunnel/releases/current
+Id=ai-review-stream.service
+ActiveState=active
+SubState=running
+FragmentPath=/etc/systemd/system/ai-review-stream.service
+ActiveEnterTimestamp=Sat 2026-08-08 12:35:03 CST
+
+MainPID=3191245
+NRestarts=3
+ExecStart={ path=/home/ai_review_tunnel/ai-review-system/venv/bin/python ; argv[]=/home/ai_review_tunnel/ai-review-system/venv/bin/python -m app.scheduler.runner ; ignore_errors=no ; start_time=[Sat 2026-08-08 12:35:04 CST] ; stop_time=[n/a] ; pid=3191245 ; code=(null) ; status=0/0 }
+WorkingDirectory=/home/ai_review_tunnel/releases/current
+Id=ai-review-scheduler.service
+ActiveState=active
+SubState=running
+FragmentPath=/etc/systemd/system/ai-review-scheduler.service
+ActiveEnterTimestamp=Sat 2026-08-08 12:35:04 CST
