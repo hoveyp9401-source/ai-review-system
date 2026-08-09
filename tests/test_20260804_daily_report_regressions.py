@@ -226,6 +226,15 @@ def test_daily_briefing_send_persists_full_outbound_evidence() -> None:
         def add(self, event):
             self.events.append(event)
 
+        async def scalars(self, _query):
+            events = self.events
+
+            class Rows:
+                def all(self):
+                    return list(events)
+
+            return Rows()
+
     session = Session()
     sent = asyncio.run(
         _send_daily_briefings(

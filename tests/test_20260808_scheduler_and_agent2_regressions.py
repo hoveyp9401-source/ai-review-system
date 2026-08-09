@@ -398,6 +398,15 @@ async def test_one_briefing_recipient_failure_does_not_stop_the_next() -> None:
         def add(self, event) -> None:
             self.events.append(event)
 
+        async def scalars(self, _query):
+            events = self.events
+
+            class Rows:
+                def all(self):
+                    return list(events)
+
+            return Rows()
+
     robot = Robot()
     session = Session()
     sent = await _send_daily_briefings(

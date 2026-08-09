@@ -503,6 +503,15 @@ def test_briefing_dispatch_persists_the_generation_snapshot_unchanged() -> None:
         def add(self, event) -> None:
             self.events.append(event)
 
+        async def scalars(self, _query):
+            events = self.events
+
+            class Rows:
+                def all(self):
+                    return list(events)
+
+            return Rows()
+
     session = Session()
     sent = asyncio.run(
         _send_daily_briefings(
