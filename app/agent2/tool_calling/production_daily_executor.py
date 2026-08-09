@@ -23,11 +23,19 @@ from app.agent2.tool_calling.contracts import (
     DeleteDailyItemsArgs,
     EditDailyItemsArgs,
     MoveDailyItemsArgs,
+    QueryDailyBriefingFactsArgs,
     QueryManagedDailyReportsArgs,
     QueryReportInsightsArgs,
     QueryReportByDateArgs,
     ReceiptStatus,
     RequestClearReportArgs,
+)
+from app.agent2.daily_briefing_fact_query import (
+    DailyBriefingFactAmbiguous,
+    DailyBriefingFactNotFound,
+    DailyBriefingFactQuery,
+    DailyBriefingFactQueryRequest,
+    SqlDailyBriefingFactRepository,
 )
 from app.agent2.report_insight_query import StructuredReportInsightQuery
 from app.agent2.report_insights import (
@@ -99,6 +107,7 @@ class ProductionDailyExecutor:
         source_text_hash: str,
         date_resolver: ProductionDateResolver,
         managed_daily_query: ManagedDailyQuery | None = None,
+        daily_briefing_fact_query: DailyBriefingFactQuery | None = None,
     ) -> None:
         self._session = session
         self._user = user
@@ -110,6 +119,12 @@ class ProductionDailyExecutor:
         self._date_resolver = date_resolver
         self._managed_daily_query = managed_daily_query or ManagedDailyQuery(
             SqlDashboardRepository(session)
+        )
+        self._daily_briefing_fact_query = (
+            daily_briefing_fact_query
+            or DailyBriefingFactQuery(
+                SqlDailyBriefingFactRepository(session)
+            )
         )
         self._context_store = ProductionContextStore(
             session,
@@ -224,6 +239,113 @@ class ProductionDailyExecutor:
         if candidate_matches is not None:
             facts["date_candidate_matches"] = candidate_matches
         return self._managed_daily_read_outcome(
+            request=request,
+            report_date=report_date,
+            status=ReceiptStatus.SUCCESS,
+            facts=facts,
+        )
+
+    async def query_daily_briefing_facts(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(
+            request,
+            QueryDailyBriefingFactsArgs,
+        )
+        report_date: date | None = None
+        candidate_matches: bool | None = None
+        if arguments.report_date_expression is not None:
+            resolution = self._date_resolver.resolve(
+                expression=arguments.report_date_expression,
+                proposed_date=arguments.proposed_report_date,
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+            if resolution.resolved_date is None:
+                return self._daily_briefing_fact_read_outcome(
+                    request=request,
+                    report_date=self._today(),
+                    status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                    error_code=(
+                        resolution.error_code
+                        or "DATE_EXPRESSION_UNRESOLVED"
+                    ),
+                    facts={
+                        "clarification": {
+                            "reason": "briefing_date_unresolved",
+                        },
+                    },
+                )
+            report_date = resolution.resolved_date
+            candidate_matches = resolution.candidate_matches
+        else:
+            focused_date = str(
+                self._context.business_glossary.get(
+                    "conversation_report_date",
+                    "",
+                )
+            ).strip()
+            if focused_date:
+                try:
+                    report_date = date.fromisoformat(focused_date)
+                    candidate_matches = True
+                except ValueError:
+                    report_date = None
+        if report_date is None:
+            return self._daily_briefing_fact_read_outcome(
+                request=request,
+                report_date=self._today(),
+                status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                error_code="DAILY_BRIEFING_DATE_REQUIRED",
+                facts={
+                    "clarification": {
+                        "reason": "briefing_date_required",
+                    },
+                },
+            )
+        try:
+            result = await self._daily_briefing_fact_query.execute(
+                tenant_id=self._managed_daily_data_tenant_id(),
+                actor_user_id=str(self._context.principal.user_id),
+                request=DailyBriefingFactQueryRequest(
+                    report_date=report_date,
+                    view=arguments.view,
+                    member_name=arguments.member_name,
+                    recipient_name=arguments.recipient_name,
+                    team_name=arguments.team_name,
+                ),
+                now=self._context.now,
+            )
+        except DailyBriefingFactAmbiguous as exc:
+            return self._daily_briefing_fact_read_outcome(
+                request=request,
+                report_date=report_date,
+                status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                error_code="DAILY_BRIEFING_TARGET_AMBIGUOUS",
+                facts={
+                    "clarification": {
+                        "reason": "ambiguous_target",
+                        "candidates": list(exc.candidates),
+                    },
+                },
+            )
+        except DailyBriefingFactNotFound:
+            return self._daily_briefing_fact_read_outcome(
+                request=request,
+                report_date=report_date,
+                status=ReceiptStatus.BLOCKED,
+                error_code="DAILY_BRIEFING_TARGET_NOT_FOUND",
+                facts={
+                    "access": "not_found",
+                },
+            )
+        facts: dict[str, Any] = {
+            "daily_briefing_facts": result,
+        }
+        if candidate_matches is not None:
+            facts["date_candidate_matches"] = candidate_matches
+        return self._daily_briefing_fact_read_outcome(
             request=request,
             report_date=report_date,
             status=ReceiptStatus.SUCCESS,
@@ -821,7 +943,45 @@ class ProductionDailyExecutor:
         )
         return ProductionHandlerOutcome(
             target_type="managed_daily_report",
-            target_id=hashlib.sha256(target_material.encode("utf-8")).hexdigest(),
+            target_id=hashlib.sha256(
+                target_material.encode("utf-8")
+            ).hexdigest(),
+            before_report=None,
+            after_report=None,
+            idempotency_key=None,
+            safe_user_facts={
+                "actual_write": False,
+                **facts,
+            },
+            status_if_unchanged=status,
+            error_code=error_code,
+        )
+
+    def _daily_briefing_fact_read_outcome(
+        self,
+        *,
+        request: ProductionHandlerRequest,
+        report_date: date,
+        status: ReceiptStatus,
+        facts: dict[str, Any],
+        error_code: str | None = None,
+    ) -> ProductionHandlerOutcome:
+        target_material = json.dumps(
+            {
+                "tenant_id": self._context.principal.tenant_id,
+                "user_id": str(self._context.principal.user_id),
+                "report_date": report_date.isoformat(),
+                "arguments": request.arguments.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ProductionHandlerOutcome(
+            target_type="daily_briefing_fact",
+            target_id=hashlib.sha256(
+                target_material.encode("utf-8")
+            ).hexdigest(),
             before_report=None,
             after_report=None,
             idempotency_key=None,

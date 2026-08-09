@@ -31,6 +31,11 @@ class ProductionDailyExecutorPort(Protocol):
         request: ProductionHandlerRequest,
     ) -> Any: ...
 
+    async def query_daily_briefing_facts(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> Any: ...
+
     async def query_report_insights(
         self,
         request: ProductionHandlerRequest,
@@ -93,6 +98,12 @@ async def execute_query_managed_daily_reports(
     return await request.executor.query_managed_daily_reports(
         request
     )
+
+
+async def execute_query_daily_briefing_facts(
+    request: ProductionHandlerRequest,
+) -> Any:
+    return await request.executor.query_daily_briefing_facts(request)
 
 
 async def execute_query_report_insights(

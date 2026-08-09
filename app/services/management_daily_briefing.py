@@ -152,6 +152,12 @@ def build_management_daily_briefings(
                 "recipients": _serialize_recipients(team_recipients),
                 "target_count": len(team_recipients),
                 "stats": _serialize_submission_stats(view),
+                "briefing_snapshot": _serialize_briefing_snapshot(
+                    report_date=report_date,
+                    generated_at=now,
+                    scope="team",
+                    views=(view,),
+                ),
                 "text": build_team_management_briefing_text(
                     report_date=report_date,
                     now=now,
@@ -170,6 +176,15 @@ def build_management_daily_briefings(
         "stats": _aggregate_submission_stats(
             team_views,
             department_direct_view=department_direct_view,
+        ),
+        "briefing_snapshot": _serialize_briefing_snapshot(
+            report_date=report_date,
+            generated_at=now,
+            scope="department",
+            views=(
+                *team_views,
+                *((department_direct_view,) if department_direct_view else ()),
+            ),
         ),
         "text": build_department_management_briefing_text(
             report_date=report_date,
@@ -741,6 +756,77 @@ def _serialize_submission_stats(
         "missing": len(view.missing_members),
         "unknown_responsibility": len(view.unknown_members),
         "exempt": len(view.exempt_members),
+    }
+
+
+def _serialize_briefing_snapshot(
+    *,
+    report_date: date,
+    generated_at: datetime,
+    scope: str,
+    views: tuple[TeamSubmissionView, ...],
+) -> dict[str, Any]:
+    members = [
+        _serialize_member_snapshot(view, member)
+        for view in views
+        for member in view.members
+    ]
+    members.sort(
+        key=lambda item: (
+            str(item["team_name"]),
+            str(item["member_name"]),
+            str(item["member_ref"]),
+        )
+    )
+    return {
+        "generated_at": generated_at.isoformat(),
+        "report_date": report_date.isoformat(),
+        "scope": scope,
+        "members": members,
+    }
+
+
+def _serialize_member_snapshot(
+    view: TeamSubmissionView,
+    member: MemberRecord,
+) -> dict[str, Any]:
+    report = next(
+        (
+            item
+            for item in view.submitted_reports
+            if item.member_ref == member.ref
+        ),
+        None,
+    )
+    if report is not None:
+        classification = (
+            "submitted"
+            if report.status == "completed"
+            else "pending_confirmation"
+        )
+    elif any(item.ref == member.ref for item in view.missing_members):
+        classification = "missing"
+    elif any(item.ref == member.ref for item in view.unknown_members):
+        classification = "responsibility_unknown"
+    elif any(item.ref == member.ref for item in view.exempt_members):
+        classification = "exempt"
+    else:
+        classification = "unknown"
+    return {
+        "member_ref": member.ref,
+        "member_name": member.name,
+        "team_ref": member.team_ref,
+        "team_name": member.team_name or view.team.name,
+        "classification": classification,
+        "report_status": report.status if report is not None else None,
+        "confirmation_type": (
+            report.confirmation_type if report is not None else None
+        ),
+        "submitted_at": (
+            report.submitted_at.isoformat()
+            if report is not None and report.submitted_at is not None
+            else None
+        ),
     }
 
 

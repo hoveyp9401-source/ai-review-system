@@ -132,6 +132,60 @@ class QueryManagedDailyReportsArgs(StrictContract):
         return self
 
 
+class QueryDailyBriefingFactsArgs(StrictContract):
+    view: Literal["member_classification", "recipient_delivery"] = (
+        "member_classification"
+    )
+    report_date_expression: DateExpression | None = None
+    proposed_report_date: date | None = None
+    member_name: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description=(
+                "Exact member named by the current user. Omit only when "
+                "member_classification refers to the authenticated user."
+            ),
+        ),
+    ] = None
+    recipient_name: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description=(
+                "Exact briefing recipient named by the current user. Omit "
+                "for the authenticated user's own received briefing."
+            ),
+        ),
+    ] = None
+    team_name: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description="Exact team scope named by the current user.",
+        ),
+    ] = None
+
+    @model_validator(mode="after")
+    def enforce_briefing_fact_contract(
+        self,
+    ) -> "QueryDailyBriefingFactsArgs":
+        if (self.report_date_expression is None) != (
+            self.proposed_report_date is None
+        ):
+            raise ValueError(
+                "report date expression and proposed date must be supplied together"
+            )
+        if self.view == "recipient_delivery" and self.member_name is not None:
+            raise ValueError(
+                "member_name is valid only for member_classification"
+            )
+        return self
+
+
 class QueryReportInsightsArgs(StrictContract):
     query_kind: Literal[
         "report_count",

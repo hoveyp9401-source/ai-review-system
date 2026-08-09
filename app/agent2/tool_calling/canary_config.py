@@ -17,9 +17,8 @@ _CONVERSATION_CONTINUITY_POLICY = """
 Conversation continuity rules:
 - `business_glossary.conversation_report_date`, when present, is a
   server-resolved date focus for this turn. For a follow-up managed-daily
-  question that refers to the earlier result (for example "那份晨报", "刚才",
-  or "为什么说没交"), call `query_managed_daily_reports` with both date
-  fields set to that exact date; never silently fall back to today.
+  or briefing-fact question that refers to the earlier result, preserve that
+  exact date in the matching read tool; never silently fall back to today.
 - `confirm_report` may confirm either today's report or one exact historical
   report already present in trusted context. A historical confirmation is
   allowed only when the current user message explicitly confirms/submits the
@@ -31,6 +30,32 @@ Conversation continuity rules:
   a match, and explain that it was a snapshot at send time. Never deny a
   recorded outbound briefing without contrary server evidence.
 """.strip()
+
+_DAILY_BRIEFING_FACT_POLICY = """
+Daily-briefing fact boundary:
+- `query_daily_briefing_facts` is required when the user semantically asks
+  about a scheduled morning briefing itself: its recorded text, recipient,
+  sending or delivery evidence, member classification at generation time, a
+  disagreement between two briefing copies, or a difference between the
+  briefing and the report now visible. Do not substitute a current
+  `query_managed_daily_reports` snapshot for historical briefing evidence.
+- Preserve every exact member, recipient, team, and date scope expressed by
+  the user. When the member is the authenticated user, member_name may be
+  omitted. When the recipient is the authenticated user, recipient_name may
+  be omitted. Names remain server-resolved references; never invent IDs.
+- Separate four facts in the answer: what outbound text was recorded, what
+  structured member snapshot was recorded at generation time, what the report
+  looks like now, and what delivery evidence exists. Provider acceptance is
+  not delivery unless the returned fact explicitly verifies delivery.
+- The returned `cause` is intentionally null: causal wording remains your job
+  and must be supported by the returned timeline. If `evidence_limits` is
+  non-empty or the relevant event lacks a member snapshot, say exactly what is
+  known and what is missing. 不能仅凭当前日报状态反推当时原因，也不要编造调度延迟、
+  提交先后或统计故障。
+- This is a read-only tool. Never alter a report, submission state, briefing
+  record, delivery record, or personal memory while answering.
+""".strip()
+
 
 _REPORT_INSIGHT_TOOL_POLICY = """
 Daily-report read-tool boundary:
@@ -134,6 +159,7 @@ def canary_system_prompt() -> str:
     return (
         f"{SYSTEM_PROMPT.rstrip()}\n\n"
         f"{_CONVERSATION_CONTINUITY_POLICY}\n\n"
+        f"{_DAILY_BRIEFING_FACT_POLICY}\n\n"
         f"{_REPORT_INSIGHT_TOOL_POLICY}\n\n"
         f"{_MANAGED_DAILY_REPLY_POLICY}\n\n"
         f"{_DEFERRED_ACTION_POLICY}\n\n"

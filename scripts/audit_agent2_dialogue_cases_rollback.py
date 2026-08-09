@@ -550,6 +550,23 @@ async def run_case(
                 and "再发一次" not in reply
             )
         elif mode == "incident":
+            briefing_receipts = [
+                row
+                for row in receipts
+                if row.tool_name == "query_daily_briefing_facts"
+            ]
+            briefing_fact_payloads = [
+                dict(row.safe_user_facts or {}).get(
+                    "daily_briefing_facts"
+                )
+                for row in briefing_receipts
+            ]
+            evidence_limits = [
+                str(limit)
+                for payload in briefing_fact_payloads
+                if isinstance(payload, dict)
+                for limit in payload.get("evidence_limits", [])
+            ]
             speculative = bool(
                 re.search(
                     r"快照.*(之后|延迟|时间差|尚未提交)|提交.*晚于.*晨报|统计.*延迟|统计.*早于.*提交|统计已经跑完",
@@ -561,13 +578,35 @@ async def run_case(
                 or "没有处理完整" in reply
                 or "请再发一次" in reply
             )
+            limitation_explained = (
+                not evidence_limits
+                or any(
+                    marker in reply
+                    for marker in (
+                        "无法确认",
+                        "不能确认",
+                        "没有保存",
+                        "缺少",
+                        "证据不足",
+                    )
+                )
+            )
             result["expected"] = "confirm facts but do not invent an incident cause"
             result["speculative_cause"] = speculative
             result["incomplete_reply"] = incomplete_reply
+            result["briefing_fact_receipt_count"] = len(
+                briefing_receipts
+            )
+            result["evidence_limit_count"] = len(evidence_limits)
+            result["limitation_explained"] = limitation_explained
             result["passed"] = bool(
                 not outcome.actual_write
+                and len(briefing_receipts) == 1
+                and briefing_receipts[0].status == "success"
+                and not briefing_receipts[0].changed
                 and not speculative
                 and not incomplete_reply
+                and limitation_explained
                 and not result["raw_error_exposed"]
             )
         await session.rollback()

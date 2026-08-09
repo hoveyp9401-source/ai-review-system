@@ -263,15 +263,18 @@ def test_daily_briefing_send_persists_full_outbound_evidence() -> None:
     ]
 
 
-def test_summary_flushes_auto_submit_before_briefing_projection() -> None:
+def test_summary_commits_auto_submit_before_new_briefing_projection_session() -> None:
     source = inspect.getsource(run_scheduler)
     auto_submit = source.index("await auto_submit_due_pending_reports(")
-    flush = source.index("await session.flush()", auto_submit)
+    commit = source.index("await state_session.commit()", auto_submit)
+    new_read_session = source.index(
+        "async with AsyncSessionLocal() as delivery_session", commit
+    )
     build = source.index(
         "await summary_service.build_daily_briefings", auto_submit
     )
 
-    assert auto_submit < flush < build
+    assert auto_submit < commit < new_read_session < build
 
 
 def test_incomplete_historical_confirmation_has_honest_guidance() -> None:
@@ -284,5 +287,6 @@ def test_incomplete_historical_confirmation_has_honest_guidance() -> None:
     assert reason == "tool_call_canary_report_incomplete"
     message = canary_block_message(reason)
     assert "还没填完整" in message
-    assert "问题/风险无" in message
+    assert "直接自然说明即可" in message
+    assert "照着固定句式" not in message
     assert "已经提交" not in message

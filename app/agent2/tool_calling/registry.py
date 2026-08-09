@@ -19,6 +19,7 @@ from app.agent2.tool_calling.contracts import (
     ExecutionMode,
     ForgetPersonalMemoryArgs,
     MoveDailyItemsArgs,
+    QueryDailyBriefingFactsArgs,
     QueryDefendantPerformanceArgs,
     QueryManagedDailyReportsArgs,
     QueryReportInsightsArgs,
@@ -47,6 +48,7 @@ from app.agent2.tool_calling.memory_handlers import (
     simulate_memory_remember,
 )
 from app.agent2.tool_calling.managed_daily_handlers import (
+    simulate_daily_briefing_fact_query,
     simulate_managed_daily_query,
     simulate_report_insight_query,
 )
@@ -283,6 +285,44 @@ TOOL_REGISTRY = MappingProxyType(
             sandbox_handler=execute_query_report_by_date,
             production_handler=production_handlers.execute_query_report_by_date,
             shadow_handler=simulate_query,
+        ),
+        "query_daily_briefing_facts": _definition(
+            "query_daily_briefing_facts",
+            "Read the system's recorded scheduled daily-briefing facts for "
+            "one exact report date. Use this when the current user asks what a "
+            "morning briefing said, whether or when it was sent, why its "
+            "member classification differs from the report now visible, or "
+            "whether two briefing copies disagreed. This tool reads the "
+            "historical outbound message, delivery evidence, the structured "
+            "at-generation member snapshot when available, and the member's "
+            "current report metadata. It never manufactures a historical "
+            "snapshot and never infers a cause from the later report alone. "
+            "Every active authenticated user may read these facts inside the "
+            "current tenant. Copy exact person, recipient, and team names from "
+            "the current user_message; never invent IDs or use fuzzy matches. "
+            "Omit member_name only when member_classification refers to the "
+            "authenticated user, and omit recipient_name only when "
+            "recipient_delivery refers to that user. Supply both date fields "
+            "for an explicit date or a trusted conversation_report_date. If "
+            "neither exists, omit both so the server can request a date "
+            "clarification rather than silently using today.",
+            QueryDailyBriefingFactsArgs,
+            "read",
+            "low",
+            "authenticated_tenant_briefing_fact_read",
+            "server_tenant_filtered_exact_briefing_targets",
+            "server_expression_or_conversation_focus",
+            transaction_target="read_only",
+            production_handler=(
+                production_handlers.execute_query_daily_briefing_facts
+            ),
+            shadow_handler=simulate_daily_briefing_fact_query,
+            enabled_modes=frozenset(
+                {
+                    ExecutionMode.SHADOW_PROPOSAL,
+                    ExecutionMode.CANARY_EXECUTE,
+                }
+            ),
         ),
         "query_managed_daily_reports": _definition(
             "query_managed_daily_reports",

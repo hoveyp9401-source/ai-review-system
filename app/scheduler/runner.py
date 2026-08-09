@@ -737,6 +737,9 @@ def _record_daily_briefing_events(
                 ),
                 "target_report_date": report_date.isoformat(),
                 "business_write": False,
+                "briefing_snapshot": dict(
+                    item.get("briefing_snapshot") or {}
+                ),
                 "message_status": message_status,
                 "provider_references": provider_references,
                 "provider_reference_available": bool(
