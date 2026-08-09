@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>数据接入中心｜Legal Ops</title>
+    <link rel="stylesheet" href="/legal-ops/data-intake/assets/styles.css?v=13" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <a class="brand" href="/legal-ops/" aria-label="返回法务管理端">
+          <span class="brand-mark">LO</span>
+          <span><strong>数据接入中心</strong><small>Legal Ops 管理端</small></span>
+        </a>
+        <nav id="navigation" aria-label="数据接入中心导航"></nav>
+        <div class="boundary">
+          <strong>安全边界</strong>
+          <span>暂存后预览，管理员确认才发布</span>
+          <span>不写回 ERP · 不发送消息</span>
+        </div>
+      </aside>
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="page-eyebrow">数据接入中心</p>
+            <h1 id="page-title">绩效板块</h1>
+          </div>
+          <div class="top-actions">
+            <span class="identity" id="identity">正在确认身份</span>
+            <button class="button ghost" id="refresh-button" type="button">刷新</button>
+            <a class="button ghost" href="/legal-ops/">返回管理端</a>
+          </div>
+        </header>
+        <div class="notice" id="safety-notice">正在读取安全边界……</div>
+        <section id="content" class="content" aria-live="polite">
+          <div class="loading"><span></span>正在加载</div>
+        </section>
+      </main>
+    </div>
+
+    <div class="modal-backdrop" id="login-modal">
+      <form class="login-card" id="login-form">
+        <span class="brand-mark large">LO</span>
+        <p class="eyebrow">Legal Ops</p>
+        <h2>登录数据接入中心</h2>
+        <p>请输入管理员分配的登录凭证。系统会按账号权限分别开放查看、上传和发布功能。</p>
+        <label>登录凭证<input id="token-input" type="password" required autocomplete="current-password" /></label>
+        <button class="button primary wide" type="submit">验证并进入</button>
+        <p class="form-error" id="login-error"></p>
+      </form>
+    </div>
+
+    <div class="drawer-mask hidden" id="drawer-mask"></div>
+    <aside class="drawer hidden" id="drawer" aria-label="批次明细">
+      <button class="drawer-close" id="drawer-close" type="button" aria-label="关闭">×</button>
+      <div id="drawer-content"></div>
+    </aside>
+
+    <div class="toast" id="toast" role="status"></div>
+    <script src="/legal-ops/data-intake/assets/app.js?v=13" defer></script>
+  </body>
+</html>

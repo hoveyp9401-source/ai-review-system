@@ -178,6 +178,13 @@ def format_items(values: list[str], *, empty: str = "") -> str:
     return "；".join(cleaned) if cleaned else empty
 
 
+def problems_acknowledged_empty(report: Any) -> bool:
+    """Trust only Agent2's structured semantic decision for an empty field."""
+
+    section_status = getattr(report, "section_status", None) or {}
+    return bool(section_status.get("problems_acknowledged_empty"))
+
+
 def _append_content_risks(risks: list[dict[str, str]], field: str, values: list[str]) -> None:
     label = FIELD_LABELS[field]
     for value in values:
@@ -226,20 +233,13 @@ def _no_problem_for_recent_days(report: DailyReport, history: list[DailyReport],
     reports = [report, *history]
     checked = 0
     for item in reports:
-        problems = list(getattr(item, "problems", []) or [])
         section_status = getattr(item, "section_status", None) or {}
-        no_problem = bool(section_status.get("problems_acknowledged_empty")) or all(_is_no_problem_text(text) for text in problems)
-        if not no_problem:
+        if not bool(section_status.get("problems_acknowledged_empty")):
             return False
         checked += 1
         if checked >= days:
             return True
     return False
-
-
-def _is_no_problem_text(text: str) -> bool:
-    compact = _compact(text)
-    return compact in {"暂无明显问题", "暂无问题", "无明显问题", "无问题", "没有问题", "没问题"}
 
 
 def _has_real_legal_risk(values: list[str]) -> bool:

@@ -27,6 +27,7 @@ BusinessStatus = Literal[
     "accepted_by_both",
     "declined",
     "cancelled",
+    "changed",
     "expired",
 ]
 MessageStatus = Literal[
@@ -303,6 +304,25 @@ class TravelReply:
         date_label = str(snapshot.get("date_label") or "")
         purpose = str(snapshot.get("purpose") or "")
         counterparty = str(snapshot.get("counterparty") or "")
+        if outcome.operation == "update" and outcome.business_status == "cancelled":
+            return "\n".join(
+                value
+                for value in (
+                    "已取消这次出差安排。",
+                    f"地点：{destination}" if destination else "",
+                )
+                if value
+            )
+        if outcome.operation == "update" and outcome.business_status == "changed":
+            return "\n".join(
+                value
+                for value in (
+                    "已更新这次出差安排。",
+                    f"地点：{destination}" if destination else "",
+                    f"时间：{date_label}" if date_label else "",
+                )
+                if value
+            )
         details = [f"地点：{destination}"]
         if date_label:
             details.append(f"时间：{date_label}")

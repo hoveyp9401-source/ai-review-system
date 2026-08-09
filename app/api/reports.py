@@ -4,7 +4,7 @@ import logging
 import uuid
 from dataclasses import replace
 from datetime import date
-from typing import Any
+from typing import Any, Mapping
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -17,6 +17,12 @@ from app.agent2.business.entrypoint import (
     resolve_agent2_entrypoint,
 )
 from app.agent2.context_pack import Agent2ContextPack, build_agent2_context_pack
+from app.agent2.cognitive_reply_v3 import (
+    append_cognitive_clarification,
+    has_bound_confirmation_pending,
+    has_pending_lifecycle_update,
+    pending_lifecycle_reply,
+)
 from app.agent2.cognitive_runtime_v3 import (
     cognitive_core_v3_enabled,
     finalize_cognitive_core_v3_execution,
@@ -75,7 +81,7 @@ from app.schemas import StructuredDailyReport
 from app.services.report_service import DailyReportService
 from app.utils.time import now_in_timezone
 from app.workflows.daily_context import build_live_daily_active_task
-from app.workflows.intake import IncomingMessageEnvelope
+from app.workflows.intake import IncomingMessageEnvelope, WORKFLOW_DAILY_REPORT
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 logger = logging.getLogger(__name__)
@@ -140,52 +146,37 @@ async def submit_manual_report(
             )
         await session.commit()
         return agent2_response
-
-    try:
-        result = await service.submit_text(
-            session,
-            user=user,
-            raw_input=body.raw_input,
-            source=body.source,
-            report_date=body.report_date,
-        )
-    except Exception as exc:
-        await session.rollback()
-        if event is not None:
-            async with session.begin():
-                event = await session.merge(event)
-                await mark_webhook_event_failed(
-                    session,
-                    event,
-                    error_message=str(exc),
-                    response_payload={"status": "failed", "message": "Report parsing failed; data was not saved."},
-                    now=now_in_timezone(user.timezone),
-                )
-        raise
     response = {
-        "report_id": result.report_id,
-        "report_date": result.report_date.isoformat(),
-        "status": result.status,
-        "completeness_score": result.completeness_score,
-        "missing_sections": result.missing_sections,
-        "message": result.message,
-        "confirmation_type": result.confirmation_type,
-        "confirmed_by_user": result.confirmed_by_user,
-        "quality_warning": result.quality_warning,
-        "reply_kind": result.reply_kind,
-        "structured": result.structured.model_dump(),
+        "report_id": None,
+        "report_date": (
+            body.report_date
+            or now_in_timezone(user.timezone).date()
+        ).isoformat(),
+        "status": "agent2_unavailable",
+        "completeness_score": 0,
+        "missing_sections": [],
+        "message": "当前 Agent2 暂时无法处理，本次没有写入任何内容，请稍后再试。",
+        "confirmation_type": "none",
+        "confirmed_by_user": False,
+        "quality_warning": None,
+        "reply_kind": "agent2_unavailable_fail_closed",
+        "structured": {
+            "today_work": [],
+            "problems": [],
+            "tomorrow_plan": [],
+        },
         "merged_report": {
-            "today_work": result.today_work,
-            "problems": result.problems,
-            "tomorrow_plan": result.tomorrow_plan,
-            "section_status": result.section_status,
+            "today_work": [],
+            "problems": [],
+            "tomorrow_plan": [],
+            "section_status": {},
         },
     }
     if event is not None:
         await mark_webhook_event_processed(
             session,
             event,
-            report_id=uuid.UUID(result.report_id) if result.report_id else None,
+            report_id=None,
             response_payload=response,
             now=now_in_timezone(user.timezone),
         )
@@ -252,20 +243,23 @@ async def _submit_manual_agent2_if_applicable(
         active_tasks=tuple(active_tasks),
     )
     shadow: DailyShadowEvaluation | None = None
-    target_report_date = report_date or received_at.date()
+    target_report_date = report_date or _daily_task_report_date(
+        daily_task,
+        fallback=received_at.date(),
+    )
     existing = await get_report(session, user.id, target_report_date)
     if entrypoint is not None and entrypoint.decision.route == "blocked":
         return _manual_route_blocked_response(
             existing,
             target_report_date,
-            message="Agent2 身份或租户路由不唯一，本次已阻断，未写入业务数据。",
+            message="当前账号或所属组织信息无法唯一确认，本次没有执行任何业务操作。",
             reply_kind="agent2_entrypoint_blocked",
         )
     if phase2_primary and not cognitive_core_v3_enabled(settings):
         return _manual_route_blocked_response(
             existing,
             target_report_date,
-            message="Agent2 主路由已启用，但认知核心未启用；本次已阻断，未写入业务数据。",
+            message="当前服务暂时无法处理这条消息，本次没有执行任何业务操作。",
             reply_kind="agent2_cognitive_core_disabled",
         )
     if cognitive_core_v3_enabled(settings):
@@ -354,6 +348,7 @@ async def _submit_manual_agent2_if_applicable(
                     if command.command_type
                     in {
                         "record_travel_candidate",
+                        "update_travel_candidate",
                         "respond_travel_collaboration_candidate",
                         "record_case_progress_candidate",
                         "update_case_progress_candidate",
@@ -407,11 +402,19 @@ async def _submit_manual_agent2_if_applicable(
                     or ()
                 )
             )
+            has_bound_pending = has_bound_confirmation_pending(
+                cognitive_v3.decision
+            )
+            has_lifecycle_update = has_pending_lifecycle_update(
+                cognitive_v3.decision
+            )
             if (
                 daily_result is not None
                 or business_result is not None
                 or periodic_results
                 or has_selection_request
+                or has_bound_pending
+                or has_lifecycle_update
             ):
                 await finalize_cognitive_core_v3_execution(
                     session=session,
@@ -454,7 +457,10 @@ async def _submit_manual_agent2_if_applicable(
                 if outcomes:
                     daily_result = replace(
                         daily_result,
-                        message=OutcomeReplyComposer().compose(outcomes),
+                        message=append_cognitive_clarification(
+                            OutcomeReplyComposer().compose(outcomes),
+                            cognitive_v3.decision,
+                        ),
                     )
                 return _agent2_result_manual_response(daily_result)
             if business_result is not None or periodic_results:
@@ -472,7 +478,10 @@ async def _submit_manual_agent2_if_applicable(
                     section_status=dict(
                         getattr(existing, "section_status", None) or {}
                     ),
-                    message=OutcomeReplyComposer().compose(outcomes),
+                    message=append_cognitive_clarification(
+                        OutcomeReplyComposer().compose(outcomes),
+                        cognitive_v3.decision,
+                    ),
                     reply_kind="agent2_business",
                     confirmation_type="none",
                     confirmed_by_user=False,
@@ -483,8 +492,12 @@ async def _submit_manual_agent2_if_applicable(
                     raise RuntimeError(
                         "manual Semantic Admission Enforce requires verified identity"
                     )
+                lifecycle_message = pending_lifecycle_reply(cognitive_v3.decision)
                 selection_message = selection_request_reply(cognitive_v3.decision)
-                if selection_message:
+                if lifecycle_message:
+                    read_only_message = lifecycle_message
+                    read_only_reply_kind = "cognitive_v3_pending_lifecycle"
+                elif selection_message:
                     read_only_message = selection_message
                     read_only_reply_kind = "cognitive_v3_selection"
                 elif cognitive_v3.decision.clarification_need is not None:
@@ -549,8 +562,12 @@ async def _submit_manual_agent2_if_applicable(
                 llm_client=llm_client,
                 context_pack=context_pack,
             )
+            lifecycle_message = pending_lifecycle_reply(cognitive_v3.decision)
             selection_message = selection_request_reply(cognitive_v3.decision)
-            if selection_message:
+            if lifecycle_message:
+                response["message"] = lifecycle_message
+                response["reply_kind"] = "cognitive_v3_pending_lifecycle"
+            elif selection_message:
                 response["message"] = selection_message
                 response["reply_kind"] = "cognitive_v3_selection"
             elif cognitive_v3.decision.clarification_need is not None:
@@ -663,6 +680,21 @@ def _manual_should_use_agent2(settings: Any, user: Any) -> bool:
     # The trusted Settings allowlist is the sole authority for the legacy
     # daily Agent2 gate; request payload never reaches this decision.
     return agent2_daily_enabled_for_user(settings, user)
+
+
+def _daily_task_report_date(task: Any, *, fallback: date) -> date:
+    """Use the server-resolved Daily task date as the implicit write target."""
+
+    if str(getattr(task, "workflow", "") or "") != WORKFLOW_DAILY_REPORT:
+        return fallback
+    metadata = getattr(task, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return fallback
+    raw_report_date = str(metadata.get("report_date") or "").strip()
+    try:
+        return date.fromisoformat(raw_report_date)
+    except ValueError:
+        return fallback
 
 
 async def _agent2_blocked_manual_response(

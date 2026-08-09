@@ -32,6 +32,10 @@ from app.agent2.business.contracts import BusinessCommandError
 TYPED_REPORT_VERSION_KEY = "_agent2_report_version"
 TYPED_COMMAND_KEYS_KEY = "_agent2_typed_command_keys"
 TYPED_AUDIT_KEY = "_agent2_typed_audit"
+EMPTY_ACK_KEYS = {
+    field_name: f"{field_name}_acknowledged_empty"
+    for field_name in REPORT_FIELD_ORDER
+}
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,9 +59,18 @@ class TypedDailyExecutionContext:
     team_id: str = ""
     actor_role_ids: tuple[str, ...] = ()
     allowed_case_ids: tuple[str, ...] = ()
+    runtime_label: str = "agent2_cognitive_core_v3"
+    contract_version: str = "cognitive_core.v3"
+    allow_completed_append: bool = False
 
     def __post_init__(self) -> None:
-        if not self.source or len(self.source_text_hash) != 64 or not self.tenant_id.strip():
+        if (
+            not self.source
+            or len(self.source_text_hash) != 64
+            or not self.tenant_id.strip()
+            or not self.runtime_label.strip()
+            or not self.contract_version.strip()
+        ):
             raise ValueError("typed execution context requires source and SHA-256 source hash")
         if self.execution_started_at is not None and self.execution_started_at.tzinfo is None:
             raise ValueError("typed execution start must be timezone-aware")
@@ -170,6 +183,7 @@ async def execute_typed_agent2_daily_commands(
                 snapshot=snapshot,
                 actor_user_id=user.id,
                 executed_idempotency_keys=successful_receipt_keys,
+                allow_completed_append=execution_context.allow_completed_append,
                 admission_scope=_daily_admission_scope(
                     command=command,
                     user_id=str(user.id),
@@ -339,6 +353,7 @@ async def execute_typed_agent2_daily_commands(
                 snapshot=working,
                 actor_user_id=user.id,
                 executed_idempotency_keys=known_keys,
+                allow_completed_append=execution_context.allow_completed_append,
                 admission_scope=_daily_admission_scope(
                     command=command,
                     user_id=str(user.id),
@@ -413,6 +428,48 @@ async def execute_typed_agent2_daily_commands(
             ],
         )
 
+    if not any(execution.should_write_db for execution in executions):
+        await _persist_execution_receipts(
+            session,
+            user=user,
+            report_date=report_date,
+            report_id=getattr(existing, "id", None),
+            executions=tuple(executions),
+            context=execution_context,
+        )
+        if ticket_leases:
+            await session.flush()
+            for execution, ticket_lease in ticket_leases:
+                await ticket_store.consume(
+                    ticket_lease,
+                    receipt=AdmissionReceiptReference(
+                        receipt_kind="daily_report",
+                        receipt_id=_daily_receipt_id(
+                            execution.command.idempotency_key,
+                            tenant_id=execution_context.tenant_id,
+                        ),
+                        status=_receipt_status(execution),
+                        actual_write=False,
+                    ),
+                    consumed_at=_daily_execution_time(execution_context),
+                )
+        return Agent2DailyExecutionResult(
+            report_id=str(getattr(existing, "id", "") or working.report_id),
+            report_date=report_date,
+            status=working.status,
+            message="日报内容已在对应栏目中，本次没有修改。\n\n"
+            + _query_result_message(report_date, working),
+            report_saved=False,
+            read_only=False,
+            today_work=list(working.today_work),
+            problems=list(working.problems),
+            tomorrow_plan=list(working.tomorrow_plan),
+            command_results=[
+                _execution_result(item, tenant_id=execution_context.tenant_id)
+                for item in executions
+            ],
+        )
+
     received_at = datetime.now(
         ZoneInfo(getattr(user, "timezone", None) or getattr(settings, "timezone", "Asia/Shanghai"))
     )
@@ -428,6 +485,11 @@ async def execute_typed_agent2_daily_commands(
         field_name: list(working.item_ids.get(field_name, ()))
         for field_name in REPORT_FIELD_ORDER
     }
+    for field_name, status_key in EMPTY_ACK_KEYS.items():
+        if field_name in working.acknowledged_empty_fields:
+            section_status[status_key] = True
+        else:
+            section_status.pop(status_key, None)
     report = await upsert_daily_report(
         session,
         user=user,
@@ -441,10 +503,10 @@ async def execute_typed_agent2_daily_commands(
         completeness_score=_completeness(working),
         status=working.status,
         section_status=section_status,
-        llm_model="agent2_cognitive_core_v3",
+        llm_model=execution_context.runtime_label,
         llm_payload={
             "agent2": True,
-            "contract_version": "cognitive_core.v3",
+            "contract_version": execution_context.contract_version,
             "source_text_hash": execution_context.source_text_hash,
             "typed_commands": [command.as_dict() for command in commands],
             "typed_audit": [execution.audit.as_dict() for execution in executions],
@@ -563,6 +625,11 @@ def build_typed_daily_snapshot(
         problems=values["problems"],
         tomorrow_plan=values["tomorrow_plan"],
         item_ids=item_ids,
+        acknowledged_empty_fields=frozenset(
+            field_name
+            for field_name, status_key in EMPTY_ACK_KEYS.items()
+            if bool(section_status.get(status_key)) and not values[field_name]
+        ),
     )
 
 
@@ -721,6 +788,11 @@ def _prior_receipt_matches(
     require_execution_scope: bool,
 ) -> bool:
     receipt_report_date = getattr(receipt, "report_date", None)
+    expected_report_date = (
+        _query_report_date(command, context.report_date)
+        if command.command_type == "query_report"
+        else _mutation_report_date((command,), context.report_date)
+    )
     receipt_report_id = str(
         getattr(receipt, "report_id", "")
         or getattr(receipt, "resource_id", "")
@@ -745,7 +817,7 @@ def _prior_receipt_matches(
         == command.command_type
         and str(getattr(receipt, "idempotency_key", "") or "")
         == command.idempotency_key
-        and (receipt_report_date is None or receipt_report_date == snapshot.report_date)
+        and (receipt_report_date is None or receipt_report_date == expected_report_date)
         and (not receipt_report_id or receipt_report_id == str(snapshot.report_id))
         and (not receipt_message_id or receipt_message_id == expected_message_id)
         and (scope_matches or not require_execution_scope)
@@ -900,6 +972,9 @@ def _snapshot_json(snapshot: DailyReportMutationSnapshot) -> dict:
         "today_work": list(snapshot.today_work),
         "problems": list(snapshot.problems),
         "tomorrow_plan": list(snapshot.tomorrow_plan),
+        "acknowledged_empty_fields": sorted(
+            snapshot.acknowledged_empty_fields
+        ),
         "item_ids": {
             field_name: list(item_ids)
             for field_name, item_ids in snapshot.item_ids.items()
@@ -969,19 +1044,23 @@ def _mutation_report_date(commands: Sequence[TypedDailyCommand], default: date) 
 
 
 def _query_result_message(report_date: date, snapshot: DailyReportMutationSnapshot) -> str:
-    if not any((snapshot.today_work, snapshot.problems, snapshot.tomorrow_plan)):
+    if not any((snapshot.today_work, snapshot.problems, snapshot.tomorrow_plan)) and not snapshot.acknowledged_empty_fields:
         return f"{report_date.isoformat()} 暂无日报内容。"
     status_text = "已提交" if snapshot.status == "completed" else "填写中"
     lines = [f"{report_date.isoformat()} 日报（{status_text}）"]
-    for title, values in (
-        ("今日工作", snapshot.today_work),
-        ("问题与风险", snapshot.problems),
-        ("明日计划", snapshot.tomorrow_plan),
+    for field_name, title, values in (
+        ("today_work", "今日工作", snapshot.today_work),
+        ("problems", "问题与风险", snapshot.problems),
+        ("tomorrow_plan", "明日计划", snapshot.tomorrow_plan),
     ):
         lines.append(f"{title}：")
         lines.extend(f"- {value}" for value in values)
         if not values:
-            lines.append("- 暂无")
+            lines.append(
+                "- 暂无"
+                if field_name in snapshot.acknowledged_empty_fields
+                else "- 未填写"
+            )
     return "\n".join(lines)
 
 
@@ -1008,5 +1087,9 @@ def _make_item_id(field_name: str, index: int, value: str) -> str:
 
 
 def _completeness(snapshot: DailyReportMutationSnapshot) -> float:
-    filled = sum(bool(values) for values in (snapshot.today_work, snapshot.problems, snapshot.tomorrow_plan))
+    filled = sum(
+        bool(getattr(snapshot, field_name))
+        or field_name in snapshot.acknowledged_empty_fields
+        for field_name in REPORT_FIELD_ORDER
+    )
     return round(filled / 3, 4)

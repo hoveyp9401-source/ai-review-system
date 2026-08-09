@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
 from typing import Any, Protocol, Sequence
 from uuid import UUID
 
@@ -15,10 +16,7 @@ from app.agent2.fact_permissions import (
     DEPARTMENT_HEAD_ROLES,
     TEAM_LEADER_ROLES,
 )
-from app.agent2.report_insight_intent import (
-    report_insight_query_scope,
-    standalone_report_insight_query_kind,
-)
+from app.agent2.report_insight_query import StructuredReportInsightQuery
 from app.config import get_settings
 from app.models import User
 from app.repositories import (
@@ -33,11 +31,9 @@ REPORT_INSIGHT_SOURCE_TYPE = "daily_report_insight"
 
 
 class ReportInsightRepository(Protocol):
-    async def list_users(self) -> Sequence[Any]:
-        ...
+    async def list_users(self) -> Sequence[Any]: ...
 
-    async def list_teams(self) -> Sequence[Any]:
-        ...
+    async def list_teams(self) -> Sequence[Any]: ...
 
     async def count_reports(
         self,
@@ -45,8 +41,7 @@ class ReportInsightRepository(Protocol):
         user_ids: Sequence[str],
         end_date: date,
         team_ids: Sequence[str] | None = None,
-    ) -> dict[str, int]:
-        ...
+    ) -> dict[str, int]: ...
 
     async def list_reports(
         self,
@@ -55,8 +50,7 @@ class ReportInsightRepository(Protocol):
         start_date: date,
         end_date: date,
         team_ids: Sequence[str] | None = None,
-    ) -> Sequence[Any]:
-        ...
+    ) -> Sequence[Any]: ...
 
 
 @dataclass(frozen=True)
@@ -91,9 +85,13 @@ class InMemoryReportInsightRepository:
         team_ids: Sequence[str] | None = None,
     ) -> dict[str, int]:
         allowed_ids = {str(value) for value in user_ids}
-        allowed_team_ids = None if team_ids is None else {str(value) for value in team_ids}
+        allowed_team_ids = (
+            None if team_ids is None else {str(value) for value in team_ids}
+        )
         current_team_by_user = {
-            str(_value(user, "id") or _value(user, "user_id") or ""): str(_value(user, "team_id") or "")
+            str(_value(user, "id") or _value(user, "user_id") or ""): str(
+                _value(user, "team_id") or ""
+            )
             for user in self._users
         }
         counts: dict[str, int] = {}
@@ -101,10 +99,15 @@ class InMemoryReportInsightRepository:
             report_user_id = str(_value(report, "user_id"))
             if report_user_id not in allowed_ids:
                 continue
-            report_team_id = str(_value(report, "team_id") or current_team_by_user.get(report_user_id, ""))
+            report_team_id = str(
+                _value(report, "team_id")
+                or current_team_by_user.get(report_user_id, "")
+            )
             if allowed_team_ids is not None and report_team_id not in allowed_team_ids:
                 continue
-            report_date = _as_date(_value(report, "report_date") or _value(report, "date"))
+            report_date = _as_date(
+                _value(report, "report_date") or _value(report, "date")
+            )
             if report_date is None or report_date > end_date:
                 continue
             status = str(_value(report, "status") or "collecting")
@@ -120,9 +123,13 @@ class InMemoryReportInsightRepository:
         team_ids: Sequence[str] | None = None,
     ) -> Sequence[Any]:
         allowed_ids = None if user_ids is None else {str(value) for value in user_ids}
-        allowed_team_ids = None if team_ids is None else {str(value) for value in team_ids}
+        allowed_team_ids = (
+            None if team_ids is None else {str(value) for value in team_ids}
+        )
         current_team_by_user = {
-            str(_value(user, "id") or _value(user, "user_id") or ""): str(_value(user, "team_id") or "")
+            str(_value(user, "id") or _value(user, "user_id") or ""): str(
+                _value(user, "team_id") or ""
+            )
             for user in self._users
         }
         matches = []
@@ -130,17 +137,29 @@ class InMemoryReportInsightRepository:
             report_user_id = str(_value(report, "user_id"))
             if allowed_ids is not None and report_user_id not in allowed_ids:
                 continue
-            report_team_id = str(_value(report, "team_id") or current_team_by_user.get(report_user_id, ""))
+            report_team_id = str(
+                _value(report, "team_id")
+                or current_team_by_user.get(report_user_id, "")
+            )
             if allowed_team_ids is not None and report_team_id not in allowed_team_ids:
                 continue
-            report_date = _as_date(_value(report, "report_date") or _value(report, "date"))
-            if report_date is None or report_date < start_date or report_date > end_date:
+            report_date = _as_date(
+                _value(report, "report_date") or _value(report, "date")
+            )
+            if (
+                report_date is None
+                or report_date < start_date
+                or report_date > end_date
+            ):
                 continue
             matches.append(report)
         return tuple(
             sorted(
                 matches,
-                key=lambda report: _as_date(_value(report, "report_date") or _value(report, "date")) or date.min,
+                key=lambda report: _as_date(
+                    _value(report, "report_date") or _value(report, "date")
+                )
+                or date.min,
                 reverse=True,
             )
         )
@@ -319,7 +338,10 @@ def report_insight_reply_from_context(context_pack: Any | None) -> str:
     if context_pack is None:
         return ""
     for evidence in tuple(getattr(context_pack, "knowledge", ()) or ()):
-        if str(getattr(evidence, "source_type", "") or "") != REPORT_INSIGHT_SOURCE_TYPE:
+        if (
+            str(getattr(evidence, "source_type", "") or "")
+            != REPORT_INSIGHT_SOURCE_TYPE
+        ):
             continue
         summary = str(getattr(evidence, "summary", "") or "").strip()
         if summary:
@@ -338,6 +360,12 @@ class ReportInsightModule:
         requester: Any,
         current_date: date,
     ) -> ReportInsightAnswer | None:
+        # Historical/offline compatibility only. Production enters through
+        # ``answer_query`` after Agent2 has produced a typed semantic proposal.
+        from app.agent2.report_insight_intent import (
+            standalone_report_insight_query_kind,
+        )
+
         query_text = str(text or "").strip()
         query_kind = standalone_report_insight_query_kind(query_text)
         if query_kind is None:
@@ -418,7 +446,11 @@ class ReportInsightModule:
             team_ids=permission_team_ids,
         )
         target_name = str(_value(target, "name") or "该人员")
-        scope_text = "根据日报台账" if permission_team_ids is None else "根据你可查看范围内的日报台账"
+        scope_text = (
+            "根据日报台账"
+            if permission_team_ids is None
+            else "根据你可查看范围内的日报台账"
+        )
         if query_kind == "completed_report_count":
             report_count = int(status_counts.get("completed", 0))
             other_counts = {
@@ -457,6 +489,175 @@ class ReportInsightModule:
             freshness=current_date.isoformat(),
         )
         return ReportInsightAnswer(text=reply, evidence=evidence)
+
+    async def answer_query(
+        self,
+        query: StructuredReportInsightQuery,
+        *,
+        requester: Any,
+        current_date: date,
+    ) -> ReportInsightAnswer | None:
+        """Answer one Agent2-understood query without re-reading natural language."""
+
+        users = tuple(await self.repository.list_users())
+        teams = tuple(await self.repository.list_teams())
+        start_date, end_date = _report_insight_period_bounds(
+            query.period_type,
+            current_date=current_date,
+        )
+        if query.scope_type == "person":
+            named_users = _matched_named_users(query.scope_name, users, teams=teams)
+            if not named_users:
+                return _resolution_answer(
+                    scope_type="person",
+                    resolution_status="not_found",
+                    current_date=current_date,
+                )
+            if len(named_users) > 1:
+                return _resolution_answer(
+                    scope_type="person",
+                    resolution_status="ambiguous",
+                    current_date=current_date,
+                )
+            target = named_users[0]
+            permission_allowed, permission_team_ids = _person_report_scope(
+                requester=requester,
+                target=target,
+                teams=teams,
+            )
+            if not permission_allowed:
+                return _permission_denied_answer(target, current_date=current_date)
+            if query.query_kind == "report_count":
+                return await self._person_report_count_answer(
+                    target=target,
+                    permission_team_ids=permission_team_ids,
+                    current_date=current_date,
+                    completed_only=query.status_filter == "completed",
+                )
+            if query.query_kind == "recent_work":
+                return await self._recent_person_work_answer(
+                    target=target,
+                    target_id=str(
+                        _value(target, "id") or _value(target, "user_id") or ""
+                    ),
+                    permission_team_ids=permission_team_ids,
+                    current_date=current_date,
+                    period_type=query.period_type,
+                    start_date_override=start_date or date.min,
+                    end_date_override=end_date or current_date,
+                )
+            if query.query_kind == "unclosed_work":
+                return await self._person_unclosed_work_answer(
+                    target=target,
+                    permission_team_ids=permission_team_ids,
+                    current_date=current_date,
+                    period_type=query.period_type,
+                    plan_start_date=start_date,
+                    plan_end_date=end_date,
+                )
+            return None
+
+        if query.query_kind == "unclosed_work":
+            return await self._organization_unclosed_work_answer(
+                query_scope=query.scope_name,
+                requester=requester,
+                users=users,
+                teams=teams,
+                current_date=current_date,
+                period_type=query.period_type,
+                plan_start_date=start_date,
+                plan_end_date=end_date,
+            )
+        if query.query_kind == "recent_attention":
+            return await self._department_recent_attention_answer(
+                query_text=query.query,
+                requester=requester,
+                users=users,
+                teams=teams,
+                current_date=current_date,
+                requested_scope_override=query.scope_name,
+                start_date_override=start_date,
+                period_type_override=query.period_type,
+            )
+        if query.query_kind == "period_work":
+            return await self._team_period_work_answer(
+                query_text=query.query,
+                query_kind=(
+                    "team_previous_week_work"
+                    if query.period_type == "previous_week"
+                    else "team_current_week_work"
+                ),
+                requester=requester,
+                users=users,
+                teams=teams,
+                current_date=current_date,
+                requested_scope_override=query.scope_name,
+                period_type_override=query.period_type,
+            )
+        return None
+
+    async def _person_report_count_answer(
+        self,
+        *,
+        target: Any,
+        permission_team_ids: Sequence[str] | None,
+        current_date: date,
+        completed_only: bool,
+    ) -> ReportInsightAnswer:
+        target_id = str(_value(target, "id") or _value(target, "user_id") or "")
+        target_name = str(_value(target, "name") or "该人员")
+        status_counts = await self.repository.count_reports(
+            user_ids=[target_id],
+            end_date=current_date,
+            team_ids=permission_team_ids,
+        )
+        scope_text = (
+            "根据日报台账"
+            if permission_team_ids is None
+            else "根据你可查看范围内的日报台账"
+        )
+        if completed_only:
+            query_kind = "completed_report_count"
+            report_count = int(status_counts.get("completed", 0))
+            other_counts = {
+                status: count
+                for status, count in status_counts.items()
+                if status != "completed"
+            }
+            detail = _status_count_text(other_counts)
+            reply = f"{scope_text}，{target_name}已完成 {report_count} 份日报"
+            if detail:
+                reply += f"；另有{detail}"
+        else:
+            query_kind = "report_count"
+            report_count = sum(status_counts.values())
+            detail = _status_count_text(status_counts)
+            reply = f"{scope_text}，{target_name}目前共有 {report_count} 份日报"
+            if detail:
+                reply += f"，其中{detail}"
+        reply += f"。统计截至 {current_date.isoformat()}，包含已保存的日报记录。"
+        return ReportInsightAnswer(
+            text=reply,
+            evidence=KnowledgeEvidenceFrame(
+                source_type=REPORT_INSIGHT_SOURCE_TYPE,
+                source_id=f"daily_report_count:{query_kind}:{target_id}:{current_date.isoformat()}",
+                title=f"{target_name}日报数量",
+                summary=reply,
+                facts={
+                    "query_kind": query_kind,
+                    "scope_type": "person",
+                    "scope_label": target_name,
+                    "target_user_ids": [target_id],
+                    "report_count": report_count,
+                    "status_counts": dict(status_counts),
+                    "permission_scope_team_ids": sorted(permission_team_ids or ()),
+                    "as_of_date": current_date.isoformat(),
+                    "permission_allowed": True,
+                },
+                confidence=0.99,
+                freshness=current_date.isoformat(),
+            ),
+        )
 
     async def _unclosed_work_answer(
         self,
@@ -497,7 +698,11 @@ class ReportInsightModule:
                 current_date=current_date,
             )
 
-        query_scope = report_insight_query_scope(query_text, query_kind).strip().rstrip("的")
+        query_scope = (
+            _legacy_report_insight_query_scope(query_text, query_kind)
+            .strip()
+            .rstrip("的")
+        )
         named_scope = _matched_exact_named_scope(query_scope, teams)
         if named_scope is not None or _looks_like_organization_scope(query_scope):
             return await self._organization_unclosed_work_answer(
@@ -515,36 +720,66 @@ class ReportInsightModule:
         target: Any,
         permission_team_ids: Sequence[str] | None,
         current_date: date,
+        period_type: str = "all_history",
+        plan_start_date: date | None = None,
+        plan_end_date: date | None = None,
     ) -> ReportInsightAnswer:
         target_id = str(_value(target, "id") or _value(target, "user_id") or "")
         target_name = str(_value(target, "name") or "该人员")
         reports = tuple(
             await self.repository.list_reports(
                 user_ids=[target_id],
-                start_date=date.min,
+                start_date=plan_start_date or date.min,
                 end_date=current_date,
                 team_ids=permission_team_ids,
             )
         )
-        unclosed_items = _unclosed_plan_items(
+        followup_analysis = _plan_followup_analysis(
             reports,
             user_names={target_id: target_name},
             closure_across_users=False,
             as_of_date=current_date,
+            plan_start_date=plan_start_date,
+            plan_end_date=plan_end_date,
         )
+        unclosed_items = list(followup_analysis.no_followup_items)
         scope_text = "日报" if permission_team_ids is None else "可查看范围内日报"
-        lines = [
-            (
-                f"根据截至 {current_date.isoformat()} 的{scope_text}，按计划日期之后的“今日工作”文字核对，"
-                f"{target_name}共有 {len(unclosed_items)} 项计划尚未找到闭环记录。"
+        if plan_start_date is not None and plan_end_date is not None:
+            opening = (
+                f"根据 {plan_start_date.isoformat()} 至 {plan_end_date.isoformat()} 的工作计划，"
+                f"并核对截至 {current_date.isoformat()} 的后续“今日工作”，"
+                f"{target_name}共有 {len(unclosed_items)} 项计划未找到后续工作记录。"
             )
-        ]
-        if unclosed_items:
-            lines.extend(_unclosed_numbered_lines(unclosed_items, include_user=False, limit=20))
         else:
-            lines.append("- 暂未发现未闭环计划。")
+            opening = (
+                f"根据截至 {current_date.isoformat()} 的{scope_text}，按计划日期之后的“今日工作”文字核对，"
+                f"{target_name}共有 {len(unclosed_items)} 项计划未找到后续工作记录。"
+            )
+        lines = [opening]
+        if unclosed_items:
+            lines.extend(
+                _unclosed_numbered_lines(unclosed_items, include_user=False, limit=20)
+            )
+        else:
+            lines.append("- 暂未发现没有后续工作记录的计划。")
+        if followup_analysis.in_progress_items:
+            lines.append(
+                f"另有 {len(followup_analysis.in_progress_items)} 项已在后续日报中继续跟进，"
+                "未计入上述数字。"
+            )
+        if followup_analysis.mentioned_items:
+            lines.append(
+                f"另有 {len(followup_analysis.mentioned_items)} 项已有后续工作记录，"
+                "未计入上述数字。"
+            )
+        if followup_analysis.pending_evidence_items:
+            lines.append(
+                f"另有 {len(followup_analysis.pending_evidence_items)} 项在计划后没有可用于核对的"
+                "后续日报，暂无法判断。"
+            )
         lines.append(
-            "说明：后续日期的“今日工作”需明确提及同一事项，且未写明“尚未完成/仍在推进”，才视为已闭环。"
+            "说明：同一工作跨日重复计划只算一项；只要后续日期的“今日工作”明确提及"
+            "同一事项，就算已有后续记录。“未找到后续记录”不等于实际工作一定未完成。"
         )
         reply = "\n".join(lines)
         evidence = KnowledgeEvidenceFrame(
@@ -560,10 +795,25 @@ class ReportInsightModule:
                 "permission_scope_team_ids": sorted(permission_team_ids or ()),
                 "history_start": _first_report_date(reports),
                 "history_end": current_date.isoformat(),
+                "period_type": period_type,
+                "period_start": plan_start_date.isoformat()
+                if plan_start_date
+                else _first_report_date(reports),
+                "period_end": plan_end_date.isoformat()
+                if plan_end_date
+                else current_date.isoformat(),
                 "report_count": len(reports),
                 "unclosed_count": len(unclosed_items),
                 "unclosed_items": unclosed_items,
-                "closure_rule": "later_today_work_mentions_same_item_without_explicit_unfinished_status",
+                "followed_up_count": followup_analysis.followed_up_count,
+                "in_progress_count": len(followup_analysis.in_progress_items),
+                "completed_count": len(followup_analysis.completed_items),
+                "pending_evidence_count": len(followup_analysis.pending_evidence_items),
+                "in_progress_items": list(followup_analysis.in_progress_items),
+                "pending_evidence_items": list(
+                    followup_analysis.pending_evidence_items
+                ),
+                "closure_rule": "later_today_work_mentions_same_item",
                 "permission_allowed": True,
             },
             confidence=0.92,
@@ -579,15 +829,26 @@ class ReportInsightModule:
         users: Sequence[Any],
         teams: Sequence[Any],
         current_date: date,
+        period_type: str = "all_history",
+        plan_start_date: date | None = None,
+        plan_end_date: date | None = None,
     ) -> ReportInsightAnswer:
         target_scope = _matched_exact_named_scope(query_scope, teams)
         if target_scope is not None:
             scope_type, scope_label, target_teams = target_scope
             if scope_type == "department":
-                if not _can_read_department(requester=requester, department_name=scope_label, teams=teams):
-                    return _department_permission_denied_answer(scope_label, current_date=current_date)
-            elif not _can_read_team(requester=requester, target_team=target_teams[0], teams=teams):
-                return _team_permission_denied_answer(target_teams[0], current_date=current_date)
+                if not _can_read_department(
+                    requester=requester, department_name=scope_label, teams=teams
+                ):
+                    return _department_permission_denied_answer(
+                        scope_label, current_date=current_date
+                    )
+            elif not _can_read_team(
+                requester=requester, target_team=target_teams[0], teams=teams
+            ):
+                return _team_permission_denied_answer(
+                    target_teams[0], current_date=current_date
+                )
         else:
             requested_scope = query_scope
             if requested_scope and not _is_generic_organization_label(requested_scope):
@@ -602,7 +863,8 @@ class ReportInsightModule:
                 target_teams = [
                     team
                     for team in teams
-                    if str(_value(team, "id") or _value(team, "team_id") or "") == requester_team_id
+                    if str(_value(team, "id") or _value(team, "team_id") or "")
+                    == requester_team_id
                 ]
                 if not target_teams:
                     return _resolution_answer(
@@ -625,13 +887,16 @@ class ReportInsightModule:
                     department_name=department_name,
                     teams=teams,
                 ):
-                    return _department_permission_denied_answer(department_name, current_date=current_date)
+                    return _department_permission_denied_answer(
+                        department_name, current_date=current_date
+                    )
                 scope_type = "department"
                 scope_label = department_name
                 target_teams = [
                     team
                     for team in teams
-                    if str(_value(team, "department_name") or "").strip() == department_name
+                    if str(_value(team, "department_name") or "").strip()
+                    == department_name
                 ]
 
         target_team_ids = sorted(
@@ -650,31 +915,59 @@ class ReportInsightModule:
         reports = tuple(
             await self.repository.list_reports(
                 user_ids=None,
-                start_date=date.min,
+                start_date=plan_start_date or date.min,
                 end_date=current_date,
                 team_ids=target_team_ids,
             )
         )
-        unclosed_items = _unclosed_plan_items(
+        followup_analysis = _plan_followup_analysis(
             reports,
             user_names=user_names,
             closure_across_users=True,
             as_of_date=current_date,
+            plan_start_date=plan_start_date,
+            plan_end_date=plan_end_date,
         )
-        target_user_ids = sorted({str(_value(report, "user_id") or "") for report in reports})
-        lines = [
-            (
-                f"根据截至 {current_date.isoformat()} 的可查看日报，按计划日期之后的部门成员“今日工作”文字核对，"
-                f"{scope_label}共有 {len(unclosed_items)} 项计划尚未找到闭环记录。"
+        unclosed_items = list(followup_analysis.no_followup_items)
+        target_user_ids = sorted(
+            {str(_value(report, "user_id") or "") for report in reports}
+        )
+        if plan_start_date is not None and plan_end_date is not None:
+            opening = (
+                f"根据 {plan_start_date.isoformat()} 至 {plan_end_date.isoformat()} 的工作计划，"
+                f"并核对截至 {current_date.isoformat()} 的后续部门成员“今日工作”，"
+                f"{scope_label}共有 {len(unclosed_items)} 项计划未找到后续工作记录。"
             )
-        ]
-        if unclosed_items:
-            lines.extend(_unclosed_numbered_lines(unclosed_items, include_user=True, limit=30))
         else:
-            lines.append("- 暂未发现未闭环计划。")
+            opening = (
+                f"根据截至 {current_date.isoformat()} 的可查看日报，按计划日期之后的部门成员“今日工作”文字核对，"
+                f"{scope_label}共有 {len(unclosed_items)} 项计划未找到后续工作记录。"
+            )
+        lines = [opening]
+        if unclosed_items:
+            lines.extend(
+                _unclosed_numbered_lines(unclosed_items, include_user=True, limit=30)
+            )
+        else:
+            lines.append("- 暂未发现没有后续工作记录的计划。")
+        if followup_analysis.in_progress_items:
+            lines.append(
+                f"另有 {len(followup_analysis.in_progress_items)} 项已由部门成员在后续日报中继续跟进，"
+                "未计入上述数字。"
+            )
+        if followup_analysis.mentioned_items:
+            lines.append(
+                f"另有 {len(followup_analysis.mentioned_items)} 项已有部门后续工作记录，"
+                "未计入上述数字。"
+            )
+        if followup_analysis.pending_evidence_items:
+            lines.append(
+                f"另有 {len(followup_analysis.pending_evidence_items)} 项在计划后没有可用于核对的"
+                "后续日报，暂无法判断。"
+            )
         lines.append(
-            "说明：部门内任一成员在后续日期明确提及同一事项，且未写明“尚未完成/仍在推进”，"
-            "才视为部门层面已闭环。"
+            "说明：同一工作跨日重复计划只算一项；部门内任一成员在后续日期的“今日工作”"
+            "明确提及同一事项，就算已有后续记录。“未找到后续记录”不等于实际工作一定未完成。"
         )
         reply = "\n".join(lines)
         evidence = KnowledgeEvidenceFrame(
@@ -690,10 +983,25 @@ class ReportInsightModule:
                 "target_user_ids": target_user_ids,
                 "history_start": _first_report_date(reports),
                 "history_end": current_date.isoformat(),
+                "period_type": period_type,
+                "period_start": plan_start_date.isoformat()
+                if plan_start_date
+                else _first_report_date(reports),
+                "period_end": plan_end_date.isoformat()
+                if plan_end_date
+                else current_date.isoformat(),
                 "report_count": len(reports),
                 "unclosed_count": len(unclosed_items),
                 "unclosed_items": unclosed_items,
-                "closure_rule": "later_department_today_work_mentions_same_item_without_explicit_unfinished_status",
+                "followed_up_count": followup_analysis.followed_up_count,
+                "in_progress_count": len(followup_analysis.in_progress_items),
+                "completed_count": len(followup_analysis.completed_items),
+                "pending_evidence_count": len(followup_analysis.pending_evidence_items),
+                "in_progress_items": list(followup_analysis.in_progress_items),
+                "pending_evidence_items": list(
+                    followup_analysis.pending_evidence_items
+                ),
+                "closure_rule": "later_department_today_work_mentions_same_item",
                 "permission_allowed": True,
             },
             confidence=0.92,
@@ -709,11 +1017,20 @@ class ReportInsightModule:
         users: Sequence[Any],
         teams: Sequence[Any],
         current_date: date,
+        requested_scope_override: str | None = None,
+        start_date_override: date | None = None,
+        period_type_override: str | None = None,
     ) -> ReportInsightAnswer | None:
-        requested_scope = report_insight_query_scope(
-            query_text,
-            "department_recent_attention",
-        ).strip().rstrip("的")
+        requested_scope = (
+            requested_scope_override.strip().rstrip("的")
+            if requested_scope_override is not None
+            else _legacy_report_insight_query_scope(
+                query_text,
+                "department_recent_attention",
+            )
+            .strip()
+            .rstrip("的")
+        )
         named_scope = _matched_exact_named_scope(requested_scope, teams)
         requester_team_id = str(_value(requester, "team_id") or "")
         department_name = _team_department(teams, requester_team_id)
@@ -721,10 +1038,18 @@ class ReportInsightModule:
         if named_scope is not None:
             scope_type, scope_label, target_teams = named_scope
             if scope_type == "department":
-                if not _can_read_department(requester=requester, department_name=scope_label, teams=teams):
-                    return _department_permission_denied_answer(scope_label, current_date=current_date)
-            elif not _can_read_team(requester=requester, target_team=target_teams[0], teams=teams):
-                return _team_permission_denied_answer(target_teams[0], current_date=current_date)
+                if not _can_read_department(
+                    requester=requester, department_name=scope_label, teams=teams
+                ):
+                    return _department_permission_denied_answer(
+                        scope_label, current_date=current_date
+                    )
+            elif not _can_read_team(
+                requester=requester, target_team=target_teams[0], teams=teams
+            ):
+                return _team_permission_denied_answer(
+                    target_teams[0], current_date=current_date
+                )
         elif requested_scope and not _is_generic_organization_label(requested_scope):
             return _resolution_answer(
                 scope_type="organization",
@@ -735,7 +1060,8 @@ class ReportInsightModule:
             target_teams = [
                 team
                 for team in teams
-                if str(_value(team, "id") or _value(team, "team_id") or "") == requester_team_id
+                if str(_value(team, "id") or _value(team, "team_id") or "")
+                == requester_team_id
             ]
             if not target_teams:
                 return _resolution_answer(
@@ -757,8 +1083,12 @@ class ReportInsightModule:
                 for team in teams
                 if str(_value(team, "department_name") or "").strip() == department_name
             ]
-            if not _can_read_department(requester=requester, department_name=department_name, teams=teams):
-                return _department_permission_denied_answer(department_name, current_date=current_date)
+            if not _can_read_department(
+                requester=requester, department_name=department_name, teams=teams
+            ):
+                return _department_permission_denied_answer(
+                    department_name, current_date=current_date
+                )
             scope_type = "department"
             scope_label = department_name
 
@@ -767,10 +1097,12 @@ class ReportInsightModule:
             for team in target_teams
         }
         user_names = {
-            str(_value(user, "id") or _value(user, "user_id") or ""): str(_value(user, "name") or "未命名人员")
+            str(_value(user, "id") or _value(user, "user_id") or ""): str(
+                _value(user, "name") or "未命名人员"
+            )
             for user in users
         }
-        start_date = current_date - timedelta(days=6)
+        start_date = start_date_override or (current_date - timedelta(days=6))
         reports = tuple(
             await self.repository.list_reports(
                 user_ids=None,
@@ -779,24 +1111,39 @@ class ReportInsightModule:
                 team_ids=sorted(target_team_ids),
             )
         )
-        target_user_ids = sorted({str(_value(report, "user_id") or "") for report in reports})
-        problem_items = [
-            item
-            for item in _scoped_report_items(reports, "problems", user_names=user_names)
-            if not _is_empty_problem(item["text"])
-        ]
-        plan_items = [
-            item
-            for item in _scoped_report_items(reports, "tomorrow_plan", user_names=user_names)
-            if _is_attention_plan(item["text"])
-        ]
+        target_user_ids = sorted(
+            {str(_value(report, "user_id") or "") for report in reports}
+        )
+        problem_analysis = _problem_attention_analysis(
+            reports,
+            user_names=user_names,
+            closure_across_users=True,
+            as_of_date=current_date,
+        )
+        problem_items = list(problem_analysis.active_items)
+        plan_analysis = _plan_followup_analysis(
+            reports,
+            user_names=user_names,
+            closure_across_users=True,
+            # Attention includes today's newly recorded plan. Treat the next day
+            # as the evidence boundary so that it remains pending, rather than
+            # disappearing merely because no later report can exist yet.
+            as_of_date=current_date + timedelta(days=1),
+            plan_start_date=start_date,
+            plan_end_date=current_date,
+        )
+        plan_items = _active_attention_plan_items(plan_analysis)
         lines = [
             f"根据 {start_date.isoformat()} 至 {current_date.isoformat()} 的日报，{scope_label}近期重点关注如下："
         ]
         if problem_items:
-            lines.extend(["问题/风险：", *_scoped_numbered_lines(problem_items, limit=16)])
+            lines.extend(
+                ["问题/风险：", *_scoped_numbered_lines(problem_items, limit=16)]
+            )
         if plan_items:
-            lines.extend(["需跟进事项：", *_scoped_numbered_lines(plan_items, limit=12)])
+            lines.extend(
+                ["需跟进事项：", *_scoped_numbered_lines(plan_items, limit=12)]
+            )
         if not problem_items and not plan_items:
             lines.append("- 暂无已记录的重点问题、风险或需跟进计划。")
         reply = "\n".join(lines)
@@ -811,12 +1158,20 @@ class ReportInsightModule:
                 "scope_label": scope_label,
                 "target_team_ids": sorted(target_team_ids),
                 "target_user_ids": target_user_ids,
-                "period_type": "recent_7_days",
+                "period_type": period_type_override or "recent_7_days",
                 "period_start": start_date.isoformat(),
                 "period_end": current_date.isoformat(),
                 "report_count": len(reports),
                 "problem_items": problem_items,
+                "resolved_problem_count": len(problem_analysis.resolved_items),
                 "plan_items": plan_items,
+                "completed_attention_plan_count": len(
+                    [
+                        item
+                        for item in plan_analysis.completed_items
+                        if _is_attention_plan(item["plan_text"])
+                    ]
+                ),
                 "permission_allowed": True,
             },
             confidence=0.98,
@@ -833,8 +1188,16 @@ class ReportInsightModule:
         users: Sequence[Any],
         teams: Sequence[Any],
         current_date: date,
+        requested_scope_override: str | None = None,
+        period_type_override: str | None = None,
     ) -> ReportInsightAnswer | None:
-        requested_scope = report_insight_query_scope(query_text, query_kind).strip().rstrip("的")
+        requested_scope = (
+            requested_scope_override.strip().rstrip("的")
+            if requested_scope_override is not None
+            else _legacy_report_insight_query_scope(query_text, query_kind)
+            .strip()
+            .rstrip("的")
+        )
         target_scope = _matched_exact_named_scope(requested_scope, teams)
         if target_scope is None:
             return _resolution_answer(
@@ -844,21 +1207,33 @@ class ReportInsightModule:
             )
         scope_type, scope_label, target_teams = target_scope
         if scope_type == "department":
-            if not _can_read_department(requester=requester, department_name=scope_label, teams=teams):
-                return _department_permission_denied_answer(scope_label, current_date=current_date)
-        elif not _can_read_team(requester=requester, target_team=target_teams[0], teams=teams):
-            return _team_permission_denied_answer(target_teams[0], current_date=current_date)
+            if not _can_read_department(
+                requester=requester, department_name=scope_label, teams=teams
+            ):
+                return _department_permission_denied_answer(
+                    scope_label, current_date=current_date
+                )
+        elif not _can_read_team(
+            requester=requester, target_team=target_teams[0], teams=teams
+        ):
+            return _team_permission_denied_answer(
+                target_teams[0], current_date=current_date
+            )
 
         target_team_ids = {
             str(_value(team, "id") or _value(team, "team_id") or "")
             for team in target_teams
         }
         user_names = {
-            str(_value(user, "id") or _value(user, "user_id") or ""): str(_value(user, "name") or "未命名人员")
+            str(_value(user, "id") or _value(user, "user_id") or ""): str(
+                _value(user, "name") or "未命名人员"
+            )
             for user in users
         }
         current_week_start = current_date - timedelta(days=current_date.weekday())
-        if query_kind == "team_previous_week_work":
+        if (
+            period_type_override or ""
+        ) == "previous_week" or query_kind == "team_previous_week_work":
             start_date = current_week_start - timedelta(days=7)
             end_date = current_week_start - timedelta(days=1)
             period_type = "previous_week"
@@ -876,11 +1251,17 @@ class ReportInsightModule:
                 team_ids=sorted(target_team_ids),
             )
         )
-        target_user_ids = sorted({str(_value(report, "user_id") or "") for report in reports})
+        target_user_ids = sorted(
+            {str(_value(report, "user_id") or "") for report in reports}
+        )
         work_items = _scoped_report_items(reports, "today_work", user_names=user_names)
         problem_items = _scoped_report_items(reports, "problems", user_names=user_names)
-        plan_items = _scoped_report_items(reports, "tomorrow_plan", user_names=user_names)
-        reporter_count = len({str(_value(report, "user_id") or "") for report in reports})
+        plan_items = _scoped_report_items(
+            reports, "tomorrow_plan", user_names=user_names
+        )
+        reporter_count = len(
+            {str(_value(report, "user_id") or "") for report in reports}
+        )
         lines = [
             (
                 f"根据 {start_date.isoformat()} 至 {end_date.isoformat()} 的日报，"
@@ -890,7 +1271,9 @@ class ReportInsightModule:
             *(_scoped_numbered_lines(work_items, limit=16) or ["- 暂无已记录工作"]),
         ]
         if problem_items:
-            lines.extend(["问题/风险：", *_scoped_numbered_lines(problem_items, limit=10)])
+            lines.extend(
+                ["问题/风险：", *_scoped_numbered_lines(problem_items, limit=10)]
+            )
         if plan_items:
             lines.extend(["后续计划：", *_scoped_numbered_lines(plan_items, limit=10)])
         reply = "\n".join(lines)
@@ -927,13 +1310,17 @@ class ReportInsightModule:
         target_id: str,
         permission_team_ids: Sequence[str] | None,
         current_date: date,
+        period_type: str = "recent_7_days",
+        start_date_override: date | None = None,
+        end_date_override: date | None = None,
     ) -> ReportInsightAnswer:
-        start_date = current_date - timedelta(days=6)
+        start_date = start_date_override or (current_date - timedelta(days=6))
+        end_date = end_date_override or current_date
         reports = tuple(
             await self.repository.list_reports(
                 user_ids=[target_id],
                 start_date=start_date,
-                end_date=current_date,
+                end_date=end_date,
                 team_ids=permission_team_ids,
             )
         )
@@ -943,7 +1330,7 @@ class ReportInsightModule:
         plan_items = _report_items(reports, "tomorrow_plan")
         lines = [
             (
-                f"根据 {start_date.isoformat()} 至 {current_date.isoformat()} 的"
+                f"根据 {start_date.isoformat()} 至 {end_date.isoformat()} 的"
                 f"{'日报' if permission_team_ids is None else '可查看范围内日报'}，"
                 f"{target_name}共有 {len(reports)} 份记录。"
             ),
@@ -957,7 +1344,7 @@ class ReportInsightModule:
         reply = "\n".join(lines)
         evidence = KnowledgeEvidenceFrame(
             source_type=REPORT_INSIGHT_SOURCE_TYPE,
-            source_id=f"daily_recent_work:{target_id}:{start_date.isoformat()}:{current_date.isoformat()}",
+            source_id=f"daily_recent_work:{target_id}:{start_date.isoformat()}:{end_date.isoformat()}",
             title=f"{target_name}近期工作",
             summary=reply,
             facts={
@@ -965,9 +1352,9 @@ class ReportInsightModule:
                 "scope_type": "person",
                 "scope_label": target_name,
                 "target_user_ids": [target_id],
-                "period_type": "recent_7_days",
+                "period_type": period_type,
                 "period_start": start_date.isoformat(),
-                "period_end": current_date.isoformat(),
+                "period_end": end_date.isoformat(),
                 "report_count": len(reports),
                 "permission_scope_team_ids": sorted(permission_team_ids or ()),
                 "work_items": work_items,
@@ -976,7 +1363,7 @@ class ReportInsightModule:
                 "permission_allowed": True,
             },
             confidence=0.98,
-            freshness=current_date.isoformat(),
+            freshness=end_date.isoformat(),
         )
         return ReportInsightAnswer(text=reply, evidence=evidence)
 
@@ -995,27 +1382,39 @@ def _person_report_scope(
     if requester_dingtalk_id in ALL_ACCESS_DINGTALK_USER_IDS:
         return True, None
 
-    requester_role = str(_value(requester, "role") or "member").strip().lower()
     requester_team_id = str(_value(requester, "team_id") or "")
     target_team_id = str(_value(target, "team_id") or "")
+    requester_department = _team_department(teams, requester_team_id)
+    target_department = _team_department(teams, target_team_id)
+    if requester_department and requester_department == target_department:
+        team_ids = sorted(
+            str(_value(team, "id") or _value(team, "team_id") or "")
+            for team in teams
+            if str(_value(team, "department_name") or "").strip()
+            == requester_department
+        )
+        return True, team_ids
+
+    requester_role = str(_value(requester, "role") or "member").strip().lower()
     if requester_role in TEAM_LEADER_ROLES:
         allowed = bool(requester_team_id and requester_team_id == target_team_id)
         return allowed, [requester_team_id] if allowed else []
     if requester_role in DEPARTMENT_HEAD_ROLES:
-        requester_department = _team_department(teams, requester_team_id)
-        target_department = _team_department(teams, target_team_id)
         if not requester_department or requester_department != target_department:
             return False, []
         team_ids = sorted(
             str(_value(team, "id") or _value(team, "team_id") or "")
             for team in teams
-            if str(_value(team, "department_name") or "").strip() == requester_department
+            if str(_value(team, "department_name") or "").strip()
+            == requester_department
         )
         return True, team_ids
     return False, []
 
 
-def _permission_denied_answer(target: Any, *, current_date: date) -> ReportInsightAnswer:
+def _permission_denied_answer(
+    target: Any, *, current_date: date
+) -> ReportInsightAnswer:
     target_name = str(_value(target, "name") or "该人员")
     reply = f"你没有权限查看{target_name}的日报。"
     return ReportInsightAnswer(
@@ -1086,6 +1485,34 @@ def _status_count_text(status_counts: dict[str, int]) -> str:
     )
 
 
+def _report_insight_period_bounds(
+    period_type: str,
+    *,
+    current_date: date,
+) -> tuple[date | None, date | None]:
+    if period_type == "all_history":
+        return None, None
+    if period_type == "recent_7_days":
+        return current_date - timedelta(days=6), current_date
+    current_week_start = current_date - timedelta(days=current_date.weekday())
+    if period_type == "current_week":
+        return current_week_start, current_date
+    if period_type == "previous_week":
+        return (
+            current_week_start - timedelta(days=7),
+            current_week_start - timedelta(days=1),
+        )
+    raise ValueError("unsupported report insight period type")
+
+
+def _legacy_report_insight_query_scope(text: str, query_kind: str) -> str:
+    """Lazy bridge for historical parser tests; never used by Agent2 production."""
+
+    from app.agent2.report_insight_intent import report_insight_query_scope
+
+    return report_insight_query_scope(text, query_kind)
+
+
 def _matched_named_users(
     text: str,
     users: Sequence[Any],
@@ -1102,7 +1529,11 @@ def _matched_named_users(
         return []
     longest_length = max(len(name) for name in matched_names)
     longest_names = {name for name in matched_names if len(name) == longest_length}
-    candidates = [user for user in users if str(_value(user, "name") or "").strip() in longest_names]
+    candidates = [
+        user
+        for user in users
+        if str(_value(user, "name") or "").strip() in longest_names
+    ]
     named_scope = _matched_named_scope(text, teams)
     if named_scope is None:
         return candidates
@@ -1110,7 +1541,11 @@ def _matched_named_users(
         str(_value(team, "id") or _value(team, "team_id") or "")
         for team in named_scope[2]
     }
-    return [user for user in candidates if str(_value(user, "team_id") or "") in target_team_ids]
+    return [
+        user
+        for user in candidates
+        if str(_value(user, "team_id") or "") in target_team_ids
+    ]
 
 
 def _query_scope_matches_target(
@@ -1120,7 +1555,9 @@ def _query_scope_matches_target(
     target: Any,
     teams: Sequence[Any],
 ) -> bool:
-    scope = report_insight_query_scope(query_text, query_kind).strip().rstrip("的")
+    scope = (
+        _legacy_report_insight_query_scope(query_text, query_kind).strip().rstrip("的")
+    )
     target_name = str(_value(target, "name") or "").strip()
     if not scope or not target_name:
         return False
@@ -1154,13 +1591,20 @@ def _report_items(reports: Sequence[Any], field: str) -> list[dict[str, str]]:
             if not item_text or item_text in seen:
                 continue
             seen.add(item_text)
-            items.append({"date": report_date.isoformat() if report_date else "", "text": item_text})
+            items.append(
+                {
+                    "date": report_date.isoformat() if report_date else "",
+                    "text": item_text,
+                }
+            )
     return items
 
 
 def _numbered_lines(items: Sequence[dict[str, str]], *, limit: int) -> list[str]:
     return [
-        f"{index}. {item['text']}（{item['date']}）" if item.get("date") else f"{index}. {item['text']}"
+        f"{index}. {item['text']}（{item['date']}）"
+        if item.get("date")
+        else f"{index}. {item['text']}"
         for index, item in enumerate(items[:limit], start=1)
     ]
 
@@ -1207,33 +1651,66 @@ def _scoped_numbered_lines(items: Sequence[dict[str, str]], *, limit: int) -> li
     ]
 
 
-def _unclosed_plan_items(
+@dataclass(frozen=True)
+class _PlanFollowupAnalysis:
+    no_followup_items: tuple[dict[str, Any], ...]
+    in_progress_items: tuple[dict[str, Any], ...]
+    mentioned_items: tuple[dict[str, Any], ...]
+    completed_items: tuple[dict[str, Any], ...]
+    pending_evidence_items: tuple[dict[str, Any], ...]
+
+    @property
+    def followed_up_count(self) -> int:
+        return (
+            len(self.in_progress_items)
+            + len(self.mentioned_items)
+            + len(self.completed_items)
+        )
+
+
+def _plan_followup_analysis(
     reports: Sequence[Any],
     *,
     user_names: dict[str, str],
     closure_across_users: bool,
     as_of_date: date,
-) -> list[dict[str, str]]:
+    plan_start_date: date | None = None,
+    plan_end_date: date | None = None,
+) -> _PlanFollowupAnalysis:
     plans = [
         item
         for item in _dated_report_field_items(reports, "tomorrow_plan")
         if item["date"] < as_of_date
+        and (plan_start_date is None or item["date"] >= plan_start_date)
+        and (plan_end_date is None or item["date"] <= plan_end_date)
     ]
-    work_entries = _dated_report_field_items(reports, "today_work")
+    work_entries = [
+        item
+        for item in _dated_report_field_items(reports, "today_work")
+        if item["date"] <= as_of_date
+    ]
     plans_by_date = _items_by_date(plans)
     work_by_date = _items_by_date(work_entries)
-    active = _ActiveUnclosedPlans(
+    tracker = _PlanFollowupTracker(
         user_names=user_names,
         closure_across_users=closure_across_users,
     )
     for report_date in sorted(set(plans_by_date) | set(work_by_date)):
         for work in work_by_date.get(report_date, ()):
-            active.close_with(work)
+            tracker.observe_work(work)
         for plan in plans_by_date.get(report_date, ()):
-            active.add_or_refresh(plan)
+            tracker.add_or_refresh(plan)
 
-    active_items = active.items()
-    active_items.sort(
+    later_evidence_dates = _followup_evidence_dates(reports, as_of_date=as_of_date)
+    classified: dict[str, list[dict[str, Any]]] = {
+        "no_followup": [],
+        "in_progress": [],
+        "mentioned": [],
+        "completed": [],
+        "pending_evidence": [],
+    }
+    tracked_items = tracker.items()
+    tracked_items.sort(
         key=lambda item: (
             item["first_plan_date"],
             item["last_plan_date"],
@@ -1241,22 +1718,238 @@ def _unclosed_plan_items(
             item["plan_text"],
         )
     )
-    return [
-        {
+    for item in tracked_items:
+        serialized = {
             "user_id": str(item["user_id"]),
             "user_name": str(item["user_name"]),
             "plan_text": str(item["plan_text"]),
             "first_plan_date": item["first_plan_date"].isoformat(),
             "last_plan_date": item["last_plan_date"].isoformat(),
+            "repeat_count": int(item.get("repeat_count") or 1),
         }
-        for item in active_items
+        followup_date = item.get("latest_followup_date")
+        if followup_date is not None and followup_date > item["last_plan_date"]:
+            serialized["latest_followup_date"] = followup_date.isoformat()
+            serialized["latest_followup_text"] = str(
+                item.get("latest_followup_text") or ""
+            )
+            followup_status = str(item.get("latest_followup_status") or "mentioned")
+            classified[
+                followup_status
+                if followup_status in {"in_progress", "completed"}
+                else "mentioned"
+            ].append(serialized)
+            continue
+        if any(value > item["last_plan_date"] for value in later_evidence_dates):
+            classified["no_followup"].append(serialized)
+        else:
+            classified["pending_evidence"].append(serialized)
+
+    return _PlanFollowupAnalysis(
+        no_followup_items=tuple(classified["no_followup"]),
+        in_progress_items=tuple(classified["in_progress"]),
+        mentioned_items=tuple(classified["mentioned"]),
+        completed_items=tuple(classified["completed"]),
+        pending_evidence_items=tuple(classified["pending_evidence"]),
+    )
+
+
+@dataclass(frozen=True)
+class _ProblemAttentionAnalysis:
+    active_items: tuple[dict[str, Any], ...]
+    resolved_items: tuple[dict[str, Any], ...]
+
+
+def _problem_attention_analysis(
+    reports: Sequence[Any],
+    *,
+    user_names: dict[str, str],
+    closure_across_users: bool,
+    as_of_date: date,
+) -> _ProblemAttentionAnalysis:
+    problems = [
+        item
+        for item in _dated_report_field_items(reports, "problems")
+        if item["date"] <= as_of_date and not _is_empty_problem(item["text"])
     ]
+    work_entries = [
+        item
+        for item in _dated_report_field_items(reports, "today_work")
+        if item["date"] <= as_of_date
+    ]
+
+    # Repeated descriptions of the same problem by the same person represent one
+    # workstream. The newest occurrence is authoritative, because an issue may be
+    # resolved and then genuinely recur.
+    latest_problems: list[dict[str, Any]] = []
+    for problem in problems:
+        existing_index = next(
+            (
+                index
+                for index, existing in enumerate(latest_problems)
+                if existing["user_id"] == problem["user_id"]
+                and _same_work_item(existing["text"], problem["text"])
+            ),
+            None,
+        )
+        if existing_index is None:
+            latest_problems.append(problem)
+        else:
+            latest_problems[existing_index] = problem
+
+    active_items: list[dict[str, Any]] = []
+    resolved_items: list[dict[str, Any]] = []
+    for problem in latest_problems:
+        decisive_followups: list[dict[str, Any]] = []
+        for work in work_entries:
+            if work["date"] <= problem["date"]:
+                continue
+            if (
+                not closure_across_users
+                and work["user_id"] != problem["user_id"]
+            ):
+                continue
+            status = _work_text_followup_status(problem["text"], work["text"])
+            if status not in {"completed", "in_progress"}:
+                continue
+            decisive_followups.append({**work, "status": status})
+
+        serialized: dict[str, Any] = {
+            "user_id": str(problem["user_id"]),
+            "user_name": user_names.get(str(problem["user_id"]), "未命名人员"),
+            "date": problem["date"].isoformat(),
+            "text": str(problem["text"]),
+        }
+        if not decisive_followups:
+            active_items.append(serialized)
+            continue
+
+        latest_date = max(item["date"] for item in decisive_followups)
+        latest_followups = [
+            item for item in decisive_followups if item["date"] == latest_date
+        ]
+        # If the same day's records conflict, keep the item visible for review.
+        latest_status = (
+            "in_progress"
+            if any(item["status"] == "in_progress" for item in latest_followups)
+            else "completed"
+        )
+        latest_followup = next(
+            item for item in reversed(latest_followups) if item["status"] == latest_status
+        )
+        serialized.update(
+            {
+                "latest_followup_date": latest_date.isoformat(),
+                "latest_followup_text": str(latest_followup["text"]),
+                "latest_followup_status": latest_status,
+            }
+        )
+        if latest_status == "completed":
+            resolved_items.append(serialized)
+        else:
+            active_items.append(serialized)
+
+    def sort_key(item: dict[str, Any]) -> tuple[str, str, str]:
+        return (item["date"], item["user_name"], item["text"])
+
+    active_items.sort(key=sort_key)
+    resolved_items.sort(key=sort_key)
+    return _ProblemAttentionAnalysis(
+        active_items=tuple(active_items),
+        resolved_items=tuple(resolved_items),
+    )
+
+
+def _active_attention_plan_items(
+    analysis: _PlanFollowupAnalysis,
+) -> list[dict[str, Any]]:
+    active_items: list[dict[str, Any]] = []
+    status_groups = (
+        ("no_followup", analysis.no_followup_items),
+        ("in_progress", analysis.in_progress_items),
+        ("pending_evidence", analysis.pending_evidence_items),
+    )
+    for status, items in status_groups:
+        for item in items:
+            if not _is_attention_plan(item["plan_text"]):
+                continue
+            active_items.append(
+                {
+                    "user_id": str(item["user_id"]),
+                    "user_name": str(item["user_name"]),
+                    "date": str(item["last_plan_date"]),
+                    "text": str(item["plan_text"]),
+                    "first_plan_date": str(item["first_plan_date"]),
+                    "last_plan_date": str(item["last_plan_date"]),
+                    "repeat_count": int(item.get("repeat_count") or 1),
+                    "followup_status": status,
+                    **(
+                        {
+                            "latest_followup_date": str(
+                                item.get("latest_followup_date") or ""
+                            ),
+                            "latest_followup_text": str(
+                                item.get("latest_followup_text") or ""
+                            ),
+                        }
+                        if status == "in_progress"
+                        else {}
+                    ),
+                }
+            )
+    active_items.sort(key=lambda item: (item["date"], item["user_name"], item["text"]))
+    return active_items
+
+
+def _unclosed_plan_items(
+    reports: Sequence[Any],
+    *,
+    user_names: dict[str, str],
+    closure_across_users: bool,
+    as_of_date: date,
+    plan_start_date: date | None = None,
+    plan_end_date: date | None = None,
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper for callers that only need missing follow-up rows."""
+
+    return list(
+        _plan_followup_analysis(
+            reports,
+            user_names=user_names,
+            closure_across_users=closure_across_users,
+            as_of_date=as_of_date,
+            plan_start_date=plan_start_date,
+            plan_end_date=plan_end_date,
+        ).no_followup_items
+    )
+
+
+def _followup_evidence_dates(
+    reports: Sequence[Any],
+    *,
+    as_of_date: date,
+) -> tuple[date, ...]:
+    evidence_dates: set[date] = set()
+    for report in reports:
+        report_date = _as_date(_value(report, "report_date") or _value(report, "date"))
+        if report_date is None or report_date > as_of_date:
+            continue
+        status = str(_value(report, "status") or "").strip().lower()
+        today_work = _value(report, "today_work") or ()
+        if not isinstance(today_work, (list, tuple)):
+            today_work = (today_work,)
+        has_work = any(
+            not _is_empty_plan_or_work(str(item or "")) for item in today_work
+        )
+        if has_work or status in {"completed", "pending_confirmation"}:
+            evidence_dates.add(report_date)
+    return tuple(sorted(evidence_dates))
 
 
 _MAX_FUZZY_WORK_CANDIDATES = 64
 
 
-class _ActiveUnclosedPlans:
+class _PlanFollowupTracker:
     def __init__(
         self,
         *,
@@ -1276,20 +1969,41 @@ class _ActiveUnclosedPlans:
 
     def add_or_refresh(self, plan: dict[str, Any]) -> None:
         candidate_ids = self._candidate_ids(plan["text"], user_id=plan["user_id"])
-        existing_id = next(
-            (
-                item_id
-                for item_id in sorted(candidate_ids)
-                if _same_work_item(self._items[item_id]["plan_text"], plan["text"])
-            ),
-            None,
-        )
+        matching_ids = [
+            item_id
+            for item_id in sorted(candidate_ids)
+            if _same_work_item(self._items[item_id]["plan_text"], plan["text"])
+        ]
+        existing_id = matching_ids[0] if matching_ids else None
         if existing_id is not None:
             item = self._items[existing_id]
             self._remove_from_indexes(existing_id, item["plan_text"])
             item["last_plan_date"] = plan["date"]
             item["plan_text"] = plan["text"]
+            item["repeat_count"] = int(item.get("repeat_count") or 1) + 1
             self._add_to_indexes(existing_id, item["plan_text"])
+            for duplicate_id in matching_ids[1:]:
+                duplicate = self._items.get(duplicate_id)
+                if duplicate is None:
+                    continue
+                self._remove_from_indexes(duplicate_id, duplicate["plan_text"])
+                item["first_plan_date"] = min(
+                    item["first_plan_date"], duplicate["first_plan_date"]
+                )
+                item["repeat_count"] += int(duplicate.get("repeat_count") or 1)
+                duplicate_followup_date = duplicate.get("latest_followup_date")
+                if duplicate_followup_date is not None and (
+                    item.get("latest_followup_date") is None
+                    or duplicate_followup_date > item["latest_followup_date"]
+                ):
+                    item["latest_followup_date"] = duplicate_followup_date
+                    item["latest_followup_text"] = duplicate.get(
+                        "latest_followup_text", ""
+                    )
+                    item["latest_followup_status"] = duplicate.get(
+                        "latest_followup_status", "mentioned"
+                    )
+                del self._items[duplicate_id]
             return
 
         item_id = self._next_id
@@ -1300,18 +2014,28 @@ class _ActiveUnclosedPlans:
             "plan_text": plan["text"],
             "first_plan_date": plan["date"],
             "last_plan_date": plan["date"],
+            "repeat_count": 1,
+            "latest_followup_date": None,
+            "latest_followup_text": "",
+            "latest_followup_status": "",
         }
         self._add_to_indexes(item_id, plan["text"])
 
-    def close_with(self, work: dict[str, Any]) -> None:
+    def observe_work(self, work: dict[str, Any]) -> None:
         user_id = None if self.closure_across_users else work["user_id"]
         candidate_ids = self._candidate_ids(work["text"], user_id=user_id)
         for item_id in sorted(candidate_ids):
             item = self._items.get(item_id)
-            if item is None or not _work_text_closes_plan(item["plan_text"], work["text"]):
+            if item is None or work["date"] <= item["last_plan_date"]:
                 continue
-            self._remove_from_indexes(item_id, item["plan_text"])
-            del self._items[item_id]
+            followup_status = _work_text_followup_status(
+                item["plan_text"], work["text"]
+            )
+            if followup_status is None:
+                continue
+            item["latest_followup_date"] = work["date"]
+            item["latest_followup_text"] = work["text"]
+            item["latest_followup_status"] = followup_status
 
     def items(self) -> list[dict[str, Any]]:
         return list(self._items.values())
@@ -1331,7 +2055,9 @@ class _ActiveUnclosedPlans:
                 for variant in variants
                 for item_id in self._variant_posting(variant, user_id=user_id)
             )
-            candidate_ids.update(self._limited_fuzzy_candidate_ids(variants, user_id=user_id))
+            candidate_ids.update(
+                self._limited_fuzzy_candidate_ids(variants, user_id=user_id)
+            )
         return candidate_ids
 
     def _limited_fuzzy_candidate_ids(
@@ -1351,7 +2077,9 @@ class _ActiveUnclosedPlans:
         for posting in postings[:6]:
             for item_id in posting:
                 candidate_ids.add(item_id)
-                signature = tuple(sorted(_work_item_variants(self._items[item_id]["plan_text"])))
+                signature = tuple(
+                    sorted(_work_item_variants(self._items[item_id]["plan_text"]))
+                )
                 signatures.add(signature)
                 if len(signatures) > _MAX_FUZZY_WORK_CANDIDATES:
                     return set()
@@ -1399,7 +2127,9 @@ class _ActiveUnclosedPlans:
         identifiers = _work_item_identifiers(text)
         if identifiers:
             self._identifier_index.setdefault(identifiers, set()).add(item_id)
-            self._user_identifier_index.setdefault((user_id, identifiers), set()).add(item_id)
+            self._user_identifier_index.setdefault((user_id, identifiers), set()).add(
+                item_id
+            )
 
     def _remove_from_indexes(self, item_id: int, text: str) -> None:
         user_id = str(self._items[item_id]["user_id"])
@@ -1436,7 +2166,9 @@ def _items_by_date(items: Sequence[dict[str, Any]]) -> dict[date, list[dict[str,
     return grouped
 
 
-def _dated_report_field_items(reports: Sequence[Any], field: str) -> list[dict[str, Any]]:
+def _dated_report_field_items(
+    reports: Sequence[Any], field: str
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for report in reports:
         report_date = _as_date(_value(report, "report_date") or _value(report, "date"))
@@ -1477,12 +2209,18 @@ def _first_report_date(reports: Sequence[Any]) -> str:
     dates = [
         report_date
         for report in reports
-        if (report_date := _as_date(_value(report, "report_date") or _value(report, "date"))) is not None
+        if (
+            report_date := _as_date(
+                _value(report, "report_date") or _value(report, "date")
+            )
+        )
+        is not None
     ]
     return min(dates).isoformat() if dates else ""
 
 
 _WORK_TEXT_SEPARATOR = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]+")
+_CHINESE_FLOOR_NUMBER = re.compile(r"([零〇一二三四五六七八九十]{1,3})(?=楼)")
 _WORK_CANDIDATE_SEPARATOR = re.compile(
     r"[，,；;。.!！？、\n]+|(?:同时|另外|此外|并且|以及)|"
     r"并(?=(?:已经|现已|已|完成|整理|跟进|推进|处理|办理|协调|沟通|对接|提交|"
@@ -1530,6 +2268,21 @@ _WORK_ACTION_PREFIXES = tuple(
         reverse=True,
     )
 )
+_WORK_SUBJECT_EDGE_TERMS = tuple(
+    sorted(
+        {
+            *_WORK_ACTION_PREFIXES,
+            "收集",
+            "催收",
+            "已",
+            "完毕",
+            "了",
+            "的",
+        },
+        key=len,
+        reverse=True,
+    )
+)
 
 
 def _same_work_item(left: str, right: str) -> bool:
@@ -1539,17 +2292,45 @@ def _same_work_item(left: str, right: str) -> bool:
         return False
     left_identifiers = tuple(_WORK_IDENTIFIER.findall(left_normalized))
     right_identifiers = tuple(_WORK_IDENTIFIER.findall(right_normalized))
-    if (left_identifiers or right_identifiers) and left_identifiers != right_identifiers:
+    if (
+        left_identifiers or right_identifiers
+    ) and left_identifiers != right_identifiers:
         return False
-    if _strong_text_overlap(left_normalized, right_normalized):
-        return True
-    left_core = _work_item_core(left_normalized)
-    right_core = _work_item_core(right_normalized)
-    return bool(left_core and right_core and _strong_text_overlap(left_core, right_core))
+    return any(
+        _strong_text_overlap(left_variant, right_variant)
+        for left_variant in _work_item_variants(left)
+        for right_variant in _work_item_variants(right)
+    )
 
 
 def _normalize_work_item(text: str) -> str:
-    return _WORK_TEXT_SEPARATOR.sub("", str(text or "").lower())
+    compact = _WORK_TEXT_SEPARATOR.sub("", str(text or "").lower())
+    return _CHINESE_FLOOR_NUMBER.sub(
+        lambda match: str(_small_chinese_number(match.group(1))),
+        compact,
+    )
+
+
+def _small_chinese_number(value: str) -> int:
+    digits = {
+        "零": 0,
+        "〇": 0,
+        "一": 1,
+        "二": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if "十" not in value:
+        return int("".join(str(digits[character]) for character in value))
+    left, _, right = value.partition("十")
+    tens = digits[left] if left else 1
+    ones = digits[right] if right else 0
+    return tens * 10 + ones
 
 
 def _work_item_core(text: str) -> str:
@@ -1565,12 +2346,38 @@ def _work_item_core(text: str) -> str:
     return core
 
 
+def _work_item_subject_core(text: str) -> str:
+    core = _work_item_core(text)
+    changed = True
+    while changed and core:
+        changed = False
+        for term in _WORK_SUBJECT_EDGE_TERMS:
+            if core.startswith(term) and len(core) > len(term):
+                core = core[len(term) :]
+                changed = True
+                break
+            if core.endswith(term) and len(core) > len(term):
+                core = core[: -len(term)]
+                changed = True
+                break
+    return core
+
+
 def _work_item_variants(text: str) -> set[str]:
-    normalized = _normalize_work_item(text)
-    if not normalized:
-        return set()
-    core = _work_item_core(normalized)
-    return {value for value in (normalized, core) if value}
+    variants: set[str] = set()
+    fragments = _work_candidate_fragments(text)
+    for fragment in fragments:
+        normalized = _normalize_work_item(fragment)
+        if not normalized:
+            continue
+        core = _work_item_core(normalized)
+        subject_core = _work_item_subject_core(normalized)
+        variants.update(
+            value
+            for value in (normalized, core, subject_core)
+            if value and (len(value) >= 4 or value == normalized)
+        )
+    return variants
 
 
 def _work_item_identifiers(text: str) -> tuple[str, ...]:
@@ -1597,6 +2404,13 @@ def _work_item_grams(variants: set[str]) -> set[str]:
 
 
 def _work_text_closes_plan(plan_text: str, work_text: str) -> bool:
+    return _work_text_followup_status(plan_text, work_text) in {
+        "mentioned",
+        "completed",
+    }
+
+
+def _work_text_followup_status(plan_text: str, work_text: str) -> str | None:
     clauses = _work_status_clause_fragments(work_text)
     matching_clauses: list[str] = []
     for index, clause in enumerate(clauses):
@@ -1604,20 +2418,22 @@ def _work_text_closes_plan(plan_text: str, work_text: str) -> bool:
             continue
         matching_text = clause
         following_index = index + 1
-        while (
-            following_index < len(clauses)
-            and _work_clause_is_status_only(clauses[following_index])
+        while following_index < len(clauses) and _work_clause_is_status_only(
+            clauses[following_index]
         ):
             matching_text += clauses[following_index]
             following_index += 1
         matching_clauses.append(matching_text)
     if not matching_clauses and _same_work_item(plan_text, work_text):
         matching_clauses = [work_text]
-    for clause in matching_clauses:
-        final_status = _work_text_final_status(clause)
-        if final_status in {None, "completed"}:
-            return True
-    return False
+    if not matching_clauses:
+        return None
+    final_status = _work_text_final_status(matching_clauses[-1])
+    if final_status == "completed":
+        return "completed"
+    if final_status == "unfinished":
+        return "in_progress"
+    return "mentioned"
 
 
 _WORK_STATUS_ACTION = (
@@ -1752,45 +2568,45 @@ def _strong_text_overlap(left: str, right: str) -> bool:
     right_pairs = {right[index : index + 2] for index in range(len(right) - 1)}
     if not left_pairs or not right_pairs:
         return False
-    similarity = 2 * len(left_pairs & right_pairs) / (len(left_pairs) + len(right_pairs))
-    return similarity >= 0.8
+    similarity = (
+        2 * len(left_pairs & right_pairs) / (len(left_pairs) + len(right_pairs))
+    )
+    if similarity >= 0.8:
+        return True
+    matcher = SequenceMatcher(None, left, right, autojunk=False)
+    matched_characters = sum(block.size for block in matcher.get_matching_blocks())
+    return matched_characters / len(shorter) >= 0.7
 
 
 def _has_conflicting_short_qualifiers(left: str, right: str) -> bool:
-    common_suffix_length = 0
-    for offset in range(1, min(len(left), len(right)) + 1):
-        if left[-offset] != right[-offset]:
-            break
-        common_suffix_length = offset
-    if common_suffix_length >= 4:
-        left_prefix = left[:-common_suffix_length]
-        right_prefix = right[:-common_suffix_length]
-        if (
-            left_prefix
-            and right_prefix
-            and left_prefix != right_prefix
-            and len(left_prefix) <= 4
-            and len(right_prefix) <= 4
-        ):
-            return True
-
     common_prefix_length = 0
     for index in range(min(len(left), len(right))):
         if left[index] != right[index]:
             break
         common_prefix_length = index + 1
-    if common_prefix_length >= 4:
-        left_suffix = left[common_prefix_length:]
-        right_suffix = right[common_prefix_length:]
-        if (
-            left_suffix
-            and right_suffix
-            and left_suffix != right_suffix
-            and len(left_suffix) <= 4
-            and len(right_suffix) <= 4
-        ):
-            return True
-    return False
+
+    common_suffix_length = 0
+    remaining = min(len(left), len(right)) - common_prefix_length
+    for offset in range(1, remaining + 1):
+        if left[-offset] != right[-offset]:
+            break
+        common_suffix_length = offset
+
+    left_end = len(left) - common_suffix_length if common_suffix_length else len(left)
+    right_end = (
+        len(right) - common_suffix_length if common_suffix_length else len(right)
+    )
+    left_difference = left[common_prefix_length:left_end]
+    right_difference = right[common_prefix_length:right_end]
+    common_context_length = common_prefix_length + common_suffix_length
+    return bool(
+        common_context_length >= 4
+        and left_difference
+        and right_difference
+        and left_difference != right_difference
+        and len(left_difference) <= 4
+        and len(right_difference) <= 4
+    )
 
 
 def _is_empty_plan_or_work(text: str) -> bool:
@@ -1814,7 +2630,12 @@ def _looks_like_organization_scope(text: str) -> bool:
         return True
     if text.endswith(("部", "组")):
         return True
-    return re.search(r"[\u4e00-\u9fffA-Za-z0-9·]{2,12}部(?:有|还有|存在|没|未|没有|尚未)", text) is not None
+    return (
+        re.search(
+            r"[\u4e00-\u9fffA-Za-z0-9·]{2,12}部(?:有|还有|存在|没|未|没有|尚未)", text
+        )
+        is not None
+    )
 
 
 def _is_generic_organization_label(value: str) -> bool:
@@ -1836,11 +2657,17 @@ def _is_generic_organization_label(value: str) -> bool:
     }
 
 
-def _matched_named_scope(text: str, teams: Sequence[Any]) -> tuple[str, str, list[Any]] | None:
-    matches = [team for team in teams if str(_value(team, "name") or "").strip() in text]
+def _matched_named_scope(
+    text: str, teams: Sequence[Any]
+) -> tuple[str, str, list[Any]] | None:
+    matches = [
+        team for team in teams if str(_value(team, "name") or "").strip() in text
+    ]
     if matches:
         longest = max(len(str(_value(team, "name") or "")) for team in matches)
-        longest_matches = [team for team in matches if len(str(_value(team, "name") or "")) == longest]
+        longest_matches = [
+            team for team in matches if len(str(_value(team, "name") or "")) == longest
+        ]
         if len(longest_matches) == 1:
             label = str(_value(longest_matches[0], "name") or "").strip()
             return "team", label, longest_matches
@@ -1922,7 +2749,9 @@ def _matched_exact_named_scope(
     if matched is None:
         return None
     _scope_type, resolved_label, _target_teams = matched
-    if requested == resolved_label or requested in _organization_aliases(resolved_label):
+    if requested == resolved_label or requested in _organization_aliases(
+        resolved_label
+    ):
         return matched
     return None
 
@@ -1943,17 +2772,23 @@ def _can_read_team(*, requester: Any, target_team: Any, teams: Sequence[Any]) ->
         return True
     requester_role = str(_value(requester, "role") or "member").strip().lower()
     requester_team_id = str(_value(requester, "team_id") or "")
-    target_team_id = str(_value(target_team, "id") or _value(target_team, "team_id") or "")
+    target_team_id = str(
+        _value(target_team, "id") or _value(target_team, "team_id") or ""
+    )
+    requester_department = _team_department(teams, requester_team_id)
+    target_department = str(_value(target_team, "department_name") or "").strip()
+    if requester_department and requester_department == target_department:
+        return True
     if requester_role in TEAM_LEADER_ROLES:
         return bool(requester_team_id and requester_team_id == target_team_id)
     if requester_role in DEPARTMENT_HEAD_ROLES:
-        requester_department = _team_department(teams, requester_team_id)
-        target_department = str(_value(target_team, "department_name") or "").strip()
         return bool(requester_department and requester_department == target_department)
     return False
 
 
-def _team_permission_denied_answer(target_team: Any, *, current_date: date) -> ReportInsightAnswer:
+def _team_permission_denied_answer(
+    target_team: Any, *, current_date: date
+) -> ReportInsightAnswer:
     team_name = str(_value(target_team, "name") or "该部门")
     reply = f"你没有权限查看{team_name}的部门日报。"
     return ReportInsightAnswer(
@@ -1975,18 +2810,19 @@ def _team_permission_denied_answer(target_team: Any, *, current_date: date) -> R
     )
 
 
-def _can_read_department(*, requester: Any, department_name: str, teams: Sequence[Any]) -> bool:
+def _can_read_department(
+    *, requester: Any, department_name: str, teams: Sequence[Any]
+) -> bool:
     requester_dingtalk_id = str(_value(requester, "dingtalk_user_id") or "")
     if requester_dingtalk_id in ALL_ACCESS_DINGTALK_USER_IDS:
         return True
-    requester_role = str(_value(requester, "role") or "member").strip().lower()
-    if requester_role not in DEPARTMENT_HEAD_ROLES:
-        return False
     requester_team_id = str(_value(requester, "team_id") or "")
     return _team_department(teams, requester_team_id) == department_name
 
 
-def _department_permission_denied_answer(department_name: str, *, current_date: date) -> ReportInsightAnswer:
+def _department_permission_denied_answer(
+    department_name: str, *, current_date: date
+) -> ReportInsightAnswer:
     reply = f"你没有权限查看{department_name}的部门日报。"
     return ReportInsightAnswer(
         text=reply,
@@ -2009,7 +2845,14 @@ def _department_permission_denied_answer(department_name: str, *, current_date: 
 
 def _is_empty_problem(text: str) -> bool:
     compact = "".join(str(text or "").split()).strip("。！!，,")
-    return compact in {"暂无问题", "暂无明显问题", "无问题", "无明显问题", "没有问题", "没问题"}
+    return compact in {
+        "暂无问题",
+        "暂无明显问题",
+        "无问题",
+        "无明显问题",
+        "没有问题",
+        "没问题",
+    }
 
 
 def _is_attention_plan(text: str) -> bool:

@@ -192,10 +192,9 @@ async def _load_daily_report_for_date(
 
 
 async def build_live_daily_active_task(session: Any, user: Any, settings: Any) -> ActiveWorkflowTask | None:
-    """Build a daily active task from recent persisted report state."""
+    """Build the same active Daily task used by every public entrypoint."""
 
-    report = await load_live_daily_report(session, user, settings)
-    return daily_active_task_from_report(report) if report is not None else None
+    return (await load_live_daily_context(session, user, settings)).active_task
 
 
 def daily_active_task_from_report(report: Any) -> ActiveWorkflowTask | None:

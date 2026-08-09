@@ -44,6 +44,8 @@ _ACTION_ENTITY_TYPES = {
     "edit_daily_item": ("daily_item_target", 1, 1),
     "delete_daily_item": ("daily_item_target", 1, 1),
     "merge_daily_items": ("daily_item_target", 1, 1),
+    "replace_daily_section": ("daily_report", 1, 1),
+    "move_daily_items": ("daily_item_target", 1, 1),
     "query_daily_report": ("daily_report", 1, 1),
     "copy_previous_daily_report": ("daily_report", 1, 1),
     "clear_daily_section": ("daily_report", 1, 1),
@@ -59,6 +61,7 @@ _ACTION_ENTITY_TYPES = {
     "link_case_progress": ("case_progress_ref", 1, 1),
     "answer_case_query": ("case_query", 1, 1),
     "record_travel_event": ("travel_event", 1, 1),
+    "update_travel_event": ("travel_intent_ref", 1, 1),
     "respond_travel_collaboration": ("travel_collaboration_ref", 1, 1),
     "search_enterprise_knowledge": ("knowledge_query", 1, 1),
     "capture_report_event": ("report_event", 1, 1),
@@ -108,6 +111,8 @@ class SemanticContextUpdate:
     bind_pending: "PendingBindingRequest | None" = None
     user_constraints: "UserConstraintUpdate | None" = None
     consumed_pending_ids: tuple[str, ...] = ()
+    invalidated_pending_ids: tuple[str, ...] = ()
+    pending_invalidation_reason: str = ""
     resume_previous_goal: bool = False
     clear_current_goal: bool = False
 
@@ -383,7 +388,18 @@ class CognitiveCoreV3:
         _validate_identity(turn, state)
         interpretation = await self._interpreter.interpret(turn, state)
         interpretation = _resolve_context_references(interpretation, state)
-        interpretation = _validate_pending_continuations(interpretation, state, turn.occurred_at)
+        interpretation = _apply_pending_lifecycle(
+            interpretation,
+            state,
+            turn.occurred_at,
+            turn.text,
+        )
+        interpretation = _validate_pending_continuations(
+            interpretation,
+            state,
+            turn.occurred_at,
+            turn.text,
+        )
         admission_tickets: tuple[AdmissionTicket, ...] = ()
         admission_information_pendings: tuple[InformationPending, ...] = ()
         admission_selection_requests: tuple[TrustedSelectionRequest, ...] = ()
@@ -499,6 +515,13 @@ class CognitiveCoreV3:
         # succeeds. This prevents a blocked/version-conflicted executor from
         # losing the user's pending operation.
         active_pending = state.active_pending(turn.occurred_at)
+        invalidated_pending_ids = set(update.invalidated_pending_ids)
+        if invalidated_pending_ids:
+            active_pending = tuple(
+                item
+                for item in active_pending
+                if item.pending_id not in invalidated_pending_ids
+            )
         if update.bind_pending is not None:
             request = update.bind_pending
             active_pending = tuple(item for item in active_pending if item.pending_id != request.pending_id) + (
@@ -561,6 +584,9 @@ def _context_update_payload(update: SemanticContextUpdate) -> dict[str, Any]:
         }
     if update.consumed_pending_ids:
         payload["consumed_pending_ids"] = list(update.consumed_pending_ids)
+    if update.invalidated_pending_ids:
+        payload["invalidated_pending_ids"] = list(update.invalidated_pending_ids)
+        payload["pending_invalidation_reason"] = update.pending_invalidation_reason
     return payload
 
 
@@ -761,19 +787,124 @@ def _resolve_context_references(
     )
 
 
+_PENDING_SUPERSEDING_ACTION_TYPES = frozenset(
+    {
+        "capture_daily_event",
+        "edit_daily_item",
+        "delete_daily_item",
+        "merge_daily_items",
+        "replace_daily_section",
+        "move_daily_items",
+        "copy_previous_daily_report",
+        "clear_daily_section",
+        "clear_daily_report",
+        "reopen_daily_report",
+        "copy_current_work_to_tomorrow",
+        "complete_previous_daily_plan",
+        "record_case_progress",
+        "update_case_progress",
+        "delete_case_progress",
+        "link_case_progress",
+        "submit_daily_report",
+        "record_travel_event",
+        "update_travel_event",
+        "respond_travel_collaboration",
+        "capture_report_event",
+        "submit_periodic_report",
+        "edit_periodic_report_item",
+        "delete_periodic_report_item",
+        "update_case_followup_policy",
+        "trigger_case_followup_now",
+    }
+)
+
+
+def is_explicit_pending_cancellation(text: str) -> bool:
+    """Return whether text is an exact closed-protocol pending cancellation."""
+
+    normalized = "".join(str(text or "").split()).casefold().strip("。！!?？")
+    return normalized in {
+        "算了",
+        "先算了",
+        "不用了",
+        "不要了",
+        "不确认",
+        "先不执行",
+        "别执行",
+        "取消这次操作",
+        "停止这次操作",
+    }
+
+
+def _apply_pending_lifecycle(
+    interpretation: SemanticInterpretation,
+    state: ConversationState,
+    now: datetime,
+    turn_text: str,
+) -> SemanticInterpretation:
+    """Invalidate old confirmation authority without granting new authority.
+
+    The semantic model may describe the user's new request, but it never gets
+    to choose which existing pending authority survives.  Exact cancellation
+    is a closed protocol.  Supersession happens only when the same turn carries
+    a concrete mutating action, a replacement pending request, or an explicit
+    new goal; persistence is still delayed until any typed execution succeeds.
+    """
+
+    active = state.active_pending(now)
+    if not active or is_explicit_pending_confirmation(turn_text):
+        return interpretation
+    active_ids = tuple(item.pending_id for item in active)
+    update = interpretation.context_update
+    if is_explicit_pending_cancellation(turn_text):
+        return replace(
+            interpretation,
+            required_actions=(),
+            clarification_need=None,
+            context_update=replace(
+                update,
+                preserve_current_goal=True,
+                remember_entity_ids=(),
+                remember_turn=False,
+                bind_pending=None,
+                invalidated_pending_ids=active_ids,
+                pending_invalidation_reason="cancelled_by_user",
+            ),
+        )
+
+    mutating_new_instruction = any(
+        action.action_type in _PENDING_SUPERSEDING_ACTION_TYPES
+        and action.action_type != "continue_pending"
+        for action in interpretation.required_actions
+    )
+    replacement_pending = update.bind_pending is not None
+    if not (mutating_new_instruction or replacement_pending):
+        return interpretation
+    return replace(
+        interpretation,
+        context_update=replace(
+            update,
+            invalidated_pending_ids=active_ids,
+            pending_invalidation_reason="superseded_by_new_instruction",
+        ),
+    )
+
+
 def _validate_pending_continuations(
     interpretation: SemanticInterpretation,
     state: ConversationState,
     now: datetime,
+    turn_text: str,
 ) -> SemanticInterpretation:
     active = state.active_pending(now)
     safe_actions: list[RequiredAction] = []
     consumed_pending_ids: list[str] = []
     mismatch = False
     for action in interpretation.required_actions:
-        if action.action_type == "clear_daily_report":
-            # Whole-report clear is never directly model-authorized. Only the
-            # validated continue_pending branch below may synthesize it.
+        if action.action_type in {"clear_daily_report", "update_travel_event"}:
+            # High-impact report clears and medium-risk Travel updates are
+            # never directly model-authorized. Only the validated
+            # continue_pending branch below may synthesize them.
             mismatch = True
             continue
         if action.action_type != "continue_pending":
@@ -783,7 +914,8 @@ def _validate_pending_continuations(
         bound_action = str(action.parameters.get("bound_action") or "").strip()
         matches = [item for item in active if item.pending_id == pending_id]
         if (
-            len(active) != 1
+            not is_explicit_pending_confirmation(turn_text)
+            or len(active) != 1
             or len(matches) != 1
             or matches[0].intent != action.intent
             or matches[0].action != bound_action
@@ -821,3 +953,26 @@ def _validate_pending_continuations(
             question="这条确认没有匹配到唯一的待处理事项，请说明要继续哪一项。",
         ),
     )
+
+
+def is_explicit_pending_confirmation(text: str) -> bool:
+    """Return whether text is an exact member of the closed confirmation protocol."""
+
+    normalized = "".join(str(text or "").split()).casefold().strip("。！!?？")
+    return normalized in {
+        "好",
+        "好的",
+        "可以",
+        "确认",
+        "确认执行",
+        "同意",
+        "确定",
+        "对",
+        "对的",
+        "没错",
+        "是",
+        "是的",
+        "yes",
+        "confirm",
+        "confirmclear",
+    }

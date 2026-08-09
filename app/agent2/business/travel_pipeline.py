@@ -31,6 +31,7 @@ REAL_USER_TRAVEL_SOURCE_CHANNELS = (
     "dingtalk_webhook",
     "dingtalk_webhook_text",
 )
+TRAVEL_MATCHER_ACTOR_USER_ID = "system:travel-collaboration-matcher"
 
 
 @dataclass(frozen=True)
@@ -256,7 +257,7 @@ async def _record_candidate_creation(
             tenant_id=candidate.tenant_id,
             command_id=f"travel-candidate:{candidate.candidate_id}",
             command_type="create_travel_collaboration_candidate",
-            actor_user_id="system:agent2_travel_matcher",
+            actor_user_id=TRAVEL_MATCHER_ACTOR_USER_ID,
             source_message_id=source_message_id,
             idempotency_key=idempotency_key,
             status="executed",
@@ -280,7 +281,7 @@ async def _record_candidate_creation(
             audit_id=uuid5(NAMESPACE_URL, f"business-audit:{receipt_id}"),
             tenant_id=candidate.tenant_id,
             receipt_id=receipt_id,
-            actor_user_id="system:agent2_travel_matcher",
+            actor_user_id=TRAVEL_MATCHER_ACTOR_USER_ID,
             source_message_id=source_message_id,
             source_channel="agent2_background_worker",
             command_type="create_travel_collaboration_candidate",

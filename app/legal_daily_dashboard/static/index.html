@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="面向法务团队负责人的日报管理、事项跟进与协调支撑工作台"
+    />
+    <title>法务日报管理驾驶舱</title>
+    <link rel="stylesheet" href="./assets/styles.css" />
+  </head>
+  <body>
+    <div class="auth-gate" id="auth-gate">
+      <div class="auth-card">
+        <div class="brand-mark" aria-hidden="true">法</div>
+        <p class="eyebrow">LEGAL DAILY · V1</p>
+        <h1>法务日报管理驾驶舱</h1>
+        <p class="muted">
+          请使用管理员分配的访问凭证进入。系统只读取日报，负责人处理结果单独留痕。
+        </p>
+        <form id="auth-form">
+          <label for="access-token">访问凭证</label>
+          <input
+            id="access-token"
+            name="access-token"
+            type="password"
+            autocomplete="current-password"
+            placeholder="请输入访问凭证"
+            required
+          />
+          <button class="button primary full" type="submit">进入驾驶舱</button>
+          <p class="form-error" id="auth-error" role="alert"></p>
+        </form>
+      </div>
+    </div>
+
+    <div class="app-shell" id="app-shell" hidden>
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark small" aria-hidden="true">法</div>
+          <div>
+            <strong>法务日报</strong>
+            <span>管理驾驶舱</span>
+          </div>
+        </div>
+        <nav class="main-nav" aria-label="主导航">
+          <button class="nav-item active" data-page="overview">
+            <span class="nav-icon">⌂</span>
+            <span>今日总览</span>
+          </button>
+          <button class="nav-item" data-page="members">
+            <span class="nav-icon">人</span>
+            <span>成员日报</span>
+          </button>
+          <button class="nav-item" data-page="items">
+            <span class="nav-icon">线</span>
+            <span>事项追踪</span>
+          </button>
+          <button class="nav-item" data-page="trends">
+            <span class="nav-icon">势</span>
+            <span>趋势复盘</span>
+          </button>
+        </nav>
+        <div class="sidebar-note">
+          <span class="safe-dot"></span>
+          <div>
+            <strong>只读日报</strong>
+            <p>不催交、不发消息、不改原文</p>
+          </div>
+        </div>
+        <button class="text-button sign-out" id="sign-out" type="button">
+          退出当前访问
+        </button>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="scope-kicker">负责人工作台</p>
+            <h1 id="page-title">今日总览</h1>
+          </div>
+          <div class="global-filters">
+            <label>
+              <span>日期</span>
+              <input id="report-date" type="date" />
+            </label>
+            <label>
+              <span>团队</span>
+              <select id="team-filter">
+                <option value="">全部团队</option>
+              </select>
+            </label>
+            <button class="button quiet" id="refresh" type="button">
+              刷新
+            </button>
+          </div>
+        </header>
+
+        <main id="main-content">
+          <section class="page active" id="page-overview">
+            <div class="page-intro">
+              <div>
+                <p class="eyebrow">TODAY AT A GLANCE</p>
+                <h2>先看需要介入的事，再看提交数字</h2>
+              </div>
+              <p class="muted" id="overview-as-of"></p>
+            </div>
+
+            <div class="metric-grid" id="overview-metrics"></div>
+            <div class="data-notice" id="data-notice" hidden></div>
+
+            <section class="support-board">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">MANAGEMENT FOCUS</p>
+                  <h2>负责人关注与支撑</h2>
+                </div>
+                <div class="segmented" id="action-filters">
+                  <button class="active" data-action-filter="all">全部</button>
+                  <button data-action-filter="today_confirmation">今日需确认</button>
+                  <button data-action-filter="team_followup">团队跟进</button>
+                  <button data-action-filter="department_support">部门支撑</button>
+                </div>
+              </div>
+              <div class="support-summary" id="support-summary"></div>
+              <div class="action-list" id="action-list"></div>
+            </section>
+
+            <section class="team-comparison">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">TEAM VIEW</p>
+                  <h2>团队日报情况</h2>
+                </div>
+                <p class="hint">点击团队进入成员明细</p>
+              </div>
+              <div class="team-table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>团队</th>
+                      <th>应交</th>
+                      <th>已交</th>
+                      <th>尚未提交</th>
+                      <th>截止后未交</th>
+                      <th>未最终确认</th>
+                      <th>建议复核</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="team-comparison-body"></tbody>
+                </table>
+              </div>
+            </section>
+          </section>
+
+          <section class="page" id="page-members">
+            <div class="page-intro">
+              <div>
+                <p class="eyebrow">PEOPLE & REPORTS</p>
+                <h2>从团队进入个人日报线</h2>
+              </div>
+              <div class="segmented" id="timeline-range">
+                <button data-days="7">近 7 天</button>
+                <button class="active" data-days="14">近 14 天</button>
+                <button data-days="30">近 30 天</button>
+              </div>
+            </div>
+            <div class="member-layout">
+              <aside class="member-panel">
+                <div class="panel-title">
+                  <h3>团队成员</h3>
+                  <span id="member-count"></span>
+                </div>
+                <div class="member-list" id="member-list"></div>
+              </aside>
+              <section class="timeline-panel">
+                <div class="timeline-empty" id="timeline-empty">
+                  <div class="empty-symbol">纵</div>
+                  <h3>个人日报线</h3>
+                  <p>从左侧选择一位成员，按日期纵向查看完成工作、风险和下一步计划。</p>
+                </div>
+                <div id="member-timeline" hidden></div>
+              </section>
+            </div>
+          </section>
+
+          <section class="page" id="page-items">
+            <div class="page-intro">
+              <div>
+                <p class="eyebrow">WORK STREAM</p>
+                <h2>同一事项，沿时间看真实进展</h2>
+              </div>
+              <p class="muted">内容重复不是结论，外部等待与停滞分开呈现。</p>
+            </div>
+            <div class="status-legend" id="item-legend"></div>
+            <div class="item-board" id="item-board"></div>
+          </section>
+
+          <section class="page" id="page-trends">
+            <div class="page-intro">
+              <div>
+                <p class="eyebrow">REVIEW & BRIEF</p>
+                <h2>把日报变化整理成负责人简报</h2>
+              </div>
+              <div class="inline-actions">
+                <div class="segmented" id="trend-period">
+                  <button class="active" data-period="week">周度</button>
+                  <button data-period="month">月度</button>
+                </div>
+                <button class="button primary" id="download-briefing" type="button">
+                  导出负责人简报
+                </button>
+              </div>
+            </div>
+            <div class="trend-grid">
+              <section class="trend-card wide">
+                <div class="section-heading compact">
+                  <h3>团队提交变化</h3>
+                  <span id="trend-range-label"></span>
+                </div>
+                <div id="trend-teams"></div>
+              </section>
+              <section class="trend-card">
+                <h3>反复出现的问题</h3>
+                <div id="recurring-problems"></div>
+              </section>
+              <section class="trend-card">
+                <h3>需要负责人协调</h3>
+                <div id="coordination-needed"></div>
+              </section>
+              <section class="trend-card">
+                <h3>团队近期工作重点</h3>
+                <div id="recent-focus"></div>
+              </section>
+              <section class="trend-card wide">
+                <h3>长期未推进事项</h3>
+                <div id="long-running-items"></div>
+              </section>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <aside
+      class="evidence-drawer"
+      id="evidence-drawer"
+      aria-labelledby="evidence-title"
+      aria-hidden="true"
+    >
+      <div class="drawer-head">
+        <div>
+          <p class="eyebrow">TRACEABLE EVIDENCE</p>
+          <h2 id="evidence-title">原文证据</h2>
+        </div>
+        <button class="icon-button" id="close-evidence" aria-label="关闭证据">
+          ×
+        </button>
+      </div>
+      <div id="evidence-content"></div>
+    </aside>
+    <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+
+    <dialog id="decision-dialog">
+      <form method="dialog" id="decision-form">
+        <div class="dialog-head">
+          <div>
+            <p class="eyebrow">MANAGER REVIEW</p>
+            <h2>记录负责人判断</h2>
+          </div>
+          <button class="icon-button" id="close-decision" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="muted" id="decision-target-title"></p>
+        <fieldset id="decision-options"></fieldset>
+        <label for="decision-note">补充说明（选填）</label>
+        <textarea
+          id="decision-note"
+          rows="3"
+          maxlength="2000"
+          placeholder="例如：已与项目团队确认，周三前补齐资料"
+        ></textarea>
+        <div class="dialog-actions">
+          <button class="button quiet" value="cancel" type="button" id="cancel-decision">
+            取消
+          </button>
+          <button class="button primary" type="submit">保存处理结果</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="loading-bar" id="loading-bar" hidden></div>
+    <div class="toast" id="toast" role="status" hidden></div>
+    <script src="./assets/app.js" defer></script>
+  </body>
+</html>

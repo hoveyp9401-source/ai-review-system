@@ -22,6 +22,7 @@ from app.agent2.business.contracts import (
     ListAssignedCases,
     QueryOperationStatus,
     RespondTravelCollaboration,
+    UpdateTravelIntent,
 )
 from app.agent2.business.travel import LocationRegistry, resolve_travel_window
 from app.agent2.case_statement_contract import is_nonassertive_case_progress
@@ -79,6 +80,8 @@ class Phase2BusinessCommandCompiler:
             return self._compile_operation_status(candidate, entity)
         if candidate.command_type == "record_travel_candidate":
             return self._compile_travel(candidate, entity, context)
+        if candidate.command_type == "update_travel_candidate":
+            return self._compile_travel_update(candidate, entity)
         if candidate.command_type == "record_case_progress_candidate":
             return self._compile_case_progress(candidate, entity, context, cases)
         if candidate.command_type == "respond_travel_collaboration_candidate":
@@ -202,6 +205,71 @@ class Phase2BusinessCommandCompiler:
                 "destination": location.destination_normalized,
                 "date_label": _travel_date_label(window.start_date, window.end_date),
                 "purpose": str(attributes.get("purpose") or "").strip(),
+            },
+        )
+
+    def _compile_travel_update(
+        self,
+        candidate: TypedBusinessCommand,
+        entity: dict,
+    ) -> Phase2CommandCompilation:
+        if entity.get("entity_type") != "travel_intent_ref":
+            return self._blocked(candidate, "travel_intent_ref_required")
+        attributes = (
+            entity.get("attributes")
+            if isinstance(entity.get("attributes"), dict)
+            else {}
+        )
+        travel_intent_id = str(attributes.get("travel_intent_id") or "").strip()
+        expected_version = attributes.get("expected_version")
+        authority_scope = candidate.admission_ticket.get("authority_scope")
+        if (
+            not travel_intent_id
+            or not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 1
+            or not isinstance(authority_scope, dict)
+            or str(authority_scope.get("travel_intent_id") or "")
+            != travel_intent_id
+            or authority_scope.get("version") != expected_version
+        ):
+            return self._blocked(candidate, "travel_intent_target_mismatch")
+        status = str(authority_scope.get("status") or "").strip()
+        start_at: datetime | None = None
+        end_at: datetime | None = None
+        if status == "cancelled":
+            pass
+        elif status == "changed":
+            try:
+                start_at = datetime.fromisoformat(
+                    str(authority_scope.get("start_at") or "").replace("Z", "+00:00")
+                )
+                end_at = datetime.fromisoformat(
+                    str(authority_scope.get("end_at") or "").replace("Z", "+00:00")
+                )
+            except ValueError:
+                return self._blocked(candidate, "travel_update_time_invalid")
+            if (
+                start_at.tzinfo is None
+                or end_at.tzinfo is None
+                or end_at < start_at
+            ):
+                return self._blocked(candidate, "travel_update_time_invalid")
+        else:
+            return self._blocked(candidate, "travel_update_status_invalid")
+        return Phase2CommandCompilation(
+            command=UpdateTravelIntent(
+                command_id=str(candidate.command_id),
+                travel_intent_id=travel_intent_id,
+                expected_version=expected_version,
+                start_at=start_at,
+                end_at=end_at,
+                status=status,
+            ),
+            outcome_context={
+                "destination": str(attributes.get("destination") or "").strip(),
+                "date_label": str(attributes.get("new_date_hint") or "").strip(),
+                "status": status,
             },
         )
 

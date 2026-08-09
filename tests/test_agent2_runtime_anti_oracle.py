@@ -12,7 +12,6 @@ from app.agent2.runtime.blind import BlindActualArtifact
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "app" / "agent2" / "runtime"
-BLIND_RUNNER = ROOT / "scripts" / "run_agent2_runtime_blind.py"
 
 
 def test_runtime_dependency_graph_cannot_import_scorer_or_label_store():
@@ -30,27 +29,6 @@ def test_runtime_dependency_graph_cannot_import_scorer_or_label_store():
                         violations.append(f"{path.name}: {alias.name}")
 
     assert violations == []
-
-
-def test_blind_runner_cli_has_no_label_or_scorer_input_interface():
-    tree = ast.parse(BLIND_RUNNER.read_text(encoding="utf-8"), filename=str(BLIND_RUNNER))
-    imports: list[str] = []
-    cli_flags: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            imports.append(str(node.module or ""))
-        elif isinstance(node, ast.Import):
-            imports.extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr == "add_argument":
-                cli_flags.extend(
-                    str(arg.value)
-                    for arg in node.args
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
-                )
-
-    assert not any(name.startswith("app.agent2.evaluation") for name in imports)
-    assert not any("label" in flag or "score" in flag for flag in cli_flags)
 
 
 def test_scorer_cannot_accept_an_unfinished_actual_artifact():

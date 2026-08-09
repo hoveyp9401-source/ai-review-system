@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 import hashlib
 import json
 from types import MappingProxyType
@@ -148,6 +148,7 @@ class MvpContextAssembler:
             message_id=request.message_id,
             actor_user_id=request.actor.actor_id,
             daily_snapshot=snapshot,
+            current_report_date=_daily_policy_report_date(self._daily_policy),
             user_constraints=state.user_constraints,
         )
         user_identity = MappingProxyType(
@@ -205,6 +206,18 @@ class MvpContextAssembler:
             planning_context=planning_context,
             manifest=manifest,
         )
+
+
+def _daily_policy_report_date(policy: Mapping[str, Any]) -> date | None:
+    raw_value = policy.get("current_report_date")
+    if raw_value in {None, ""}:
+        return None
+    if isinstance(raw_value, date) and not isinstance(raw_value, datetime):
+        return raw_value
+    try:
+        return date.fromisoformat(str(raw_value))
+    except ValueError as exc:
+        raise ValueError("daily policy current_report_date must be ISO YYYY-MM-DD") from exc
 
 
 def _daily_snapshot_resource(snapshot: DailyReportMutationSnapshot) -> dict[str, Any]:

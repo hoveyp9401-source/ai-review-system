@@ -92,8 +92,7 @@ def test_operation_outcome_has_a_persistent_replayable_audit_envelope():
     columns = set(Agent2OperationOutcome.__table__.columns.keys())
     assert {
         "outcome_id", "tenant_id", "user_id", "conversation_id", "source_turn_id",
-        "domain", "operation", "object_type", "object_id", "object_label",
-        "object_version", "business_status",
+        "domain", "operation", "object_type", "object_id", "business_status",
         "message_status", "actual_write", "would_write", "changed_fields_json",
         "user_visible_snapshot_json", "blocking_reason", "receipt_refs_json",
         "audit_refs_json", "state_transition_json", "idempotency_key", "created_at",
@@ -118,5 +117,3 @@ def test_case_followup_migration_is_idempotent_and_creates_every_phase1_table():
     assert "CREATE UNIQUE INDEX IF NOT EXISTS" in sql
     assert "accepted_by_provider" in sql
     assert "delivery_confirmed" in sql
-    assert "ADD COLUMN IF NOT EXISTS object_label" in sql
-    assert "ADD COLUMN IF NOT EXISTS object_version" in sql

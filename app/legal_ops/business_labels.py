@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 UNKNOWN_LABEL = "数据状态异常"
 
 CASE_TYPE_LABELS = {
@@ -60,9 +59,12 @@ REPORT_STATUS_LABELS = {
 }
 
 SOURCE_LABELS = {
+    "ERP_PLAINTIFF_CASES": "ERP 原告案件底表",
+    "ERP_DEFENDANT_CASES": "ERP 被告案件底表",
     "real_case_workbook": "真实来源灰测副本",
     "real_user_message": "真实用户消息",
     "human_record": "人工录入",
+    "imported_record": "ERP 文件导入",
     "robot_followup": "主动追问提取",
     "ai_extracted": "AI 提取待确认",
     "system_fact": "系统事实",

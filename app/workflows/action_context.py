@@ -255,8 +255,6 @@ def _looks_like_daily_report(text: str) -> bool:
         return True
     if _contains_any(text, _TODAY_MARKERS) and _contains_any(text, _DAILY_WORK_VERBS):
         return True
-    if _contains_any(text, _TODAY_MARKERS) and _contains_any(text, _PLAN_OR_WORK_VERBS) and _contains_any(text, _BUSINESS_OBJECT_MARKERS):
-        return True
     if _contains_any(text, _TOMORROW_MARKERS) and _contains_any(text, _PLAN_OR_WORK_VERBS):
         return True
     if _contains_any(text, _COMPLETED_PREVIOUS_PLAN_MARKERS):
@@ -463,7 +461,7 @@ _DAILY_OBJECT_MARKERS = (
     "\u5f53\u524d\u8349\u7a3f",
 )
 _DAILY_HISTORY_REFERENCES = _YESTERDAY_MARKERS + _DAY_BEFORE_YESTERDAY_MARKERS + ("\u4e0a\u6b21",)
-_DAILY_WORK_VERBS = ("\u5b8c\u6210", "\u5904\u7406", "\u5ba1\u6838", "\u8ddf\u8fdb", "\u6c9f\u901a", "\u6574\u7406", "\u7f16\u8f91", "\u4f18\u5316", "\u95ee", "\u54a8\u8be2", "\u8054\u7cfb", "\u5bf9\u4e86", "\u4fee\u4e86")
+_DAILY_WORK_VERBS = ("\u5b8c\u6210", "\u5904\u7406", "\u5ba1\u6838", "\u8ddf\u8fdb", "\u6c9f\u901a", "\u6574\u7406", "\u7f16\u8f91", "\u4f18\u5316", "\u95ee", "\u54a8\u8be2", "\u8054\u7cfb")
 _PLAN_OR_WORK_VERBS = _DAILY_WORK_VERBS + ("\u8ba1\u5212", "\u51c6\u5907", "\u62df", "\u53bb", "\u51fa\u5dee")
 _COMPLETED_PREVIOUS_PLAN_MARKERS = (
     "\u6628\u5929\u7684\u660e\u65e5\u8ba1\u5212\u5df2\u5b8c\u6210",
@@ -512,14 +510,6 @@ _BUSINESS_OBJECT_MARKERS = _DAILY_OBJECT_MARKERS + (
     "\u6cd5\u5b98",
     "\u6cd5\u9662",
     "\u5ba2\u6237",
-    "\u94f6\u884c",
-    "\u7814\u53d1",
-    "\u8fed\u4ee3",
-    "\u9700\u6c42",
-    "\u63a5\u53e3",
-    "\u5546\u52a1",
-    "bug",
-    "BUG",
 )
 _CHAT_EXACT_MARKERS = (
     "\u6d4b\u8bd5",

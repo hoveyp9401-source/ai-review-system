@@ -356,6 +356,19 @@ def apply_performance_reply(
             confirmed_by_user=True,
         )
 
+    if _looks_like_complete_performance_preview(raw_input):
+        ordered = _ordered_responses(clean_metrics, merged)
+        missing = missing_by_metric(clean_metrics, ordered)
+        next_status = PERFORMANCE_PENDING_CONFIRMATION if not missing else PERFORMANCE_COLLECTING
+        return ParsedPerformanceResult(
+            status=next_status,
+            message=_build_preview_replay_message(clean_metrics, missing, ordered),
+            touched_metrics=[],
+            missing=missing,
+            responses=ordered,
+            confirmed_by_user=False,
+        )
+
     clear_metric_numbers = _parse_metric_clear_instruction(raw_input, clean_metrics)
     if clear_metric_numbers:
         initial_by_no = {int(item["metric_no"]): item for item in initial_responses(clean_metrics)}
@@ -543,7 +556,8 @@ def _segment_metric_blocks(
     metrics: list[dict[str, Any]],
     current_responses: dict[int, dict[str, Any]],
 ) -> list[tuple[int, str]]:
-    lines = [line.strip() for line in str(raw_input or "").replace("\r\n", "\n").split("\n")]
+    prepared_text = _prepare_metric_reply_text(raw_input, metrics)
+    lines = [line.strip() for line in prepared_text.replace("\r\n", "\n").split("\n")]
     lines = [line for line in lines if line]
     metric_numbers = {int(metric["metric_no"]) for metric in metrics}
     metric_names = {int(metric["metric_no"]): _compact(str(metric["name"])) for metric in metrics}
@@ -574,6 +588,46 @@ def _segment_metric_blocks(
     return [(metric_no, "\n".join(parts).strip()) for metric_no, parts in blocks if "\n".join(parts).strip()]
 
 
+def _prepare_metric_reply_text(raw_input: str, metrics: list[dict[str, Any]]) -> str:
+    text = str(raw_input or "").replace("\r\n", "\n").strip()
+    if not text:
+        return text
+    ordinal_header_pattern = re.compile(
+        r"(?<!^)(?<!\n)(?=(?:"
+        r"第[一二两三四五六七八九十\d]{1,3}(?:个|项|条)?"
+        r"|\d{1,3}[、.．）):：\s-]+"
+        r"|[一二两三四五六七八九十]{1,3}[、.．）):：\s-]+"
+        r")[^\n。；;]{0,30}(?:未完成|存在的问题|存在问题|原因|下月|下一|目标|行动方案|措施|指标))"
+    )
+    text = ordinal_header_pattern.sub("\n", text)
+    aliases = sorted(
+        {
+            alias
+            for metric in normalize_metrics(metrics)
+            for alias in _metric_raw_aliases(str(metric.get("name") or ""))
+            if len(_compact(alias)) >= 4
+        },
+        key=len,
+        reverse=True,
+    )
+    for alias in aliases:
+        pattern = re.compile(
+            rf"(?<!^)(?<!\n)(?={re.escape(alias)}[^\n。；;]{{0,24}}(?:未完成|存在的问题|存在问题|原因|下月|下一|目标|行动方案|措施))"
+        )
+        text = pattern.sub("\n", text)
+    return text
+
+
+def _metric_raw_aliases(metric_name: str) -> set[str]:
+    name = str(metric_name or "").strip()
+    aliases = {name}
+    aliases.add(re.sub(r"[（(][^）)]*[）)]", "", name).strip())
+    aliases.add(name.replace("/", ""))
+    aliases.add(name.replace("／", ""))
+    aliases.add(name.replace("（现金）", "").replace("(现金)", "").strip())
+    return {alias for alias in aliases if alias}
+
+
 def _metric_header_from_line(
     line: str,
     metric_numbers: set[int],
@@ -582,13 +636,26 @@ def _metric_header_from_line(
     in_actions: bool,
 ) -> tuple[int, str] | None:
     line = _strip_markdown_metric_prefix(line)
-    match = re.match(r"^\s*(?:把|将)?(?:第)?([一二两三四五六七八九十\d]{1,3})(?:个|项|条)?[、.．）):：\s-]*(.*)$", line)
+    match = re.match(
+        r"^\s*(?:把|将)?(?:"
+        r"第(?P<prefixed>[一二两三四五六七八九十\d]{1,3})(?:个|项|条)?"
+        r"|(?P<cn_suffix>[一二两三四五六七八九十]{1,3})(?:个|项|条)"
+        r"|(?P<digit>\d{1,3})[、.．）):：\s-]+"
+        r"|(?P<cn>[一二两三四五六七八九十]{1,3})[、.．）):：\s-]+"
+        r")(.*)$",
+        line,
+    )
     if not match:
-        return None
-    metric_no = _parse_cn_number(match.group(1))
+        return _metric_name_header_from_line(line, metric_names, in_actions=in_actions)
+    metric_no = _parse_cn_number(
+        match.group("prefixed")
+        or match.group("cn_suffix")
+        or match.group("digit")
+        or match.group("cn")
+    )
     if metric_no is None or metric_no not in metric_numbers:
         return None
-    rest = match.group(2).strip()
+    rest = match.group(5).strip()
     compact_rest = _compact(rest)
     has_field_label = any(token in compact_rest for token in ("未完成原因", "存在问题", "原因", "下月目标", "目标", "行动方案", "措施"))
     has_metric_name = bool(compact_rest and any(name and (name in compact_rest or compact_rest in name) for name in metric_names.values()))
@@ -597,6 +664,31 @@ def _metric_header_from_line(
     if not rest or has_field_label or has_metric_name:
         return metric_no, rest
     return metric_no, rest
+
+
+def _metric_name_header_from_line(
+    line: str,
+    metric_names: dict[int, str],
+    *,
+    in_actions: bool,
+) -> tuple[int, str] | None:
+    compact_line = _compact(line)
+    if not compact_line:
+        return None
+    aliases: list[tuple[int, str]] = []
+    for metric_no, name in metric_names.items():
+        values = {name, name.replace("/", ""), name.replace("／", ""), name.replace("现金", "")}
+        for alias in values:
+            if len(alias) >= 4:
+                aliases.append((metric_no, alias))
+    aliases.sort(key=lambda item: len(item[1]), reverse=True)
+    for metric_no, alias in aliases:
+        if not compact_line.startswith(alias):
+            continue
+        if in_actions and not any(token in compact_line for token in ("未完成原因", "存在的问题", "存在问题", "原因", "下月目标", "下一目标", "目标", "行动方案", "措施")):
+            return None
+        return metric_no, line
+    return None
 
 
 def _metric_header_name_mismatch(raw_input: str, metrics: list[dict[str, Any]]) -> bool:
@@ -633,7 +725,7 @@ def _metric_header_name_mismatch(raw_input: str, metrics: list[dict[str, Any]]) 
 
 
 def _has_metric_field_label(compact_value: str) -> bool:
-    return any(token in compact_value for token in ("未完成原因", "存在问题", "原因", "下月目标", "目标", "行动方案", "措施"))
+    return any(token in compact_value for token in ("未完成原因", "存在的问题", "存在问题", "原因", "下月目标", "下一目标", "目标", "行动方案", "措施"))
 
 
 def _looks_like_metric_title(value: str) -> bool:
@@ -658,15 +750,25 @@ def _strip_markdown_metric_prefix(line: str) -> str:
 
 def _parse_metric_fields(text: str) -> dict[str, Any]:
     normalized = _trim_metric_reply_context(str(text or "").strip())
-    next_target = _extract_field(normalized, ("下月绩效目标", "下月目标"), ("行动方案", "措施"))
+    next_target = _extract_field(normalized, ("下月绩效目标", "下月目标", "下一目标", "下一个月目标"), ("行动方案", "措施"))
     if not next_target:
         next_target = _extract_field(normalized, ("目标",), ("行动方案", "措施"), require_separator=True)
     next_target = _strip_target_unit_prefix(next_target)
     return {
         "reason": _extract_field(
             normalized,
-            ("未完成原因/存在问题", "未完成原因分析", "未完成原因", "存在问题", "原因"),
-            ("下月绩效目标及行动方案", "下月目标", "目标", "行动方案", "措施"),
+            (
+                "未完成原因/存在问题",
+                "未完成原因分析",
+                "未完成原因及存在问题",
+                "未完成的原因及存在的问题",
+                "未完成的原因",
+                "未完成原因",
+                "存在的问题",
+                "存在问题",
+                "原因",
+            ),
+            ("下月绩效目标及行动方案", "下月目标", "下一目标", "目标", "行动方案", "措施"),
         ),
         "next_target": next_target,
         "actions": _extract_actions(normalized),
@@ -700,20 +802,21 @@ def _extract_field(
     label_pattern = "|".join(re.escape(label) for label in labels)
     stop_pattern = "|".join(re.escape(label) for label in stop_labels)
     edit_pattern = "改成|改为|替换成|换成|调整为|变更为"
-    label_separator = rf"\s*(?:[:：；;]|{edit_pattern})\s*" if require_separator else rf"\s*(?:[:：；;]|{edit_pattern})?\s*"
-    stop_separator = rf"\s*(?:[:：；;]|{edit_pattern})?\s*"
-    match = re.search(rf"(?:{label_pattern}){label_separator}(.*?)(?=(?:{stop_pattern}){stop_separator}|$)", text, flags=re.S)
+    label_separator = rf"\s*(?:[:：；;]|是|为|{edit_pattern})\s*" if require_separator else rf"\s*(?:[:：；;]|是|为|{edit_pattern})?\s*"
+    stop_separator = rf"\s*(?:[:：；;]|是|为|{edit_pattern})?\s*"
+    unit_suffix = r"(?:\s*[（(][^）)]*[）)])?"
+    match = re.search(rf"(?:{label_pattern}){unit_suffix}{label_separator}(.*?)(?=(?:{stop_pattern}){unit_suffix}{stop_separator}|$)", text, flags=re.S)
     if not match:
         return ""
     value = match.group(1).strip()
     value = re.sub(r"^[：:，,。；;\s]+", "", value)
     value = re.sub(r"\s+", " ", value)
     value = _strip_edit_prefix(value)
-    return value.strip(" _-—；;。")
+    return value.strip(" _-—；;。，,、")
 
 
 def _strip_target_unit_prefix(value: str) -> str:
-    return re.sub(r"^（[^）]+）\s*[:：；;]?\s*", "", str(value or "")).strip()
+    return re.sub(r"^（[^）]+）\s*[:：；;]?\s*", "", str(value or "")).strip(" _-—；;。，,、")
 
 
 def _extract_actions(text: str) -> list[str]:
@@ -771,6 +874,19 @@ def _build_update_message(
         return _build_progress_message(metrics, missing, prefix=f"已记录{touched_text}。")
     preview = build_complete_performance_report(metrics, responses)
     return f"已记录{touched_text}，所有指标都已补齐。\n\n{preview}\n\n确认无误请回复“确认提交”；需要修改可以说“把XX改成XX”，也可以按指标编号整段重发。"
+
+
+def _looks_like_complete_performance_preview(raw_input: str) -> bool:
+    return "完整绩效汇报预览" in _compact(raw_input)
+
+
+def _build_preview_replay_message(
+    metrics: list[dict[str, Any]], missing: dict[int, list[str]], responses: list[dict[str, Any]]
+) -> str:
+    if missing:
+        return _build_progress_message(metrics, missing, prefix="已收到预览内容，未重复写入。")
+    preview = build_complete_performance_report(metrics, responses)
+    return f"已收到当前预览，未重复写入。\n\n{preview}\n\n确认无误请回复“确认提交”；需要修改可以说“把XX改成XX”，也可以按指标编号整段重发。"
 
 
 def _build_missing_message(metrics: list[dict[str, Any]], missing: dict[int, list[str]], *, prefix: str) -> str:

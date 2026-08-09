@@ -289,6 +289,8 @@ DAILY_DOMAIN_CONTRACT = DomainPackContract(
         "edit_daily_item",
         "delete_daily_item",
         "merge_daily_items",
+        "replace_daily_section",
+        "move_daily_items",
         "query_daily_report",
         "copy_previous_daily_report",
         "clear_daily_section",
@@ -303,6 +305,8 @@ DAILY_DOMAIN_CONTRACT = DomainPackContract(
         "edit_item",
         "delete_item",
         "merge_items",
+        "move_items",
+        "replace_section",
         "query_report",
         "copy_report",
         "clear_report",
@@ -338,8 +342,16 @@ TRAVEL_DOMAIN_CONTRACT = DomainPackContract(
     domain_id="travel",
     version="0.1.0-contract-only",
     command_source="business",
-    action_types=("record_travel_event", "respond_travel_collaboration"),
-    command_types=("record_travel_candidate", "respond_travel_collaboration_candidate"),
+    action_types=(
+        "record_travel_event",
+        "update_travel_event",
+        "respond_travel_collaboration",
+    ),
+    command_types=(
+        "record_travel_candidate",
+        "update_travel_candidate",
+        "respond_travel_collaboration_candidate",
+    ),
 )
 PERFORMANCE_DOMAIN_CONTRACT = DomainPackContract(
     domain_id="performance",

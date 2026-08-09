@@ -37,6 +37,7 @@ from app.services.performance_service import (
     submission_metrics,
 )
 from app.services.report_service import DailyReportService
+from app.utils.dingtalk_text import format_dingtalk_plain_text
 from app.utils.time import now_in_timezone
 from app.agent2.cognitive_runtime_v3 import (
     admission_block_reply,
@@ -55,9 +56,24 @@ from app.agent2.turn_runtime import (
     production_agent2_turn_runtime,
     verified_turn_rejection_reply,
 )
-from app.agent2.cognitive_reply_v3 import build_cognitive_side_reply_v3
-from app.agent2.report_insight_intent import is_report_insight_question
-from app.agent2.report_insights import load_live_report_insight_answer
+from app.agent2.cognitive_reply_v3 import (
+    append_cognitive_clarification,
+    build_cognitive_side_reply_v3,
+    has_bound_confirmation_pending,
+    has_pending_lifecycle_update,
+    pending_lifecycle_reply,
+)
+from app.agent2.context_pack import build_agent2_context_pack
+from app.agent2.performance_knowledge import attach_live_performance_catalog
+from app.agent2.tool_calling.canary_service import (
+    CanaryIngressExecutionError,
+    build_canary_response_payload,
+    canary_route_suppresses_delivery,
+    deliver_canary_message_if_enabled,
+    is_canary_message_delivery_suppressed,
+    process_tool_call_canary_ingress,
+    resolve_tool_call_canary_route,
+)
 from app.agent2.case_report_projection_runtime import (
     project_committed_case_followup_facts,
 )
@@ -322,7 +338,46 @@ async def dingtalk_webhook(
     await session.commit()
 
     if not inserted:
-        resp = event.response_payload or dingtalk_text_response("这条复盘已收到，请等待处理结果。")
+        resp = event.response_payload
+        if not resp:
+            duplicate_user = await get_active_user_by_dingtalk_id(
+                session,
+                incoming.dingtalk_user_id,
+            )
+            if duplicate_user is not None:
+                duplicate_resolution = (
+                    await resolve_tool_call_canary_route(
+                        session,
+                        user=duplicate_user,
+                        dingtalk_user_id=incoming.dingtalk_user_id,
+                        settings=settings,
+                        conversation_id=str(
+                            getattr(incoming, "conversation_id", "")
+                            or (
+                                f"dingtalk:{incoming.source}:"
+                                f"{incoming.dingtalk_user_id}"
+                            )
+                        ),
+                        source_message_id=idempotency_key,
+                        now=now_in_timezone(
+                            duplicate_user.timezone
+                            or settings.timezone
+                        ),
+                    )
+                )
+                if canary_route_suppresses_delivery(
+                    duplicate_resolution
+                ):
+                    if is_encrypted and crypto:
+                        return _encrypted_success(crypto)
+                    return PlainTextResponse("ok")
+            resp = dingtalk_text_response(
+                "这条复盘已收到，请等待处理结果。"
+            )
+        if is_canary_message_delivery_suppressed(resp):
+            if is_encrypted and crypto:
+                return _encrypted_success(crypto)
+            return PlainTextResponse("ok")
         if is_encrypted and crypto:
             return _encrypt_response(crypto, resp)
         return resp
@@ -406,19 +461,54 @@ async def dingtalk_webhook(
                     return _encrypted_success(crypto)
                 return response_payload
 
-        agent2_result = await _submit_webhook_agent2_if_enabled(
-            session=session,
-            user=user,
-            incoming=incoming,
-            settings=settings,
-            message_id=idempotency_key,
-            llm_client=(
-                getattr(request.app.state, "llm_client", None)
-                or getattr(getattr(getattr(request.app.state, "report_service", None), "extractor", None), "client", None)
-            ),
+        ingress_llm_client = (
+            getattr(request.app.state, "llm_client", None)
+            or getattr(
+                getattr(
+                    getattr(request.app.state, "report_service", None),
+                    "extractor",
+                    None,
+                ),
+                "client",
+                None,
+            )
         )
+        tool_call_canary = await process_tool_call_canary_ingress(
+            session,
+            user=user,
+            dingtalk_user_id=incoming.dingtalk_user_id,
+            user_text=incoming.text,
+            source_channel=incoming.source,
+            conversation_id=str(
+                getattr(incoming, "conversation_id", "") or ""
+            ),
+            source_message_id=idempotency_key,
+            settings=settings,
+            llm_client=ingress_llm_client,
+            now=now_in_timezone(user.timezone or settings.timezone),
+        )
+        if tool_call_canary.handled:
+            agent2_result = Agent2DailyExecutionResult(
+                report_id=tool_call_canary.report_id,
+                report_date=now_in_timezone(
+                    user.timezone or settings.timezone
+                ).date(),
+                status="collecting",
+                message=tool_call_canary.message,
+                report_saved=tool_call_canary.actual_write,
+                read_only=not tool_call_canary.actual_write,
+                command_results=[],
+            )
+        else:
+            raise RuntimeError(
+                "Agent2 Tool-Call Core did not handle a production webhook turn"
+            )
         if agent2_result is not None:
-            response_payload = dingtalk_text_response(agent2_result.message)
+            response_payload = (
+                build_canary_response_payload(tool_call_canary)
+                if tool_call_canary.handled
+                else dingtalk_text_response(agent2_result.message)
+            )
             await mark_webhook_event_processed(
                 session,
                 event,
@@ -429,65 +519,61 @@ async def dingtalk_webhook(
             await session.commit()
             if is_encrypted and crypto:
                 robot = request.app.state.dingtalk_robot
-                try:
+
+                async def send_agent2_reply() -> None:
                     if incoming.session_webhook:
-                        await robot.send_session_webhook_text(session_webhook=incoming.session_webhook, text=agent2_result.message)
+                        await robot.send_session_webhook_text(
+                            session_webhook=incoming.session_webhook,
+                            text=agent2_result.message,
+                        )
                     else:
-                        await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=agent2_result.message)
+                        await robot.send_robot_direct_text(
+                            user_ids=[incoming.dingtalk_user_id],
+                            text=agent2_result.message,
+                        )
+
+                try:
+                    if tool_call_canary.handled:
+                        await deliver_canary_message_if_enabled(
+                            tool_call_canary,
+                            send_agent2_reply,
+                        )
+                    else:
+                        await send_agent2_reply()
                 except Exception as send_exc:
                     _log_runtime_failure("dingtalk_async_agent2_reply_failed", send_exc)
                 return _encrypted_success(crypto)
+            if (
+                tool_call_canary.handled
+                and is_canary_message_delivery_suppressed(response_payload)
+            ):
+                return PlainTextResponse("ok")
             return response_payload
 
-        gate_decision = await _evaluate_legacy_daily_gate(
-            session=session,
-            user=user,
-            incoming=incoming,
-            performance_service=performance_service,
-            settings=settings,
+        raise RuntimeError(
+            "Agent2 Tool-Call Core response was not returned by webhook ingress"
         )
-        if gate_decision.block_legacy_daily:
-            response_payload = dingtalk_text_response(gate_decision.reply_text or "这句我先不写入日报，请补充说明。")
-            await mark_webhook_event_processed(
+    except CanaryIngressExecutionError as exc:
+        await session.rollback()
+        failure_outcome = exc.outcome()
+        response_payload = build_canary_response_payload(
+            failure_outcome
+        )
+        async with session.begin():
+            event = await session.merge(event)
+            await mark_webhook_event_failed(
                 session,
                 event,
-                report_id=None,
+                error_message=exc.error_type,
                 response_payload=response_payload,
                 now=now_in_timezone(settings.timezone),
             )
-            await session.commit()
+        if is_canary_message_delivery_suppressed(response_payload):
             if is_encrypted and crypto:
-                robot = request.app.state.dingtalk_robot
-                try:
-                    if incoming.session_webhook:
-                        await robot.send_session_webhook_text(session_webhook=incoming.session_webhook, text=response_payload["text"]["content"])
-                    else:
-                        await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=response_payload["text"]["content"])
-                except Exception as send_exc:
-                    _log_runtime_failure("dingtalk_async_gate_reply_failed", send_exc)
                 return _encrypted_success(crypto)
-            return response_payload
-
-        report_service: DailyReportService = request.app.state.report_service
-        result = await report_service.submit_text(
-            session, user=user, raw_input=incoming.text, source=incoming.source,
-        )
-        response_payload = dingtalk_text_response(result.message)
-        await mark_webhook_event_processed(
-            session, event, report_id=uuid.UUID(result.report_id) if result.report_id else None,
-            response_payload=response_payload, now=now_in_timezone(settings.timezone),
-        )
-        await session.commit()
+            return PlainTextResponse("ok")
         if is_encrypted and crypto:
-            robot = request.app.state.dingtalk_robot
-            try:
-                if incoming.session_webhook:
-                    await robot.send_session_webhook_text(session_webhook=incoming.session_webhook, text=result.message)
-                else:
-                    await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=result.message)
-            except Exception as send_exc:
-                _log_runtime_failure("dingtalk_async_reply_failed", send_exc)
-            return _encrypted_success(crypto)
+            return _encrypt_response(crypto, response_payload)
         return response_payload
     except LLMOutputError as exc:
         await session.rollback()
@@ -556,41 +642,11 @@ async def _submit_webhook_agent2_if_enabled(
             report_id=None,
             report_date=current_date,
             status="collecting",
-            message="Agent2 身份或租户路由不唯一，本次已阻断，未回退 Agent1，也未写入业务数据。",
+            message="当前账号或所属组织信息无法唯一确认，本次没有执行任何业务操作。",
             report_saved=False,
             read_only=True,
             command_results=[],
         )
-    if is_report_insight_question(str(getattr(incoming, "text", "") or "")):
-        current_date = now_in_timezone(settings.timezone).date()
-        try:
-            report_insight_answer = await load_live_report_insight_answer(
-                session,
-                requester=user,
-                text=str(getattr(incoming, "text", "") or ""),
-                current_date=current_date,
-            )
-        except Exception as exc:
-            _log_runtime_failure("webhook_report_insight_failed", exc)
-            return Agent2DailyExecutionResult(
-                report_id=None,
-                report_date=current_date,
-                status="collecting",
-                message="日报查询暂时不可用，本次没有写入任何内容，请稍后重试。",
-                report_saved=False,
-                read_only=True,
-                command_results=[],
-            )
-        if report_insight_answer is not None:
-            return Agent2DailyExecutionResult(
-                report_id=None,
-                report_date=current_date,
-                status="collecting",
-                message=report_insight_answer.text,
-                report_saved=False,
-                read_only=True,
-                command_results=[],
-            )
     if runtime_owner == "agent1":
         return None
     daily_context = await load_live_daily_context(session, user, settings)
@@ -696,7 +752,7 @@ async def _submit_webhook_agent2_if_enabled(
             report_id=str(getattr(daily_report, "id", "") or "") or None,
             report_date=report_date,
             status=str(getattr(daily_report, "status", "") or "collecting"),
-            message="Agent2 业务主路已启用，但 Cognitive Core 未启用。本次已阻断，未回退 Agent1，也未写入业务数据。",
+            message="当前服务暂时无法处理这条消息，本次没有执行任何业务操作。",
             report_saved=False,
             read_only=True,
             today_work=list(getattr(daily_report, "today_work", []) or []),
@@ -763,6 +819,27 @@ async def _submit_webhook_agent2_if_enabled(
             verified_execution_context = (
                 turn_runtime_result.business_execution_context
             )
+            context_pack = await attach_live_performance_catalog(
+                context_pack=build_agent2_context_pack(
+                    envelope,
+                    daily_report=daily_report,
+                ),
+                session=session,
+                user=user,
+                settings=settings,
+                decision=cognitive_v3.decision,
+                anchor_date=now_in_timezone(settings.timezone).date(),
+                tenant_id=(
+                    verified_execution_context.tenant_id
+                    if verified_execution_context is not None
+                    else ""
+                ),
+                actor_role_ids=(
+                    tuple(verified_execution_context.actor_role_ids)
+                    if verified_execution_context is not None
+                    else ()
+                ),
+            )
             if cognitive_v3.command_plan.report_commands:
                 if phase2_business_context is None:
                     raise RuntimeError("periodic Report commands require a verified Agent2 identity")
@@ -788,6 +865,7 @@ async def _submit_webhook_agent2_if_enabled(
                     if command.command_type
                     in {
                         "record_travel_candidate",
+                        "update_travel_candidate",
                         "respond_travel_collaboration_candidate",
                         "record_case_progress_candidate",
                         "update_case_progress_candidate",
@@ -862,6 +940,7 @@ async def _submit_webhook_agent2_if_enabled(
                     side_reply = await build_cognitive_side_reply_v3(
                         decision=cognitive_v3.decision,
                         llm_client=llm_client,
+                        context_pack=context_pack,
                     )
                     if side_reply:
                         outcomes += (
@@ -878,7 +957,10 @@ async def _submit_webhook_agent2_if_enabled(
                     )
                 daily_result = replace(
                     daily_result,
-                    message=OutcomeReplyComposer().compose(outcomes),
+                    message=append_cognitive_clarification(
+                        OutcomeReplyComposer().compose(outcomes),
+                        cognitive_v3.decision,
+                    ),
                 )
                 return daily_result
             if phase2_business_result is not None:
@@ -909,6 +991,7 @@ async def _submit_webhook_agent2_if_enabled(
                 side_reply = await build_cognitive_side_reply_v3(
                     decision=cognitive_v3.decision,
                     llm_client=llm_client,
+                    context_pack=context_pack,
                 )
                 if side_reply:
                     outcomes += (text_outcome(side_reply, source_turn_id=message_id),)
@@ -921,7 +1004,10 @@ async def _submit_webhook_agent2_if_enabled(
                         source_turn_id=message_id,
                         now=verified_execution_context.occurred_at,
                     )
-                business_message = OutcomeReplyComposer().compose(outcomes)
+                business_message = append_cognitive_clarification(
+                    OutcomeReplyComposer().compose(outcomes),
+                    cognitive_v3.decision,
+                )
                 return Agent2DailyExecutionResult(
                     report_id=str(getattr(daily_report, "id", "") or "") or None,
                     report_date=report_date,
@@ -978,15 +1064,31 @@ async def _submit_webhook_agent2_if_enabled(
                     report_id=str(latest.execution.after.report_id),
                     report_date=report_date,
                     status=latest.execution.after.status,
-                    message=OutcomeReplyComposer().compose(outcomes),
+                    message=append_cognitive_clarification(
+                        OutcomeReplyComposer().compose(outcomes),
+                        cognitive_v3.decision,
+                    ),
                     report_saved=any(item.actual_write for item in periodic_report_results),
                     read_only=not any(item.actual_write for item in periodic_report_results),
                     command_results=[item.as_dict() for item in periodic_report_results],
                 )
+            lifecycle_message = pending_lifecycle_reply(cognitive_v3.decision)
             selection_message = selection_request_reply(cognitive_v3.decision)
             information_message = information_pending_reply(cognitive_v3.decision)
             admission_message = admission_block_reply(cognitive_v3.decision)
-            if selection_message:
+            if lifecycle_message:
+                if not has_pending_lifecycle_update(cognitive_v3.decision):
+                    raise RuntimeError("pending lifecycle reply requires a state update")
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[],
+                    business_context=verified_execution_context,
+                )
+                message = lifecycle_message
+            elif selection_message:
                 await finalize_cognitive_core_v3_execution(
                     session=session,
                     result=cognitive_v3,
@@ -996,7 +1098,7 @@ async def _submit_webhook_agent2_if_enabled(
                     business_context=verified_execution_context,
                 )
                 message = selection_message
-            elif information_message or admission_message:
+            elif information_message:
                 await finalize_cognitive_core_v3_execution(
                     session=session,
                     result=cognitive_v3,
@@ -1005,18 +1107,39 @@ async def _submit_webhook_agent2_if_enabled(
                     report_results=[],
                     business_context=verified_execution_context,
                 )
-                message = information_message or admission_message
+                message = information_message
+            elif has_bound_confirmation_pending(cognitive_v3.decision):
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[],
+                    business_context=verified_execution_context,
+                )
+                message = cognitive_v3.decision.clarification_need.question
+            elif admission_message:
+                await finalize_cognitive_core_v3_execution(
+                    session=session,
+                    result=cognitive_v3,
+                    command_results=[],
+                    business_result=None,
+                    report_results=[],
+                    business_context=verified_execution_context,
+                )
+                message = admission_message
             elif cognitive_v3.decision.clarification_need is not None:
                 message = cognitive_v3.decision.clarification_need.question
             elif phase2_primary and (
                 message := await build_cognitive_side_reply_v3(
                     decision=cognitive_v3.decision,
                     llm_client=llm_client,
+                    context_pack=context_pack,
                 )
             ):
                 pass
             elif phase2_primary:
-                message = "这条消息未形成可执行的 Agent2 typed command，本次未写入，也未回退 Agent1。"
+                message = "这条消息暂时无法形成明确可执行的操作，本次没有写入任何内容。"
             else:
                 message = (
                     getattr(getattr(shadow, "assistant_reply", None), "text", "")
@@ -1028,6 +1151,7 @@ async def _submit_webhook_agent2_if_enabled(
                     raise RuntimeError(
                         "Agent2 read-only outcome requires verified execution context"
                     )
+                message = format_dingtalk_plain_text(message)
                 outcomes = (text_outcome(message, source_turn_id=message_id),)
                 await persist_operation_outcomes(
                     session,

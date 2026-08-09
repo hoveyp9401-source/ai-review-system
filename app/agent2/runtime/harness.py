@@ -43,12 +43,40 @@ _FORBIDDEN_COGNITIVE_KEYS = frozenset(
 )
 _ENTITY_ATTRIBUTE_KEYS = {
     "daily_event": frozenset({"field", "context_reference"}),
-    "daily_item_target": frozenset({"target_item_ids", "replacement", "context_reference"}),
+    "daily_item_target": frozenset(
+        {
+            "target_item_ids",
+            "replacement",
+            "source_field",
+            "target_field",
+            "context_reference",
+        }
+    ),
     "case_query": frozenset({"matter_hint", "question", "context_reference"}),
-    "travel_event": frozenset({"destination", "date_hint", "purpose", "context_reference"}),
+    "travel_event": frozenset(
+        {
+            "destination",
+            "date_hint",
+            "purpose",
+            "statement_mode",
+            "traveler_scope",
+            "evidence_spans",
+            "context_reference",
+        }
+    ),
+    "travel_intent_ref": frozenset(
+        {
+            "travel_intent_id",
+            "expected_version",
+            "destination",
+            "new_date_hint",
+            "new_status",
+            "context_reference",
+        }
+    ),
     "travel_collaboration_ref": frozenset({"candidate_id", "response", "context_reference"}),
     "daily_report": frozenset(
-        {"report_id", "version", "report_date", "field", "context_reference"}
+        {"report_id", "version", "report_date", "field", "items", "context_reference"}
     ),
     "case_ref": frozenset({"stage", "context_reference"}),
     "case_progress_ref": frozenset(
@@ -74,6 +102,8 @@ _ACTION_PARAMETER_KEYS = {
     "edit_daily_item": frozenset({"confirmed_pending_id"}),
     "delete_daily_item": frozenset({"confirmed_pending_id"}),
     "merge_daily_items": frozenset({"confirmed_pending_id"}),
+    "replace_daily_section": frozenset({"confirmed_pending_id"}),
+    "move_daily_items": frozenset({"confirmed_pending_id"}),
     "query_daily_report": frozenset({"confirmed_pending_id"}),
     "copy_previous_daily_report": frozenset({"confirmed_pending_id"}),
     "clear_daily_section": frozenset({"confirmed_pending_id"}),
@@ -89,15 +119,21 @@ _ACTION_PARAMETER_KEYS = {
     "submit_daily_report": frozenset({"confirmed_pending_id"}),
     "answer_case_query": frozenset({"confirmed_pending_id"}),
     "record_travel_event": frozenset({"confirmed_pending_id"}),
+    "update_travel_event": frozenset({"confirmed_pending_id"}),
     "respond_travel_collaboration": frozenset({"confirmed_pending_id"}),
     "search_enterprise_knowledge": frozenset({"confirmed_pending_id"}),
 }
 _CONTEXT_REFERENCE_KEYS = frozenset({"intent", "context_id", "selection", "value_source"})
 _STRING_ENTITY_ATTRIBUTES = {
     "daily_event": frozenset({"field"}),
-    "daily_item_target": frozenset({"replacement"}),
+    "daily_item_target": frozenset({"replacement", "source_field", "target_field"}),
     "case_query": frozenset({"matter_hint", "question"}),
-    "travel_event": frozenset({"destination", "date_hint", "purpose"}),
+    "travel_event": frozenset(
+        {"destination", "date_hint", "purpose", "statement_mode", "traveler_scope"}
+    ),
+    "travel_intent_ref": frozenset(
+        {"travel_intent_id", "destination", "new_date_hint", "new_status"}
+    ),
     "travel_collaboration_ref": frozenset({"candidate_id", "response"}),
     "daily_report": frozenset({"report_id", "report_date", "field"}),
     "case_ref": frozenset({"stage"}),
@@ -442,7 +478,12 @@ def _validate_cognitive_decision(decision: CognitiveDecisionV3) -> None:
     targeted_daily_entity_ids = {
         entity_id
         for action in decision.required_actions
-        if action.action_type in {"edit_daily_item", "delete_daily_item", "merge_daily_items"}
+        if action.action_type in {
+            "edit_daily_item",
+            "delete_daily_item",
+            "merge_daily_items",
+            "move_daily_items",
+        }
         for entity_id in action.entity_ids
     }
 

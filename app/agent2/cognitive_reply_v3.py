@@ -18,6 +18,40 @@ _INTENT_REPLY_TYPES = (
 )
 
 
+def has_bound_confirmation_pending(decision: Any) -> bool:
+    update = getattr(decision, "context_update", None)
+    return getattr(update, "bind_pending", None) is not None
+
+
+def pending_lifecycle_reply(decision: Any) -> str:
+    """Describe a trusted lifecycle-only result without claiming a business write."""
+
+    update = getattr(decision, "context_update", None)
+    invalidated_ids = tuple(
+        getattr(update, "invalidated_pending_ids", ()) or ()
+    )
+    reason = str(
+        getattr(update, "pending_invalidation_reason", "") or ""
+    ).strip()
+    if invalidated_ids and reason == "cancelled_by_user":
+        return "好的，已取消这次待确认操作，原操作不会执行。"
+    return ""
+
+
+def has_pending_lifecycle_update(decision: Any) -> bool:
+    update = getattr(decision, "context_update", None)
+    return bool(tuple(getattr(update, "invalidated_pending_ids", ()) or ()))
+
+
+def append_cognitive_clarification(reply: str, decision: Any) -> str:
+    clarification = getattr(decision, "clarification_need", None)
+    question = str(getattr(clarification, "question", "") or "").strip()
+    base = str(reply or "").strip()
+    if not question or question in base:
+        return base
+    return f"{base}\n\n{question}" if base else question
+
+
 async def build_cognitive_side_reply_v3(
     *,
     decision: Any,
