@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field, replace
+from datetime import date
 from time import perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -17,6 +18,16 @@ from app.agent2.tool_calling.daily_briefing_reply import (
     daily_briefing_reply_retry_instruction,
     render_daily_briefing_reply,
     validate_daily_briefing_reply,
+)
+from app.agent2.tool_calling.daily_write_date_review import (
+    DAILY_REPORT_DATE_REVIEW_TOOL,
+    DailyReportDateDecision,
+    daily_report_date_clarification_instruction,
+    daily_report_date_review_messages,
+    daily_report_date_review_tool_schema,
+    decision_date_selection,
+    decisions_agree,
+    validate_daily_report_date_review,
 )
 from app.agent2.tool_calling.managed_daily_reply import (
     managed_daily_reply_retry_instruction,
@@ -177,6 +188,13 @@ class DeepSeekCanaryResult:
 class _ParsedAssistantTurn:
     assistant_message: dict[str, Any]
     tool_calls: tuple[NativeToolCall, ...]
+    audit: tuple[RawToolCallAudit, ...]
+
+
+@dataclass(frozen=True)
+class _DailyWriteDateReviewResult:
+    assistant_message: dict[str, Any]
+    decisions: tuple[DailyReportDateDecision, ...]
     audit: tuple[RawToolCallAudit, ...]
 
 
@@ -483,6 +501,7 @@ class DeepSeekToolCallingAdapter:
         tool_argument_repair_count = 0
         daily_submit_section_review_count = 0
         daily_write_date_review_count = 0
+        daily_write_date_clarification_required = False
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
         async def rollback_pending() -> None:
@@ -514,22 +533,27 @@ class DeepSeekToolCallingAdapter:
             runtime_results[-1] = committed
 
         async def review_daily_write_dates(
-            calls: tuple[NativeToolCall, ...],
+            draft_count: int,
             *,
             review_attempt: int,
-            disagreement_feedback: tuple[dict[str, Any], ...] = (),
-        ) -> _ParsedAssistantTurn:
+        ) -> _DailyWriteDateReviewResult:
             nonlocal iterations
+            ordered_messages = user_messages or (user_text,)
+            local_now = context.now.astimezone(
+                ZoneInfo(context.principal.timezone)
+            )
             try:
                 completion = await self._complete(
-                    _daily_write_date_review_messages(
-                        user_text=user_text,
-                        user_messages=user_messages,
-                        calls=calls,
-                        context=context,
-                        disagreement_feedback=disagreement_feedback,
+                    daily_report_date_review_messages(
+                        ordered_messages=ordered_messages,
+                        local_now=local_now,
+                        server_default_report_date=default_daily_write_date(
+                            now=context.now,
+                            timezone=context.principal.timezone,
+                        ),
+                        draft_count=draft_count,
                     ),
-                    tool_schemas=deepseek_tool_schemas(frozenset({"add_daily_items"})),
+                    tool_schemas=daily_report_date_review_tool_schema(),
                     thinking_enabled=True,
                 )
                 iterations += 1
@@ -544,8 +568,11 @@ class DeepSeekToolCallingAdapter:
                         },
                     )
                 )
-                result = _parse_assistant_turn(completion.message)
-                _validate_completion_protocol(completion, result)
+                result = _parse_daily_write_date_review_completion(
+                    completion,
+                    ordered_messages=ordered_messages,
+                    expected_count=draft_count,
+                )
                 audits.extend(result.audit)
             except DeepSeekToolCallingError as exc:
                 raise _with_canary_turn_state(
@@ -553,16 +580,6 @@ class DeepSeekToolCallingAdapter:
                     audits=audits,
                     model_turns=model_turns,
                 ) from exc
-            if len(result.tool_calls) != len(calls) or any(
-                call.tool_name != "add_daily_items" for call in result.tool_calls
-            ):
-                raise _with_canary_turn_state(
-                    DeepSeekResponseError(
-                        "daily write date review did not return one date decision per draft"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
-                )
             return result
 
         try:
@@ -579,6 +596,7 @@ class DeepSeekToolCallingAdapter:
                                 or daily_briefing_reply_retry_count
                                 or managed_daily_reply_retry_count
                                 or write_reply_retry_count
+                                or daily_write_date_clarification_required
                             )
                             else tool_schemas
                         ),
@@ -869,6 +887,7 @@ class DeepSeekToolCallingAdapter:
                     or daily_briefing_reply_retry_count
                     or managed_daily_reply_retry_count
                     or write_reply_retry_count
+                    or daily_write_date_clarification_required
                 ):
                     raise _with_canary_turn_state(
                         DeepSeekResponseError(
@@ -993,72 +1012,89 @@ class DeepSeekToolCallingAdapter:
                     )
                     daily_write_date_review_count += 1
                     first_date_review = await review_daily_write_dates(
-                        date_review_targets,
+                        len(date_review_targets),
                         review_attempt=1,
                     )
-                    first_adjusted = tuple(
-                        _apply_reviewed_daily_write_date(original, reviewed)
-                        for original, reviewed in zip(
-                            date_review_targets,
-                            first_date_review.tool_calls,
-                            strict=True,
-                        )
+                    server_default_date = default_daily_write_date(
+                        now=context.now,
+                        timezone=context.principal.timezone,
                     )
-                    disagreement_indices = tuple(
+                    confirmation_indices = tuple(
                         index
-                        for index, (original, reviewed) in enumerate(
+                        for index, (original, decision) in enumerate(
                             zip(
                                 date_review_targets,
-                                first_adjusted,
+                                first_date_review.decisions,
                                 strict=True,
                             )
                         )
-                        if _daily_write_date_vote(original)
-                        != _daily_write_date_vote(reviewed)
+                        if _daily_write_date_review_needs_confirmation(
+                            original,
+                            decision,
+                            server_default_date=server_default_date,
+                        )
                     )
-                    final_date_calls = list(first_adjusted)
+                    final_decisions = list(first_date_review.decisions)
                     assistant_message = first_date_review.assistant_message
                     review_audit = first_date_review.audit
-                    if disagreement_indices:
-                        tiebreak_targets = tuple(
-                            date_review_targets[index] for index in disagreement_indices
-                        )
-                        disagreement_feedback = tuple(
-                            {
-                                "sequence": feedback_sequence,
-                                "original_draft_sequence": index + 1,
-                                "review_mode": "independent_tiebreak",
-                            }
-                            for feedback_sequence, index in enumerate(
-                                disagreement_indices,
-                                start=1,
-                            )
-                        )
-                        tiebreak_review = await review_daily_write_dates(
-                            tiebreak_targets,
+                    clarification_required = False
+                    if confirmation_indices:
+                        confirmation_review = await review_daily_write_dates(
+                            len(confirmation_indices),
                             review_attempt=2,
-                            disagreement_feedback=disagreement_feedback,
                         )
-                        for target_index, reviewed in zip(
-                            disagreement_indices,
-                            tiebreak_review.tool_calls,
+                        for target_index, decision in zip(
+                            confirmation_indices,
+                            confirmation_review.decisions,
                             strict=True,
                         ):
-                            final_date_calls[target_index] = (
-                                _apply_reviewed_daily_write_date(
-                                    date_review_targets[target_index],
-                                    reviewed,
-                                )
-                            )
-                        assistant_message = tiebreak_review.assistant_message
+                            if not decisions_agree(
+                                first_date_review.decisions[target_index],
+                                decision,
+                            ):
+                                clarification_required = True
+                            else:
+                                final_decisions[target_index] = decision
+                        assistant_message = confirmation_review.assistant_message
                         review_audit = (
                             *first_date_review.audit,
-                            *tiebreak_review.audit,
+                            *confirmation_review.audit,
                         )
+                    if any(
+                        decision_date_selection(decision) is None
+                        for decision in final_decisions
+                    ):
+                        clarification_required = True
+                    if clarification_required:
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "daily_write_date_clarification_required": True,
+                                "draft_executed": False,
+                            },
+                        )
+                        messages.append(
+                            daily_report_date_clarification_instruction()
+                        )
+                        daily_write_date_clarification_required = True
+                        continue
+                    final_date_calls = tuple(
+                        _apply_reviewed_daily_write_date(
+                            original,
+                            decision,
+                            server_default_date=server_default_date,
+                        )
+                        for original, decision in zip(
+                            date_review_targets,
+                            final_decisions,
+                            strict=True,
+                        )
+                    )
                     parsed = _merge_reviewed_calls(
                         original=parsed,
                         targets=date_review_targets,
-                        replacements=tuple(final_date_calls),
+                        replacements=final_date_calls,
                         assistant_message=assistant_message,
                         review_audit=review_audit,
                     )
@@ -1294,6 +1330,91 @@ def _server_requests_json_object(messages: list[dict[str, Any]]) -> bool:
         ):
             return True
     return False
+
+
+def _parse_daily_write_date_review_completion(
+    completion: _CompletionResponse,
+    *,
+    ordered_messages: tuple[str, ...],
+    expected_count: int,
+) -> _DailyWriteDateReviewResult:
+    if completion.metadata.get("finish_reason") != "tool_calls":
+        raise DeepSeekResponseError(
+            "daily-report date review did not finish with an internal tool call"
+        )
+    raw_calls = completion.message.get("tool_calls")
+    if not isinstance(raw_calls, (list, tuple)) or len(raw_calls) != 1:
+        raise MalformedToolCallError(
+            "daily-report date review must return exactly one internal tool call"
+        )
+    raw_call = raw_calls[0]
+    try:
+        call_id = raw_call["id"]
+        call_type = raw_call["type"]
+        function = raw_call["function"]
+        tool_name = function["name"]
+        raw_arguments = function["arguments"]
+    except (KeyError, TypeError) as exc:
+        raise MalformedToolCallError(
+            "daily-report date review tool call is malformed"
+        ) from exc
+    if call_type != "function" or not all(
+        isinstance(value, str) and value
+        for value in (call_id, tool_name, raw_arguments)
+    ):
+        raise MalformedToolCallError(
+            "daily-report date review tool fields are malformed"
+        )
+    audit = RawToolCallAudit(
+        tool_call_id=call_id,
+        tool_name=tool_name,
+        raw_arguments=raw_arguments,
+        arguments_sha256=hashlib.sha256(raw_arguments.encode("utf-8")).hexdigest(),
+        parse_status="received",
+    )
+    if tool_name != DAILY_REPORT_DATE_REVIEW_TOOL:
+        raise UnknownNativeToolError(
+            "daily-report date review returned an unexpected internal tool",
+            raw_tool_call_audit=(audit,),
+        )
+    try:
+        arguments = json.loads(raw_arguments)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise MalformedToolCallError(
+            "daily-report date review arguments are not valid JSON",
+            raw_tool_call_audit=(audit,),
+        ) from exc
+    try:
+        decisions = validate_daily_report_date_review(
+            arguments,
+            ordered_messages=ordered_messages,
+            expected_count=expected_count,
+        )
+    except (TypeError, ValueError) as exc:
+        raise InvalidNativeToolArgumentsError(
+            "daily-report date review returned invalid structured evidence",
+            raw_tool_call_audit=(audit,),
+        ) from exc
+    assistant_message = {
+        key: value
+        for key, value in completion.message.items()
+        if key in {"role", "content", "reasoning_content", "tool_calls"}
+    }
+    assistant_message["role"] = "assistant"
+    assistant_message["content"] = assistant_message.get("content") or ""
+    return _DailyWriteDateReviewResult(
+        assistant_message=assistant_message,
+        decisions=decisions,
+        audit=(
+            RawToolCallAudit(
+                tool_call_id=call_id,
+                tool_name=tool_name,
+                raw_arguments=raw_arguments,
+                arguments_sha256=audit.arguments_sha256,
+                parse_status="validated",
+            ),
+        ),
+    )
 
 
 def _parse_assistant_turn(message: dict[str, Any]) -> _ParsedAssistantTurn:
@@ -1698,100 +1819,55 @@ def _daily_write_date_review_targets(
     return tuple(call for call in calls if call.tool_name == "add_daily_items")
 
 
-def _daily_write_date_vote(call: NativeToolCall) -> str:
-    return str(call.arguments.get("date_selection") or "server_default")
+def _daily_write_date_review_needs_confirmation(
+    original: NativeToolCall,
+    decision: DailyReportDateDecision,
+    *,
+    server_default_date: date,
+) -> bool:
+    reviewed_selection = decision_date_selection(decision)
+    if reviewed_selection is None or decision.binding == "work_event_time_only":
+        return True
+    original_selection = str(
+        original.arguments.get("date_selection") or "server_default"
+    )
+    if original_selection != reviewed_selection:
+        return True
+    original_proposed_date = str(original.arguments.get("proposed_date") or "")
+    if original_selection == "server_default":
+        return original_proposed_date != server_default_date.isoformat()
+    return (
+        decision.proposed_date is None
+        or original_proposed_date != decision.proposed_date.isoformat()
+    )
 
 
 def _apply_reviewed_daily_write_date(
     original: NativeToolCall,
-    reviewed: NativeToolCall,
+    decision: DailyReportDateDecision,
+    *,
+    server_default_date: date,
 ) -> NativeToolCall:
+    date_selection = decision_date_selection(decision)
+    if date_selection is None:
+        raise ValueError("an ambiguous report date cannot be executed")
+    if date_selection == "user_explicit":
+        date_expression = decision.date_expression
+        proposed_date = decision.proposed_date
+    else:
+        date_expression = server_default_date.isoformat()
+        proposed_date = server_default_date
     arguments = {
         **original.arguments,
-        "date_selection": reviewed.arguments["date_selection"],
-        "date_expression": reviewed.arguments["date_expression"],
-        "proposed_date": reviewed.arguments["proposed_date"],
+        "date_selection": date_selection,
+        "date_expression": date_expression,
+        "proposed_date": proposed_date,
     }
     return NativeToolCall(
-        reviewed.tool_call_id,
+        original.tool_call_id,
         original.tool_name,
         validate_tool_arguments(original.tool_name, arguments),
     )
-
-
-def _daily_write_date_review_messages(
-    *,
-    user_text: str,
-    user_messages: tuple[str, ...],
-    calls: tuple[NativeToolCall, ...],
-    context: TrustedContext,
-    disagreement_feedback: tuple[dict[str, Any], ...] = (),
-) -> list[dict[str, str]]:
-    ordered_messages = user_messages or (user_text,)
-    local_now = context.now.astimezone(ZoneInfo(context.principal.timezone))
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are an isolated Agent2 reporting-date reviewer for "
-                "unexecuted daily-report drafts. Decide only whether the exact "
-                "current user messages explicitly identify the report calendar "
-                "date. Use date_selection=user_explicit only when they do, and "
-                "preserve the explicit date expression and resolved calendar "
-                "proposal. An explicit date must be directly bound to the report "
-                "itself or to an instruction selecting that report's date. A time "
-                "reference attached only to a work event describes the event, not "
-                "the report date. Otherwise use date_selection=server_default. "
-                "Never infer a report date from tense or section meaning. Draft "
-                "date fields and prior votes are intentionally withheld; decide "
-                "independently from the exact user messages. Copy every protected "
-                "non-date argument from each draft unchanged. Return exactly one "
-                "add_daily_items call per draft in the same order. This review is "
-                "semantic model judgment, never phrase or keyword matching. None "
-                "of the drafts has executed."
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "ordered_current_user_messages": [
-                        {"sequence": index, "content": content}
-                        for index, content in enumerate(
-                            ordered_messages,
-                            start=1,
-                        )
-                    ],
-                    "trusted_local_time": local_now.isoformat(),
-                    "server_default_report_date": default_daily_write_date(
-                        now=context.now,
-                        timezone=context.principal.timezone,
-                    ).isoformat(),
-                    "unexecuted_daily_drafts": [
-                        {
-                            "sequence": index,
-                            "tool_name": call.tool_name,
-                            "protected_non_date_arguments": {
-                                key: value
-                                for key, value in call.arguments.items()
-                                if key
-                                not in {
-                                    "date_selection",
-                                    "date_expression",
-                                    "proposed_date",
-                                }
-                            },
-                        }
-                        for index, call in enumerate(calls, start=1)
-                    ],
-                    "prior_model_disagreement": list(disagreement_feedback),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        },
-    ]
 
 
 def _daily_submit_section_review_messages(

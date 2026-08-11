@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta
-from decimal import Decimal
 import json
 import os
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -28,7 +28,6 @@ from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
 from app.models import DailyReport, User, WebhookEvent
 
-
 PANG_USER_ID = "222b1eeb-4faa-40cf-a193-e1892c9377b0"
 SOURCE_PREFIX = f"overnight-v22-rollback-{uuid4()}"
 OBSERVATION_KEY = "_agent2_turn_observation_v1"
@@ -37,6 +36,7 @@ SELECTED_CASE_NAMES = frozenset(
     for value in os.getenv("SMOKE_CASE_NAMES", "").split(",")
     if value.strip()
 )
+INCLUDE_MODEL_AUDIT = os.getenv("SMOKE_INCLUDE_MODEL_AUDIT", "").strip() == "1"
 
 
 UNDATED_CASES = (
@@ -177,6 +177,66 @@ def _safe_model_audit(payload: object) -> dict[str, object]:
     }
 
 
+def _compact_daily_date_votes(
+    model_audits: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    votes: list[dict[str, object]] = []
+    for audit in model_audits:
+        turns = audit.get("turns")
+        if not isinstance(turns, list):
+            continue
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            metadata = turn.get("response_metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            message = turn.get("message")
+            if not isinstance(message, dict) or message.get("kind") != "tool_calls":
+                continue
+            calls = message.get("calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                arguments = call.get("arguments")
+                arguments = arguments if isinstance(arguments, dict) else {}
+                if call.get("name") == "add_daily_items":
+                    votes.append(
+                        {
+                            "iteration": turn.get("iteration"),
+                            "review_attempt": None,
+                            "kind": "draft",
+                            "date_selection": arguments.get("date_selection"),
+                            "date_expression": arguments.get("date_expression"),
+                            "proposed_date": arguments.get("proposed_date"),
+                        }
+                    )
+                    continue
+                if call.get("name") != "review_daily_report_dates":
+                    continue
+                decisions = arguments.get("decisions")
+                if not isinstance(decisions, list):
+                    continue
+                for decision in decisions:
+                    if not isinstance(decision, dict):
+                        continue
+                    votes.append(
+                        {
+                            "iteration": turn.get("iteration"),
+                            "review_attempt": metadata.get(
+                                "daily_write_date_semantic_review_attempt"
+                            ),
+                            "kind": "semantic_review",
+                            "binding": decision.get("binding"),
+                            "evidence": decision.get("evidence"),
+                            "date_expression": decision.get("date_expression"),
+                            "proposed_date": decision.get("proposed_date"),
+                        }
+                    )
+    return votes
+
+
 async def _user_and_control(session):
     user = await session.get(User, PANG_USER_ID)
     if user is None:
@@ -209,15 +269,38 @@ async def _turn(
     source_message_id: str,
     now: datetime,
     accepted_business_results: frozenset[str] = frozenset({"success"}),
+    model_audit_sink: list[dict[str, object]] | None = None,
 ):
-    model_audits: list[dict[str, object]] = []
+    model_audits = model_audit_sink if model_audit_sink is not None else []
     original_audit_recorder = canary_service._record_model_audit_safely
+    original_run_canary_turn = canary_service.DeepSeekToolCallingAdapter.run_canary_turn
 
     def capture_model_audit(payload):
         model_audits.append(_safe_model_audit(payload))
         original_audit_recorder(payload)
 
+    async def capture_successful_model_turns(adapter, *args, **kwargs):
+        result = await original_run_canary_turn(adapter, *args, **kwargs)
+        model_audits.append(
+            {
+                "status": "success",
+                "turns": [
+                    {
+                        "iteration": turn.iteration,
+                        "message": _safe_message_summary(turn.raw_assistant_message),
+                        "response_metadata": turn.response_metadata,
+                        "tool_results": turn.tool_results,
+                    }
+                    for turn in result.model_turns
+                ],
+            }
+        )
+        return result
+
     canary_service._record_model_audit_safely = capture_model_audit
+    canary_service.DeepSeekToolCallingAdapter.run_canary_turn = (
+        capture_successful_model_turns
+    )
     try:
         outcome = await process_tool_call_canary_ingress(
             session,
@@ -242,6 +325,9 @@ async def _turn(
         ) from exc
     finally:
         canary_service._record_model_audit_safely = original_audit_recorder
+        canary_service.DeepSeekToolCallingAdapter.run_canary_turn = (
+            original_run_canary_turn
+        )
     observation = build_canary_persisted_response_payload(outcome)[OBSERVATION_KEY]
     assessment = assess_release_turn(
         webhook_status="processed",
@@ -342,6 +428,7 @@ async def _run_write_case(
             )
             conversation_id = f"{SOURCE_PREFIX}-{case_name}"
             source_message_id = f"{conversation_id}-message"
+            model_audits: list[dict[str, object]] = []
             outcome = await _turn(
                 session,
                 user=user,
@@ -351,6 +438,7 @@ async def _run_write_case(
                 conversation_id=conversation_id,
                 source_message_id=source_message_id,
                 now=now,
+                model_audit_sink=model_audits,
             )
             await session.flush()
             report = await session.scalar(
@@ -359,6 +447,31 @@ async def _run_write_case(
                     DailyReport.report_date == expected_date,
                 )
             )
+            if report is None:
+                actual_reports = list(
+                    (
+                        await session.scalars(
+                            select(DailyReport).where(
+                                DailyReport.user_id == user.id,
+                                DailyReport.report_date.in_(
+                                    {
+                                        local_date,
+                                        local_date - timedelta(days=1),
+                                    }
+                                ),
+                            )
+                        )
+                    ).all()
+                )
+                raise AssertionError(
+                    {
+                        "expected_report_date": expected_date.isoformat(),
+                        "actual_report_dates": sorted(
+                            item.report_date.isoformat() for item in actual_reports
+                        ),
+                        "daily_date_votes": _compact_daily_date_votes(model_audits),
+                    }
+                )
             _assert_report(
                 report,
                 expected_date=expected_date,
@@ -392,7 +505,7 @@ async def _run_write_case(
                         "changed": receipts[0].changed,
                     }
                 )
-            return {
+            result = {
                 "name": case_name,
                 "status": "pass",
                 "report_date": expected_date.isoformat(),
@@ -400,6 +513,9 @@ async def _run_write_case(
                 "model_calls": outcome.model_call_count,
                 "tools": [row.tool_name for row in receipts],
             }
+            if INCLUDE_MODEL_AUDIT:
+                result["daily_date_votes"] = _compact_daily_date_votes(model_audits)
+            return result
         finally:
             await session.rollback()
 

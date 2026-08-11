@@ -20,6 +20,7 @@ from app.agent2.tool_calling.deepseek_adapter import (
     DeepSeekResponseError,
     DeepSeekTimeoutError,
     DeepSeekToolCallingAdapter,
+    InvalidNativeToolArgumentsError,
     MalformedToolCallError,
     _canary_post_write_protocol_message,
     _CompletionResponse,
@@ -391,6 +392,50 @@ def _submit_tool_call_completion(
     )
 
 
+def _date_review_completion(
+    *,
+    call_id: str,
+    binding: str,
+    evidence_quote: str | None = None,
+    date_expression: str | None = None,
+    proposed_date: str | None = None,
+) -> _CompletionResponse:
+    decision = {
+        "sequence": 1,
+        "binding": binding,
+        "evidence": (
+            {
+                "message_sequence": 1,
+                "exact_quote": evidence_quote,
+            }
+            if evidence_quote is not None
+            else None
+        ),
+        "date_expression": date_expression,
+        "proposed_date": proposed_date,
+    }
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "review_daily_report_dates",
+                        "arguments": json.dumps(
+                            {"decisions": [decision]},
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
 def _mixed_submit_and_query_completion(
     *,
     reviewed: bool = False,
@@ -666,7 +711,7 @@ async def test_incomplete_first_review_gets_one_structural_model_retry(
 
 
 @pytest.mark.asyncio
-async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
+async def test_before_nine_date_disagreement_requires_matching_independent_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _DeferredRuntimeSession()
@@ -677,24 +722,17 @@ async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
         max_tool_loops=2,
         endpoint="https://example.invalid/chat/completions",
     )
-    first_review = _submit_tool_call_completion(
+    first_review = _date_review_completion(
         call_id="date-review-1",
-        reviewed=True,
-        date_selection="user_explicit",
+        binding="explicit_report_date",
+        evidence_quote="This report explicitly belongs to today",
         date_expression="today",
         proposed_date="2026-08-11",
     )
-    first_review_arguments = json.loads(
-        first_review.message["tool_calls"][0]["function"]["arguments"]
-    )
-    first_review_arguments["items"][0]["content"] = "reviewer must not change this"
-    first_review.message["tool_calls"][0]["function"]["arguments"] = json.dumps(
-        first_review_arguments
-    )
-    tiebreak_review = _submit_tool_call_completion(
+    confirmation_review = _date_review_completion(
         call_id="date-review-2",
-        reviewed=True,
-        date_selection="user_explicit",
+        binding="explicit_report_date",
+        evidence_quote="This report explicitly belongs to today",
         date_expression="today",
         proposed_date="2026-08-11",
     )
@@ -708,7 +746,7 @@ async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
                 proposed_date="2026-08-10",
             ),
             first_review,
-            tiebreak_review,
+            confirmation_review,
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -725,10 +763,12 @@ async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
         )
     )
     captured_messages: list[tuple[dict, ...]] = []
+    captured_tool_schemas: list[list[dict]] = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del tool_schemas, thinking_enabled
+        del thinking_enabled
         captured_messages.append(tuple(messages))
+        captured_tool_schemas.append(tool_schemas)
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
@@ -752,7 +792,7 @@ async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
     assert result.iterations == 4
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
-    assert runtime.calls[0].tool_call_id == "date-review-2"
+    assert runtime.calls[0].tool_call_id == "draft"
     assert runtime.calls[0].arguments["date_selection"] == "user_explicit"
     assert runtime.calls[0].arguments["proposed_date"] == "2026-08-11"
     assert runtime.calls[0].arguments["items"][0]["content"] == "核对付款节点"
@@ -769,20 +809,15 @@ async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
         == 2
     )
     first_review_payload = json.loads(captured_messages[1][1]["content"])
-    first_protected_arguments = first_review_payload["unexecuted_daily_drafts"][0][
-        "protected_non_date_arguments"
-    ]
-    assert "date_selection" not in first_protected_arguments
-    assert "date_expression" not in first_protected_arguments
-    assert "proposed_date" not in first_protected_arguments
-    tiebreak_payload = json.loads(captured_messages[2][1]["content"])
-    assert tiebreak_payload["prior_model_disagreement"] == [
-        {
-            "original_draft_sequence": 1,
-            "review_mode": "independent_tiebreak",
-            "sequence": 1,
-        }
-    ]
+    assert first_review_payload["unexecuted_daily_draft_count"] == 1
+    assert "unexecuted_daily_drafts" not in first_review_payload
+    assert "prior_model_disagreement" not in first_review_payload
+    assert captured_tool_schemas[1][0]["function"]["name"] == (
+        "review_daily_report_dates"
+    )
+    assert captured_tool_schemas[2][0]["function"]["name"] == (
+        "review_daily_report_dates"
+    )
 
 
 @pytest.mark.asyncio
@@ -800,12 +835,13 @@ async def test_before_nine_date_review_preserves_unrelated_query_call(
     completions = iter(
         (
             _mixed_submit_and_query_completion(reviewed=True),
-            _submit_tool_call_completion(
-                call_id="date-reviewed",
-                reviewed=True,
-                date_selection="server_default",
-                date_expression="default",
-                proposed_date="2026-08-10",
+            _date_review_completion(
+                call_id="date-review-1",
+                binding="no_report_date_reference",
+            ),
+            _date_review_completion(
+                call_id="date-review-2",
+                binding="no_report_date_reference",
             ),
             _CompletionResponse(
                 message={
@@ -846,13 +882,157 @@ async def test_before_nine_date_review_preserves_unrelated_query_call(
         runtime_session=runtime,
     )
 
-    assert result.iterations == 3
+    assert result.iterations == 4
     assert [call.tool_name for call in runtime.calls] == [
         "query_today_report",
         "add_daily_items",
     ]
     assert runtime.calls[0].tool_call_id == "original-query"
-    assert runtime.calls[1].tool_call_id == "date-reviewed"
+    assert runtime.calls[1].tool_call_id == "draft"
+    assert runtime.calls[1].arguments["date_selection"] == "server_default"
+    assert runtime.calls[1].arguments["proposed_date"] == "2026-08-10"
+
+
+@pytest.mark.asyncio
+async def test_disagreeing_date_reviews_ask_naturally_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _submit_tool_call_completion(
+                call_id="draft",
+                reviewed=True,
+                date_selection="server_default",
+                date_expression="default",
+                proposed_date="2026-08-10",
+            ),
+            _date_review_completion(
+                call_id="date-review-1",
+                binding="explicit_report_date",
+                evidence_quote="This report belongs to today",
+                date_expression="today",
+                proposed_date="2026-08-11",
+            ),
+            _date_review_completion(
+                call_id="date-review-2",
+                binding="work_event_time_only",
+                evidence_quote="today",
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": (
+                        "Which calendar date should I use for this report? "
+                        "Nothing has been written yet."
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    captured_tool_schemas: list[list[dict]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, thinking_enabled
+        captured_tool_schemas.append(tool_schemas)
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="This report belongs to today; submit it.",
+        context=_context(
+            now=datetime(
+                2026,
+                8,
+                11,
+                8,
+                20,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            )
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 4
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert result.receipts == ()
+    assert "Which calendar date" in result.final_content
+    assert captured_tool_schemas[-1] == []
+    assert (
+        result.model_turns[2].response_metadata[
+            "daily_write_date_clarification_required"
+        ]
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_date_review_rejects_non_source_evidence_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _submit_tool_call_completion(
+                call_id="draft",
+                reviewed=True,
+                date_selection="server_default",
+                date_expression="default",
+                proposed_date="2026-08-10",
+            ),
+            _date_review_completion(
+                call_id="date-review-1",
+                binding="explicit_report_date",
+                evidence_quote="invented evidence",
+                date_expression="today",
+                proposed_date="2026-08-11",
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(InvalidNativeToolArgumentsError):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="This report belongs to today; submit it.",
+            context=_context(
+                now=datetime(
+                    2026,
+                    8,
+                    11,
+                    8,
+                    20,
+                    tzinfo=ZoneInfo("Asia/Shanghai"),
+                )
+            ),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
 
 
 def _malformed_tool_call_completion() -> _CompletionResponse:
