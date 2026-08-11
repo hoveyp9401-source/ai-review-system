@@ -31,6 +31,7 @@ from app.services.report_risk import problems_acknowledged_empty
 from app.utils.time import now_in_timezone
 
 SEPARATOR = "────────────"
+HIDDEN_MISSING_DETAIL_MEMBER_NAME = "赵卫中"
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,10 @@ class ManagementDailyBriefingService:
             tenant_id=tenant_id,
             on_date=report_date,
         )
+        hidden_missing_detail_member_refs = _hidden_missing_detail_member_refs(
+            self._settings,
+            formal_roster=formal_roster,
+        )
         repository = SqlDashboardRepository(session)
         teams = await repository.list_teams(
             tenant_id=tenant_id,
@@ -117,6 +122,7 @@ class ManagementDailyBriefingService:
             records=records,
             recipients=(*recipients, *cc_recipients),
             recipient_warnings=(*recipient_warnings, *cc_warnings),
+            hidden_missing_detail_member_refs=hidden_missing_detail_member_refs,
         )
 
 
@@ -169,6 +175,7 @@ def build_management_daily_briefings(
     records: DashboardRecords,
     recipients: tuple[BriefingRecipient, ...],
     recipient_warnings: tuple[str, ...] = (),
+    hidden_missing_detail_member_refs: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     ordered_teams = tuple(sorted(teams, key=_team_sort_key))
     team_views = tuple(
@@ -244,6 +251,7 @@ def build_management_daily_briefings(
             team_views=team_views,
             department_direct_view=department_direct_view,
             records=records,
+            hidden_missing_detail_member_refs=hidden_missing_detail_member_refs,
         ),
     }
     return {
@@ -345,6 +353,7 @@ def build_department_management_briefing_text(
     team_views: tuple[TeamSubmissionView, ...],
     department_direct_view: TeamSubmissionView | None,
     records: DashboardRecords,
+    hidden_missing_detail_member_refs: frozenset[str] = frozenset(),
 ) -> str:
     department_views = (
         (*team_views, department_direct_view)
@@ -412,9 +421,9 @@ def build_department_management_briefing_text(
     ]
     team_entries = [_department_team_entry(view) for view in department_views]
     missing_entries = [
-        (
-            f"**{view.team.name}（{len(view.missing_members)}人）**",
-            "、".join(member.name for member in view.missing_members),
+        _department_missing_entry(
+            view,
+            hidden_member_refs=hidden_missing_detail_member_refs,
         )
         for view in known_views
         if view.missing_members
@@ -601,6 +610,25 @@ def _department_team_entry(
     return f"**{view.team.name}**", detail
 
 
+def _department_missing_entry(
+    view: TeamSubmissionView,
+    *,
+    hidden_member_refs: frozenset[str],
+) -> tuple[str, str]:
+    """Render missing names without changing the underlying submission totals."""
+
+    visible_members = tuple(
+        member
+        for member in view.missing_members
+        if member.ref not in hidden_member_refs
+    )
+    visible_names = "、".join(member.name for member in visible_members)
+    return (
+        f"**{view.team.name}（{len(view.missing_members)}人）**",
+        visible_names,
+    )
+
+
 def _attention_entries(
     *,
     records: DashboardRecords,
@@ -761,7 +789,11 @@ def _numbered_section(
         lines.append(empty_text)
         return "\n\n".join(lines)
     for index, (heading, body) in enumerate(materialized, start=1):
-        lines.append(f"{index}. {heading}\n   {body}")
+        lines.append(
+            f"{index}. {heading}\n   {body}"
+            if body
+            else f"{index}. {heading}"
+        )
     return "\n\n".join(lines)
 
 
@@ -1097,6 +1129,34 @@ def _configured_identifiers(value: object) -> tuple[str, ...]:
             item.strip() for item in str(value or "").split(",") if item.strip()
         )
     )
+
+
+def _hidden_missing_detail_member_refs(
+    settings: Settings,
+    *,
+    formal_roster: FormalLegalDailyRoster,
+) -> frozenset[str]:
+    configured = frozenset(
+        _configured_identifiers(
+            getattr(
+                settings,
+                "management_daily_briefing_hidden_missing_detail_user_ids",
+                "",
+            )
+        )
+    )
+    expected = frozenset(
+        {
+            formal_roster.member_by_name(
+                HIDDEN_MISSING_DETAIL_MEMBER_NAME
+            ).user_id
+        }
+    )
+    if configured != expected:
+        raise RuntimeError(
+            "management briefing hidden-detail users must match Zhao Weizhong exactly"
+        )
+    return expected
 
 
 async def _load_department_cc_recipients(
