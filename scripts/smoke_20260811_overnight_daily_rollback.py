@@ -241,6 +241,58 @@ def _compact_daily_date_votes(
     return votes
 
 
+def _compact_model_flow(
+    model_audits: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    flow: list[dict[str, object]] = []
+    selected_argument_keys = {
+        "date_selection",
+        "date_expression",
+        "proposed_date",
+        "source_date_expression",
+        "proposed_source_date",
+        "target_date_expression",
+        "proposed_target_date",
+        "acknowledged_empty_fields",
+        "submit_after_write",
+        "submit_after_correction",
+        "decisions",
+    }
+    for audit in model_audits:
+        turns = audit.get("turns")
+        if not isinstance(turns, list):
+            continue
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            message = turn.get("message")
+            if not isinstance(message, dict):
+                continue
+            row: dict[str, object] = {
+                "iteration": turn.get("iteration"),
+                "kind": message.get("kind"),
+            }
+            if message.get("kind") == "tool_calls":
+                calls = message.get("calls")
+                row["calls"] = [
+                    {
+                        "name": call.get("name"),
+                        "arguments": {
+                            key: value
+                            for key, value in arguments.items()
+                            if key in selected_argument_keys
+                        },
+                    }
+                    for call in calls
+                    if isinstance(call, dict)
+                    and isinstance((arguments := call.get("arguments")), dict)
+                ] if isinstance(calls, list) else []
+            else:
+                row["content_preview"] = message.get("content_preview")
+            flow.append(row)
+    return flow
+
+
 async def _user_and_control(session):
     user = await session.get(User, PANG_USER_ID)
     if user is None:
@@ -346,6 +398,7 @@ async def _turn(
                 "business_result": outcome.user_visible_result,
                 "release_blockers": assessment.blockers,
                 "daily_date_votes": _compact_daily_date_votes(model_audits),
+                "model_flow": _compact_model_flow(model_audits),
             }
         )
     if outcome.messages_enabled:
@@ -624,6 +677,7 @@ async def _run_correction_case(
                 else None
             )
             correction_source = f"{conversation_id}-correction"
+            correction_audits: list[dict[str, object]] = []
             correction = await _turn(
                 session,
                 user=user,
@@ -638,12 +692,16 @@ async def _run_correction_case(
                     if target_conflict
                     else frozenset({"success"})
                 ),
+                model_audit_sink=correction_audits,
             )
             await session.flush()
             receipts = await _receipts(session, correction_source)
             if [row.tool_name for row in receipts] != ["correct_daily_report_date"]:
                 raise AssertionError(
-                    {"unexpected_tools": [row.tool_name for row in receipts]}
+                    {
+                        "unexpected_tools": [row.tool_name for row in receipts],
+                        "model_flow": _compact_model_flow(correction_audits),
+                    }
                 )
 
             await session.refresh(source)
