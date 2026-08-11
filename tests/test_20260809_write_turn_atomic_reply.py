@@ -128,9 +128,11 @@ class _DeferredRuntimeSession:
         self.commit_count = 0
         self.rollback_count = 0
         self.execute_count = 0
+        self.calls = ()
 
     async def execute(self, calls, *, defer_finalization):
         self.execute_count += 1
+        self.calls = calls
         assert defer_finalization is True
         assert len(calls) == 1
         return ProductionRuntimeResult(
@@ -267,6 +269,136 @@ def _tool_call_completion() -> _CompletionResponse:
             ],
         },
         metadata={"finish_reason": "tool_calls"},
+    )
+
+
+def _submit_tool_call_completion(
+    *,
+    call_id: str,
+    reviewed: bool,
+) -> _CompletionResponse:
+    arguments = {
+        "date_selection": "server_default",
+        "date_expression": "今天",
+        "proposed_date": "2026-08-09",
+        "items": [
+            {
+                "field": "today_work",
+                "content": (
+                    "核对付款节点" if reviewed else "核对付款节点，没有发现问题"
+                ),
+                "source_evidence": {"source_message_index": 1},
+            },
+            {
+                "field": "tomorrow_plan",
+                "content": "继续跟进回款",
+                "source_evidence": {"source_message_index": 1},
+            },
+        ],
+        "acknowledged_empty_fields": ["problems"] if reviewed else [],
+        "empty_field_evidence": (
+            [
+                {
+                    "field": "problems",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ]
+            if reviewed
+            else []
+        ),
+        "submit_after_write": True,
+    }
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "add_daily_items",
+                        "arguments": json.dumps(
+                            arguments,
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_atomic_submit_draft_gets_model_section_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _submit_tool_call_completion(call_id="draft", reviewed=False),
+            _submit_tool_call_completion(call_id="reviewed", reviewed=True),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "日报已按你的原意提交。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    captured_messages: list[tuple[dict, ...]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del tool_schemas, thinking_enabled
+        captured_messages.append(tuple(messages))
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text=(
+            "日报内容：今日核对付款节点，没什么问题；明日继续跟进回款，请直接提交。"
+        ),
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 3
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.calls[0].tool_call_id == "reviewed"
+    assert runtime.calls[0].arguments["acknowledged_empty_fields"] == ["problems"]
+    assert runtime.calls[0].arguments["items"][0]["content"] == "核对付款节点"
+    assert (
+        result.model_turns[0].response_metadata["pre_execution_daily_section_review"]
+        is True
+    )
+    assert any(
+        message.get("role") == "system"
+        and "isolated Agent2 semantic reviewer" in str(message.get("content"))
+        for message in captured_messages[1]
+    )
+    assert any(
+        message.get("role") == "user"
+        and "unexecuted_draft_calls" in str(message.get("content"))
+        for message in captured_messages[1]
     )
 
 
@@ -635,9 +767,7 @@ async def test_internal_error_code_is_hidden_and_model_retries_naturally(
                     "role": "assistant",
                     "content": json.dumps(
                         {
-                            "reply": (
-                                "本次未执行：SOURCE_REPORT_DATE_MISMATCH"
-                            ),
+                            "reply": ("本次未执行：SOURCE_REPORT_DATE_MISMATCH"),
                             "actual_write": False,
                             "operation_outcome": "not_executed",
                         },

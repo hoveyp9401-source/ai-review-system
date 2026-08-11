@@ -248,8 +248,13 @@ class DeepSeekToolCallingAdapter:
         runtime: ShadowRuntime,
         thinking_enabled: bool = False,
     ) -> DeepSeekToolCallingResult:
-        if type(runtime) is not ShadowRuntime or runtime.mode != ExecutionMode.SHADOW_PROPOSAL:
-            raise TypeError("run_shadow_turn requires the exact zero-write ShadowRuntime capability")
+        if (
+            type(runtime) is not ShadowRuntime
+            or runtime.mode != ExecutionMode.SHADOW_PROPOSAL
+        ):
+            raise TypeError(
+                "run_shadow_turn requires the exact zero-write ShadowRuntime capability"
+            )
         session = runtime.open_session(context)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -284,10 +289,7 @@ class DeepSeekToolCallingAdapter:
                     messages,
                     tool_schemas=(
                         []
-                        if (
-                            write_batch_seen
-                            or managed_daily_reply_retry_count
-                        )
+                        if (write_batch_seen or managed_daily_reply_retry_count)
                         else tool_schemas
                     ),
                     thinking_enabled=thinking_enabled,
@@ -333,7 +335,11 @@ class DeepSeekToolCallingAdapter:
                     )
                 turn_plan = merge_turn_plans(context, tuple(plans))
                 if turn_plan is not None:
-                    _assert_shadow_plan(turn_plan, context, expected_receipt_count=len(turn_plan.tool_calls))
+                    _assert_shadow_plan(
+                        turn_plan,
+                        context,
+                        expected_receipt_count=len(turn_plan.tool_calls),
+                    )
                 final_content, model_hash = finalize_shadow_content(content, turn_plan)
                 return DeepSeekToolCallingResult(
                     final_content=final_content,
@@ -432,8 +438,7 @@ class DeepSeekToolCallingAdapter:
     ) -> DeepSeekCanaryResult:
         if (
             context.namespace != "agent2.tool_calling.canary.v1"
-            or getattr(runtime_session, "mode", None)
-            != ExecutionMode.CANARY_EXECUTE
+            or getattr(runtime_session, "mode", None) != ExecutionMode.CANARY_EXECUTE
         ):
             raise TypeError(
                 "run_canary_turn requires a Canary context and runtime session"
@@ -471,6 +476,7 @@ class DeepSeekToolCallingAdapter:
         managed_daily_reply_retry_count = 0
         write_reply_retry_count = 0
         tool_argument_repair_count = 0
+        daily_submit_section_review_count = 0
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
         async def rollback_pending() -> None:
@@ -518,10 +524,7 @@ class DeepSeekToolCallingAdapter:
                             )
                             else tool_schemas
                         ),
-                        thinking_enabled=(
-                            thinking_enabled
-                            or briefing_fact_batch_seen
-                        ),
+                        thinking_enabled=(thinking_enabled or briefing_fact_batch_seen),
                     )
                     model_turns.append(
                         _model_turn_audit(
@@ -541,10 +544,7 @@ class DeepSeekToolCallingAdapter:
                                 briefing_fact_batch_seen
                                 and daily_briefing_reply_retry_count == 0
                             )
-                            or (
-                                write_batch_seen
-                                and write_reply_retry_count < 2
-                            )
+                            or (write_batch_seen and write_reply_retry_count < 2)
                         ),
                     )
                     if protocol_warning is not None:
@@ -573,9 +573,7 @@ class DeepSeekToolCallingAdapter:
                                 "tool_argument_error_type": type(exc).__name__,
                             },
                         )
-                        messages.append(
-                            _pre_execution_tool_argument_repair_message()
-                        )
+                        messages.append(_pre_execution_tool_argument_repair_message())
                         tool_argument_repair_count += 1
                         continue
                     raise _with_canary_turn_state(
@@ -601,8 +599,7 @@ class DeepSeekToolCallingAdapter:
                             model_turns=model_turns,
                         )
                     if any(
-                        marker in content
-                        for marker in _TEXTUAL_TOOL_PROTOCOL_MARKERS
+                        marker in content for marker in _TEXTUAL_TOOL_PROTOCOL_MARKERS
                     ):
                         error = (
                             ToolCallsAfterWriteBatchError(
@@ -624,8 +621,8 @@ class DeepSeekToolCallingAdapter:
                     briefing_validation_errors: tuple[str, ...] = ()
                     briefing_envelope = None
                     if write_batch_seen:
-                        envelope, write_validation_errors = (
-                            validate_write_reply(content, tuple(receipts))
+                        envelope, write_validation_errors = validate_write_reply(
+                            content, tuple(receipts)
                         )
                         if envelope is not None:
                             reply_for_validation = envelope.reply
@@ -657,14 +654,12 @@ class DeepSeekToolCallingAdapter:
                     )
                     if validation_errors:
                         validation_metadata = {
-                            "terminal_reply_validation": list(
-                                validation_errors
-                            ),
+                            "terminal_reply_validation": list(validation_errors),
                         }
                         if briefing_fact_batch_seen:
-                            validation_metadata[
-                                "daily_briefing_reply_validation"
-                            ] = list(validation_errors)
+                            validation_metadata["daily_briefing_reply_validation"] = (
+                                list(validation_errors)
+                            )
                         model_turns[-1] = replace(
                             model_turns[-1],
                             response_metadata={
@@ -718,8 +713,7 @@ class DeepSeekToolCallingAdapter:
                                                 tuple(validation_errors),
                                                 tuple(receipts),
                                                 retry_number=(
-                                                    daily_briefing_reply_retry_count
-                                                    + 1
+                                                    daily_briefing_reply_retry_count + 1
                                                 ),
                                             )
                                         ),
@@ -773,8 +767,8 @@ class DeepSeekToolCallingAdapter:
                                 "managed daily reply failed factual validation"
                             ),
                             audits=audits,
-                                model_turns=model_turns,
-                            )
+                            model_turns=model_turns,
+                        )
 
                     if write_batch_seen:
                         await commit_pending()
@@ -797,28 +791,18 @@ class DeepSeekToolCallingAdapter:
                         runtime_results=tuple(runtime_results),
                         model_turns=tuple(model_turns),
                         request_attempt_count=sum(
-                            int(
-                                item.response_metadata.get(
-                                    "request_attempt_count", 1
-                                )
-                            )
+                            int(item.response_metadata.get("request_attempt_count", 1))
                             for item in model_turns
                         ),
                         transport_retry_count=sum(
-                            int(
-                                item.response_metadata.get(
-                                    "transport_retry_count", 0
-                                )
-                            )
+                            int(item.response_metadata.get("transport_retry_count", 0))
                             for item in model_turns
                         ),
                     )
 
                 if tool_loops >= self._max_tool_loops:
                     raise _with_canary_turn_state(
-                        MaxToolLoopsExceeded(
-                            "maximum tool-call loops exceeded"
-                        ),
+                        MaxToolLoopsExceeded("maximum tool-call loops exceeded"),
                         audits=audits,
                         model_turns=model_turns,
                     )
@@ -843,6 +827,78 @@ class DeepSeekToolCallingAdapter:
                         audits=audits,
                         model_turns=model_turns,
                     )
+                current_has_write = any(
+                    TOOL_REGISTRY[call.tool_name].read_or_write == "write"
+                    for call in parsed.tool_calls
+                )
+                if (
+                    daily_submit_section_review_count == 0
+                    and _needs_daily_submit_section_review(parsed.tool_calls)
+                ):
+                    model_turns[-1] = replace(
+                        model_turns[-1],
+                        response_metadata={
+                            **model_turns[-1].response_metadata,
+                            "pre_execution_daily_section_review": True,
+                            "draft_executed": False,
+                        },
+                    )
+                    daily_submit_section_review_count += 1
+                    review_tool_names = frozenset(
+                        call.tool_name for call in parsed.tool_calls
+                    )
+                    try:
+                        review_completion = await self._complete(
+                            _daily_submit_section_review_messages(
+                                user_text=user_text,
+                                user_messages=user_messages,
+                                calls=parsed.tool_calls,
+                            ),
+                            tool_schemas=deepseek_tool_schemas(review_tool_names),
+                            thinking_enabled=thinking_enabled,
+                        )
+                        iterations += 1
+                        model_turns.append(
+                            _model_turn_audit(
+                                iterations,
+                                review_completion.message,
+                                response_metadata={
+                                    **review_completion.metadata,
+                                    "daily_section_semantic_review": True,
+                                },
+                            )
+                        )
+                        reviewed = _parse_assistant_turn(review_completion.message)
+                        _validate_completion_protocol(
+                            review_completion,
+                            reviewed,
+                        )
+                        audits.extend(reviewed.audit)
+                    except DeepSeekToolCallingError as exc:
+                        raise _with_canary_turn_state(
+                            exc,
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
+                    reviewed_names = tuple(
+                        call.tool_name for call in reviewed.tool_calls
+                    )
+                    original_names = tuple(call.tool_name for call in parsed.tool_calls)
+                    if not reviewed.tool_calls or sorted(reviewed_names) != sorted(
+                        original_names
+                    ):
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "daily submit semantic review did not return the complete tool batch"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+                    parsed = reviewed
+                    current_has_write = any(
+                        TOOL_REGISTRY[call.tool_name].read_or_write == "write"
+                        for call in parsed.tool_calls
+                    )
                 try:
                     _reject_repeated_calls(
                         parsed.tool_calls,
@@ -857,10 +913,6 @@ class DeepSeekToolCallingAdapter:
                         model_turns=model_turns,
                     ) from exc
 
-                current_has_write = any(
-                    TOOL_REGISTRY[call.tool_name].read_or_write == "write"
-                    for call in parsed.tool_calls
-                )
                 messages.append(parsed.assistant_message)
                 runtime_result = (
                     await runtime_session.execute(
@@ -897,9 +949,7 @@ class DeepSeekToolCallingAdapter:
                 messages.extend(tool_results)
                 if current_has_write:
                     messages.append(
-                        _canary_post_write_protocol_message(
-                            tuple(receipts)
-                        )
+                        _canary_post_write_protocol_message(tuple(receipts))
                     )
                 current_has_briefing_fact = any(
                     call.tool_name == "query_daily_briefing_facts"
@@ -1121,9 +1171,7 @@ def _transport_error_audit(
     retryable: bool,
 ) -> dict[str, Any]:
     status_code = (
-        error.response.status_code
-        if isinstance(error, httpx.HTTPStatusError)
-        else None
+        error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
     )
     return {
         "attempt": attempt,
@@ -1324,6 +1372,90 @@ def _pre_execution_tool_argument_repair_message() -> dict[str, str]:
     }
 
 
+def _needs_daily_submit_section_review(
+    calls: tuple[NativeToolCall, ...],
+) -> bool:
+    """Request model review when an atomic submit draft does not cover all sections."""
+
+    all_sections = {"today_work", "problems", "tomorrow_plan"}
+    for call in calls:
+        if call.tool_name != "add_daily_items":
+            continue
+        arguments = call.arguments
+        if not bool(arguments.get("submit_after_write", False)):
+            continue
+        covered_sections = {
+            str(item.get("field") or "")
+            for item in arguments.get("items", ())
+            if isinstance(item, dict)
+        }
+        covered_sections.update(
+            str(field_name)
+            for field_name in arguments.get(
+                "acknowledged_empty_fields",
+                (),
+            )
+        )
+        if not all_sections.issubset(covered_sections):
+            return True
+    return False
+
+
+def _daily_submit_section_review_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    calls: tuple[NativeToolCall, ...],
+) -> list[dict[str, str]]:
+    draft_calls = [
+        {
+            "tool_name": call.tool_name,
+            "arguments": call.arguments,
+        }
+        for call in calls
+    ]
+    ordered_messages = user_messages or (user_text,)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the isolated Agent2 semantic reviewer for one "
+                "unexecuted daily-report submission draft. Reread the exact "
+                "user messages independently; do not inherit the draft's "
+                "wording or field split. Treat today_work, problems, and "
+                "tomorrow_plan as three separate semantic sections, including "
+                "ordinary conversational assertions that a section has no "
+                "content. A clear assertion that no current problem or risk "
+                "exists is an explicit empty problems section even when it "
+                "appears beside work content. It must not be stored inside a "
+                "work item. Distinguish that from denial of a work event. "
+                "This is semantic judgment, never phrase or keyword matching. "
+                "Preserve all actors, facts, dates, plans, and source-evidence "
+                "bindings. Return only one complete corrected native tool-call "
+                "batch using the supplied tools. The draft has not executed."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "unexecuted_draft_calls": draft_calls,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
 def _canary_tool_result_messages(
     calls: tuple[NativeToolCall, ...],
     receipts: tuple[ToolReceipt, ...],
@@ -1355,11 +1487,7 @@ def _canary_tool_result_messages(
                         if write_batch_closed
                         else receipt.safe_user_facts
                     ),
-                    **(
-                        {"turn_protocol": turn_protocol}
-                        if turn_protocol
-                        else {}
-                    ),
+                    **({"turn_protocol": turn_protocol} if turn_protocol else {}),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1381,9 +1509,7 @@ def _canary_post_write_protocol_message(
                     "execution_mode": ExecutionMode.CANARY_EXECUTE.value,
                     "final_response_required": True,
                     "final_response_source": "safe_user_facts_only",
-                    "terminal_response_contract": write_reply_protocol(
-                        receipts
-                    ),
+                    "terminal_response_contract": write_reply_protocol(receipts),
                     "further_tool_calls_allowed": False,
                     "native_or_textual_tool_calls_allowed": False,
                     "same_turn_pending_confirmation_allowed": False,
@@ -1444,14 +1570,11 @@ def _with_canary_turn_state(
         transport_errors=tuple(
             transport_error
             for turn in model_turns
-            for transport_error in turn.response_metadata.get(
-                "transport_errors", ()
-            )
+            for transport_error in turn.response_metadata.get("transport_errors", ())
         )
         + error.transport_errors,
         model_elapsed_seconds=round(
-            _model_turn_elapsed_seconds(model_turns)
-            + error.model_elapsed_seconds,
+            _model_turn_elapsed_seconds(model_turns) + error.model_elapsed_seconds,
             4,
         ),
     )
@@ -1488,8 +1611,7 @@ def _with_turn_state(
         + error.transport_retry_count,
         transport_errors=prior_transport_errors + error.transport_errors,
         model_elapsed_seconds=round(
-            _model_turn_elapsed_seconds(model_turns)
-            + error.model_elapsed_seconds,
+            _model_turn_elapsed_seconds(model_turns) + error.model_elapsed_seconds,
             4,
         ),
     )
@@ -1503,10 +1625,7 @@ def _model_turn_elapsed_seconds(
         try:
             elapsed += max(
                 0.0,
-                float(
-                    turn.response_metadata.get("elapsed_seconds")
-                    or 0.0
-                ),
+                float(turn.response_metadata.get("elapsed_seconds") or 0.0),
             )
         except (TypeError, ValueError):
             continue
@@ -1546,9 +1665,7 @@ def _model_turn_audit(
             if reasoning_text is not None
             else None
         ),
-        response_metadata=json.loads(
-            json.dumps(response_metadata, ensure_ascii=False)
-        ),
+        response_metadata=json.loads(json.dumps(response_metadata, ensure_ascii=False)),
     )
 
 
@@ -1559,9 +1676,13 @@ def _assert_shadow_plan(
     expected_receipt_count: int,
 ) -> None:
     if type(plan) is not TurnExecutionPlan:
-        raise ShadowCapabilityViolationError("ShadowRuntime returned an invalid plan type")
+        raise ShadowCapabilityViolationError(
+            "ShadowRuntime returned an invalid plan type"
+        )
     if len(plan.receipts) != expected_receipt_count:
-        raise ShadowCapabilityViolationError("ShadowRuntime returned a receipt count mismatch")
+        raise ShadowCapabilityViolationError(
+            "ShadowRuntime returned a receipt count mismatch"
+        )
     if (
         plan.mode != ExecutionMode.SHADOW_PROPOSAL
         or plan.namespace != context.namespace
@@ -1571,7 +1692,9 @@ def _assert_shadow_plan(
         or plan.conversation_state_write_count
         or plan.message_send_count
     ):
-        raise ShadowCapabilityViolationError("ShadowRuntime violated zero-write plan invariants")
+        raise ShadowCapabilityViolationError(
+            "ShadowRuntime violated zero-write plan invariants"
+        )
     for receipt in plan.receipts:
         if (
             not isinstance(receipt, ToolReceipt)

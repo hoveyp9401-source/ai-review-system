@@ -4,11 +4,13 @@ import asyncio
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import json
+import os
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
+from app.agent2.tool_calling import canary_service
 from app.agent2.tool_calling.canary_config import (
     CANARY_MODEL_NAME,
     canary_prompt_sha256,
@@ -30,6 +32,11 @@ from app.models import DailyReport, User, WebhookEvent
 PANG_USER_ID = "222b1eeb-4faa-40cf-a193-e1892c9377b0"
 SOURCE_PREFIX = f"overnight-v22-rollback-{uuid4()}"
 OBSERVATION_KEY = "_agent2_turn_observation_v1"
+SELECTED_CASE_NAMES = frozenset(
+    value.strip()
+    for value in os.getenv("SMOKE_CASE_NAMES", "").split(",")
+    if value.strip()
+)
 
 
 UNDATED_CASES = (
@@ -111,6 +118,65 @@ CONFLICT_CASES = (
 )
 
 
+def _selected(case_name: str) -> bool:
+    return not SELECTED_CASE_NAMES or case_name in SELECTED_CASE_NAMES
+
+
+def _safe_message_summary(raw_message: object) -> dict[str, object]:
+    if not isinstance(raw_message, dict):
+        return {"kind": "invalid_message"}
+    tool_calls = raw_message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        calls: list[dict[str, object]] = []
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function")
+            if not isinstance(function, dict):
+                continue
+            raw_arguments = str(function.get("arguments") or "")
+            try:
+                arguments: object = json.loads(raw_arguments)
+            except (json.JSONDecodeError, TypeError):
+                arguments = {"unparsed_preview": raw_arguments[:2000]}
+            calls.append(
+                {
+                    "name": str(function.get("name") or ""),
+                    "arguments": arguments,
+                }
+            )
+        return {"kind": "tool_calls", "calls": calls}
+    content = raw_message.get("content")
+    return {
+        "kind": "terminal_text" if isinstance(content, str) else "no_content",
+        "content_preview": content[:2000] if isinstance(content, str) else None,
+    }
+
+
+def _safe_model_audit(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {"kind": "invalid_audit"}
+    turns = payload.get("model_turns")
+    return {
+        "status": payload.get("status"),
+        "error_type": payload.get("error_type"),
+        "error_message": payload.get("error_message"),
+        "failure_reason": payload.get("failure_reason"),
+        "turns": [
+            {
+                "iteration": turn.get("iteration"),
+                "message": _safe_message_summary(turn.get("raw_assistant_message")),
+                "response_metadata": turn.get("response_metadata"),
+                "tool_results": turn.get("tool_results"),
+            }
+            for turn in turns
+            if isinstance(turn, dict)
+        ]
+        if isinstance(turns, list)
+        else [],
+    }
+
+
 async def _user_and_control(session):
     user = await session.get(User, PANG_USER_ID)
     if user is None:
@@ -144,21 +210,39 @@ async def _turn(
     now: datetime,
     accepted_business_results: frozenset[str] = frozenset({"success"}),
 ):
-    outcome = await process_tool_call_canary_ingress(
-        session,
-        user=user,
-        dingtalk_user_id=user.dingtalk_user_id,
-        user_text=text,
-        source_channel="overnight_v22_rollback_smoke",
-        conversation_id=conversation_id,
-        source_message_id=source_message_id,
-        settings=settings,
-        llm_client=llm_client,
-        now=now,
-    )
-    observation = build_canary_persisted_response_payload(outcome)[
-        OBSERVATION_KEY
-    ]
+    model_audits: list[dict[str, object]] = []
+    original_audit_recorder = canary_service._record_model_audit_safely
+
+    def capture_model_audit(payload):
+        model_audits.append(_safe_model_audit(payload))
+        original_audit_recorder(payload)
+
+    canary_service._record_model_audit_safely = capture_model_audit
+    try:
+        outcome = await process_tool_call_canary_ingress(
+            session,
+            user=user,
+            dingtalk_user_id=user.dingtalk_user_id,
+            user_text=text,
+            source_channel="overnight_v22_rollback_smoke",
+            conversation_id=conversation_id,
+            source_message_id=source_message_id,
+            settings=settings,
+            llm_client=llm_client,
+            now=now,
+        )
+    except Exception as exc:
+        raise AssertionError(
+            {
+                "source_message_id": source_message_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "model_audits": model_audits,
+            }
+        ) from exc
+    finally:
+        canary_service._record_model_audit_safely = original_audit_recorder
+    observation = build_canary_persisted_response_payload(outcome)[OBSERVATION_KEY]
     assessment = assess_release_turn(
         webhook_status="processed",
         observation=observation,
@@ -183,10 +267,7 @@ async def _receipts(session, source_message_id: str):
         (
             await session.scalars(
                 select(ToolCallCanaryReceipt)
-                .where(
-                    ToolCallCanaryReceipt.source_message_id
-                    == source_message_id
-                )
+                .where(ToolCallCanaryReceipt.source_message_id == source_message_id)
                 .order_by(ToolCallCanaryReceipt.created_at)
             )
         ).all()
@@ -285,7 +366,9 @@ async def _run_write_case(
                 completed=True,
             )
             unexpected_date = (
-                local_date if expected_date != local_date else local_date - timedelta(days=1)
+                local_date
+                if expected_date != local_date
+                else local_date - timedelta(days=1)
             )
             unexpected = await session.scalar(
                 select(DailyReport).where(
@@ -304,7 +387,10 @@ async def _run_write_case(
                 )
             if receipts[0].status != "success" or not receipts[0].changed:
                 raise AssertionError(
-                    {"receipt_status": receipts[0].status, "changed": receipts[0].changed}
+                    {
+                        "receipt_status": receipts[0].status,
+                        "changed": receipts[0].changed,
+                    }
                 )
             return {
                 "name": case_name,
@@ -359,7 +445,10 @@ async def _run_correction_case(
             _assert_report(
                 source,
                 expected_date=source_date,
-                required_fragments={"today_work": fragments[:1], "tomorrow_plan": fragments[1:]},
+                required_fragments={
+                    "today_work": fragments[:1],
+                    "tomorrow_plan": fragments[1:],
+                },
                 completed=False,
             )
             if source.status == "completed":
@@ -464,7 +553,10 @@ async def _run_correction_case(
                     live_target.status,
                     dict(live_target.section_status or {}),
                 )
-                if current_source != source_before or current_target != target_before_snapshot:
+                if (
+                    current_source != source_before
+                    or current_target != target_before_snapshot
+                ):
                     raise AssertionError("target conflict changed a report")
             else:
                 if receipts[0].status != "success" or not receipts[0].changed:
@@ -474,10 +566,15 @@ async def _run_correction_case(
                 _assert_report(
                     source,
                     expected_date=target_date,
-                    required_fragments={"today_work": fragments[:1], "tomorrow_plan": fragments[1:]},
+                    required_fragments={
+                        "today_work": fragments[:1],
+                        "tomorrow_plan": fragments[1:],
+                    },
                     completed=True,
                 )
-                if source_before[0] != list(source.today_work) or source_before[2] != list(source.tomorrow_plan):
+                if source_before[0] != list(source.today_work) or source_before[
+                    2
+                ] != list(source.tomorrow_plan):
                     raise AssertionError("date correction changed report content")
             return {
                 "name": case_name,
@@ -516,9 +613,7 @@ async def _verify_clean() -> dict[str, int]:
         receipt_count = int(
             await session.scalar(
                 select(func.count(ToolCallCanaryReceipt.receipt_id)).where(
-                    ToolCallCanaryReceipt.source_message_id.like(
-                        f"{SOURCE_PREFIX}%"
-                    )
+                    ToolCallCanaryReceipt.source_message_id.like(f"{SOURCE_PREFIX}%")
                 )
             )
             or 0
@@ -526,9 +621,7 @@ async def _verify_clean() -> dict[str, int]:
         webhook_count = int(
             await session.scalar(
                 select(func.count(WebhookEvent.id)).where(
-                    WebhookEvent.external_message_id.like(
-                        f"{SOURCE_PREFIX}%"
-                    )
+                    WebhookEvent.external_message_id.like(f"{SOURCE_PREFIX}%")
                 )
             )
             or 0
@@ -550,14 +643,15 @@ async def main() -> None:
     results: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []
     try:
-        for index, (local_date, text, fragments) in enumerate(
-            UNDATED_CASES, start=1
-        ):
+        for index, (local_date, text, fragments) in enumerate(UNDATED_CASES, start=1):
+            case_name = f"undated_before_nine_{index}"
+            if not _selected(case_name):
+                continue
             try:
                 results.append(
                     await _run_write_case(
                         llm_client=llm_client,
-                        case_name=f"undated_before_nine_{index}",
+                        case_name=case_name,
                         local_date=local_date,
                         text=text,
                         expected_date=local_date - timedelta(days=1),
@@ -566,16 +660,19 @@ async def main() -> None:
                 )
             except Exception as exc:
                 failures.append(
-                    {"name": f"undated_before_nine_{index}", "error": f"{type(exc).__name__}: {exc}"}
+                    {"name": case_name, "error": f"{type(exc).__name__}: {exc}"}
                 )
         for index, (local_date, text, fragments) in enumerate(
             EXPLICIT_TODAY_CASES, start=1
         ):
+            case_name = f"explicit_today_{index}"
+            if not _selected(case_name):
+                continue
             try:
                 results.append(
                     await _run_write_case(
                         llm_client=llm_client,
-                        case_name=f"explicit_today_{index}",
+                        case_name=case_name,
                         local_date=local_date,
                         text=text,
                         expected_date=local_date,
@@ -584,16 +681,19 @@ async def main() -> None:
                 )
             except Exception as exc:
                 failures.append(
-                    {"name": f"explicit_today_{index}", "error": f"{type(exc).__name__}: {exc}"}
+                    {"name": case_name, "error": f"{type(exc).__name__}: {exc}"}
                 )
         for index, (source_date, first_text, correction_text, fragments) in enumerate(
             CORRECTION_CASES, start=1
         ):
+            case_name = f"date_correction_{index}"
+            if not _selected(case_name):
+                continue
             try:
                 results.append(
                     await _run_correction_case(
                         llm_client=llm_client,
-                        case_name=f"date_correction_{index}",
+                        case_name=case_name,
                         source_date=source_date,
                         first_text=first_text,
                         correction_text=correction_text,
@@ -603,16 +703,19 @@ async def main() -> None:
                 )
             except Exception as exc:
                 failures.append(
-                    {"name": f"date_correction_{index}", "error": f"{type(exc).__name__}: {exc}"}
+                    {"name": case_name, "error": f"{type(exc).__name__}: {exc}"}
                 )
         for index, (source_date, first_text, correction_text) in enumerate(
             CONFLICT_CASES, start=1
         ):
+            case_name = f"occupied_target_{index}"
+            if not _selected(case_name):
+                continue
             try:
                 results.append(
                     await _run_correction_case(
                         llm_client=llm_client,
-                        case_name=f"occupied_target_{index}",
+                        case_name=case_name,
                         source_date=source_date,
                         first_text=first_text,
                         correction_text=correction_text,
@@ -622,7 +725,7 @@ async def main() -> None:
                 )
             except Exception as exc:
                 failures.append(
-                    {"name": f"occupied_target_{index}", "error": f"{type(exc).__name__}: {exc}"}
+                    {"name": case_name, "error": f"{type(exc).__name__}: {exc}"}
                 )
     finally:
         await llm_client.close()
