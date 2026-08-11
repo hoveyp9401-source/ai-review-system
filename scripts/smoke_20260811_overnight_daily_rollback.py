@@ -289,8 +289,32 @@ def _compact_model_flow(
                 ] if isinstance(calls, list) else []
             else:
                 row["content_preview"] = message.get("content_preview")
+            tool_results = turn.get("tool_results")
+            if isinstance(tool_results, (list, tuple)) and tool_results:
+                row["tool_results"] = tool_results
             flow.append(row)
     return flow
+
+
+def _compact_result_receipts(
+    model_audits: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for audit in model_audits:
+        receipts = audit.get("result_receipts")
+        runtime_results = audit.get("runtime_results")
+        if isinstance(receipts, list) or isinstance(runtime_results, list):
+            results.append(
+                {
+                    "receipts": receipts if isinstance(receipts, list) else [],
+                    "runtime_results": (
+                        runtime_results
+                        if isinstance(runtime_results, list)
+                        else []
+                    ),
+                }
+            )
+    return results
 
 
 async def _user_and_control(session):
@@ -340,6 +364,27 @@ async def _turn(
         model_audits.append(
             {
                 "status": "success",
+                "result_receipts": [
+                    {
+                        "tool_name": receipt.tool_name,
+                        "status": receipt.status.value,
+                        "changed": receipt.changed,
+                        "error_code": receipt.error_code,
+                    }
+                    for receipt in result.receipts
+                ],
+                "runtime_results": [
+                    {
+                        "status": runtime_result.status,
+                        "transaction_pending": runtime_result.transaction_pending,
+                        "committed_to_outer_transaction": (
+                            runtime_result.committed_to_outer_transaction
+                        ),
+                        "rolled_back": runtime_result.rolled_back,
+                        "receipt_write_count": runtime_result.receipt_write_count,
+                    }
+                    for runtime_result in result.runtime_results
+                ],
                 "turns": [
                     {
                         "iteration": turn.iteration,
@@ -697,9 +742,30 @@ async def _run_correction_case(
             await session.flush()
             receipts = await _receipts(session, correction_source)
             if [row.tool_name for row in receipts] != ["correct_daily_report_date"]:
+                conversation_receipts = list(
+                    (
+                        await session.scalars(
+                            select(ToolCallCanaryReceipt).where(
+                                ToolCallCanaryReceipt.conversation_id
+                                == conversation_id
+                            )
+                        )
+                    ).all()
+                )
                 raise AssertionError(
                     {
                         "unexpected_tools": [row.tool_name for row in receipts],
+                        "conversation_receipts": [
+                            {
+                                "source_message_id": row.source_message_id,
+                                "tool_name": row.tool_name,
+                                "status": row.status,
+                            }
+                            for row in conversation_receipts
+                        ],
+                        "result_receipts": _compact_result_receipts(
+                            correction_audits
+                        ),
                         "model_flow": _compact_model_flow(correction_audits),
                     }
                 )
@@ -755,7 +821,7 @@ async def _run_correction_case(
                     2
                 ] != list(source.tomorrow_plan):
                     raise AssertionError("date correction changed report content")
-            return {
+            result = {
                 "name": case_name,
                 "status": "pass",
                 "source_date": source_date.isoformat(),
@@ -764,6 +830,11 @@ async def _run_correction_case(
                 "model_calls": first.model_call_count + correction.model_call_count,
                 "tools": [row.tool_name for row in receipts],
             }
+            if INCLUDE_MODEL_AUDIT:
+                result["correction_runtime"] = _compact_result_receipts(
+                    correction_audits
+                )
+            return result
         finally:
             await session.rollback()
 
