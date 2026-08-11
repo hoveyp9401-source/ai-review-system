@@ -230,8 +230,12 @@ def _compact_daily_date_votes(
                             "kind": "semantic_review",
                             "binding": decision.get("binding"),
                             "evidence": decision.get("evidence"),
-                            "date_expression": decision.get("date_expression"),
-                            "proposed_date": decision.get("proposed_date"),
+                            "observed_time_expression": decision.get(
+                                "observed_time_expression"
+                            ),
+                            "proposed_report_date": decision.get(
+                                "proposed_report_date"
+                            ),
                         }
                     )
     return votes

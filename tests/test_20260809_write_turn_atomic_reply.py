@@ -397,8 +397,8 @@ def _date_review_completion(
     call_id: str,
     binding: str,
     evidence_quote: str | None = None,
-    date_expression: str | None = None,
-    proposed_date: str | None = None,
+    observed_time_expression: str | None = None,
+    proposed_report_date: str | None = None,
 ) -> _CompletionResponse:
     decision = {
         "sequence": 1,
@@ -411,8 +411,8 @@ def _date_review_completion(
             if evidence_quote is not None
             else None
         ),
-        "date_expression": date_expression,
-        "proposed_date": proposed_date,
+        "observed_time_expression": observed_time_expression,
+        "proposed_report_date": proposed_report_date,
     }
     return _CompletionResponse(
         message={
@@ -726,15 +726,15 @@ async def test_before_nine_date_disagreement_requires_matching_independent_revie
         call_id="date-review-1",
         binding="explicit_report_date",
         evidence_quote="This report explicitly belongs to today",
-        date_expression="today",
-        proposed_date="2026-08-11",
+        observed_time_expression="today",
+        proposed_report_date="2026-08-11",
     )
     confirmation_review = _date_review_completion(
         call_id="date-review-2",
         binding="explicit_report_date",
         evidence_quote="This report explicitly belongs to today",
-        date_expression="today",
-        proposed_date="2026-08-11",
+        observed_time_expression="today",
+        proposed_report_date="2026-08-11",
     )
     completions = iter(
         (
@@ -918,13 +918,14 @@ async def test_disagreeing_date_reviews_ask_naturally_without_writing(
                 call_id="date-review-1",
                 binding="explicit_report_date",
                 evidence_quote="This report belongs to today",
-                date_expression="today",
-                proposed_date="2026-08-11",
+                observed_time_expression="today",
+                proposed_report_date="2026-08-11",
             ),
             _date_review_completion(
                 call_id="date-review-2",
                 binding="work_event_time_only",
                 evidence_quote="today",
+                observed_time_expression="today",
             ),
             _CompletionResponse(
                 message={
@@ -1002,8 +1003,8 @@ async def test_date_review_rejects_non_source_evidence_before_execution(
                 call_id="date-review-1",
                 binding="explicit_report_date",
                 evidence_quote="invented evidence",
-                date_expression="today",
-                proposed_date="2026-08-11",
+                observed_time_expression="today",
+                proposed_report_date="2026-08-11",
             ),
         )
     )

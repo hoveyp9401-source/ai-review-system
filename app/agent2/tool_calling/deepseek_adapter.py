@@ -1837,8 +1837,8 @@ def _daily_write_date_review_needs_confirmation(
     if original_selection == "server_default":
         return original_proposed_date != server_default_date.isoformat()
     return (
-        decision.proposed_date is None
-        or original_proposed_date != decision.proposed_date.isoformat()
+        decision.proposed_report_date is None
+        or original_proposed_date != decision.proposed_report_date.isoformat()
     )
 
 
@@ -1852,8 +1852,8 @@ def _apply_reviewed_daily_write_date(
     if date_selection is None:
         raise ValueError("an ambiguous report date cannot be executed")
     if date_selection == "user_explicit":
-        date_expression = decision.date_expression
-        proposed_date = decision.proposed_date
+        date_expression = decision.observed_time_expression
+        proposed_date = decision.proposed_report_date
     else:
         date_expression = server_default_date.isoformat()
         proposed_date = server_default_date

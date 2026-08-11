@@ -25,28 +25,38 @@ class DailyReportDateDecision(StrictContract):
         "ambiguous",
     ]
     evidence: DailyReportDateEvidence | None = None
-    date_expression: DateExpression | None = None
-    proposed_date: date | None = None
+    observed_time_expression: DateExpression | None = None
+    proposed_report_date: date | None = None
 
     @model_validator(mode="after")
     def validate_binding_fields(self) -> DailyReportDateDecision:
         if self.binding == "explicit_report_date":
             if (
                 self.evidence is None
-                or self.date_expression is None
-                or self.proposed_date is None
+                or self.observed_time_expression is None
+                or self.proposed_report_date is None
             ):
                 raise ValueError(
                     "an explicit report date requires exact evidence "
                     "and resolved date fields"
                 )
             return self
-        if self.date_expression is not None or self.proposed_date is not None:
+        if self.proposed_report_date is not None:
             raise ValueError(
-                "only an explicit report date may carry resolved date fields"
+                "only an explicit report date may carry a resolved report date"
             )
-        if self.binding == "work_event_time_only" and self.evidence is None:
-            raise ValueError("a work-event time reference requires exact evidence")
+        if self.binding == "work_event_time_only" and (
+            self.evidence is None or self.observed_time_expression is None
+        ):
+            raise ValueError(
+                "a work-event time reference requires an expression and exact evidence"
+            )
+        if self.binding == "no_report_date_reference" and (
+            self.evidence is not None or self.observed_time_expression is not None
+        ):
+            raise ValueError(
+                "a no-reference decision cannot carry time evidence or an expression"
+            )
         return self
 
 
@@ -103,8 +113,10 @@ def daily_report_date_review_messages(
                 "or is genuinely ambiguous. Do not treat tense or a report section "
                 "label as a calendar-date instruction. For any explicit report "
                 "date or work-event time reference, copy the smallest sufficient "
-                "exact quote from the current user messages. Resolve date fields "
-                "only for explicit_report_date. If the relationship cannot be "
+                "exact quote from the current user messages. Copy an observed "
+                "time expression for explicit_report_date and work_event_time_only, "
+                "but resolve proposed_report_date only for explicit_report_date. "
+                "If the relationship cannot be "
                 "determined reliably, choose ambiguous. Return exactly one internal "
                 "review tool call and one decision per draft in sequence order. "
                 "This is semantic model judgment, never phrase, keyword, or "
@@ -177,7 +189,7 @@ def decisions_agree(
     if first_selection != second_selection:
         return False
     if first_selection == "user_explicit":
-        return first.proposed_date == second.proposed_date
+        return first.proposed_report_date == second.proposed_report_date
     return True
 
 
