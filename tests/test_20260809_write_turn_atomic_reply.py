@@ -37,10 +37,11 @@ from app.agent2.tool_calling.write_reply import (
 def _context(
     *,
     allowed_tool_names: frozenset[str] = frozenset({"add_daily_items"}),
+    now: datetime | None = None,
 ) -> TrustedContext:
     return TrustedContext(
         namespace=CANARY_STATE_NAMESPACE,
-        now=datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        now=(now or datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))),
         principal=TrustedPrincipal(
             tenant_id="test-tenant",
             user_id=UUID("10000000-0000-0000-0000-000000000001"),
@@ -333,11 +334,14 @@ def _submit_tool_call_completion(
     *,
     call_id: str,
     reviewed: bool,
+    date_selection: str = "server_default",
+    date_expression: str = "today",
+    proposed_date: str = "2026-08-09",
 ) -> _CompletionResponse:
     arguments = {
-        "date_selection": "server_default",
-        "date_expression": "今天",
-        "proposed_date": "2026-08-09",
+        "date_selection": date_selection,
+        "date_expression": date_expression,
+        "proposed_date": proposed_date,
         "items": [
             {
                 "field": "today_work",
@@ -387,8 +391,11 @@ def _submit_tool_call_completion(
     )
 
 
-def _mixed_submit_and_query_completion() -> _CompletionResponse:
-    submit = _submit_tool_call_completion(call_id="draft", reviewed=False)
+def _mixed_submit_and_query_completion(
+    *,
+    reviewed: bool = False,
+) -> _CompletionResponse:
+    submit = _submit_tool_call_completion(call_id="draft", reviewed=reviewed)
     return _CompletionResponse(
         message={
             "role": "assistant",
@@ -654,6 +661,179 @@ async def test_incomplete_first_review_gets_one_structural_model_retry(
     )
     assert "previous_review_structural_feedback" in retry_payload
     assert '"missing_sections":["problems"]' in retry_payload
+
+
+@pytest.mark.asyncio
+async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    first_review = _submit_tool_call_completion(
+        call_id="date-review-1",
+        reviewed=True,
+        date_selection="user_explicit",
+        date_expression="today",
+        proposed_date="2026-08-11",
+    )
+    first_review_arguments = json.loads(
+        first_review.message["tool_calls"][0]["function"]["arguments"]
+    )
+    first_review_arguments["items"][0]["content"] = "reviewer must not change this"
+    first_review.message["tool_calls"][0]["function"]["arguments"] = json.dumps(
+        first_review_arguments
+    )
+    tiebreak_review = _submit_tool_call_completion(
+        call_id="date-review-2",
+        reviewed=True,
+        date_selection="user_explicit",
+        date_expression="today",
+        proposed_date="2026-08-11",
+    )
+    completions = iter(
+        (
+            _submit_tool_call_completion(
+                call_id="draft",
+                reviewed=True,
+                date_selection="server_default",
+                date_expression="default",
+                proposed_date="2026-08-10",
+            ),
+            first_review,
+            tiebreak_review,
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "The report was submitted for the reviewed date.",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        }
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="This report explicitly belongs to today; submit it.",
+        context=_context(
+            now=datetime(
+                2026,
+                8,
+                11,
+                8,
+                20,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            )
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 4
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.calls[0].tool_call_id == "date-review-2"
+    assert runtime.calls[0].arguments["date_selection"] == "user_explicit"
+    assert runtime.calls[0].arguments["proposed_date"] == "2026-08-11"
+    assert runtime.calls[0].arguments["items"][0]["content"] == "核对付款节点"
+    assert (
+        result.model_turns[1].response_metadata[
+            "daily_write_date_semantic_review_attempt"
+        ]
+        == 1
+    )
+    assert (
+        result.model_turns[2].response_metadata[
+            "daily_write_date_semantic_review_attempt"
+        ]
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_before_nine_date_review_preserves_unrelated_query_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _MixedDeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _mixed_submit_and_query_completion(reviewed=True),
+            _submit_tool_call_completion(
+                call_id="date-reviewed",
+                reviewed=True,
+                date_selection="server_default",
+                date_expression="default",
+                proposed_date="2026-08-10",
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "The report was submitted and the report was read.",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        }
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="Submit the undated report and show my current report.",
+        context=_context(
+            allowed_tool_names=frozenset({"add_daily_items", "query_today_report"}),
+            now=datetime(
+                2026,
+                8,
+                11,
+                8,
+                20,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 3
+    assert [call.tool_name for call in runtime.calls] == [
+        "query_today_report",
+        "add_daily_items",
+    ]
+    assert runtime.calls[0].tool_call_id == "original-query"
+    assert runtime.calls[1].tool_call_id == "date-reviewed"
 
 
 def _malformed_tool_call_completion() -> _CompletionResponse:
