@@ -196,6 +196,13 @@ class ShadowCallBinder:
         source_report: TrustedReportSnapshot | None = None
         resolved_source_date: date | None = None
         date_facts: dict[str, Any] = {}
+        # Agent2 owns the meaning of the current correction message.  The
+        # server still binds both proposed dates to exact owned reports and
+        # enforces target-conflict and transaction safeguards below.
+        model_resolved_correction_dates = (
+            call.tool_name == "correct_daily_report_date"
+            and self._current_turn_source is not None
+        )
         if (
             call.tool_name == "add_daily_items"
             and arguments.get("date_selection") == "server_default"
@@ -251,11 +258,18 @@ class ShadowCallBinder:
             proposed_target_date = date.fromisoformat(
                 str(arguments["proposed_target_date"])
             )
-            target_resolution = self._date_resolver.resolve(
-                expression=str(arguments["target_date_expression"]),
-                proposed_date=proposed_target_date,
-                now=self._context.now,
-                timezone=self._context.principal.timezone,
+            target_resolution = (
+                DateResolution(
+                    proposed_target_date,
+                    candidate_matches=True,
+                )
+                if model_resolved_correction_dates
+                else self._date_resolver.resolve(
+                    expression=str(arguments["target_date_expression"]),
+                    proposed_date=proposed_target_date,
+                    now=self._context.now,
+                    timezone=self._context.principal.timezone,
+                )
             )
             if target_resolution.resolved_date is None:
                 return None, failure_receipt(
@@ -284,12 +298,21 @@ class ShadowCallBinder:
                 }
             )
         if "source_date_expression" in arguments:
-            proposed_source_date = date.fromisoformat(str(arguments["proposed_source_date"]))
-            source_resolution = self._date_resolver.resolve(
-                expression=str(arguments["source_date_expression"]),
-                proposed_date=proposed_source_date,
-                now=self._context.now,
-                timezone=self._context.principal.timezone,
+            proposed_source_date = date.fromisoformat(
+                str(arguments["proposed_source_date"])
+            )
+            source_resolution = (
+                DateResolution(
+                    proposed_source_date,
+                    candidate_matches=True,
+                )
+                if model_resolved_correction_dates
+                else self._date_resolver.resolve(
+                    expression=str(arguments["source_date_expression"]),
+                    proposed_date=proposed_source_date,
+                    now=self._context.now,
+                    timezone=self._context.principal.timezone,
+                )
             )
             if source_resolution.resolved_date is None:
                 return None, failure_receipt(

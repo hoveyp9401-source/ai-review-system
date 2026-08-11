@@ -127,6 +127,14 @@ class _DateResolver:
         return DateResolution(proposed_date, candidate_matches=True)
 
 
+class _DateResolverThatMustNotRun:
+    def resolve(self, *, expression, proposed_date, now, timezone):
+        del expression, proposed_date, now, timezone
+        raise AssertionError(
+            "grounded Agent2 date correction must not be reinterpreted by text rules"
+        )
+
+
 def _ding_source_report() -> TrustedReportSnapshot:
     report_id = UUID("11111111-1111-1111-1111-111111111111")
     return TrustedReportSnapshot(
@@ -195,6 +203,62 @@ async def test_cross_midnight_correction_binds_source_and_empty_target() -> None
         _DateResolver(),
         None,
         execution_mode=ExecutionMode.SHADOW_PROPOSAL,
+    ).bind(call)
+
+    assert failure is None
+    assert bound is not None
+    assert bound.source_report == source
+    assert bound.report is None
+    assert bound.date_facts == {
+        "resolved_source_date": "2026-08-11",
+        "source_date_candidate_matches": True,
+        "resolved_target_date": "2026-08-10",
+        "target_date_candidate_matches": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_grounded_date_correction_uses_agent2_dates_without_text_reinterpretation() -> None:
+    source = _ding_source_report()
+    current_message = "刚才那份日报实际是昨天的，问题暂无，请提交。"
+    context = TrustedContext(
+        now=datetime(2026, 8, 11, 0, 59, tzinfo=UTC),
+        principal=TrustedPrincipal(
+            tenant_id="tenant",
+            user_id=source.owner_user_id,
+            conversation_id="ding-conversation",
+            source_message_id="ding-grounded-correction",
+            timezone="Asia/Shanghai",
+        ),
+        today_report=source,
+        allowed_tool_names=frozenset({"correct_daily_report_date"}),
+        gate_decisions={"correct_daily_report_date": True},
+    )
+    call = NativeToolCall(
+        tool_call_id="correct-grounded",
+        tool_name="correct_daily_report_date",
+        arguments={
+            "source_date_expression": "刚才那份日报",
+            "proposed_source_date": "2026-08-11",
+            "target_date_expression": "昨天",
+            "proposed_target_date": "2026-08-10",
+            "acknowledged_empty_fields": ["problems"],
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
+            "submit_after_correction": True,
+        },
+    )
+
+    bound, failure = await ShadowCallBinder(
+        context,
+        _DateResolverThatMustNotRun(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource((current_message,)),
     ).bind(call)
 
     assert failure is None
