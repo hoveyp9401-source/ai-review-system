@@ -63,6 +63,26 @@ Daily-briefing fact boundary:
 """.strip()
 
 
+_DAILY_WRITE_DATE_POLICY = """
+Daily-report write date rules:
+- For `add_daily_items`, decide whether the current user_message explicitly
+  identifies the report's calendar date. If it does, set
+  `date_selection=user_explicit` and preserve that explicit date. Otherwise
+  set `date_selection=server_default`; do not infer an explicit date merely
+  from the work item's tense or section meaning.
+- The server owns the default: before 09:00 in the authenticated user's
+  timezone it is the previous calendar day; from 09:00 onward it is the
+  current calendar day. Never override the server-resolved date with your
+  proposed date.
+- If the user-supplied date is genuinely ambiguous, ask naturally instead of
+  calling a write tool.
+- When the same current message both supplies report content (including an
+  explicit empty section) and explicitly asks to submit, use one
+  `add_daily_items` call with `submit_after_write=true`. Do not predict an
+  intermediate report version or pair it with `confirm_report`; the server
+  performs the whole write atomically.
+""".strip()
+
 _REPORT_INSIGHT_TOOL_POLICY = """
 Daily-report read-tool boundary:
 - `query_managed_daily_reports` is only for one exact calendar date: one
@@ -222,6 +242,7 @@ def canary_system_prompt() -> str:
         f"{SYSTEM_PROMPT.rstrip()}\n\n"
         f"{_CONVERSATION_CONTINUITY_POLICY}\n\n"
         f"{_DAILY_BRIEFING_FACT_POLICY}\n\n"
+        f"{_DAILY_WRITE_DATE_POLICY}\n\n"
         f"{_REPORT_INSIGHT_TOOL_POLICY}\n\n"
         f"{_MANAGED_DAILY_REPLY_POLICY}\n\n"
         f"{_DEFERRED_ACTION_POLICY}\n\n"

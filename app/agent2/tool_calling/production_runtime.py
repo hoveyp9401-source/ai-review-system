@@ -734,6 +734,10 @@ def _prepare_call(
 ) -> _PreparedCall:
     arguments_hash = _sha256(bound.arguments)
     principal = context.principal
+    is_date_correction = (
+        bound.call.tool_name == "correct_daily_report_date"
+    )
+    relocation_report = bound.source_report or bound.report
     base = {
         "tenant_id": principal.tenant_id,
         "user_id": str(principal.user_id),
@@ -743,22 +747,40 @@ def _prepare_call(
         "arguments": bound.arguments,
         "server_binding": {
             "report_id": (
-                str(bound.report.report_id)
-                if bound.report is not None
-                else None
+                str(relocation_report.report_id)
+                if is_date_correction and relocation_report is not None
+                else (
+                    str(bound.report.report_id)
+                    if bound.report is not None
+                    else None
+                )
             ),
             "report_version": (
-                bound.report.version if bound.report is not None else None
+                None
+                if is_date_correction
+                else (
+                    bound.report.version
+                    if bound.report is not None
+                    else None
+                )
             ),
             "source_report_id": (
-                str(bound.source_report.report_id)
-                if bound.source_report is not None
-                else None
+                str(relocation_report.report_id)
+                if is_date_correction and relocation_report is not None
+                else (
+                    str(bound.source_report.report_id)
+                    if bound.source_report is not None
+                    else None
+                )
             ),
             "source_report_version": (
-                bound.source_report.version
-                if bound.source_report is not None
-                else None
+                None
+                if is_date_correction
+                else (
+                    bound.source_report.version
+                    if bound.source_report is not None
+                    else None
+                )
             ),
             "date_facts": bound.date_facts,
         },

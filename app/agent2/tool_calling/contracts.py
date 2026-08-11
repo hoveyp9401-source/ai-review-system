@@ -313,6 +313,9 @@ class DailyEmptyFieldEvidence(StrictContract):
 
 
 class AddDailyItemsArgs(StrictContract):
+    date_selection: Literal["server_default", "user_explicit"] = (
+        "server_default"
+    )
     date_expression: DateExpression
     proposed_date: date
     items: tuple[DailyItemInput, ...] = Field(default=(), max_length=30)
@@ -324,14 +327,19 @@ class AddDailyItemsArgs(StrictContract):
         default=(),
         max_length=3,
     )
+    submit_after_write: bool = False
 
     @model_validator(mode="after")
     def require_content_or_explicit_empty_acknowledgement(
         self,
     ) -> "AddDailyItemsArgs":
-        if not self.items and not self.acknowledged_empty_fields:
+        if (
+            not self.items
+            and not self.acknowledged_empty_fields
+            and not self.submit_after_write
+        ):
             raise ValueError(
-                "at least one report item or explicitly empty field is required"
+                "report content, an explicitly empty field, or submission is required"
             )
         if len(self.acknowledged_empty_fields) != len(
             set(self.acknowledged_empty_fields)
@@ -389,6 +397,32 @@ class MoveDailyItemsArgs(_VersionedItemTarget):
 class CopyPreviousToTodayArgs(StrictContract):
     source_date_expression: DateExpression
     proposed_source_date: date
+
+
+class CorrectDailyReportDateArgs(StrictContract):
+    """One model-decided correction, executed atomically by the server."""
+
+    source_date_expression: DateExpression
+    proposed_source_date: date
+    target_date_expression: DateExpression
+    proposed_target_date: date
+    acknowledged_empty_fields: tuple[ReportField, ...] = Field(
+        default=(),
+        max_length=3,
+    )
+    submit_after_correction: bool = False
+
+    @model_validator(mode="after")
+    def require_distinct_dates_and_unique_empty_fields(
+        self,
+    ) -> "CorrectDailyReportDateArgs":
+        if self.proposed_source_date == self.proposed_target_date:
+            raise ValueError("source and target report dates must differ")
+        if len(self.acknowledged_empty_fields) != len(
+            set(self.acknowledged_empty_fields)
+        ):
+            raise ValueError("explicitly empty fields must be unique")
+        return self
 
 
 class CompletePreviousPlanArgs(_VersionedItemTarget):

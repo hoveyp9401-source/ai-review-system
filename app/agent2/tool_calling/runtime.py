@@ -371,6 +371,21 @@ def _call_target(
         if not isinstance(resolved_date, str) or not resolved_date:
             return "*"
         return _daily_report_key(context, resolved_date)
+    if policy == "source_and_target_reports":
+        if bound is None:
+            return "*"
+        source_date = bound.date_facts.get("resolved_source_date")
+        target_date = bound.date_facts.get("resolved_target_date")
+        if not all(
+            isinstance(value, str) and value
+            for value in (source_date, target_date)
+        ):
+            return "*"
+        principal = context.principal
+        return (
+            f"daily_report_relocation:{principal.tenant_id}:"
+            f"{principal.user_id}:{source_date}:{target_date}"
+        )
     if policy == "bound_report":
         raw_report_id = call.arguments.get("report_id")
         if raw_report_id is None:

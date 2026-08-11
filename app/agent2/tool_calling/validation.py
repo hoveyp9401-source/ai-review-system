@@ -19,6 +19,7 @@ from app.agent2.tool_calling.registry import (
     UnknownToolError,
     validate_tool_arguments,
 )
+from app.agent2.tool_calling.reporting_date import default_daily_write_date
 
 
 @dataclass(frozen=True)
@@ -195,7 +196,31 @@ class ShadowCallBinder:
         source_report: TrustedReportSnapshot | None = None
         resolved_source_date: date | None = None
         date_facts: dict[str, Any] = {}
-        if "date_expression" in arguments:
+        if (
+            call.tool_name == "add_daily_items"
+            and arguments.get("date_selection") == "server_default"
+        ):
+            resolved_default = default_daily_write_date(
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+            try:
+                report = await self.report_by_date(resolved_default)
+            except _UntrustedReadSnapshotError:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_READ_RESOURCE",
+                )
+            date_facts = {
+                "resolved_date": resolved_default.isoformat(),
+                "date_candidate_matches": (
+                    str(arguments.get("proposed_date") or "")
+                    == resolved_default.isoformat()
+                ),
+                "date_resolution_basis": "server_default",
+            }
+        elif "date_expression" in arguments:
             proposed_date = date.fromisoformat(str(arguments["proposed_date"]))
             resolution = self._date_resolver.resolve(
                 expression=str(arguments["date_expression"]),
@@ -220,7 +245,44 @@ class ShadowCallBinder:
             date_facts = {
                 "resolved_date": resolution.resolved_date.isoformat(),
                 "date_candidate_matches": resolution.candidate_matches,
+                "date_resolution_basis": "user_explicit",
             }
+        if "target_date_expression" in arguments:
+            proposed_target_date = date.fromisoformat(
+                str(arguments["proposed_target_date"])
+            )
+            target_resolution = self._date_resolver.resolve(
+                expression=str(arguments["target_date_expression"]),
+                proposed_date=proposed_target_date,
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+            if target_resolution.resolved_date is None:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.CLARIFICATION_REQUIRED,
+                    target_resolution.error_code or "DATE_RESOLUTION_FAILED",
+                )
+            try:
+                report = await self.report_by_date(
+                    target_resolution.resolved_date
+                )
+            except _UntrustedReadSnapshotError:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_READ_RESOURCE",
+                )
+            date_facts.update(
+                {
+                    "resolved_target_date": (
+                        target_resolution.resolved_date.isoformat()
+                    ),
+                    "target_date_candidate_matches": (
+                        target_resolution.candidate_matches
+                    ),
+                }
+            )
         if "source_date_expression" in arguments:
             proposed_source_date = date.fromisoformat(str(arguments["proposed_source_date"]))
             source_resolution = self._date_resolver.resolve(
@@ -244,10 +306,16 @@ class ShadowCallBinder:
                     ReceiptStatus.BLOCKED,
                     "UNTRUSTED_READ_RESOURCE",
                 )
-            date_facts = {
-                "resolved_source_date": source_resolution.resolved_date.isoformat(),
-                "source_date_candidate_matches": source_resolution.candidate_matches,
-            }
+            date_facts.update(
+                {
+                    "resolved_source_date": (
+                        source_resolution.resolved_date.isoformat()
+                    ),
+                    "source_date_candidate_matches": (
+                        source_resolution.candidate_matches
+                    ),
+                }
+            )
             if definition.object_binding_policy in {
                 "server_resolved_source_and_today_owner_reports",
                 "trusted_previous_report_version_and_today_owner_report",
@@ -270,6 +338,30 @@ class ShadowCallBinder:
                 )
         if definition.object_binding_policy == "server_today_owner_report":
             report = self._context.today_report
+        if (
+            definition.object_binding_policy
+            == "trusted_source_report_and_server_empty_target"
+            and source_report is None
+            and report is not None
+            and report.report_date
+            == date.fromisoformat(
+                str(date_facts.get("resolved_target_date") or "")
+            )
+        ):
+            # A provider replay can arrive after the first transaction moved
+            # the same report. Bind the stable report at the target so the
+            # production receipt can win idempotently before any new write.
+            source_report = report
+        if (
+            definition.object_binding_policy
+            == "trusted_source_report_and_server_empty_target"
+            and source_report is None
+        ):
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.CLARIFICATION_REQUIRED,
+                "SOURCE_REPORT_NOT_FOUND",
+            )
 
         previous_binding = definition.object_binding_policy in {
             "trusted_previous_report_version_and_plan_item_ids",
@@ -439,7 +531,9 @@ def _locked_historical_report_date(
         return None
     target_date = report.report_date if report is not None else None
     if target_date is None:
-        resolved = date_facts.get("resolved_date")
+        resolved = date_facts.get("resolved_date") or date_facts.get(
+            "resolved_target_date"
+        )
         if isinstance(resolved, str):
             try:
                 target_date = date.fromisoformat(resolved)

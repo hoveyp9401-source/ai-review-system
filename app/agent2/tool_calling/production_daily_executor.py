@@ -19,6 +19,7 @@ from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
     CompletePreviousPlanArgs,
     ConfirmReportArgs,
+    CorrectDailyReportDateArgs,
     CopyPreviousToTodayArgs,
     DeleteDailyItemsArgs,
     EditDailyItemsArgs,
@@ -43,6 +44,9 @@ from app.agent2.report_insights import (
     SqlReportInsightRepository,
 )
 from app.agent2.tool_calling.idempotency import build_write_idempotency_key
+from app.agent2.tool_calling.daily_report_date_correction import (
+    SqlDailyReportDateCorrection,
+)
 from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
 from app.agent2.tool_calling.production_store import (
     ProductionContextStore,
@@ -132,6 +136,7 @@ class ProductionDailyExecutor:
             tenant_id=context.principal.tenant_id,
             settings=settings,
         )
+        self._date_correction = SqlDailyReportDateCorrection(session)
 
     async def query_today_report(
         self,
@@ -507,6 +512,17 @@ class ProductionDailyExecutor:
                 )
             )
             next_version += 1
+        if arguments.submit_after_write and typed_before.status != "completed":
+            commands.append(
+                self._command(
+                    request,
+                    ordinal=len(commands),
+                    command_type="submit_report",
+                    report_id=typed_before.report_id,
+                    report_version=next_version,
+                    patch={},
+                )
+            )
         typed_receipts = await self._execute_typed(
             report_date,
             commands,
@@ -657,6 +673,92 @@ class ProductionDailyExecutor:
             before=before,
             after=after,
             typed_receipt_ids=typed_receipts,
+        )
+
+    async def correct_daily_report_date(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(
+            request,
+            CorrectDailyReportDateArgs,
+        )
+        bound = self._bound(request)
+        source = self._required_source_report(bound)
+        source_date = self._resolved_date(bound, "resolved_source_date")
+        target_date = self._resolved_date(bound, "resolved_target_date")
+        if source.report_date not in {source_date, target_date}:
+            raise ProductionExecutionError("SOURCE_REPORT_DATE_MISMATCH")
+        before = (
+            source
+            if source.report_date == source_date
+            else await self._snapshot(source_date)
+        )
+        result = await self._date_correction.execute(
+            user=self._user,
+            tenant_id=self._context.principal.tenant_id,
+            source_report_id=source.report_id,
+            expected_version=source.version,
+            source_date=source_date,
+            target_date=target_date,
+            acknowledged_empty_fields=(
+                arguments.acknowledged_empty_fields
+            ),
+            submit_after_correction=(
+                arguments.submit_after_correction
+            ),
+            idempotency_key=self._tool_idempotency_key(request),
+            source_message_id=(
+                self._context.principal.source_message_id
+            ),
+            now=self._context.now,
+        )
+        after = await self._snapshot(target_date)
+        if result.status in {"blocked", "clarification_required"}:
+            return ProductionHandlerOutcome(
+                target_type="daily_report",
+                target_id=str(source.report_id),
+                before_report=before or source,
+                after_report=before or source,
+                idempotency_key=self._tool_idempotency_key(request),
+                safe_user_facts={
+                    "actual_write": False,
+                    "source_report_date": source_date.isoformat(),
+                    "target_report_date": target_date.isoformat(),
+                    "clarification": {
+                        "reason": result.error_code,
+                    },
+                },
+                status_if_unchanged=(
+                    ReceiptStatus.CLARIFICATION_REQUIRED
+                    if result.status == "clarification_required"
+                    else ReceiptStatus.BLOCKED
+                ),
+                before_version=result.before_version,
+                after_version=result.after_version,
+                error_code=result.error_code,
+            )
+        effective = after or source
+        return ProductionHandlerOutcome(
+            target_type="daily_report",
+            target_id=str(effective.report_id),
+            before_report=before,
+            after_report=effective,
+            idempotency_key=self._tool_idempotency_key(request),
+            typed_receipt_ids=result.typed_receipt_ids,
+            safe_user_facts={
+                "actual_write": result.status == "success",
+                "source_report_date": source_date.isoformat(),
+                "target_report_date": target_date.isoformat(),
+                "report_date": target_date.isoformat(),
+                "report_status": effective.status,
+                "acknowledged_empty_fields": sorted(
+                    effective.acknowledged_empty_fields
+                ),
+            },
+            status_if_unchanged=ReceiptStatus.NO_OP,
+            before_version=result.before_version,
+            after_version=result.after_version,
         )
 
     async def complete_previous_plan(

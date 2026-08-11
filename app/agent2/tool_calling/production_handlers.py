@@ -51,6 +51,11 @@ class ProductionDailyExecutorPort(Protocol):
 
     async def copy_previous_to_today(self, request: ProductionHandlerRequest) -> Any: ...
 
+    async def correct_daily_report_date(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> Any: ...
+
     async def complete_previous_plan(self, request: ProductionHandlerRequest) -> Any: ...
 
     async def confirm_report(self, request: ProductionHandlerRequest) -> Any: ...
@@ -140,6 +145,12 @@ async def execute_move_daily_items(request: ProductionHandlerRequest) -> Any:
 
 async def execute_copy_previous_to_today(request: ProductionHandlerRequest) -> Any:
     return await request.executor.copy_previous_to_today(request)
+
+
+async def execute_correct_daily_report_date(
+    request: ProductionHandlerRequest,
+) -> Any:
+    return await request.executor.correct_daily_report_date(request)
 
 
 async def execute_complete_previous_plan(request: ProductionHandlerRequest) -> Any:

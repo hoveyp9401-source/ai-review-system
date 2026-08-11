@@ -71,6 +71,10 @@ def simulate_add(request: ShadowHandlerRequest) -> ToolReceipt:
         if field_name not in existing_empty_fields
     )
     would_change = would_change or bool(proposed_empty_fields)
+    would_change = would_change or bool(
+        request.arguments.get("submit_after_write", False)
+        and (report is None or report.status != "completed")
+    )
     return _receipt(
         request,
         status=ReceiptStatus.SUCCESS if would_change else ReceiptStatus.NO_OP,
@@ -83,6 +87,9 @@ def simulate_add(request: ShadowHandlerRequest) -> ToolReceipt:
             "proposed_items": proposed,
             "proposed_acknowledged_empty_fields": list(
                 proposed_empty_fields
+            ),
+            "submit_after_write": bool(
+                request.arguments.get("submit_after_write", False)
             ),
         },
     )
@@ -144,6 +151,29 @@ def simulate_copy(request: ShadowHandlerRequest) -> ToolReceipt:
             ),
             "report_confirmed": False,
             "confirmation_requires_later_trusted_version": True,
+        },
+    )
+
+
+def simulate_correct_report_date(request: ShadowHandlerRequest) -> ToolReceipt:
+    source = request.source_report
+    target_date = request.date_facts.get("resolved_target_date")
+    if source is None:
+        raise RuntimeError("report date correction requires a trusted source report")
+    return _receipt(
+        request,
+        status=ReceiptStatus.SUCCESS,
+        target=source,
+        would_change=True,
+        facts={
+            "source_report_date": source.report_date.isoformat(),
+            "target_report_date": target_date,
+            "acknowledged_empty_fields": list(
+                request.arguments.get("acknowledged_empty_fields", ())
+            ),
+            "submit_after_correction": bool(
+                request.arguments.get("submit_after_correction", False)
+            ),
         },
     )
 

@@ -14,6 +14,7 @@ from app.agent2.tool_calling.contracts import (
     CompletePreviousPlanArgs,
     ConfirmClearReportArgs,
     ConfirmReportArgs,
+    CorrectDailyReportDateArgs,
     CopyPreviousToTodayArgs,
     DeleteDailyItemsArgs,
     EditDailyItemsArgs,
@@ -37,6 +38,7 @@ from app.agent2.tool_calling.handlers import (
     simulate_confirm,
     simulate_confirm_clear,
     simulate_copy,
+    simulate_correct_report_date,
     simulate_delete,
     simulate_edit,
     simulate_move,
@@ -62,6 +64,7 @@ from app.agent2.tool_calling.sandbox_handlers import (
     execute_confirm_clear_report,
     execute_confirm_report,
     execute_copy_previous_to_today,
+    execute_correct_daily_report_date,
     execute_delete_daily_items,
     execute_edit_daily_items,
     execute_forget_personal_memory,
@@ -84,6 +87,7 @@ TransactionTargetPolicy = Literal[
     "today_report",
     "pending_report",
     "personal_memory",
+    "source_and_target_reports",
 ]
 
 
@@ -466,7 +470,14 @@ TOOL_REGISTRY = MappingProxyType(
             "unambiguously states that a specific report field intentionally has no content, put "
             "that field in acknowledged_empty_fields instead of inventing or storing a textual "
             "item. This semantic choice belongs to the model; never derive it from a keyword list "
-            "or from an omitted field. Every proposed item or empty-field acknowledgement must "
+            "or from an omitted field. Set date_selection=server_default when the current user "
+            "does not explicitly name a calendar date; the server then uses the previous day "
+            "before 09:00 and the current day from 09:00 onward. Set user_explicit only when the "
+            "current user_message itself clearly supplies the date. Set submit_after_write=true "
+            "only when this same current message explicitly asks to submit the resulting report; "
+            "the server will apply content, empty-section acknowledgements and submission in one "
+            "transaction. Do not pair that call with confirm_report. Every proposed item or "
+            "empty-field acknowledgement must "
             "carry source evidence with a one-based current-message index; the server binds that "
             "index to the original current-message text. Every acknowledged empty field must also "
             "have one "
@@ -564,6 +575,30 @@ TOOL_REGISTRY = MappingProxyType(
             sandbox_handler=execute_copy_previous_to_today,
             production_handler=production_handlers.execute_copy_previous_to_today,
             shadow_handler=simulate_copy,
+            conflict="broad_target",
+        ),
+        "correct_daily_report_date": _definition(
+            "correct_daily_report_date",
+            "Correct the date of one exact trusted owned daily report when the current "
+            "user_message explicitly says the just-recorded report belongs to a different "
+            "date. The model supplies only source and target date expressions, any report "
+            "fields the user explicitly stated are empty, and whether the same current "
+            "message explicitly asks to submit. The server binds the report identity and "
+            "version, rejects an occupied or ambiguous target date, and executes relocation, "
+            "empty-section acknowledgement and optional submission as one transaction. Do "
+            "not pair this tool with add_daily_items or confirm_report in the same turn.",
+            CorrectDailyReportDateArgs,
+            "write",
+            "medium",
+            _OWNER_WRITE,
+            "trusted_source_report_and_server_empty_target",
+            "server_source_and_target_expressions",
+            idempotency=_WRITE_KEY,
+            transaction=_ATOMIC,
+            transaction_target="source_and_target_reports",
+            sandbox_handler=execute_correct_daily_report_date,
+            production_handler=production_handlers.execute_correct_daily_report_date,
+            shadow_handler=simulate_correct_report_date,
             conflict="broad_target",
         ),
         "complete_previous_plan": _definition(
