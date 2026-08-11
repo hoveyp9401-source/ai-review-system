@@ -847,53 +847,67 @@ class DeepSeekToolCallingAdapter:
                         },
                     )
                     daily_submit_section_review_count += 1
-                    try:
-                        review_completion = await self._complete(
-                            _daily_submit_section_review_messages(
-                                user_text=user_text,
-                                user_messages=user_messages,
-                                calls=review_targets,
-                            ),
-                            tool_schemas=deepseek_tool_schemas(
-                                frozenset({"add_daily_items"})
-                            ),
-                            thinking_enabled=thinking_enabled,
-                        )
-                        iterations += 1
-                        model_turns.append(
-                            _model_turn_audit(
-                                iterations,
-                                review_completion.message,
-                                response_metadata={
-                                    **review_completion.metadata,
-                                    "daily_section_semantic_review": True,
-                                },
+                    reviewed: _ParsedAssistantTurn | None = None
+                    review_feedback: dict[str, Any] | None = None
+                    for review_attempt in range(1, 3):
+                        try:
+                            review_completion = await self._complete(
+                                _daily_submit_section_review_messages(
+                                    user_text=user_text,
+                                    user_messages=user_messages,
+                                    calls=review_targets,
+                                    structural_feedback=review_feedback,
+                                ),
+                                tool_schemas=deepseek_tool_schemas(
+                                    frozenset({"add_daily_items"})
+                                ),
+                                thinking_enabled=thinking_enabled,
                             )
+                            iterations += 1
+                            model_turns.append(
+                                _model_turn_audit(
+                                    iterations,
+                                    review_completion.message,
+                                    response_metadata={
+                                        **review_completion.metadata,
+                                        "daily_section_semantic_review": True,
+                                        "daily_section_semantic_review_attempt": review_attempt,
+                                    },
+                                )
+                            )
+                            reviewed = _parse_assistant_turn(review_completion.message)
+                            _validate_completion_protocol(
+                                review_completion,
+                                reviewed,
+                            )
+                            audits.extend(reviewed.audit)
+                        except DeepSeekToolCallingError as exc:
+                            raise _with_canary_turn_state(
+                                exc,
+                                audits=audits,
+                                model_turns=model_turns,
+                            ) from exc
+                        if _is_complete_daily_submit_section_review(
+                            reviewed.tool_calls,
+                            expected_count=len(review_targets),
+                        ):
+                            break
+                        if review_attempt == 2:
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "daily submit semantic review did not return complete corrected submissions"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            )
+                        review_feedback = _daily_submit_section_review_feedback(
+                            reviewed.tool_calls,
+                            expected_count=len(review_targets),
                         )
-                        reviewed = _parse_assistant_turn(review_completion.message)
-                        _validate_completion_protocol(
-                            review_completion,
-                            reviewed,
-                        )
-                        audits.extend(reviewed.audit)
-                    except DeepSeekToolCallingError as exc:
-                        raise _with_canary_turn_state(
-                            exc,
-                            audits=audits,
-                            model_turns=model_turns,
-                        ) from exc
-                    if (
-                        len(reviewed.tool_calls) != len(review_targets)
-                        or any(
-                            call.tool_name != "add_daily_items"
-                            or not bool(call.arguments.get("submit_after_write", False))
-                            for call in reviewed.tool_calls
-                        )
-                        or _needs_daily_submit_section_review(reviewed.tool_calls)
-                    ):
+                    if reviewed is None:
                         raise _with_canary_turn_state(
                             DeepSeekResponseError(
-                                "daily submit semantic review did not return complete corrected submissions"
+                                "daily submit semantic review produced no result"
                             ),
                             audits=audits,
                             model_turns=model_turns,
@@ -1398,25 +1412,71 @@ def _daily_submit_section_review_targets(
 def _is_incomplete_daily_submit(call: NativeToolCall) -> bool:
     """Check structural section coverage without interpreting user language."""
 
-    all_sections = {"today_work", "problems", "tomorrow_plan"}
     if call.tool_name != "add_daily_items":
         return False
     arguments = call.arguments
     if not bool(arguments.get("submit_after_write", False)):
         return False
+    return bool(_missing_daily_submit_sections(call))
+
+
+def _missing_daily_submit_sections(call: NativeToolCall) -> tuple[str, ...]:
+    all_sections = ("today_work", "problems", "tomorrow_plan")
     covered_sections = {
         str(item.get("field") or "")
-        for item in arguments.get("items", ())
+        for item in call.arguments.get("items", ())
         if isinstance(item, dict)
     }
     covered_sections.update(
         str(field_name)
-        for field_name in arguments.get(
+        for field_name in call.arguments.get(
             "acknowledged_empty_fields",
             (),
         )
     )
-    return not all_sections.issubset(covered_sections)
+    return tuple(section for section in all_sections if section not in covered_sections)
+
+
+def _is_complete_daily_submit_section_review(
+    calls: tuple[NativeToolCall, ...],
+    *,
+    expected_count: int,
+) -> bool:
+    return len(calls) == expected_count and all(
+        call.tool_name == "add_daily_items"
+        and bool(call.arguments.get("submit_after_write", False))
+        and not _missing_daily_submit_sections(call)
+        for call in calls
+    )
+
+
+def _daily_submit_section_review_feedback(
+    calls: tuple[NativeToolCall, ...],
+    *,
+    expected_count: int,
+) -> dict[str, Any]:
+    """Describe only structural validation failures for one bounded model retry."""
+
+    return {
+        "expected_call_count": expected_count,
+        "received_call_count": len(calls),
+        "calls": [
+            {
+                "sequence": index,
+                "tool_name": call.tool_name,
+                "submit_after_write": bool(
+                    call.arguments.get("submit_after_write", False)
+                ),
+                "missing_sections": list(_missing_daily_submit_sections(call)),
+            }
+            for index, call in enumerate(calls, start=1)
+        ],
+        "instruction": (
+            "The previous independent review remained structurally incomplete. "
+            "Reread the exact user messages and return a complete corrected "
+            "submission. Do not infer meaning from this validation record."
+        ),
+    }
 
 
 def _merge_daily_submit_section_review(
@@ -1466,6 +1526,7 @@ def _daily_submit_section_review_messages(
     user_text: str,
     user_messages: tuple[str, ...],
     calls: tuple[NativeToolCall, ...],
+    structural_feedback: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     draft_calls = [
         {
@@ -1507,6 +1568,7 @@ def _daily_submit_section_review_messages(
                         )
                     ],
                     "unexecuted_draft_calls": draft_calls,
+                    "previous_review_structural_feedback": structural_feedback,
                 },
                 ensure_ascii=False,
                 sort_keys=True,

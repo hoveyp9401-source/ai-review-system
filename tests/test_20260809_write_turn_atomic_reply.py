@@ -566,7 +566,8 @@ async def test_incomplete_daily_section_review_fails_before_execution(
     completions = iter(
         (
             _submit_tool_call_completion(call_id="draft", reviewed=False),
-            _submit_tool_call_completion(call_id="still-incomplete", reviewed=False),
+            _submit_tool_call_completion(call_id="still-incomplete-1", reviewed=False),
+            _submit_tool_call_completion(call_id="still-incomplete-2", reviewed=False),
         )
     )
 
@@ -590,6 +591,69 @@ async def test_incomplete_daily_section_review_fails_before_execution(
     assert runtime.execute_count == 0
     assert runtime.commit_count == 0
     assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_incomplete_first_review_gets_one_structural_model_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _submit_tool_call_completion(call_id="draft", reviewed=False),
+            _submit_tool_call_completion(call_id="still-incomplete", reviewed=False),
+            _submit_tool_call_completion(call_id="corrected", reviewed=True),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "The corrected report was submitted.",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        }
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    captured_messages: list[tuple[dict, ...]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del tool_schemas, thinking_enabled
+        captured_messages.append(tuple(messages))
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="Submit my complete report.",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 4
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.calls[0].tool_call_id == "corrected"
+    assert (
+        result.model_turns[2].response_metadata["daily_section_semantic_review_attempt"]
+        == 2
+    )
+    retry_payload = "\n".join(
+        str(message.get("content") or "") for message in captured_messages[2]
+    )
+    assert "previous_review_structural_feedback" in retry_payload
+    assert '"missing_sections":["problems"]' in retry_payload
 
 
 def _malformed_tool_call_completion() -> _CompletionResponse:
