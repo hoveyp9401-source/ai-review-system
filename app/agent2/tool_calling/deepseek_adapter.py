@@ -530,7 +530,7 @@ class DeepSeekToolCallingAdapter:
                         disagreement_feedback=disagreement_feedback,
                     ),
                     tool_schemas=deepseek_tool_schemas(frozenset({"add_daily_items"})),
-                    thinking_enabled=thinking_enabled,
+                    thinking_enabled=True,
                 )
                 iterations += 1
                 model_turns.append(
@@ -1027,12 +1027,7 @@ class DeepSeekToolCallingAdapter:
                             {
                                 "sequence": feedback_sequence,
                                 "original_draft_sequence": index + 1,
-                                "draft_date_selection": _daily_write_date_vote(
-                                    date_review_targets[index]
-                                ),
-                                "first_review_date_selection": _daily_write_date_vote(
-                                    first_adjusted[index]
-                                ),
+                                "review_mode": "independent_tiebreak",
                             }
                             for feedback_sequence, index in enumerate(
                                 disagreement_indices,
@@ -1743,10 +1738,13 @@ def _daily_write_date_review_messages(
                 "current user messages explicitly identify the report calendar "
                 "date. Use date_selection=user_explicit only when they do, and "
                 "preserve the explicit date expression and resolved calendar "
-                "proposal. Otherwise use date_selection=server_default; never "
-                "inherit the draft's date fields and never infer a date from "
-                "tense or report-section meaning. If prior disagreement is "
-                "supplied, reread independently instead of copying either vote. Copy every "
+                "proposal. An explicit date must be directly bound to the report "
+                "itself or to an instruction selecting that report's date. A time "
+                "reference attached only to a work event describes the event, not "
+                "the report date. Otherwise use date_selection=server_default. "
+                "Never infer a report date from tense or section meaning. Draft "
+                "date fields and prior votes are intentionally withheld; decide "
+                "independently from the exact user messages. Copy every protected "
                 "non-date argument from each draft unchanged. Return exactly one "
                 "add_daily_items call per draft in the same order. This review is "
                 "semantic model judgment, never phrase or keyword matching. None "
@@ -1773,7 +1771,16 @@ def _daily_write_date_review_messages(
                         {
                             "sequence": index,
                             "tool_name": call.tool_name,
-                            "arguments": call.arguments,
+                            "protected_non_date_arguments": {
+                                key: value
+                                for key, value in call.arguments.items()
+                                if key
+                                not in {
+                                    "date_selection",
+                                    "date_expression",
+                                    "proposed_date",
+                                }
+                            },
                         }
                         for index, call in enumerate(calls, start=1)
                     ],

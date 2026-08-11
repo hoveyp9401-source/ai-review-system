@@ -577,9 +577,11 @@ async def test_incomplete_daily_section_review_fails_before_execution(
             _submit_tool_call_completion(call_id="still-incomplete-2", reviewed=False),
         )
     )
+    captured_messages: list[tuple[dict, ...]] = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, tool_schemas, thinking_enabled
+        del tool_schemas, thinking_enabled
+        captured_messages.append(tuple(messages))
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
@@ -722,9 +724,11 @@ async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
             ),
         )
     )
+    captured_messages: list[tuple[dict, ...]] = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, tool_schemas, thinking_enabled
+        del tool_schemas, thinking_enabled
+        captured_messages.append(tuple(messages))
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
@@ -764,6 +768,21 @@ async def test_before_nine_date_disagreement_gets_independent_tiebreaker(
         ]
         == 2
     )
+    first_review_payload = json.loads(captured_messages[1][1]["content"])
+    first_protected_arguments = first_review_payload["unexecuted_daily_drafts"][0][
+        "protected_non_date_arguments"
+    ]
+    assert "date_selection" not in first_protected_arguments
+    assert "date_expression" not in first_protected_arguments
+    assert "proposed_date" not in first_protected_arguments
+    tiebreak_payload = json.loads(captured_messages[2][1]["content"])
+    assert tiebreak_payload["prior_model_disagreement"] == [
+        {
+            "original_draft_sequence": 1,
+            "review_mode": "independent_tiebreak",
+            "sequence": 1,
+        }
+    ]
 
 
 @pytest.mark.asyncio
