@@ -34,7 +34,10 @@ from app.agent2.tool_calling.write_reply import (
 )
 
 
-def _context() -> TrustedContext:
+def _context(
+    *,
+    allowed_tool_names: frozenset[str] = frozenset({"add_daily_items"}),
+) -> TrustedContext:
     return TrustedContext(
         namespace=CANARY_STATE_NAMESPACE,
         now=datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
@@ -46,8 +49,8 @@ def _context() -> TrustedContext:
             timezone="Asia/Shanghai",
             display_name="测试用户",
         ),
-        allowed_tool_names=frozenset({"add_daily_items"}),
-        gate_decisions={"add_daily_items": True},
+        allowed_tool_names=allowed_tool_names,
+        gate_decisions={name: True for name in allowed_tool_names},
     )
 
 
@@ -66,6 +69,21 @@ def _changed_receipt() -> ToolReceipt:
             "report_date": "2026-08-09",
             "report_status": "collecting",
             "affected_item_ids": ["test-item"],
+        },
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+
+
+def _query_receipt() -> ToolReceipt:
+    return ToolReceipt(
+        status=ReceiptStatus.SUCCESS,
+        tool_name="query_today_report",
+        changed=False,
+        target_type="daily_report",
+        target_id="test-report",
+        safe_user_facts={
+            "report_date": "2026-08-09",
+            "report_status": "collecting",
         },
         execution_mode=ExecutionMode.CANARY_EXECUTE,
     )
@@ -153,6 +171,45 @@ class _DeferredRuntimeSession:
             handler_call_count=1,
             business_write_count=1,
             receipt_write_count=1,
+        )
+
+    async def rollback_pending(self):
+        self.rollback_count += 1
+
+
+class _MixedDeferredRuntimeSession:
+    mode = ExecutionMode.CANARY_EXECUTE
+
+    def __init__(self) -> None:
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.execute_count = 0
+        self.calls = ()
+        self.receipts = (_query_receipt(), _changed_receipt())
+
+    async def execute(self, calls, *, defer_finalization):
+        self.execute_count += 1
+        self.calls = calls
+        assert defer_finalization is True
+        assert len(calls) == 2
+        return ProductionRuntimeResult(
+            status="success",
+            receipts=self.receipts,
+            transaction_opened=True,
+            transaction_pending=True,
+            handler_call_count=2,
+        )
+
+    async def commit_pending(self):
+        self.commit_count += 1
+        return ProductionRuntimeResult(
+            status="success",
+            receipts=self.receipts,
+            transaction_opened=True,
+            committed_to_outer_transaction=True,
+            handler_call_count=2,
+            business_write_count=1,
+            receipt_write_count=2,
         )
 
     async def rollback_pending(self):
@@ -330,6 +387,28 @@ def _submit_tool_call_completion(
     )
 
 
+def _mixed_submit_and_query_completion() -> _CompletionResponse:
+    submit = _submit_tool_call_completion(call_id="draft", reviewed=False)
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "original-query",
+                    "type": "function",
+                    "function": {
+                        "name": "query_today_report",
+                        "arguments": "{}",
+                    },
+                },
+                *submit.message["tool_calls"],
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
 @pytest.mark.asyncio
 async def test_incomplete_atomic_submit_draft_gets_model_section_review(
     monkeypatch: pytest.MonkeyPatch,
@@ -400,6 +479,117 @@ async def test_incomplete_atomic_submit_draft_gets_model_section_review(
         and "unexecuted_draft_calls" in str(message.get("content"))
         for message in captured_messages[1]
     )
+
+
+@pytest.mark.asyncio
+async def test_daily_section_review_preserves_unrelated_model_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _MixedDeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _mixed_submit_and_query_completion(),
+            _submit_tool_call_completion(call_id="reviewed", reviewed=True),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "The report was submitted and the requested report was read.",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        }
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    captured_tool_names: list[tuple[str, ...]] = []
+    captured_messages: list[tuple[dict, ...]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del thinking_enabled
+        captured_messages.append(tuple(messages))
+        captured_tool_names.append(
+            tuple(item["function"]["name"] for item in tool_schemas)
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="Submit this report and show my current report.",
+        context=_context(
+            allowed_tool_names=frozenset({"add_daily_items", "query_today_report"})
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 3
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert [call.tool_name for call in runtime.calls] == [
+        "query_today_report",
+        "add_daily_items",
+    ]
+    assert runtime.calls[0].tool_call_id == "original-query"
+    assert runtime.calls[1].tool_call_id == "reviewed"
+    assert runtime.calls[1].arguments["acknowledged_empty_fields"] == ["problems"]
+    assert captured_tool_names[1] == ("add_daily_items",)
+    review_payload = "\n".join(
+        str(message.get("content") or "") for message in captured_messages[1]
+    )
+    assert "query_today_report" not in review_payload
+
+
+@pytest.mark.asyncio
+async def test_incomplete_daily_section_review_fails_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _submit_tool_call_completion(call_id="draft", reviewed=False),
+            _submit_tool_call_completion(call_id="still-incomplete", reviewed=False),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(
+        DeepSeekResponseError,
+        match="did not return complete corrected submissions",
+    ):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="Submit my complete report.",
+            context=_context(),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
 
 
 def _malformed_tool_call_completion() -> _CompletionResponse:

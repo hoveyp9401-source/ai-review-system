@@ -835,6 +835,9 @@ class DeepSeekToolCallingAdapter:
                     daily_submit_section_review_count == 0
                     and _needs_daily_submit_section_review(parsed.tool_calls)
                 ):
+                    review_targets = _daily_submit_section_review_targets(
+                        parsed.tool_calls
+                    )
                     model_turns[-1] = replace(
                         model_turns[-1],
                         response_metadata={
@@ -844,17 +847,16 @@ class DeepSeekToolCallingAdapter:
                         },
                     )
                     daily_submit_section_review_count += 1
-                    review_tool_names = frozenset(
-                        call.tool_name for call in parsed.tool_calls
-                    )
                     try:
                         review_completion = await self._complete(
                             _daily_submit_section_review_messages(
                                 user_text=user_text,
                                 user_messages=user_messages,
-                                calls=parsed.tool_calls,
+                                calls=review_targets,
                             ),
-                            tool_schemas=deepseek_tool_schemas(review_tool_names),
+                            tool_schemas=deepseek_tool_schemas(
+                                frozenset({"add_daily_items"})
+                            ),
                             thinking_enabled=thinking_enabled,
                         )
                         iterations += 1
@@ -880,21 +882,26 @@ class DeepSeekToolCallingAdapter:
                             audits=audits,
                             model_turns=model_turns,
                         ) from exc
-                    reviewed_names = tuple(
-                        call.tool_name for call in reviewed.tool_calls
-                    )
-                    original_names = tuple(call.tool_name for call in parsed.tool_calls)
-                    if not reviewed.tool_calls or sorted(reviewed_names) != sorted(
-                        original_names
+                    if (
+                        len(reviewed.tool_calls) != len(review_targets)
+                        or any(
+                            call.tool_name != "add_daily_items"
+                            or not bool(call.arguments.get("submit_after_write", False))
+                            for call in reviewed.tool_calls
+                        )
+                        or _needs_daily_submit_section_review(reviewed.tool_calls)
                     ):
                         raise _with_canary_turn_state(
                             DeepSeekResponseError(
-                                "daily submit semantic review did not return the complete tool batch"
+                                "daily submit semantic review did not return complete corrected submissions"
                             ),
                             audits=audits,
                             model_turns=model_turns,
                         )
-                    parsed = reviewed
+                    parsed = _merge_daily_submit_section_review(
+                        original=parsed,
+                        reviewed=reviewed,
+                    )
                     current_has_write = any(
                         TOOL_REGISTRY[call.tool_name].read_or_write == "write"
                         for call in parsed.tool_calls
@@ -1377,28 +1384,81 @@ def _needs_daily_submit_section_review(
 ) -> bool:
     """Request model review when an atomic submit draft does not cover all sections."""
 
+    return bool(_daily_submit_section_review_targets(calls))
+
+
+def _daily_submit_section_review_targets(
+    calls: tuple[NativeToolCall, ...],
+) -> tuple[NativeToolCall, ...]:
+    """Select only incomplete atomic daily submissions; preserve every other intent."""
+
+    return tuple(call for call in calls if _is_incomplete_daily_submit(call))
+
+
+def _is_incomplete_daily_submit(call: NativeToolCall) -> bool:
+    """Check structural section coverage without interpreting user language."""
+
     all_sections = {"today_work", "problems", "tomorrow_plan"}
-    for call in calls:
-        if call.tool_name != "add_daily_items":
-            continue
-        arguments = call.arguments
-        if not bool(arguments.get("submit_after_write", False)):
-            continue
-        covered_sections = {
-            str(item.get("field") or "")
-            for item in arguments.get("items", ())
-            if isinstance(item, dict)
-        }
-        covered_sections.update(
-            str(field_name)
-            for field_name in arguments.get(
-                "acknowledged_empty_fields",
-                (),
-            )
+    if call.tool_name != "add_daily_items":
+        return False
+    arguments = call.arguments
+    if not bool(arguments.get("submit_after_write", False)):
+        return False
+    covered_sections = {
+        str(item.get("field") or "")
+        for item in arguments.get("items", ())
+        if isinstance(item, dict)
+    }
+    covered_sections.update(
+        str(field_name)
+        for field_name in arguments.get(
+            "acknowledged_empty_fields",
+            (),
         )
-        if not all_sections.issubset(covered_sections):
-            return True
-    return False
+    )
+    return not all_sections.issubset(covered_sections)
+
+
+def _merge_daily_submit_section_review(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Replace only reviewed daily submissions and keep unrelated model calls intact."""
+
+    replacements = iter(reviewed.tool_calls)
+    merged_calls = tuple(
+        next(replacements) if _is_incomplete_daily_submit(call) else call
+        for call in original.tool_calls
+    )
+    merged_message = {
+        key: value
+        for key, value in reviewed.assistant_message.items()
+        if key in {"role", "content", "reasoning_content"}
+    }
+    merged_message["role"] = "assistant"
+    merged_message["content"] = merged_message.get("content") or ""
+    merged_message["tool_calls"] = [
+        {
+            "id": call.tool_call_id,
+            "type": "function",
+            "function": {
+                "name": call.tool_name,
+                "arguments": json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        for call in merged_calls
+    ]
+    return _ParsedAssistantTurn(
+        assistant_message=merged_message,
+        tool_calls=merged_calls,
+        audit=(*original.audit, *reviewed.audit),
+    )
 
 
 def _daily_submit_section_review_messages(
