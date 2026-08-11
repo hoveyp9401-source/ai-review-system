@@ -410,6 +410,10 @@ class CorrectDailyReportDateArgs(StrictContract):
         default=(),
         max_length=3,
     )
+    empty_field_evidence: tuple[DailyEmptyFieldEvidence, ...] = Field(
+        default=(),
+        max_length=3,
+    )
     submit_after_correction: bool = False
 
     @model_validator(mode="after")
@@ -422,6 +426,15 @@ class CorrectDailyReportDateArgs(StrictContract):
             set(self.acknowledged_empty_fields)
         ):
             raise ValueError("explicitly empty fields must be unique")
+        evidence_fields = tuple(
+            item.field for item in self.empty_field_evidence
+        )
+        if len(evidence_fields) != len(set(evidence_fields)):
+            raise ValueError("empty-field evidence must be unique by field")
+        if set(evidence_fields) != set(self.acknowledged_empty_fields):
+            raise ValueError(
+                "every explicitly empty field requires matching current-message evidence"
+            )
         return self
 
 

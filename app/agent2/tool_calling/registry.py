@@ -586,7 +586,10 @@ TOOL_REGISTRY = MappingProxyType(
             "message explicitly asks to submit. The server binds the report identity and "
             "version, rejects an occupied or ambiguous target date, and executes relocation, "
             "empty-section acknowledgement and optional submission as one transaction. Do "
-            "not pair this tool with add_daily_items or confirm_report in the same turn.",
+            "not pair this tool with add_daily_items or confirm_report in the same turn. Every "
+            "acknowledged empty field must have one matching empty_field_evidence entry whose "
+            "one-based index binds to the current user message; conversation history cannot "
+            "supply an empty-field assertion.",
             CorrectDailyReportDateArgs,
             "write",
             "medium",

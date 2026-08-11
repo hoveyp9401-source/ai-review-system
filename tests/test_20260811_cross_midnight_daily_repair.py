@@ -5,6 +5,7 @@ from uuid import UUID
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from app.agent2.tool_calling.context import (
     TrustedContext,
@@ -17,6 +18,10 @@ from app.agent2.tool_calling.registry import TOOL_REGISTRY, validate_tool_argume
 from app.agent2.tool_calling.daily_report_date_correction import (
     SqlDailyReportDateCorrection,
 )
+from app.agent2.tool_calling.current_turn_source import (
+    CurrentTurnSource,
+    CurrentTurnSourceEvidenceError,
+)
 from app.agent2.tool_calling.production_runtime import _prepare_call
 from app.agent2.tool_calling.production_daily_executor import (
     ProductionDailyExecutor,
@@ -24,7 +29,10 @@ from app.agent2.tool_calling.production_daily_executor import (
 from app.agent2.tool_calling.production_handlers import (
     ProductionHandlerRequest,
 )
-from app.agent2.tool_calling.contracts import AddDailyItemsArgs
+from app.agent2.tool_calling.contracts import (
+    AddDailyItemsArgs,
+    CorrectDailyReportDateArgs,
+)
 from app.agent2.typed_daily_commands import DailyReportMutationSnapshot
 from app.agent2.tool_calling.validation import BoundCall
 from app.agent2.tool_calling.validation import (
@@ -46,6 +54,12 @@ def test_agent2_exposes_one_atomic_cross_midnight_report_correction() -> None:
             "target_date_expression": "yesterday",
             "proposed_target_date": "2026-08-10",
             "acknowledged_empty_fields": ["problems"],
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
             "submit_after_correction": True,
         },
     )
@@ -58,8 +72,53 @@ def test_agent2_exposes_one_atomic_cross_midnight_report_correction() -> None:
         "target_date_expression": "yesterday",
         "proposed_target_date": "2026-08-10",
         "acknowledged_empty_fields": ["problems"],
+        "empty_field_evidence": [
+            {
+                "field": "problems",
+                "source_evidence": {"source_message_index": 1},
+            }
+        ],
         "submit_after_correction": True,
     }
+
+
+def test_date_correction_empty_ack_requires_current_message_evidence() -> None:
+    with pytest.raises(ValidationError):
+        CorrectDailyReportDateArgs.model_validate(
+            {
+                "source_date_expression": "today",
+                "proposed_source_date": "2026-08-11",
+                "target_date_expression": "yesterday",
+                "proposed_target_date": "2026-08-10",
+                "acknowledged_empty_fields": ["problems"],
+                "submit_after_correction": True,
+            }
+        )
+
+
+def test_date_correction_empty_ack_evidence_is_bound_to_current_turn() -> None:
+    arguments = CorrectDailyReportDateArgs.model_validate(
+        {
+            "source_date_expression": "today",
+            "proposed_source_date": "2026-08-11",
+            "target_date_expression": "yesterday",
+            "proposed_target_date": "2026-08-10",
+            "acknowledged_empty_fields": ["problems"],
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {"source_message_index": 2},
+                }
+            ],
+            "submit_after_correction": True,
+        }
+    )
+
+    with pytest.raises(CurrentTurnSourceEvidenceError):
+        CurrentTurnSource(("这是昨天的日报，问题暂无，请提交。",)).validate_tool_arguments(
+            "correct_daily_report_date",
+            arguments.model_dump(mode="json"),
+        )
 
 
 class _DateResolver:
@@ -121,6 +180,12 @@ async def test_cross_midnight_correction_binds_source_and_empty_target() -> None
             "target_date_expression": "yesterday",
             "proposed_target_date": "2026-08-10",
             "acknowledged_empty_fields": ["problems"],
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
             "submit_after_correction": True,
         },
     )
@@ -166,10 +231,24 @@ async def test_undated_daily_write_before_nine_uses_previous_day() -> None:
             "date_expression": "today",
             "proposed_date": "2026-08-11",
             "items": [
-                {"field": "today_work", "content": "完成合同审核"},
-                {"field": "tomorrow_plan", "content": "继续跟进案件"},
+                {
+                    "field": "today_work",
+                    "content": "完成合同审核",
+                    "source_evidence": {"source_message_index": 1},
+                },
+                {
+                    "field": "tomorrow_plan",
+                    "content": "继续跟进案件",
+                    "source_evidence": {"source_message_index": 1},
+                },
             ],
             "acknowledged_empty_fields": ["problems"],
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
         },
     )
 
@@ -219,7 +298,11 @@ async def test_explicit_today_wins_and_nine_starts_current_day(
             "date_expression": "today",
             "proposed_date": "2026-08-11",
             "items": [
-                {"field": "today_work", "content": "完成合同审核"},
+                {
+                    "field": "today_work",
+                    "content": "完成合同审核",
+                    "source_evidence": {"source_message_index": 1},
+                },
             ],
         },
     )
@@ -399,6 +482,12 @@ async def test_provider_replay_keeps_same_correction_fingerprint_after_move() ->
             "target_date_expression": "yesterday",
             "proposed_target_date": "2026-08-10",
             "acknowledged_empty_fields": ["problems"],
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
             "submit_after_correction": True,
         },
     )
@@ -476,6 +565,12 @@ async def test_empty_acknowledgement_and_submit_are_one_atomic_add_call() -> Non
             "proposed_date": "2026-08-11",
             "items": [],
             "acknowledged_empty_fields": ["problems"],
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
             "submit_after_write": True,
         },
     )

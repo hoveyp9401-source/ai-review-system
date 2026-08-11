@@ -7,6 +7,7 @@ from typing import Any
 
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
+    CorrectDailyReportDateArgs,
     CurrentUserMessageEvidence,
     RememberPersonalMemoryArgs,
 )
@@ -61,6 +62,13 @@ class CurrentTurnSource:
             for item in typed.items:
                 self._validate_evidence(item.source_evidence)
             for item in typed.empty_field_evidence:
+                self._validate_evidence(item.source_evidence)
+            return
+        if tool_name == "correct_daily_report_date":
+            typed_correction = CorrectDailyReportDateArgs.model_validate(
+                arguments
+            )
+            for item in typed_correction.empty_field_evidence:
                 self._validate_evidence(item.source_evidence)
             return
         if tool_name != "remember_personal_memory":

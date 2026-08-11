@@ -81,6 +81,9 @@ Daily-report write date rules:
   `add_daily_items` call with `submit_after_write=true`. Do not predict an
   intermediate report version or pair it with `confirm_report`; the server
   performs the whole write atomically.
+- When `correct_daily_report_date` also acknowledges an explicitly empty
+  section, provide matching `empty_field_evidence` from the current user
+  message. Conversation history cannot supply that assertion.
 """.strip()
 
 _REPORT_INSIGHT_TOOL_POLICY = """
