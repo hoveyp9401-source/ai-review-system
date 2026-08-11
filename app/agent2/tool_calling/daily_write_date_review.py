@@ -178,21 +178,6 @@ def decision_date_selection(decision: DailyReportDateDecision) -> str | None:
     return "server_default"
 
 
-def decisions_agree(
-    first: DailyReportDateDecision,
-    second: DailyReportDateDecision,
-) -> bool:
-    first_selection = decision_date_selection(first)
-    second_selection = decision_date_selection(second)
-    if first_selection is None or second_selection is None:
-        return False
-    if first_selection != second_selection:
-        return False
-    if first_selection == "user_explicit":
-        return first.proposed_report_date == second.proposed_report_date
-    return True
-
-
 def daily_report_date_clarification_instruction() -> dict[str, str]:
     return {
         "role": "system",

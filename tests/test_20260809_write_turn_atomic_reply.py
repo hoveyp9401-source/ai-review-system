@@ -711,7 +711,7 @@ async def test_incomplete_first_review_gets_one_structural_model_retry(
 
 
 @pytest.mark.asyncio
-async def test_before_nine_date_disagreement_requires_matching_independent_review(
+async def test_before_nine_dedicated_date_review_overrides_only_draft_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _DeferredRuntimeSession()
@@ -729,13 +729,6 @@ async def test_before_nine_date_disagreement_requires_matching_independent_revie
         observed_time_expression="today",
         proposed_report_date="2026-08-11",
     )
-    confirmation_review = _date_review_completion(
-        call_id="date-review-2",
-        binding="explicit_report_date",
-        evidence_quote="This report explicitly belongs to today",
-        observed_time_expression="today",
-        proposed_report_date="2026-08-11",
-    )
     completions = iter(
         (
             _submit_tool_call_completion(
@@ -746,7 +739,6 @@ async def test_before_nine_date_disagreement_requires_matching_independent_revie
                 proposed_date="2026-08-10",
             ),
             first_review,
-            confirmation_review,
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -789,7 +781,7 @@ async def test_before_nine_date_disagreement_requires_matching_independent_revie
         runtime_session=runtime,
     )
 
-    assert result.iterations == 4
+    assert result.iterations == 3
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.calls[0].tool_call_id == "draft"
@@ -802,20 +794,11 @@ async def test_before_nine_date_disagreement_requires_matching_independent_revie
         ]
         == 1
     )
-    assert (
-        result.model_turns[2].response_metadata[
-            "daily_write_date_semantic_review_attempt"
-        ]
-        == 2
-    )
     first_review_payload = json.loads(captured_messages[1][1]["content"])
     assert first_review_payload["unexecuted_daily_draft_count"] == 1
     assert "unexecuted_daily_drafts" not in first_review_payload
     assert "prior_model_disagreement" not in first_review_payload
     assert captured_tool_schemas[1][0]["function"]["name"] == (
-        "review_daily_report_dates"
-    )
-    assert captured_tool_schemas[2][0]["function"]["name"] == (
         "review_daily_report_dates"
     )
 
@@ -837,10 +820,6 @@ async def test_before_nine_date_review_preserves_unrelated_query_call(
             _mixed_submit_and_query_completion(reviewed=True),
             _date_review_completion(
                 call_id="date-review-1",
-                binding="no_report_date_reference",
-            ),
-            _date_review_completion(
-                call_id="date-review-2",
                 binding="no_report_date_reference",
             ),
             _CompletionResponse(
@@ -882,7 +861,7 @@ async def test_before_nine_date_review_preserves_unrelated_query_call(
         runtime_session=runtime,
     )
 
-    assert result.iterations == 4
+    assert result.iterations == 3
     assert [call.tool_name for call in runtime.calls] == [
         "query_today_report",
         "add_daily_items",
@@ -894,7 +873,7 @@ async def test_before_nine_date_review_preserves_unrelated_query_call(
 
 
 @pytest.mark.asyncio
-async def test_disagreeing_date_reviews_ask_naturally_without_writing(
+async def test_ambiguous_date_review_asks_naturally_without_writing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _DeferredRuntimeSession()
@@ -916,14 +895,7 @@ async def test_disagreeing_date_reviews_ask_naturally_without_writing(
             ),
             _date_review_completion(
                 call_id="date-review-1",
-                binding="explicit_report_date",
-                evidence_quote="This report belongs to today",
-                observed_time_expression="today",
-                proposed_report_date="2026-08-11",
-            ),
-            _date_review_completion(
-                call_id="date-review-2",
-                binding="work_event_time_only",
+                binding="ambiguous",
                 evidence_quote="today",
                 observed_time_expression="today",
             ),
@@ -964,14 +936,14 @@ async def test_disagreeing_date_reviews_ask_naturally_without_writing(
         runtime_session=runtime,
     )
 
-    assert result.iterations == 4
+    assert result.iterations == 3
     assert runtime.execute_count == 0
     assert runtime.commit_count == 0
     assert result.receipts == ()
     assert "Which calendar date" in result.final_content
     assert captured_tool_schemas[-1] == []
     assert (
-        result.model_turns[2].response_metadata[
+        result.model_turns[1].response_metadata[
             "daily_write_date_clarification_required"
         ]
         is True

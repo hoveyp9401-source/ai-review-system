@@ -345,6 +345,7 @@ async def _turn(
                 "reason": outcome.reason,
                 "business_result": outcome.user_visible_result,
                 "release_blockers": assessment.blockers,
+                "daily_date_votes": _compact_daily_date_votes(model_audits),
             }
         )
     if outcome.messages_enabled:

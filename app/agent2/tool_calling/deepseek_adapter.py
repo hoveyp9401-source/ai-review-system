@@ -26,7 +26,6 @@ from app.agent2.tool_calling.daily_write_date_review import (
     daily_report_date_review_messages,
     daily_report_date_review_tool_schema,
     decision_date_selection,
-    decisions_agree,
     validate_daily_report_date_review,
 )
 from app.agent2.tool_calling.managed_daily_reply import (
@@ -1019,52 +1018,13 @@ class DeepSeekToolCallingAdapter:
                         now=context.now,
                         timezone=context.principal.timezone,
                     )
-                    confirmation_indices = tuple(
-                        index
-                        for index, (original, decision) in enumerate(
-                            zip(
-                                date_review_targets,
-                                first_date_review.decisions,
-                                strict=True,
-                            )
-                        )
-                        if _daily_write_date_review_needs_confirmation(
-                            original,
-                            decision,
-                            server_default_date=server_default_date,
-                        )
-                    )
                     final_decisions = list(first_date_review.decisions)
                     assistant_message = first_date_review.assistant_message
                     review_audit = first_date_review.audit
-                    clarification_required = False
-                    if confirmation_indices:
-                        confirmation_review = await review_daily_write_dates(
-                            len(confirmation_indices),
-                            review_attempt=2,
-                        )
-                        for target_index, decision in zip(
-                            confirmation_indices,
-                            confirmation_review.decisions,
-                            strict=True,
-                        ):
-                            if not decisions_agree(
-                                first_date_review.decisions[target_index],
-                                decision,
-                            ):
-                                clarification_required = True
-                            else:
-                                final_decisions[target_index] = decision
-                        assistant_message = confirmation_review.assistant_message
-                        review_audit = (
-                            *first_date_review.audit,
-                            *confirmation_review.audit,
-                        )
-                    if any(
+                    clarification_required = any(
                         decision_date_selection(decision) is None
                         for decision in final_decisions
-                    ):
-                        clarification_required = True
+                    )
                     if clarification_required:
                         model_turns[-1] = replace(
                             model_turns[-1],
@@ -1817,29 +1777,6 @@ def _daily_write_date_review_targets(
     if local_now.timetz().replace(tzinfo=None) >= MORNING_DAILY_CUTOFF:
         return ()
     return tuple(call for call in calls if call.tool_name == "add_daily_items")
-
-
-def _daily_write_date_review_needs_confirmation(
-    original: NativeToolCall,
-    decision: DailyReportDateDecision,
-    *,
-    server_default_date: date,
-) -> bool:
-    reviewed_selection = decision_date_selection(decision)
-    if reviewed_selection is None or decision.binding == "work_event_time_only":
-        return True
-    original_selection = str(
-        original.arguments.get("date_selection") or "server_default"
-    )
-    if original_selection != reviewed_selection:
-        return True
-    original_proposed_date = str(original.arguments.get("proposed_date") or "")
-    if original_selection == "server_default":
-        return original_proposed_date != server_default_date.isoformat()
-    return (
-        decision.proposed_report_date is None
-        or original_proposed_date != decision.proposed_report_date.isoformat()
-    )
 
 
 def _apply_reviewed_daily_write_date(
