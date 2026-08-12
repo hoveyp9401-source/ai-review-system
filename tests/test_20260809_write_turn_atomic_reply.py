@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,8 @@ from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedContext,
     TrustedPrincipal,
+    TrustedReportItem,
+    TrustedReportSnapshot,
 )
 from app.agent2.tool_calling.contracts import (
     ExecutionMode,
@@ -20,7 +22,6 @@ from app.agent2.tool_calling.deepseek_adapter import (
     DeepSeekResponseError,
     DeepSeekTimeoutError,
     DeepSeekToolCallingAdapter,
-    InvalidNativeToolArgumentsError,
     MalformedToolCallError,
     _canary_post_write_protocol_message,
     _CompletionResponse,
@@ -39,6 +40,7 @@ def _context(
     *,
     allowed_tool_names: frozenset[str] = frozenset({"add_daily_items"}),
     now: datetime | None = None,
+    historical_reports: tuple[TrustedReportSnapshot, ...] = (),
 ) -> TrustedContext:
     return TrustedContext(
         namespace=CANARY_STATE_NAMESPACE,
@@ -51,8 +53,44 @@ def _context(
             timezone="Asia/Shanghai",
             display_name="测试用户",
         ),
+        historical_reports=historical_reports,
         allowed_tool_names=allowed_tool_names,
         gate_decisions={name: True for name in allowed_tool_names},
+    )
+
+
+def _trusted_historical_report(
+    *,
+    include_tomorrow_plan: bool,
+) -> TrustedReportSnapshot:
+    report_id = UUID("20000000-0000-0000-0000-000000000001")
+    items = [
+        TrustedReportItem(
+            item_id="today-work-1",
+            field="today_work",
+            content="完成合同复核",
+            report_id=report_id,
+            report_version=2,
+        )
+    ]
+    if include_tomorrow_plan:
+        items.append(
+            TrustedReportItem(
+                item_id="tomorrow-plan-1",
+                field="tomorrow_plan",
+                content="整理附件",
+                report_id=report_id,
+                report_version=2,
+            )
+        )
+    return TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="test-tenant",
+        owner_user_id=UUID("10000000-0000-0000-0000-000000000001"),
+        report_date=date(2026, 8, 8),
+        version=2,
+        status="collecting",
+        items=tuple(items),
     )
 
 
@@ -296,6 +334,96 @@ async def test_terminal_write_reply_requests_native_json_output() -> None:
     assert http_client.payload["response_format"] == {"type": "json_object"}
 
 
+@pytest.mark.asyncio
+async def test_flash_thinking_request_is_explicitly_enabled_at_high_effort() -> None:
+    class CapturingHttpClient:
+        def __init__(self) -> None:
+            self.payload = None
+
+        async def post(self, url, **kwargs):
+            self.payload = kwargs["json"]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "response-thinking",
+                    "model": "deepseek-v4-flash",
+                    "created": 1,
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": "好的。",
+                                "reasoning_content": "checked",
+                            },
+                        }
+                    ],
+                    "usage": {},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    client = CapturingHttpClient()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=client,
+        model="deepseek-v4-flash",
+        timeout_seconds=3.0,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+
+    await adapter._complete(
+        messages=[{"role": "user", "content": "测试"}],
+        tool_schemas=[],
+        thinking_enabled=True,
+    )
+
+    assert client.payload["model"] == "deepseek-v4-flash"
+    assert client.payload["thinking"] == {"type": "enabled"}
+    assert client.payload["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_provider_model_mismatch_fails_closed_before_any_tool_execution() -> None:
+    class WrongModelHttpClient:
+        async def post(self, url, **kwargs):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "response-wrong-model",
+                    "model": "deepseek-v4-pro",
+                    "created": 1,
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": "不应采用这次响应。",
+                                "reasoning_content": "wrong served model",
+                            },
+                        }
+                    ],
+                    "usage": {},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=WrongModelHttpClient(),
+        model="deepseek-v4-flash",
+        timeout_seconds=3.0,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+
+    with pytest.raises(DeepSeekResponseError, match="unexpected model"):
+        await adapter._complete(
+            messages=[{"role": "user", "content": "测试"}],
+            tool_schemas=[],
+            thinking_enabled=True,
+        )
+
+
 def _tool_call_completion() -> _CompletionResponse:
     return _CompletionResponse(
         message={
@@ -338,6 +466,8 @@ def _submit_tool_call_completion(
     date_selection: str = "server_default",
     date_expression: str = "today",
     proposed_date: str = "2026-08-09",
+    date_evidence_quote: str | None = None,
+    reasoning_content: str | None = None,
 ) -> _CompletionResponse:
     arguments = {
         "date_selection": date_selection,
@@ -370,6 +500,41 @@ def _submit_tool_call_completion(
         ),
         "submit_after_write": True,
     }
+    if date_evidence_quote is not None:
+        arguments["date_evidence"] = {
+            "source_message_index": 1,
+            "exact_quote": date_evidence_quote,
+        }
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "add_daily_items",
+                    "arguments": json.dumps(
+                        arguments,
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ],
+    }
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+    return _CompletionResponse(
+        message=message,
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
+def _trusted_report_empty_problem_submit_completion(
+    *,
+    report: TrustedReportSnapshot,
+    call_id: str = "trusted-followup",
+) -> _CompletionResponse:
     return _CompletionResponse(
         message={
             "role": "assistant",
@@ -381,7 +546,22 @@ def _submit_tool_call_completion(
                     "function": {
                         "name": "add_daily_items",
                         "arguments": json.dumps(
-                            arguments,
+                            {
+                                "date_selection": "trusted_report",
+                                "report_id": str(report.report_id),
+                                "expected_version": report.version,
+                                "items": [],
+                                "acknowledged_empty_fields": ["problems"],
+                                "empty_field_evidence": [
+                                    {
+                                        "field": "problems",
+                                        "source_evidence": {
+                                            "source_message_index": 1,
+                                        },
+                                    }
+                                ],
+                                "submit_after_write": True,
+                            },
                             ensure_ascii=False,
                         ),
                     },
@@ -392,28 +572,11 @@ def _submit_tool_call_completion(
     )
 
 
-def _date_review_completion(
+def _confirm_trusted_report_completion(
     *,
-    call_id: str,
-    binding: str,
-    evidence_quote: str | None = None,
-    observed_time_expression: str | None = None,
-    proposed_report_date: str | None = None,
+    report: TrustedReportSnapshot,
+    call_id: str = "confirm-draft",
 ) -> _CompletionResponse:
-    decision = {
-        "sequence": 1,
-        "binding": binding,
-        "evidence": (
-            {
-                "message_sequence": 1,
-                "exact_quote": evidence_quote,
-            }
-            if evidence_quote is not None
-            else None
-        ),
-        "observed_time_expression": observed_time_expression,
-        "proposed_report_date": proposed_report_date,
-    }
     return _CompletionResponse(
         message={
             "role": "assistant",
@@ -423,9 +586,12 @@ def _date_review_completion(
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": "review_daily_report_dates",
+                        "name": "confirm_report",
                         "arguments": json.dumps(
-                            {"decisions": [decision]},
+                            {
+                                "report_id": str(report.report_id),
+                                "expected_version": report.version,
+                            },
                             ensure_ascii=False,
                         ),
                     },
@@ -531,6 +697,505 @@ async def test_incomplete_atomic_submit_draft_gets_model_section_review(
         and "unexecuted_draft_calls" in str(message.get("content"))
         for message in captured_messages[1]
     )
+
+
+@pytest.mark.asyncio
+async def test_trusted_report_existing_sections_allow_empty_problem_submit_without_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trusted_historical_report(include_tomorrow_plan=True)
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _trusted_report_empty_problem_submit_completion(report=report),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已确认问题与风险为空，并提交上一份日报。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="风险这块没遇到什么，前面那版就这么定了。",
+        context=_context(historical_reports=(report,)),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 2
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.calls[0].tool_call_id == "trusted-followup"
+    assert "pre_execution_daily_section_review" not in (
+        result.model_turns[0].response_metadata
+    )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_trusted_report_confirm_draft_gets_agent2_review_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trusted_historical_report(include_tomorrow_plan=True)
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _confirm_trusted_report_completion(report=report),
+            _trusted_report_empty_problem_submit_completion(
+                report=report,
+                call_id="reviewed-add-and-submit",
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已按你的原话补充空栏并提交上一份日报。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    captured_messages: list[tuple[dict, ...]] = []
+    captured_tool_names: list[tuple[str, ...]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del thinking_enabled
+        captured_messages.append(tuple(messages))
+        captured_tool_names.append(
+            tuple(item["function"]["name"] for item in tool_schemas)
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="问题与风险没有，前面的内容就按这个提交。",
+        context=_context(
+            allowed_tool_names=frozenset({"add_daily_items", "confirm_report"}),
+            historical_reports=(report,),
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 3
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.calls[0].tool_name == "add_daily_items"
+    assert runtime.calls[0].tool_call_id == "reviewed-add-and-submit"
+    assert runtime.calls[0].arguments["acknowledged_empty_fields"] == ["problems"]
+    assert runtime.calls[0].arguments["submit_after_write"] is True
+    assert (
+        result.model_turns[0].response_metadata[
+            "pre_execution_incomplete_confirm_review"
+        ]
+        is True
+    )
+    assert set(captured_tool_names[1]) == {
+        "add_daily_items",
+        "confirm_report",
+    }
+    review_payload = "\n".join(
+        str(message.get("content") or "") for message in captured_messages[1]
+    )
+    assert "isolated Agent2 semantic reviewer" in review_payload
+    assert "unexecuted_confirm_drafts" in review_payload
+    assert "problems" in review_payload
+
+
+@pytest.mark.asyncio
+async def test_incomplete_report_review_preserves_a_pure_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trusted_historical_report(include_tomorrow_plan=True)
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _confirm_trusted_report_completion(report=report),
+            _confirm_trusted_report_completion(
+                report=report,
+                call_id="reviewed-confirm",
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已按你的确认处理。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="就按前面这份确认。",
+        context=_context(
+            allowed_tool_names=frozenset({"add_daily_items", "confirm_report"}),
+            historical_reports=(report,),
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 3
+    assert runtime.execute_count == 1
+    assert runtime.calls[0].tool_name == "confirm_report"
+    assert runtime.calls[0].tool_call_id == "reviewed-confirm"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_confirm_review_cannot_change_trusted_report_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trusted_historical_report(include_tomorrow_plan=True)
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    wrong_report = report.model_copy(
+        update={
+            "report_id": UUID("20000000-0000-0000-0000-000000000099"),
+        }
+    )
+    completions = iter(
+        (
+            _confirm_trusted_report_completion(report=report),
+            _trusted_report_empty_problem_submit_completion(
+                report=wrong_report,
+                call_id="wrong-report-review",
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(
+        DeepSeekResponseError,
+        match="invalid replacement",
+    ):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="问题与风险没有，前面的内容就按这个提交。",
+            context=_context(
+                allowed_tool_names=frozenset({"add_daily_items", "confirm_report"}),
+                historical_reports=(report,),
+            ),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_incomplete_confirm_review_rejects_add_without_current_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trusted_historical_report(include_tomorrow_plan=True)
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    empty_add = _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "reviewed-empty-add",
+                    "type": "function",
+                    "function": {
+                        "name": "add_daily_items",
+                        "arguments": json.dumps(
+                            {
+                                "date_selection": "trusted_report",
+                                "report_id": str(report.report_id),
+                                "expected_version": report.version,
+                                "items": [],
+                                "acknowledged_empty_fields": [],
+                                "empty_field_evidence": [],
+                                "submit_after_write": True,
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+    completions = iter(
+        (
+            _confirm_trusted_report_completion(report=report),
+            empty_add,
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(
+        DeepSeekResponseError,
+        match="invalid replacement",
+    ):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="就按前面这份确认。",
+            context=_context(
+                allowed_tool_names=frozenset({"add_daily_items", "confirm_report"}),
+                historical_reports=(report,),
+            ),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_complete_trusted_report_confirmation_does_not_add_a_review_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trusted_historical_report(include_tomorrow_plan=True).model_copy(
+        update={"acknowledged_empty_fields": frozenset({"problems"})}
+    )
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _confirm_trusted_report_completion(report=report),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已按你的确认处理。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="确认提交。",
+        context=_context(
+            allowed_tool_names=frozenset({"add_daily_items", "confirm_report"}),
+            historical_reports=(report,),
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 2
+    assert runtime.execute_count == 1
+    assert runtime.calls[0].tool_name == "confirm_report"
+    assert "pre_execution_incomplete_confirm_review" not in (
+        result.model_turns[0].response_metadata
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewed_trusted_report_followup_stays_on_that_report_before_nine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trusted_historical_report(include_tomorrow_plan=True)
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _confirm_trusted_report_completion(report=report),
+            _trusted_report_empty_problem_submit_completion(
+                report=report,
+                call_id="reviewed-before-nine",
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已补充并提交指定的上一份日报。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="问题与风险没有，前面的内容就按这个提交。",
+        context=_context(
+            allowed_tool_names=frozenset({"add_daily_items", "confirm_report"}),
+            historical_reports=(report,),
+            now=datetime(
+                2026,
+                8,
+                9,
+                8,
+                0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.iterations == 3
+    assert runtime.calls[0].arguments["date_selection"] == "trusted_report"
+    assert runtime.calls[0].arguments["report_id"] == str(report.report_id)
+    assert "daily_write_date_semantic_review" not in (
+        result.model_turns[1].response_metadata
+    )
+
+
+@pytest.mark.asyncio
+async def test_trusted_report_missing_another_section_still_requires_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _trusted_historical_report(include_tomorrow_plan=False)
+    runtime = _DeferredRuntimeSession()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-pro",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _trusted_report_empty_problem_submit_completion(report=report),
+            _trusted_report_empty_problem_submit_completion(
+                report=report,
+                call_id="still-missing-plan-1",
+            ),
+            _trusted_report_empty_problem_submit_completion(
+                report=report,
+                call_id="still-missing-plan-2",
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(
+        DeepSeekResponseError,
+        match="did not return complete corrected submissions",
+    ):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="风险这块没遇到什么，前面那版就这么定了。",
+            context=_context(historical_reports=(report,)),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
 
 
 @pytest.mark.asyncio
@@ -711,40 +1376,35 @@ async def test_incomplete_first_review_gets_one_structural_model_retry(
 
 
 @pytest.mark.asyncio
-async def test_before_nine_dedicated_date_review_overrides_only_draft_date(
+async def test_before_nine_main_agent_date_decision_executes_without_a_second_router(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _DeferredRuntimeSession()
     adapter = DeepSeekToolCallingAdapter(
         http_client=object(),
-        model="deepseek-v4-pro",
+        model="deepseek-v4-flash",
         timeout_seconds=10,
         max_tool_loops=2,
         endpoint="https://example.invalid/chat/completions",
     )
-    first_review = _date_review_completion(
-        call_id="date-review-1",
-        binding="explicit_report_date",
-        evidence_quote="This report explicitly belongs to today",
-        observed_time_expression="today",
-        proposed_report_date="2026-08-11",
-    )
+    main_reasoning = "The user assigned this report to the new local calendar day."
     completions = iter(
         (
             _submit_tool_call_completion(
                 call_id="draft",
                 reviewed=True,
-                date_selection="server_default",
-                date_expression="default",
-                proposed_date="2026-08-10",
+                date_selection="user_explicit",
+                date_expression="2026-08-11",
+                proposed_date="2026-08-11",
+                date_evidence_quote="belongs to August 11",
+                reasoning_content=main_reasoning,
             ),
-            first_review,
             _CompletionResponse(
                 message={
                     "role": "assistant",
                     "content": json.dumps(
                         {
-                            "reply": "The report was submitted for the reviewed date.",
+                            "reply": "The report was submitted for August 11.",
                             "actual_write": True,
                             "operation_outcome": "changed",
                         }
@@ -755,19 +1415,17 @@ async def test_before_nine_dedicated_date_review_overrides_only_draft_date(
         )
     )
     captured_messages: list[tuple[dict, ...]] = []
-    captured_tool_schemas: list[list[dict]] = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del thinking_enabled
+        del tool_schemas, thinking_enabled
         captured_messages.append(tuple(messages))
-        captured_tool_schemas.append(tool_schemas)
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
 
     result = await adapter.run_canary_turn(
         system_prompt="Agent2 test",
-        user_text="This report explicitly belongs to today; submit it.",
+        user_text="This report belongs to August 11; submit it.",
         context=_context(
             now=datetime(
                 2026,
@@ -781,36 +1439,30 @@ async def test_before_nine_dedicated_date_review_overrides_only_draft_date(
         runtime_session=runtime,
     )
 
-    assert result.iterations == 3
+    assert result.iterations == 2
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
-    assert runtime.calls[0].tool_call_id == "draft"
     assert runtime.calls[0].arguments["date_selection"] == "user_explicit"
     assert runtime.calls[0].arguments["proposed_date"] == "2026-08-11"
-    assert runtime.calls[0].arguments["items"][0]["content"] == "核对付款节点"
-    assert (
-        result.model_turns[1].response_metadata[
-            "daily_write_date_semantic_review_attempt"
-        ]
-        == 1
-    )
-    first_review_payload = json.loads(captured_messages[1][1]["content"])
-    assert first_review_payload["unexecuted_daily_draft_count"] == 1
-    assert "unexecuted_daily_drafts" not in first_review_payload
-    assert "prior_model_disagreement" not in first_review_payload
-    assert captured_tool_schemas[1][0]["function"]["name"] == (
-        "review_daily_report_dates"
+    assert runtime.calls[0].arguments["date_evidence"] == {
+        "source_message_index": 1,
+        "exact_quote": "belongs to August 11",
+    }
+    assert captured_messages[1][-3]["reasoning_content"] == main_reasoning
+    assert all(
+        turn.response_metadata.get("daily_write_date_semantic_review") is not True
+        for turn in result.model_turns
     )
 
 
 @pytest.mark.asyncio
-async def test_before_nine_date_review_preserves_unrelated_query_call(
+async def test_before_nine_server_default_preserves_unrelated_query_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _MixedDeferredRuntimeSession()
     adapter = DeepSeekToolCallingAdapter(
         http_client=object(),
-        model="deepseek-v4-pro",
+        model="deepseek-v4-flash",
         timeout_seconds=10,
         max_tool_loops=2,
         endpoint="https://example.invalid/chat/completions",
@@ -818,10 +1470,6 @@ async def test_before_nine_date_review_preserves_unrelated_query_call(
     completions = iter(
         (
             _mixed_submit_and_query_completion(reviewed=True),
-            _date_review_completion(
-                call_id="date-review-1",
-                binding="no_report_date_reference",
-            ),
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -843,169 +1491,98 @@ async def test_before_nine_date_review_preserves_unrelated_query_call(
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
-
     result = await adapter.run_canary_turn(
         system_prompt="Agent2 test",
         user_text="Submit the undated report and show my current report.",
         context=_context(
             allowed_tool_names=frozenset({"add_daily_items", "query_today_report"}),
-            now=datetime(
-                2026,
-                8,
-                11,
-                8,
-                20,
-                tzinfo=ZoneInfo("Asia/Shanghai"),
-            ),
+            now=datetime(2026, 8, 11, 8, 20, tzinfo=ZoneInfo("Asia/Shanghai")),
         ),
         runtime_session=runtime,
     )
 
-    assert result.iterations == 3
+    assert result.iterations == 2
     assert [call.tool_name for call in runtime.calls] == [
         "query_today_report",
         "add_daily_items",
     ]
-    assert runtime.calls[0].tool_call_id == "original-query"
-    assert runtime.calls[1].tool_call_id == "draft"
     assert runtime.calls[1].arguments["date_selection"] == "server_default"
-    assert runtime.calls[1].arguments["proposed_date"] == "2026-08-10"
+    assert runtime.calls[1].arguments["proposed_date"] == "2026-08-09"
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_date_review_asks_naturally_without_writing(
+async def test_section_reviewer_replacement_keeps_main_reasoning_in_tool_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _DeferredRuntimeSession()
     adapter = DeepSeekToolCallingAdapter(
         http_client=object(),
-        model="deepseek-v4-pro",
+        model="deepseek-v4-flash",
         timeout_seconds=10,
         max_tool_loops=2,
         endpoint="https://example.invalid/chat/completions",
     )
+    main_reasoning = "Main Agent2 understood the complete user request."
+    main = _submit_tool_call_completion(
+        call_id="main-incomplete",
+        reviewed=False,
+        reasoning_content=main_reasoning,
+    )
+    review = _submit_tool_call_completion(
+        call_id="review-replacement",
+        reviewed=True,
+        reasoning_content="isolated reviewer reasoning must remain audit-only",
+    )
     completions = iter(
         (
-            _submit_tool_call_completion(
-                call_id="draft",
-                reviewed=True,
-                date_selection="server_default",
-                date_expression="default",
-                proposed_date="2026-08-10",
-            ),
-            _date_review_completion(
-                call_id="date-review-1",
-                binding="ambiguous",
-                evidence_quote="today",
-                observed_time_expression="today",
-            ),
+            main,
+            review,
             _CompletionResponse(
                 message={
                     "role": "assistant",
-                    "content": (
-                        "Which calendar date should I use for this report? "
-                        "Nothing has been written yet."
+                    "content": json.dumps(
+                        {
+                            "reply": "The complete report was submitted.",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        }
                     ),
                 },
                 metadata={"finish_reason": "stop"},
             ),
         )
     )
-    captured_tool_schemas: list[list[dict]] = []
+    captured_messages: list[tuple[dict, ...]] = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, thinking_enabled
-        captured_tool_schemas.append(tool_schemas)
+        del tool_schemas, thinking_enabled
+        captured_messages.append(tuple(messages))
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
-
     result = await adapter.run_canary_turn(
         system_prompt="Agent2 test",
-        user_text="This report belongs to today; submit it.",
-        context=_context(
-            now=datetime(
-                2026,
-                8,
-                11,
-                8,
-                20,
-                tzinfo=ZoneInfo("Asia/Shanghai"),
-            )
+        user_text=(
+            "日报内容：今日核对付款节点，没什么问题；明日继续跟进回款，请直接提交。"
         ),
+        context=_context(),
         runtime_session=runtime,
+        thinking_enabled=True,
     )
 
     assert result.iterations == 3
-    assert runtime.execute_count == 0
-    assert runtime.commit_count == 0
-    assert result.receipts == ()
-    assert "Which calendar date" in result.final_content
-    assert captured_tool_schemas[-1] == []
-    assert (
-        result.model_turns[1].response_metadata[
-            "daily_write_date_clarification_required"
-        ]
-        is True
+    tool_loop_messages = captured_messages[2]
+    assistant_tool_message = next(
+        message
+        for message in reversed(tool_loop_messages)
+        if message.get("role") == "assistant"
+        and message.get("tool_calls")
     )
-
-
-@pytest.mark.asyncio
-async def test_date_review_rejects_non_source_evidence_before_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime = _DeferredRuntimeSession()
-    adapter = DeepSeekToolCallingAdapter(
-        http_client=object(),
-        model="deepseek-v4-pro",
-        timeout_seconds=10,
-        max_tool_loops=2,
-        endpoint="https://example.invalid/chat/completions",
+    assert assistant_tool_message["reasoning_content"] == main_reasoning
+    assert "isolated reviewer reasoning" not in json.dumps(
+        tool_loop_messages,
+        ensure_ascii=False,
     )
-    completions = iter(
-        (
-            _submit_tool_call_completion(
-                call_id="draft",
-                reviewed=True,
-                date_selection="server_default",
-                date_expression="default",
-                proposed_date="2026-08-10",
-            ),
-            _date_review_completion(
-                call_id="date-review-1",
-                binding="explicit_report_date",
-                evidence_quote="invented evidence",
-                observed_time_expression="today",
-                proposed_report_date="2026-08-11",
-            ),
-        )
-    )
-
-    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, tool_schemas, thinking_enabled
-        return next(completions)
-
-    monkeypatch.setattr(adapter, "_complete", fake_complete)
-
-    with pytest.raises(InvalidNativeToolArgumentsError):
-        await adapter.run_canary_turn(
-            system_prompt="Agent2 test",
-            user_text="This report belongs to today; submit it.",
-            context=_context(
-                now=datetime(
-                    2026,
-                    8,
-                    11,
-                    8,
-                    20,
-                    tzinfo=ZoneInfo("Asia/Shanghai"),
-                )
-            ),
-            runtime_session=runtime,
-        )
-
-    assert runtime.execute_count == 0
-    assert runtime.commit_count == 0
 
 
 def _malformed_tool_call_completion() -> _CompletionResponse:

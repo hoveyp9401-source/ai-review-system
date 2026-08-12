@@ -4,10 +4,9 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field, replace
-from datetime import date
 from time import perf_counter
 from typing import Any
-from zoneinfo import ZoneInfo
+from uuid import UUID
 
 import httpx
 
@@ -19,14 +18,10 @@ from app.agent2.tool_calling.daily_briefing_reply import (
     render_daily_briefing_reply,
     validate_daily_briefing_reply,
 )
-from app.agent2.tool_calling.daily_write_date_review import (
-    DAILY_REPORT_DATE_REVIEW_TOOL,
-    DailyReportDateDecision,
-    daily_report_date_clarification_instruction,
-    daily_report_date_review_messages,
-    daily_report_date_review_tool_schema,
-    decision_date_selection,
-    validate_daily_report_date_review,
+from app.agent2.tool_calling.daily_incomplete_confirm_review import (
+    daily_incomplete_confirm_review_messages,
+    incomplete_confirm_review_targets,
+    validate_daily_incomplete_confirm_replacements,
 )
 from app.agent2.tool_calling.managed_daily_reply import (
     managed_daily_reply_retry_instruction,
@@ -43,10 +38,6 @@ from app.agent2.tool_calling.registry import (
     UnknownToolError,
     deepseek_tool_schemas,
     validate_tool_arguments,
-)
-from app.agent2.tool_calling.reporting_date import (
-    MORNING_DAILY_CUTOFF,
-    default_daily_write_date,
 )
 from app.agent2.tool_calling.runtime import (
     NativeToolCall,
@@ -75,10 +66,10 @@ class DeepSeekToolCallingError(RuntimeError):
         self,
         message: str,
         *,
-        raw_tool_call_audit: tuple["RawToolCallAudit", ...] = (),
+        raw_tool_call_audit: tuple[RawToolCallAudit, ...] = (),
         model_call_count: int = 0,
         turn_plan: TurnExecutionPlan | None = None,
-        model_turns: tuple["ModelTurnAudit", ...] = (),
+        model_turns: tuple[ModelTurnAudit, ...] = (),
         request_attempt_count: int = 0,
         transport_retry_count: int = 0,
         transport_errors: tuple[dict[str, Any], ...] = (),
@@ -187,13 +178,6 @@ class DeepSeekCanaryResult:
 class _ParsedAssistantTurn:
     assistant_message: dict[str, Any]
     tool_calls: tuple[NativeToolCall, ...]
-    audit: tuple[RawToolCallAudit, ...]
-
-
-@dataclass(frozen=True)
-class _DailyWriteDateReviewResult:
-    assistant_message: dict[str, Any]
-    decisions: tuple[DailyReportDateDecision, ...]
     audit: tuple[RawToolCallAudit, ...]
 
 
@@ -498,9 +482,8 @@ class DeepSeekToolCallingAdapter:
         managed_daily_reply_retry_count = 0
         write_reply_retry_count = 0
         tool_argument_repair_count = 0
+        incomplete_confirm_review_count = 0
         daily_submit_section_review_count = 0
-        daily_write_date_review_count = 0
-        daily_write_date_clarification_required = False
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
         async def rollback_pending() -> None:
@@ -531,56 +514,6 @@ class DeepSeekToolCallingAdapter:
                 )
             runtime_results[-1] = committed
 
-        async def review_daily_write_dates(
-            draft_count: int,
-            *,
-            review_attempt: int,
-        ) -> _DailyWriteDateReviewResult:
-            nonlocal iterations
-            ordered_messages = user_messages or (user_text,)
-            local_now = context.now.astimezone(
-                ZoneInfo(context.principal.timezone)
-            )
-            try:
-                completion = await self._complete(
-                    daily_report_date_review_messages(
-                        ordered_messages=ordered_messages,
-                        local_now=local_now,
-                        server_default_report_date=default_daily_write_date(
-                            now=context.now,
-                            timezone=context.principal.timezone,
-                        ),
-                        draft_count=draft_count,
-                    ),
-                    tool_schemas=daily_report_date_review_tool_schema(),
-                    thinking_enabled=True,
-                )
-                iterations += 1
-                model_turns.append(
-                    _model_turn_audit(
-                        iterations,
-                        completion.message,
-                        response_metadata={
-                            **completion.metadata,
-                            "daily_write_date_semantic_review": True,
-                            "daily_write_date_semantic_review_attempt": review_attempt,
-                        },
-                    )
-                )
-                result = _parse_daily_write_date_review_completion(
-                    completion,
-                    ordered_messages=ordered_messages,
-                    expected_count=draft_count,
-                )
-                audits.extend(result.audit)
-            except DeepSeekToolCallingError as exc:
-                raise _with_canary_turn_state(
-                    exc,
-                    audits=audits,
-                    model_turns=model_turns,
-                ) from exc
-            return result
-
         try:
             while True:
                 iterations += 1
@@ -595,7 +528,6 @@ class DeepSeekToolCallingAdapter:
                                 or daily_briefing_reply_retry_count
                                 or managed_daily_reply_retry_count
                                 or write_reply_retry_count
-                                or daily_write_date_clarification_required
                             )
                             else tool_schemas
                         ),
@@ -886,7 +818,6 @@ class DeepSeekToolCallingAdapter:
                     or daily_briefing_reply_retry_count
                     or managed_daily_reply_retry_count
                     or write_reply_retry_count
-                    or daily_write_date_clarification_required
                 ):
                     raise _with_canary_turn_state(
                         DeepSeekResponseError(
@@ -907,12 +838,95 @@ class DeepSeekToolCallingAdapter:
                     TOOL_REGISTRY[call.tool_name].read_or_write == "write"
                     for call in parsed.tool_calls
                 )
+                incomplete_confirm_targets = incomplete_confirm_review_targets(
+                    parsed.tool_calls,
+                    context=context,
+                )
+                if incomplete_confirm_review_count == 0 and incomplete_confirm_targets:
+                    model_turns[-1] = replace(
+                        model_turns[-1],
+                        response_metadata={
+                            **model_turns[-1].response_metadata,
+                            "pre_execution_incomplete_confirm_review": True,
+                            "draft_executed": False,
+                        },
+                    )
+                    incomplete_confirm_review_count += 1
+                    review_tool_names = frozenset(
+                        {"add_daily_items", "confirm_report"}
+                    ).intersection(context.allowed_tool_names)
+                    try:
+                        review_completion = await self._complete(
+                            daily_incomplete_confirm_review_messages(
+                                ordered_messages=user_messages or (user_text,),
+                                targets=incomplete_confirm_targets,
+                            ),
+                            tool_schemas=deepseek_tool_schemas(review_tool_names),
+                            thinking_enabled=True,
+                        )
+                        iterations += 1
+                        model_turns.append(
+                            _model_turn_audit(
+                                iterations,
+                                review_completion.message,
+                                response_metadata={
+                                    **review_completion.metadata,
+                                    "incomplete_confirm_semantic_review": True,
+                                },
+                            )
+                        )
+                        reviewed = _parse_assistant_turn(review_completion.message)
+                        _validate_completion_protocol(
+                            review_completion,
+                            reviewed,
+                        )
+                        audits.extend(reviewed.audit)
+                        validate_daily_incomplete_confirm_replacements(
+                            targets=incomplete_confirm_targets,
+                            replacements=tuple(
+                                (call.tool_name, call.arguments)
+                                for call in reviewed.tool_calls
+                            ),
+                            allowed_tool_names=context.allowed_tool_names,
+                        )
+                    except ValueError as exc:
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "incomplete confirm semantic review returned an invalid replacement"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
+                    except DeepSeekToolCallingError as exc:
+                        raise _with_canary_turn_state(
+                            exc,
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
+                    parsed = _merge_reviewed_calls(
+                        original=parsed,
+                        targets=tuple(
+                            target.original_call
+                            for target in incomplete_confirm_targets
+                        ),
+                        replacements=reviewed.tool_calls,
+                        assistant_message=reviewed.assistant_message,
+                        review_audit=reviewed.audit,
+                    )
+                    current_has_write = any(
+                        TOOL_REGISTRY[call.tool_name].read_or_write == "write"
+                        for call in parsed.tool_calls
+                    )
                 if (
                     daily_submit_section_review_count == 0
-                    and _needs_daily_submit_section_review(parsed.tool_calls)
+                    and _needs_daily_submit_section_review(
+                        parsed.tool_calls,
+                        context=context,
+                    )
                 ):
                     review_targets = _daily_submit_section_review_targets(
-                        parsed.tool_calls
+                        parsed.tool_calls,
+                        context=context,
                     )
                     model_turns[-1] = replace(
                         model_turns[-1],
@@ -966,6 +980,7 @@ class DeepSeekToolCallingAdapter:
                         if _is_complete_daily_submit_section_review(
                             reviewed.tool_calls,
                             expected_count=len(review_targets),
+                            context=context,
                         ):
                             break
                         if review_attempt == 2:
@@ -979,6 +994,7 @@ class DeepSeekToolCallingAdapter:
                         review_feedback = _daily_submit_section_review_feedback(
                             reviewed.tool_calls,
                             expected_count=len(review_targets),
+                            context=context,
                         )
                     if reviewed is None:
                         raise _with_canary_turn_state(
@@ -991,72 +1007,7 @@ class DeepSeekToolCallingAdapter:
                     parsed = _merge_daily_submit_section_review(
                         original=parsed,
                         reviewed=reviewed,
-                    )
-                    current_has_write = any(
-                        TOOL_REGISTRY[call.tool_name].read_or_write == "write"
-                        for call in parsed.tool_calls
-                    )
-                date_review_targets = _daily_write_date_review_targets(
-                    parsed.tool_calls,
-                    context=context,
-                )
-                if daily_write_date_review_count == 0 and date_review_targets:
-                    model_turns[-1] = replace(
-                        model_turns[-1],
-                        response_metadata={
-                            **model_turns[-1].response_metadata,
-                            "pre_execution_daily_write_date_review": True,
-                            "draft_executed": False,
-                        },
-                    )
-                    daily_write_date_review_count += 1
-                    first_date_review = await review_daily_write_dates(
-                        len(date_review_targets),
-                        review_attempt=1,
-                    )
-                    server_default_date = default_daily_write_date(
-                        now=context.now,
-                        timezone=context.principal.timezone,
-                    )
-                    final_decisions = list(first_date_review.decisions)
-                    assistant_message = first_date_review.assistant_message
-                    review_audit = first_date_review.audit
-                    clarification_required = any(
-                        decision_date_selection(decision) is None
-                        for decision in final_decisions
-                    )
-                    if clarification_required:
-                        model_turns[-1] = replace(
-                            model_turns[-1],
-                            response_metadata={
-                                **model_turns[-1].response_metadata,
-                                "daily_write_date_clarification_required": True,
-                                "draft_executed": False,
-                            },
-                        )
-                        messages.append(
-                            daily_report_date_clarification_instruction()
-                        )
-                        daily_write_date_clarification_required = True
-                        continue
-                    final_date_calls = tuple(
-                        _apply_reviewed_daily_write_date(
-                            original,
-                            decision,
-                            server_default_date=server_default_date,
-                        )
-                        for original, decision in zip(
-                            date_review_targets,
-                            final_decisions,
-                            strict=True,
-                        )
-                    )
-                    parsed = _merge_reviewed_calls(
-                        original=parsed,
-                        targets=date_review_targets,
-                        replacements=final_date_calls,
-                        assistant_message=assistant_message,
-                        review_audit=review_audit,
+                        context=context,
                     )
                     current_has_write = any(
                         TOOL_REGISTRY[call.tool_name].read_or_write == "write"
@@ -1153,6 +1104,10 @@ class DeepSeekToolCallingAdapter:
                 payload["tool_choice"] = "auto"
         if thinking_enabled:
             payload["thinking"] = {"type": "enabled"}
+            # DeepSeek maps lower labels to this same supported low-cost
+            # thinking tier. Send it explicitly so model comparisons and
+            # production behavior cannot silently depend on provider defaults.
+            payload["reasoning_effort"] = "high"
         if _server_requests_json_object(messages):
             payload["response_format"] = {"type": "json_object"}
         transport_errors: list[dict[str, Any]] = []
@@ -1231,6 +1186,18 @@ class DeepSeekToolCallingAdapter:
                     4,
                 ),
             )
+        served_model = str(body.get("model") or "").strip()
+        if served_model != self._model:
+            raise DeepSeekResponseError(
+                "DeepSeek served an unexpected model",
+                request_attempt_count=request_attempt_count,
+                transport_retry_count=transport_retry_count,
+                transport_errors=tuple(transport_errors),
+                model_elapsed_seconds=round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
+            )
         canonical_body = json.dumps(
             body,
             ensure_ascii=False,
@@ -1241,7 +1208,7 @@ class DeepSeekToolCallingAdapter:
             message=message,
             metadata={
                 "response_id": body.get("id"),
-                "served_model": body.get("model"),
+                "served_model": served_model,
                 "created": body.get("created"),
                 "finish_reason": choice.get("finish_reason"),
                 "usage": body.get("usage"),
@@ -1290,91 +1257,6 @@ def _server_requests_json_object(messages: list[dict[str, Any]]) -> bool:
         ):
             return True
     return False
-
-
-def _parse_daily_write_date_review_completion(
-    completion: _CompletionResponse,
-    *,
-    ordered_messages: tuple[str, ...],
-    expected_count: int,
-) -> _DailyWriteDateReviewResult:
-    if completion.metadata.get("finish_reason") != "tool_calls":
-        raise DeepSeekResponseError(
-            "daily-report date review did not finish with an internal tool call"
-        )
-    raw_calls = completion.message.get("tool_calls")
-    if not isinstance(raw_calls, (list, tuple)) or len(raw_calls) != 1:
-        raise MalformedToolCallError(
-            "daily-report date review must return exactly one internal tool call"
-        )
-    raw_call = raw_calls[0]
-    try:
-        call_id = raw_call["id"]
-        call_type = raw_call["type"]
-        function = raw_call["function"]
-        tool_name = function["name"]
-        raw_arguments = function["arguments"]
-    except (KeyError, TypeError) as exc:
-        raise MalformedToolCallError(
-            "daily-report date review tool call is malformed"
-        ) from exc
-    if call_type != "function" or not all(
-        isinstance(value, str) and value
-        for value in (call_id, tool_name, raw_arguments)
-    ):
-        raise MalformedToolCallError(
-            "daily-report date review tool fields are malformed"
-        )
-    audit = RawToolCallAudit(
-        tool_call_id=call_id,
-        tool_name=tool_name,
-        raw_arguments=raw_arguments,
-        arguments_sha256=hashlib.sha256(raw_arguments.encode("utf-8")).hexdigest(),
-        parse_status="received",
-    )
-    if tool_name != DAILY_REPORT_DATE_REVIEW_TOOL:
-        raise UnknownNativeToolError(
-            "daily-report date review returned an unexpected internal tool",
-            raw_tool_call_audit=(audit,),
-        )
-    try:
-        arguments = json.loads(raw_arguments)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise MalformedToolCallError(
-            "daily-report date review arguments are not valid JSON",
-            raw_tool_call_audit=(audit,),
-        ) from exc
-    try:
-        decisions = validate_daily_report_date_review(
-            arguments,
-            ordered_messages=ordered_messages,
-            expected_count=expected_count,
-        )
-    except (TypeError, ValueError) as exc:
-        raise InvalidNativeToolArgumentsError(
-            "daily-report date review returned invalid structured evidence",
-            raw_tool_call_audit=(audit,),
-        ) from exc
-    assistant_message = {
-        key: value
-        for key, value in completion.message.items()
-        if key in {"role", "content", "reasoning_content", "tool_calls"}
-    }
-    assistant_message["role"] = "assistant"
-    assistant_message["content"] = assistant_message.get("content") or ""
-    return _DailyWriteDateReviewResult(
-        assistant_message=assistant_message,
-        decisions=decisions,
-        audit=(
-            RawToolCallAudit(
-                tool_call_id=call_id,
-                tool_name=tool_name,
-                raw_arguments=raw_arguments,
-                arguments_sha256=audit.arguments_sha256,
-                parse_status="validated",
-            ),
-        ),
-    )
 
 
 def _parse_assistant_turn(message: dict[str, Any]) -> _ParsedAssistantTurn:
@@ -1622,21 +1504,31 @@ def _pre_execution_tool_argument_repair_message() -> dict[str, str]:
 
 def _needs_daily_submit_section_review(
     calls: tuple[NativeToolCall, ...],
+    *,
+    context: TrustedContext,
 ) -> bool:
     """Request model review when an atomic submit draft does not cover all sections."""
 
-    return bool(_daily_submit_section_review_targets(calls))
+    return bool(_daily_submit_section_review_targets(calls, context=context))
 
 
 def _daily_submit_section_review_targets(
     calls: tuple[NativeToolCall, ...],
+    *,
+    context: TrustedContext,
 ) -> tuple[NativeToolCall, ...]:
     """Select only incomplete atomic daily submissions; preserve every other intent."""
 
-    return tuple(call for call in calls if _is_incomplete_daily_submit(call))
+    return tuple(
+        call for call in calls if _is_incomplete_daily_submit(call, context=context)
+    )
 
 
-def _is_incomplete_daily_submit(call: NativeToolCall) -> bool:
+def _is_incomplete_daily_submit(
+    call: NativeToolCall,
+    *,
+    context: TrustedContext,
+) -> bool:
     """Check structural section coverage without interpreting user language."""
 
     if call.tool_name != "add_daily_items":
@@ -1644,10 +1536,14 @@ def _is_incomplete_daily_submit(call: NativeToolCall) -> bool:
     arguments = call.arguments
     if not bool(arguments.get("submit_after_write", False)):
         return False
-    return bool(_missing_daily_submit_sections(call))
+    return bool(_missing_daily_submit_sections(call, context=context))
 
 
-def _missing_daily_submit_sections(call: NativeToolCall) -> tuple[str, ...]:
+def _missing_daily_submit_sections(
+    call: NativeToolCall,
+    *,
+    context: TrustedContext,
+) -> tuple[str, ...]:
     all_sections = ("today_work", "problems", "tomorrow_plan")
     covered_sections = {
         str(item.get("field") or "")
@@ -1661,6 +1557,19 @@ def _missing_daily_submit_sections(call: NativeToolCall) -> tuple[str, ...]:
             (),
         )
     )
+    if call.arguments.get("date_selection") == "trusted_report":
+        raw_report_id = call.arguments.get("report_id")
+        try:
+            report_id = UUID(str(raw_report_id))
+        except (TypeError, ValueError):
+            report_id = None
+        report = context.report_by_id(report_id) if report_id is not None else None
+        if (
+            report is not None
+            and call.arguments.get("expected_version") == report.version
+        ):
+            covered_sections.update(item.field for item in report.items)
+            covered_sections.update(report.acknowledged_empty_fields)
     return tuple(section for section in all_sections if section not in covered_sections)
 
 
@@ -1668,11 +1577,12 @@ def _is_complete_daily_submit_section_review(
     calls: tuple[NativeToolCall, ...],
     *,
     expected_count: int,
+    context: TrustedContext,
 ) -> bool:
     return len(calls) == expected_count and all(
         call.tool_name == "add_daily_items"
         and bool(call.arguments.get("submit_after_write", False))
-        and not _missing_daily_submit_sections(call)
+        and not _missing_daily_submit_sections(call, context=context)
         for call in calls
     )
 
@@ -1681,6 +1591,7 @@ def _daily_submit_section_review_feedback(
     calls: tuple[NativeToolCall, ...],
     *,
     expected_count: int,
+    context: TrustedContext,
 ) -> dict[str, Any]:
     """Describe only structural validation failures for one bounded model retry."""
 
@@ -1694,7 +1605,9 @@ def _daily_submit_section_review_feedback(
                 "submit_after_write": bool(
                     call.arguments.get("submit_after_write", False)
                 ),
-                "missing_sections": list(_missing_daily_submit_sections(call)),
+                "missing_sections": list(
+                    _missing_daily_submit_sections(call, context=context)
+                ),
             }
             for index, call in enumerate(calls, start=1)
         ],
@@ -1710,12 +1623,16 @@ def _merge_daily_submit_section_review(
     *,
     original: _ParsedAssistantTurn,
     reviewed: _ParsedAssistantTurn,
+    context: TrustedContext,
 ) -> _ParsedAssistantTurn:
     """Replace only reviewed daily submissions and keep unrelated model calls intact."""
 
     return _merge_reviewed_calls(
         original=original,
-        targets=_daily_submit_section_review_targets(original.tool_calls),
+        targets=_daily_submit_section_review_targets(
+            original.tool_calls,
+            context=context,
+        ),
         replacements=reviewed.tool_calls,
         assistant_message=reviewed.assistant_message,
         review_audit=reviewed.audit,
@@ -1738,9 +1655,15 @@ def _merge_reviewed_calls(
         next(replacement_iterator) if id(call) in target_object_ids else call
         for call in original.tool_calls
     )
+    # The reviewer may replace an unexecuted tool draft, but it is not a new
+    # conversational authority. Preserve the main Agent2 turn (especially its
+    # reasoning_content) so the next tool-loop request continues from the
+    # user's original semantic decision rather than from an isolated review.
+    # The reviewer message remains available in model-turn audit only.
+    _ = assistant_message
     merged_message = {
         key: value
-        for key, value in assistant_message.items()
+        for key, value in original.assistant_message.items()
         if key in {"role", "content", "reasoning_content"}
     }
     merged_message["role"] = "assistant"
@@ -1765,45 +1688,6 @@ def _merge_reviewed_calls(
         assistant_message=merged_message,
         tool_calls=merged_calls,
         audit=(*original.audit, *review_audit),
-    )
-
-
-def _daily_write_date_review_targets(
-    calls: tuple[NativeToolCall, ...],
-    *,
-    context: TrustedContext,
-) -> tuple[NativeToolCall, ...]:
-    local_now = context.now.astimezone(ZoneInfo(context.principal.timezone))
-    if local_now.timetz().replace(tzinfo=None) >= MORNING_DAILY_CUTOFF:
-        return ()
-    return tuple(call for call in calls if call.tool_name == "add_daily_items")
-
-
-def _apply_reviewed_daily_write_date(
-    original: NativeToolCall,
-    decision: DailyReportDateDecision,
-    *,
-    server_default_date: date,
-) -> NativeToolCall:
-    date_selection = decision_date_selection(decision)
-    if date_selection is None:
-        raise ValueError("an ambiguous report date cannot be executed")
-    if date_selection == "user_explicit":
-        date_expression = decision.observed_time_expression
-        proposed_date = decision.proposed_report_date
-    else:
-        date_expression = server_default_date.isoformat()
-        proposed_date = server_default_date
-    arguments = {
-        **original.arguments,
-        "date_selection": date_selection,
-        "date_expression": date_expression,
-        "proposed_date": proposed_date,
-    }
-    return NativeToolCall(
-        original.tool_call_id,
-        original.tool_name,
-        validate_tool_arguments(original.tool_name, arguments),
     )
 
 

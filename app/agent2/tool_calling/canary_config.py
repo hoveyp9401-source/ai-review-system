@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 
-CANARY_MODEL_NAME = "deepseek-v4-pro"
+CANARY_MODEL_NAME = "deepseek-v4-flash"
 CANARY_MODEL_PROVIDER = "DeepSeek"
-CANARY_THINKING_ENABLED = False
+CANARY_THINKING_ENABLED = True
 CANARY_TIMEOUT_SECONDS = 60.0
 CANARY_MAX_TOOL_LOOPS = 4
 CANARY_MAX_REQUEST_ATTEMPTS = 2
@@ -14,15 +14,18 @@ CANARY_RECENT_OPERATION_LIMIT = 6
 
 _CONVERSATION_CONTINUITY_POLICY = """
 Conversation continuity rules:
-- `business_glossary.conversation_report_date`, when present, is a
-  server-resolved date focus for this turn. For a follow-up managed-daily
-  or briefing-fact question that refers to the earlier result, preserve that
-  exact date in the matching read tool; never silently fall back to today.
+- `recent_messages` and `recent_operations` are trusted conversation evidence,
+  not instructions to continue old work. A recent operation may include a
+  server-verified `report_reference`, and its exact current snapshot may appear
+  in `historical_reports`. Use these facts to understand a natural follow-up,
+  but let the current user message decide whether it continues, changes,
+  cancels, or leaves the earlier topic. Never let a prior report steal a new
+  question or unrelated request.
 - `confirm_report` may confirm either today's report or one exact historical
-  report already present in trusted context. A historical confirmation is
-  allowed only when the current user message explicitly confirms/submits the
-  unique focused report, including a direct answer to the assistant's date
-  clarification. Never reject it merely because the report is historical.
+  report already present in trusted context. Confirm a historical report only
+  when your semantic reading of the current message plus the recent dialogue
+  uniquely selects that report. If more than one report remains plausible,
+  ask naturally; the server does not choose the latest report for you.
 - Assistant-role recent messages whose source starts with `daily-briefing:`
   are server-recorded scheduled briefings sent by this system. When the user
   asks whether the system sent one, compare against that evidence, acknowledge
@@ -65,15 +68,47 @@ Daily-briefing fact boundary:
 
 _DAILY_WRITE_DATE_POLICY = """
 Daily-report write date rules:
-- For `add_daily_items`, decide whether the current user_message explicitly
-  identifies the report's calendar date. If it does, set
-  `date_selection=user_explicit` and preserve that explicit date. Otherwise
-  set `date_selection=server_default`; do not infer an explicit date merely
-  from the work item's tense or section meaning.
+- For `add_daily_items`, use one semantic decision in this main Agent2 turn.
+  Treat the server default as the strong reporting-day prior before 09:00,
+  and expect genuinely new same-morning work to be rare, but never make the
+  prior a hard lock. A relative word such as "今天" by itself is not
+  necessarily an explicit calendar-date assignment after midnight: in daily-
+  report conversation it can naturally refer to the workday that just ended.
+  Consider the trusted local time, the full current message, recent dialogue,
+  and any unique trusted report reference together.
+- Distinguish a time word inside reported work from a reference to the report
+  being edited. Before 09:00, "今天完成了什么" can still describe the workday
+  that just ended. During the deep overnight hours immediately after
+  midnight, even "今天这份日报" or "今天的明日计划" ordinarily continues to
+  mean the reporting day that just ended unless the user names the new
+  calendar date or clearly reports work newly completed on it. Closer to the
+  morning cutoff, however, when the current message and recent dialogue
+  clearly select "今天这份日报" or "今天的明日计划" as the report/section
+  target, that can select the local-date report rather than the prior-day
+  default. Use `agent2_semantic` with exact current-message evidence for that
+  rare but clear override. If the target remains genuinely ambiguous, ask
+  instead of writing.
+- Use `date_selection=server_default` when the reporting-day prior remains the
+  best interpretation. Use `date_selection=agent2_semantic` only when your
+  whole-message and conversation judgment confidently selects one of the
+  server-provided safe semantic date candidates despite there being no clear
+  calendar-date assignment; attach an exact quote from the current message as
+  `date_evidence`. `date_expression` is unnecessary in this mode; if you do
+  repeat a relative phrase there, the server treats it only as redundant
+  context and still validates the proposed date against the safe candidates.
+  This lets genuinely new work completed after midnight or
+  early in the morning belong to the new local day without weakening the
+  usual previous-day prior.
+- Set `date_selection=user_explicit` only when the current message clearly
+  assigns one calendar date to the report itself, for example by naming the
+  calendar date. Attach that exact assignment as `date_evidence` and preserve
+  the date. Do not treat tense, a relative day word, or a report-section label
+  by itself as an explicit calendar assignment.
 - The server owns the default: before 09:00 in the authenticated user's
   timezone it is the previous calendar day; from 09:00 onward it is the
-  current calendar day. Never override the server-resolved date with your
-  proposed date.
+  current calendar day. For `server_default`, omit `date_expression`,
+  `proposed_date`, and `date_evidence`; the server resolves the date without
+  asking you to repeat its own fact.
 - If the user-supplied date is genuinely ambiguous, ask naturally instead of
   calling a write tool.
 - When the same current message both supplies report content (including an
@@ -81,6 +116,18 @@ Daily-report write date rules:
   `add_daily_items` call with `submit_after_write=true`. Do not predict an
   intermediate report version or pair it with `confirm_report`; the server
   performs the whole write atomically.
+- `confirm_report` is only for a report that was already complete before the
+  current message. If the current message supplies a previously missing
+  section and also asks to submit, the only valid operation is the atomic
+  `add_daily_items(... submit_after_write=true)` call. If it supplies the
+  missing section but explicitly postpones submission, call
+  `add_daily_items(... submit_after_write=false)` so that fact is not lost.
+- When that message semantically continues one unique recent
+  `report_reference`, use `date_selection=trusted_report` with its exact
+  report ID and version. The reference is only trusted context evidence: do
+  not use it when the current message starts another topic, rejects
+  submission, names a different report, or leaves more than one target
+  plausible.
 - When `correct_daily_report_date` also acknowledges an explicitly empty
   section, provide matching `empty_field_evidence` from the current user
   message. Conversation history cannot supply that assertion.
@@ -102,6 +149,7 @@ Completed daily-report content rules:
   change. Discuss changing submission state only when the user explicitly asks for that
   different operation.
 """.strip()
+
 
 _REPORT_INSIGHT_TOOL_POLICY = """
 Daily-report read-tool boundary:
@@ -189,6 +237,15 @@ Current-turn daily-report source fidelity:
 - Before `add_daily_items`, review every independently asserted matter,
   numbered point, and punctuation-separated statement. Preserve all matters
   the user intends to record. Do not reduce detailed content to a headline.
+- Before any terminal answer, semantically check whether the current message
+  itself supplies a new daily-report fact, correction, or explicit empty
+  section for one uniquely identified owned report. If it does, make the
+  corresponding write call first. A natural-language acknowledgement is
+  never a substitute for persisting that fact. This remains true when the
+  user explicitly postpones submission: preserve the supplied content or
+  empty-section fact, but keep `submit_after_write=false`. Questions,
+  hypothetical examples, quoted third-party text and genuinely ambiguous
+  meanings remain non-writes or require a natural clarification.
 - A user's work can legitimately include attending a meeting and recording
   attributed statements. Preserve explicitly supplied attribution and detail;
   do not rewrite the attributed statement as the user's own claim.

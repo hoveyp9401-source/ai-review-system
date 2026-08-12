@@ -129,7 +129,6 @@ class TrustedContextReadPort(Protocol):
         limit: int,
     ) -> tuple[TrustedRecentOperation, ...]: ...
 
-
 class TrustedPolicyPort(Protocol):
     async def permission_allowed(
         self,
@@ -228,6 +227,88 @@ class TrustedContextAssembler:
             if self._recent_operation_limit
             else ()
         )
+        reference_warnings: list[str] = []
+        unique_report_references = {
+            operation.report_reference.report_id
+            for operation in recent_operations
+            if operation.report_reference is not None
+        }
+        unambiguous_report_id = (
+            next(iter(unique_report_references))
+            if len(unique_report_references) == 1
+            else None
+        )
+        validated_recent_operations: list[TrustedRecentOperation] = []
+        loaded_report_ids = {
+            report.report_id
+            for report in (today_report, *historical_reports)
+            if report is not None
+        }
+        loaded_report_dates = {
+            report.report_date
+            for report in (today_report, *historical_reports)
+            if report is not None
+        }
+        for operation in recent_operations:
+            reference = operation.report_reference
+            if reference is None:
+                validated_recent_operations.append(operation)
+                continue
+            if reference.report_id != unambiguous_report_id:
+                validated_recent_operations.append(
+                    operation.model_copy(update={"report_reference": None})
+                )
+                reference_warnings.append(
+                    "recent_report_reference_ambiguous"
+                )
+                continue
+            if (
+                operation.status not in {"success", "no_op"}
+                or operation.target_type != "daily_report"
+                or operation.target_id != str(reference.report_id)
+                or operation.after_version != reference.report_version
+            ):
+                validated_recent_operations.append(
+                    operation.model_copy(update={"report_reference": None})
+                )
+                reference_warnings.append(
+                    "recent_report_reference_mismatch"
+                )
+                continue
+            report = _validate_loaded_report(
+                request,
+                reference.report_date,
+                await self._read_port.load_report(
+                    request,
+                    reference.report_date,
+                ),
+            )
+            if (
+                report is None
+                or report.report_id != reference.report_id
+                or report.version != reference.report_version
+                or report.status != reference.report_status
+            ):
+                validated_recent_operations.append(
+                    operation.model_copy(update={"report_reference": None})
+                )
+                reference_warnings.append(
+                    "recent_report_reference_mismatch"
+                )
+                continue
+            validated_recent_operations.append(operation)
+            if report.report_date == today:
+                today_report = report
+            elif (
+                report.report_id not in loaded_report_ids
+                and report.report_date not in loaded_report_dates
+                and len(historical_reports) < self._history_report_limit
+            ):
+                historical_reports.append(report)
+            loaded_report_ids.add(report.report_id)
+            loaded_report_dates.add(report.report_date)
+        recent_operations = tuple(validated_recent_operations)
+
         personal_memory = (
             await self._personal_memory_module.read_for_turn(
                 PersonalMemoryScope(
@@ -239,7 +320,6 @@ class TrustedContextAssembler:
             if self._personal_memory_module is not None
             else None
         )
-
         execution_mode = (
             ExecutionMode.CANARY_EXECUTE
             if self._namespace == CANARY_STATE_NAMESPACE
@@ -273,7 +353,9 @@ class TrustedContextAssembler:
                 name for name, allowed in permission_results.items() if allowed
             ),
             gate_decisions=gate_decisions,
-            assembly_warnings=pending_warnings,
+            assembly_warnings=tuple(
+                dict.fromkeys((*pending_warnings, *reference_warnings))
+            ),
         )
 
 

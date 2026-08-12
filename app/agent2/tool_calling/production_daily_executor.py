@@ -188,19 +188,6 @@ class ProductionDailyExecutor:
                 )
             report_date = resolution.resolved_date
             candidate_matches = resolution.candidate_matches
-        else:
-            focused_date = str(
-                self._context.business_glossary.get(
-                    "conversation_report_date",
-                    "",
-                )
-            ).strip()
-            if focused_date:
-                try:
-                    report_date = date.fromisoformat(focused_date)
-                    candidate_matches = True
-                except ValueError:
-                    pass
         try:
             result = await self._managed_daily_query.execute(
                 actor=DashboardActor(
@@ -284,19 +271,6 @@ class ProductionDailyExecutor:
                 )
             report_date = resolution.resolved_date
             candidate_matches = resolution.candidate_matches
-        else:
-            focused_date = str(
-                self._context.business_glossary.get(
-                    "conversation_report_date",
-                    "",
-                )
-            ).strip()
-            if focused_date:
-                try:
-                    report_date = date.fromisoformat(focused_date)
-                    candidate_matches = True
-                except ValueError:
-                    report_date = None
         if report_date is None:
             return self._daily_briefing_fact_read_outcome(
                 request=request,

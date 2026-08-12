@@ -330,6 +330,282 @@ async def test_undated_daily_write_before_nine_uses_previous_day() -> None:
 
 
 @pytest.mark.asyncio
+async def test_before_nine_agent2_can_semantically_choose_new_day_without_a_second_date_router() -> None:
+    """The morning default is a prior, not a hard lock on yesterday."""
+
+    context = TrustedContext(
+        now=datetime(2026, 8, 13, 0, 30, tzinfo=UTC),
+        principal=TrustedPrincipal(
+            tenant_id="tenant",
+            user_id=UUID("22222222-2222-2222-2222-222222222222"),
+            conversation_id="early-morning-conversation",
+            source_message_id="early-morning-new-work",
+            timezone="Asia/Shanghai",
+        ),
+        allowed_tool_names=frozenset({"add_daily_items"}),
+        gate_decisions={"add_daily_items": True},
+    )
+    current_message = "早上刚完成了付款节点复核，这项记到8月13日的日报。"
+    call = NativeToolCall(
+        tool_call_id="add-current-workday",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "agent2_semantic",
+            "proposed_date": "2026-08-13",
+            "date_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "这项记到8月13日的日报",
+            },
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成付款节点复核",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
+        },
+    )
+
+    bound, failure = await ShadowCallBinder(
+        context,
+        _DateResolverThatMustNotRun(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource((current_message,)),
+    ).bind(call)
+
+    assert failure is None
+    assert bound is not None
+    assert bound.date_facts == {
+        "resolved_date": "2026-08-13",
+        "date_candidate_matches": True,
+        "date_resolution_basis": "agent2_semantic",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent2_semantic_date_tolerates_a_redundant_relative_expression() -> None:
+    """A safe model date must not be rejected only for repeating its relative phrase."""
+
+    context = TrustedContext(
+        now=datetime(2026, 8, 13, 0, 30, tzinfo=UTC),
+        principal=TrustedPrincipal(
+            tenant_id="tenant",
+            user_id=UUID("22222222-2222-2222-2222-222222222222"),
+            conversation_id="early-morning-conversation",
+            source_message_id="early-morning-redundant-expression",
+            timezone="Asia/Shanghai",
+        ),
+        allowed_tool_names=frozenset({"add_daily_items"}),
+        gate_decisions={"add_daily_items": True},
+    )
+    current_message = "早上刚完成付款节点复核，这项记到今天这份日报。"
+    call = NativeToolCall(
+        tool_call_id="add-current-workday-with-expression",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "agent2_semantic",
+            "date_expression": "今天",
+            "proposed_date": "2026-08-13",
+            "date_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "早上刚完成付款节点复核",
+            },
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成付款节点复核",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
+        },
+    )
+
+    bound, failure = await ShadowCallBinder(
+        context,
+        _DateResolverThatMustNotRun(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource((current_message,)),
+    ).bind(call)
+
+    assert failure is None
+    assert bound is not None
+    assert bound.arguments["date_expression"] == "今天"
+    assert bound.date_facts == {
+        "resolved_date": "2026-08-13",
+        "date_candidate_matches": True,
+        "date_resolution_basis": "agent2_semantic",
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent2_semantic_date_cannot_escape_the_morning_today_or_default_window() -> None:
+    context = TrustedContext(
+        now=datetime(2026, 8, 13, 0, 30, tzinfo=UTC),
+        principal=TrustedPrincipal(
+            tenant_id="tenant",
+            user_id=UUID("22222222-2222-2222-2222-222222222222"),
+            conversation_id="early-morning-conversation",
+            source_message_id="bad-semantic-date",
+            timezone="Asia/Shanghai",
+        ),
+        allowed_tool_names=frozenset({"add_daily_items"}),
+        gate_decisions={"add_daily_items": True},
+    )
+    call = NativeToolCall(
+        tool_call_id="bad-semantic-date",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "agent2_semantic",
+            "proposed_date": "2026-08-01",
+            "date_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "今天完成合同复核",
+            },
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成合同复核",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
+        },
+    )
+
+    bound, failure = await ShadowCallBinder(
+        context,
+        _DateResolverThatMustNotRun(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource(("今天完成合同复核",)),
+    ).bind(call)
+
+    assert bound is None
+    assert failure is not None
+    assert failure.error_code == "UNTRUSTED_SEMANTIC_REPORT_DATE"
+
+
+def test_context_exposes_morning_default_as_a_prior_not_a_lock() -> None:
+    context = TrustedContext(
+        now=datetime(2026, 8, 13, 0, 30, tzinfo=UTC),
+        principal=TrustedPrincipal(
+            tenant_id="tenant",
+            user_id=UUID("22222222-2222-2222-2222-222222222222"),
+            conversation_id="early-morning-conversation",
+            source_message_id="context-date-prior",
+            timezone="Asia/Shanghai",
+        ),
+    )
+
+    reporting = context.model_payload()["daily_reporting_context"]
+
+    assert reporting == {
+        "local_date": "2026-08-13",
+        "local_time": "2026-08-13T08:30:00+08:00",
+        "default_report_date": "2026-08-12",
+        "morning_cutoff": "09:00",
+        "default_is_prior_not_lock": True,
+        "safe_semantic_date_candidates": ["2026-08-12", "2026-08-13"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_one_am_yesterday_resolves_to_the_same_previous_day_prior() -> None:
+    """At 01:00 on Aug 13, 'yesterday' and the reporting prior are Aug 12."""
+
+    context = TrustedContext(
+        now=datetime(2026, 8, 12, 17, 0, tzinfo=UTC),
+        principal=TrustedPrincipal(
+            tenant_id="tenant",
+            user_id=UUID("22222222-2222-2222-2222-222222222222"),
+            conversation_id="one-am-yesterday",
+            source_message_id="one-am-yesterday-message",
+            timezone="Asia/Shanghai",
+        ),
+        allowed_tool_names=frozenset({"add_daily_items"}),
+        gate_decisions={"add_daily_items": True},
+    )
+    call = NativeToolCall(
+        tool_call_id="add-yesterday-at-one-am",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "date_expression": "default",
+            "proposed_date": "2026-08-12",
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成合同付款节点复核",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
+        },
+    )
+
+    bound, failure = await ShadowCallBinder(
+        context,
+        _DateResolverThatMustNotRun(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource(
+            ("昨天完成了合同付款节点复核，问题暂无，明天继续跟进。",)
+        ),
+    ).bind(call)
+
+    assert failure is None
+    assert bound is not None
+    assert bound.date_facts == {
+        "resolved_date": "2026-08-12",
+        "date_candidate_matches": True,
+        "date_resolution_basis": "server_default",
+    }
+
+
+@pytest.mark.asyncio
+async def test_server_default_needs_no_model_repetition_of_the_server_date() -> None:
+    context = TrustedContext(
+        now=datetime(2026, 8, 12, 17, 0, tzinfo=UTC),
+        principal=TrustedPrincipal(
+            tenant_id="tenant",
+            user_id=UUID("22222222-2222-2222-2222-222222222222"),
+            conversation_id="one-am-default",
+            source_message_id="one-am-default-message",
+            timezone="Asia/Shanghai",
+        ),
+        allowed_tool_names=frozenset({"add_daily_items"}),
+        gate_decisions={"add_daily_items": True},
+    )
+    call = NativeToolCall(
+        tool_call_id="default-without-duplicated-date",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成合同付款节点复核",
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
+        },
+    )
+
+    bound, failure = await ShadowCallBinder(
+        context,
+        _DateResolverThatMustNotRun(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource(("完成合同付款节点复核",)),
+    ).bind(call)
+
+    assert failure is None
+    assert bound is not None
+    assert bound.date_facts["resolved_date"] == "2026-08-12"
+    assert bound.date_facts["date_candidate_matches"] is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("local_hour", "date_selection", "expected_date"),
     (
@@ -342,6 +618,7 @@ async def test_explicit_today_wins_and_nine_starts_current_day(
     date_selection: str,
     expected_date: str,
 ) -> None:
+    current_message = "这份日报明确记到今天，完成合同审核。"
     context = TrustedContext(
         now=datetime(2026, 8, 11, local_hour - 8, 0, tzinfo=UTC),
         principal=TrustedPrincipal(
@@ -361,6 +638,16 @@ async def test_explicit_today_wins_and_nine_starts_current_day(
             "date_selection": date_selection,
             "date_expression": "today",
             "proposed_date": "2026-08-11",
+            **(
+                {
+                    "date_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "明确记到今天",
+                    }
+                }
+                if date_selection == "user_explicit"
+                else {}
+            ),
             "items": [
                 {
                     "field": "today_work",
@@ -376,6 +663,7 @@ async def test_explicit_today_wins_and_nine_starts_current_day(
         _DateResolver(),
         None,
         execution_mode=ExecutionMode.SHADOW_PROPOSAL,
+        current_turn_source=CurrentTurnSource((current_message,)),
     ).bind(call)
 
     assert failure is None

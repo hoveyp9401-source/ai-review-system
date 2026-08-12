@@ -17,6 +17,13 @@ ToolCallStateNamespace = Literal[
     "agent2.tool_calling.canary.v1",
 ]
 ReportField = Literal["today_work", "problems", "tomorrow_plan"]
+ReportStatus = Literal[
+    "collecting",
+    "pending_confirmation",
+    "completed",
+    "skipped",
+    "cancelled",
+]
 ResourceProvenance = Literal["trusted_context", "read_tool"]
 ReceiptStatus = Literal[
     "success",
@@ -59,7 +66,7 @@ class TrustedReportSnapshot(_FrozenModel):
     owner_user_id: UUID
     report_date: date
     version: int = Field(ge=0)
-    status: str = Field(min_length=1, max_length=64)
+    status: ReportStatus
     items: tuple[TrustedReportItem, ...] = ()
     acknowledged_empty_fields: frozenset[ReportField] = frozenset()
     provenance: ResourceProvenance = "trusted_context"
@@ -131,6 +138,16 @@ class TrustedRecentMessage(_FrozenModel):
     source_message_id: str = Field(min_length=1, max_length=512)
 
 
+class TrustedReportReference(_FrozenModel):
+    """A server-verified report pointer preserved by a prior tool receipt."""
+
+    report_id: UUID
+    report_date: date
+    report_version: int = Field(ge=0)
+    report_status: ReportStatus
+    provenance: Literal["server_receipt"] = "server_receipt"
+
+
 class TrustedRecentOperation(_FrozenModel):
     tenant_id: str = Field(min_length=1, max_length=128)
     user_id: UUID
@@ -145,6 +162,7 @@ class TrustedRecentOperation(_FrozenModel):
     before_version: int | None = Field(default=None, ge=0)
     after_version: int | None = Field(default=None, ge=0)
     affected_item_ids: tuple[str, ...] = ()
+    report_reference: TrustedReportReference | None = None
     occurred_at: datetime
     provenance: Literal["server_receipt"] = "server_receipt"
 
@@ -172,7 +190,7 @@ class TrustedRecentOperation(_FrozenModel):
         *,
         item_contents: dict[str, str],
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "tool_name": self.tool_name,
             "status": self.status,
             "changed": self.changed,
@@ -186,6 +204,11 @@ class TrustedRecentOperation(_FrozenModel):
             "occurred_at": self.occurred_at.isoformat(),
             "provenance": self.provenance,
         }
+        if self.report_reference is not None:
+            payload["report_reference"] = self.report_reference.model_dump(
+                mode="json"
+            )
+        return payload
 
 
 class TrustedRuntimeIdentity(_FrozenModel):
@@ -301,15 +324,38 @@ class TrustedContext(_FrozenModel):
         return next((item for item in self.all_reports() if item.report_date == report_date), None)
 
     def model_payload(self) -> dict[str, Any]:
+        from app.agent2.tool_calling.reporting_date import (
+            MORNING_DAILY_CUTOFF,
+            default_daily_write_date,
+        )
+
         pending = self.active_clear_pending
         item_contents = {
             item.item_id: item.content
             for report in self.all_reports()
             for item in report.items
         }
+        local_now = self.now.astimezone(ZoneInfo(self.principal.timezone))
+        default_report_date = default_daily_write_date(
+            now=self.now,
+            timezone=self.principal.timezone,
+        )
+        safe_date_candidates = tuple(
+            dict.fromkeys((default_report_date, local_now.date()))
+        )
         payload = {
             "current_time": self.now.isoformat(),
             "timezone": self.principal.timezone,
+            "daily_reporting_context": {
+                "local_date": local_now.date().isoformat(),
+                "local_time": local_now.isoformat(),
+                "default_report_date": default_report_date.isoformat(),
+                "morning_cutoff": MORNING_DAILY_CUTOFF.strftime("%H:%M"),
+                "default_is_prior_not_lock": True,
+                "safe_semantic_date_candidates": [
+                    item.isoformat() for item in safe_date_candidates
+                ],
+            },
             "today_report": self.today_report.safe_snapshot() if self.today_report else None,
             "historical_reports": [item.safe_snapshot() for item in self.historical_reports],
             "active_clear_pending": (

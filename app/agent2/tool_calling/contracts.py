@@ -63,6 +63,20 @@ class CurrentUserMessageEvidence(StrictContract):
     ]
 
 
+class DailyReportDateEvidence(CurrentUserMessageEvidence):
+    exact_quote: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=1000,
+            description=(
+                "Exact current-message text that lets Agent2 choose the "
+                "reporting date instead of the server default."
+            ),
+        ),
+    ]
+
+
 class PersonalMemorySourceEvidence(CurrentUserMessageEvidence):
     intent: Literal[
         "explicit_preference",
@@ -313,11 +327,19 @@ class DailyEmptyFieldEvidence(StrictContract):
 
 
 class AddDailyItemsArgs(StrictContract):
-    date_selection: Literal["server_default", "user_explicit"] = (
+    date_selection: Literal[
+        "server_default",
+        "agent2_semantic",
+        "user_explicit",
+        "trusted_report",
+    ] = (
         "server_default"
     )
-    date_expression: DateExpression
-    proposed_date: date
+    date_expression: DateExpression | None = None
+    proposed_date: date | None = None
+    report_id: UUID | None = None
+    expected_version: int | None = Field(default=None, ge=0)
+    date_evidence: DailyReportDateEvidence | None = None
     items: tuple[DailyItemInput, ...] = Field(default=(), max_length=30)
     acknowledged_empty_fields: tuple[ReportField, ...] = Field(
         default=(),
@@ -333,6 +355,51 @@ class AddDailyItemsArgs(StrictContract):
     def require_content_or_explicit_empty_acknowledgement(
         self,
     ) -> "AddDailyItemsArgs":
+        if self.date_selection == "trusted_report":
+            if self.report_id is None or self.expected_version is None:
+                raise ValueError(
+                    "trusted-report selection requires report_id and expected_version"
+                )
+            if (
+                self.date_expression is not None
+                or self.proposed_date is not None
+                or self.date_evidence is not None
+            ):
+                raise ValueError(
+                    "trusted-report selection cannot carry a date expression"
+                )
+        elif self.date_selection == "agent2_semantic":
+            if self.proposed_date is None or self.date_evidence is None:
+                raise ValueError(
+                    "Agent2 semantic date selection requires a proposed date "
+                    "and exact current-message evidence"
+                )
+            if self.report_id is not None or self.expected_version is not None:
+                raise ValueError(
+                    "only trusted-report selection may carry a report binding"
+                )
+        elif self.date_selection == "user_explicit":
+            if self.date_expression is None or self.proposed_date is None:
+                raise ValueError(
+                    "an explicit report date requires an expression and proposed date"
+                )
+            if self.report_id is not None or self.expected_version is not None:
+                raise ValueError(
+                    "only trusted-report selection may carry a report binding"
+                )
+            if self.date_evidence is None:
+                raise ValueError(
+                    "an explicit report date requires exact current-message evidence"
+                )
+        else:
+            if self.report_id is not None or self.expected_version is not None:
+                raise ValueError(
+                    "only trusted-report selection may carry a report binding"
+                )
+            if self.date_evidence is not None:
+                raise ValueError(
+                    "the server default cannot carry semantic date evidence"
+                )
         if (
             not self.items
             and not self.acknowledged_empty_fields

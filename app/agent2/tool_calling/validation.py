@@ -106,6 +106,10 @@ class ShadowCallBinder:
     def begin_batch(self) -> None:
         self._batch_reports_by_date = {}
 
+    @property
+    def current_turn_source(self) -> CurrentTurnSource | None:
+        return self._current_turn_source
+
     def promote_query_results(
         self,
         bound_calls: list[BoundCall],
@@ -221,11 +225,55 @@ class ShadowCallBinder:
                 )
             date_facts = {
                 "resolved_date": resolved_default.isoformat(),
-                "date_candidate_matches": (
-                    str(arguments.get("proposed_date") or "")
-                    == resolved_default.isoformat()
-                ),
+                "date_candidate_matches": True,
                 "date_resolution_basis": "server_default",
+            }
+        elif (
+            call.tool_name == "add_daily_items"
+            and arguments.get("date_selection") == "agent2_semantic"
+        ):
+            proposed_date = date.fromisoformat(str(arguments["proposed_date"]))
+            local_today = self._context.now.astimezone(
+                ZoneInfo(self._context.principal.timezone)
+            ).date()
+            default_date = default_daily_write_date(
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+            if proposed_date not in {default_date, local_today}:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_SEMANTIC_REPORT_DATE",
+                )
+            try:
+                report = await self.report_by_date(proposed_date)
+            except _UntrustedReadSnapshotError:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_READ_RESOURCE",
+                )
+            date_facts = {
+                "resolved_date": proposed_date.isoformat(),
+                "date_candidate_matches": True,
+                "date_resolution_basis": "agent2_semantic",
+            }
+        elif (
+            call.tool_name == "add_daily_items"
+            and arguments.get("date_selection") == "trusted_report"
+        ):
+            parsed_report_id = UUID(str(arguments["report_id"]))
+            report = self.report_by_id(parsed_report_id)
+            if report is None:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_REPORT_ID",
+                )
+            date_facts = {
+                "resolved_date": report.report_date.isoformat(),
+                "date_resolution_basis": "trusted_report_reference",
             }
         elif "date_expression" in arguments:
             proposed_date = date.fromisoformat(str(arguments["proposed_date"]))

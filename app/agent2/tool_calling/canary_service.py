@@ -5,12 +5,11 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, dataclass, is_dataclass, replace
-from datetime import date, timedelta
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from time import perf_counter
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
@@ -692,6 +691,7 @@ async def process_tool_call_canary_ingress(
             reply_formed=bool(message),
         )
 
+    turn_transaction = await session.begin_nested()
     try:
         context_store = ProductionContextStore(
             session,
@@ -716,32 +716,6 @@ async def process_tool_call_canary_ingress(
             runtime_provider_name=CANARY_MODEL_PROVIDER,
             runtime_model_name=CANARY_MODEL_NAME,
         )
-        recent_messages_for_focus = await context_store.load_recent_messages(
-            context_request,
-            namespace=CANARY_STATE_NAMESPACE,
-            limit=CANARY_RECENT_MESSAGE_LIMIT,
-        )
-        conversation_report_date = _conversation_report_date(
-            user_messages=ordered_user_messages,
-            recent_messages=recent_messages_for_focus,
-            server_now=now,
-            timezone=context_request.timezone,
-        )
-        local_today = now.astimezone(
-            ZoneInfo(context_request.timezone)
-        ).date()
-        if (
-            conversation_report_date is not None
-            and conversation_report_date != local_today
-            and _turn_requests_historical_confirmation(
-                user_messages=ordered_user_messages,
-                recent_messages=recent_messages_for_focus,
-            )
-        ):
-            context_request = replace(
-                context_request,
-                explicit_history_dates=(conversation_report_date,),
-            )
         context = await TrustedContextAssembler(
             read_port=context_store,
             policy_port=context_store,
@@ -755,10 +729,6 @@ async def process_tool_call_canary_ingress(
         context = _attach_performance_glossary(
             context,
             settings=settings,
-        )
-        context = _attach_conversation_report_date(
-            context,
-            report_date=conversation_report_date,
         )
         runtime_session = ProductionRuntime().open_session(
             session=session,
@@ -801,7 +771,6 @@ async def process_tool_call_canary_ingress(
         final_content = _select_trusted_read_response(
             model_content=result.final_content,
             receipts=result.receipts,
-            user_query="\n".join(ordered_user_messages),
         )
         if (
             resolution.control.messages_enabled
@@ -815,7 +784,81 @@ async def process_tool_call_canary_ingress(
                 context=context,
                 content=final_content,
             )
+        report_id = next(
+            (
+                receipt.target_id
+                for receipt in reversed(result.receipts)
+                if receipt.target_type == "daily_report"
+                and receipt.target_id
+            ),
+            None,
+        )
+        formatted_message = format_dingtalk_plain_text(final_content)
+        receipt_counts = _receipt_status_counts(result.receipts)
+        metric_fields = {
+            "tool_names": tuple(
+                receipt.tool_name for receipt in result.receipts
+            ),
+            "success_count": sum(
+                receipt.status.value in {"success", "no_op"}
+                for receipt in result.receipts
+            ),
+            "failure_count": sum(
+                receipt.status.value in {"failed", "blocked"}
+                for receipt in result.receipts
+            ),
+            "clarification_count": sum(
+                receipt.status.value == "clarification_required"
+                for receipt in result.receipts
+            ),
+            "receipt_mismatch_count": 0,
+            "rollback_count": sum(
+                runtime_result.rolled_back
+                for runtime_result in result.runtime_results
+            ),
+            "latency_ms": max(
+                0,
+                int((perf_counter() - started) * 1000),
+            ),
+            "model_error_count": 0,
+        }
+        outcome = CanaryIngressOutcome(
+            owner="tool_call_core",
+            reason=decision.reason,
+            message=formatted_message,
+            report_id=report_id,
+            handled=True,
+            actual_write=any(
+                receipt.changed for receipt in result.receipts
+            ),
+            messages_enabled=bool(
+                resolution.control.messages_enabled
+            ),
+            model_call_count=len(result.model_turns),
+            model_request_attempt_count=(
+                result.request_attempt_count
+            ),
+            model_transport_retry_count=(
+                result.transport_retry_count
+            ),
+            model_elapsed_seconds=_model_elapsed_seconds(
+                result.model_turns
+            ),
+            model_result_status="success",
+            tool_success_count=receipt_counts["success"],
+            tool_no_op_count=receipt_counts["no_op"],
+            tool_clarification_count=receipt_counts[
+                "clarification_required"
+            ],
+            tool_blocked_count=receipt_counts["blocked"],
+            tool_failure_count=receipt_counts["failed"],
+            user_visible_result=_user_visible_result(receipt_counts),
+            reply_formed=bool(formatted_message),
+        )
+        await turn_transaction.commit()
     except Exception as exc:
+        if turn_transaction.is_active:
+            await turn_transaction.rollback()
         failure = _record_canary_execution_failure(
             error=exc,
             messages_enabled=bool(
@@ -830,66 +873,8 @@ async def process_tool_call_canary_ingress(
         if failure.messages_enabled:
             return failure.outcome()
         raise failure from exc
-    _record_canary_metric_safely(
-        tool_names=tuple(
-            receipt.tool_name for receipt in result.receipts
-        ),
-        success_count=sum(
-            receipt.status.value in {"success", "no_op"}
-            for receipt in result.receipts
-        ),
-        failure_count=sum(
-            receipt.status.value in {"failed", "blocked"}
-            for receipt in result.receipts
-        ),
-        clarification_count=sum(
-            receipt.status.value == "clarification_required"
-            for receipt in result.receipts
-        ),
-        receipt_mismatch_count=0,
-        rollback_count=sum(
-            runtime_result.rolled_back
-            for runtime_result in result.runtime_results
-        ),
-        latency_ms=max(0, int((perf_counter() - started) * 1000)),
-        model_error_count=0,
-    )
-    report_id = next(
-        (
-            receipt.target_id
-            for receipt in reversed(result.receipts)
-            if receipt.target_type == "daily_report"
-            and receipt.target_id
-        ),
-        None,
-    )
-    formatted_message = format_dingtalk_plain_text(final_content)
-    receipt_counts = _receipt_status_counts(result.receipts)
-    return CanaryIngressOutcome(
-        owner="tool_call_core",
-        reason=decision.reason,
-        message=formatted_message,
-        report_id=report_id,
-        handled=True,
-        actual_write=any(receipt.changed for receipt in result.receipts),
-        messages_enabled=bool(resolution.control.messages_enabled),
-        model_call_count=len(result.model_turns),
-        model_request_attempt_count=result.request_attempt_count,
-        model_transport_retry_count=result.transport_retry_count,
-        model_elapsed_seconds=_model_elapsed_seconds(
-            result.model_turns
-        ),
-        model_result_status="success",
-        tool_success_count=receipt_counts["success"],
-        tool_no_op_count=receipt_counts["no_op"],
-        tool_clarification_count=receipt_counts[
-            "clarification_required"
-        ],
-        tool_blocked_count=receipt_counts["blocked"],
-        tool_failure_count=receipt_counts["failed"],
-        user_visible_result=_user_visible_result(receipt_counts),
-        reply_formed=bool(formatted_message),
-    )
+    _record_canary_metric_safely(**metric_fields)
+    return outcome
 
 
 def _receipt_status_counts(receipts: tuple[Any, ...]) -> dict[str, int]:
@@ -967,9 +952,8 @@ def _select_trusted_read_response(
     *,
     model_content: str,
     receipts: tuple[Any, ...],
-    user_query: str = "",
 ) -> str:
-    """Allow natural wording only when it remains inside trusted facts."""
+    """Keep Agent2 wording while enforcing deterministic factual grounding."""
 
     if any(
         (
@@ -990,14 +974,15 @@ def _select_trusted_read_response(
         grounded = _validated_performance_reply(
             model_content,
             facts=safe_facts,
-            user_query=user_query,
         )
         if grounded is not None:
             return grounded
-        return response_text
+        return canary_block_message(
+            "tool_call_canary_execution_failed"
+        )
     if _contains_performance_receipt(receipts):
-        return _deterministic_mixed_performance_response(
-            receipts
+        return canary_block_message(
+            "tool_call_canary_execution_failed"
         )
     return (
         _trusted_authoritative_read_response(receipts)
@@ -1023,58 +1008,22 @@ def _contains_performance_receipt(
     )
 
 
-def _deterministic_mixed_performance_response(
-    receipts: tuple[Any, ...],
-) -> str:
-    has_write = any(
-        (
-            definition := TOOL_REGISTRY.get(
-                str(getattr(receipt, "tool_name", "") or "")
-            )
-        )
-        is not None
-        and definition.read_or_write == "write"
-        for receipt in receipts
-    )
-    if has_write:
-        response, _ = finalize_canary_content(
-            "",
-            receipts,
-            write_batch_seen=True,
-        )
-        return response
-    responses: list[str] = []
-    for receipt in receipts:
-        safe_facts = getattr(receipt, "safe_user_facts", None)
-        if not isinstance(safe_facts, dict):
-            continue
-        response = str(
-            safe_facts.get("response_text") or ""
-        ).strip()
-        if response and response not in responses:
-            responses.append(response)
-    return "\n\n".join(responses) or canary_block_message(
-        "tool_call_canary_execution_failed"
-    )
-
-
 def _model_composable_performance_facts(
     receipts: tuple[Any, ...],
 ) -> tuple[dict[str, Any], str] | None:
-    # Natural performance wording is a pure-read feature. Any mixed tool
-    # batch must retain the existing deterministic write/read reply.
-    if len(receipts) != 1:
-        return None
-    only_receipt = receipts[0]
-    definition = TOOL_REGISTRY.get(
-        str(getattr(only_receipt, "tool_name", "") or "")
-    )
-    if (
-        bool(getattr(only_receipt, "changed", False))
-        or definition is None
-        or definition.read_or_write != "read"
-    ):
-        return None
+    # Agent2 may compose several read-only results in one answer.  The
+    # program only admits an unchanged, registered read batch and validates
+    # the cited performance claims; it never substitutes business prose.
+    for receipt in receipts:
+        definition = TOOL_REGISTRY.get(
+            str(getattr(receipt, "tool_name", "") or "")
+        )
+        if (
+            bool(getattr(receipt, "changed", False))
+            or definition is None
+            or definition.read_or_write != "read"
+        ):
+            return None
     for receipt in reversed(receipts):
         if bool(getattr(receipt, "changed", False)):
             continue
@@ -1132,20 +1081,10 @@ def _validated_performance_reply(
     content: str,
     *,
     facts: dict[str, Any],
-    user_query: str = "",
 ) -> str | None:
-    """Treat model output only as a selection of server-owned facts."""
+    """Validate cited model prose without selecting facts or rewriting it."""
 
     text = str(content or "").strip()
-    if _asks_for_unavailable_historical_period(
-        user_query,
-        facts=facts,
-    ):
-        return (
-            "目前对话可准确查询当前已发布的本周或本月绩效；"
-            "你指定的历史周期暂不能从对话中读取，请在绩效页面"
-            "选择对应日期查看。"
-        )
     if not text or len(text) > 12000:
         return None
     catalog = facts.get("claim_catalog")
@@ -1159,25 +1098,40 @@ def _validated_performance_reply(
         for reference in references
     ):
         return None
-
-    ordered_ids = _select_performance_facts_for_question(
-        list(dict.fromkeys(references)),
-        catalog=catalog,
-        user_query=user_query,
-    )
-    if not ordered_ids:
+    if not references:
         return None
-    ordered_ids = _expand_requested_case_list(
-        ordered_ids,
-        catalog=catalog,
-        user_query=user_query,
+    normalized_text = re.sub(
+        r"[ \t]*(\[依据:[A-Za-z0-9_.-]+\])[ \t]*",
+        r" \1 ",
+        text,
     )
-    return _render_selected_performance_facts(
-        ordered_ids,
-        facts=facts,
-        catalog=catalog,
-        user_query=user_query,
-    )
+    segments = tuple(
+        segment.strip()
+        for segment in normalized_text.splitlines()
+        if segment.strip()
+    ) or (normalized_text.strip(),)
+    for segment in segments:
+        segment_ids = tuple(_PERFORMANCE_CITATION_RE.findall(segment))
+        plain_segment = _PERFORMANCE_CITATION_RE.sub("", segment).strip()
+        if not plain_segment:
+            return None
+        if not segment_ids:
+            if not _presentation_only_performance_line(plain_segment):
+                return None
+            continue
+        claims = tuple(
+            catalog[claim_id]
+            for claim_id in dict.fromkeys(segment_ids)
+        )
+        if not _performance_line_matches_claims(
+            plain_segment,
+            claims=claims,
+            catalog=catalog,
+        ):
+            return None
+    visible = _PERFORMANCE_CITATION_RE.sub("", text)
+    visible = re.sub(r"[ \t]+(?=\r?$)", "", visible, flags=re.MULTILINE)
+    return visible.strip()
 
 
 def _select_performance_facts_for_question(
@@ -3256,7 +3210,7 @@ def _presentation_only_performance_line(text: str) -> bool:
         and ("包括" in text or "分别为" in text)
     ):
         return False
-    return True
+    return False
 
 
 def _performance_reply_segments(text: str) -> tuple[str, ...]:
@@ -3613,144 +3567,6 @@ def _runtime_attestation(settings: object) -> CanaryRuntimeAttestation:
         api_ingress_ready=True,
         stream_ingress_ready=True,
     )
-
-
-_EXPLICIT_REPORT_DATE_PATTERN = re.compile(
-    r"(?:前天|昨天|昨日|今天|今日|"
-    r"20\d{2}[-年/.]\d{1,2}[-月/.]\d{1,2}|"
-    r"\d{1,2}月\d{1,2}[日号])"
-)
-_REPORT_DATE_CONTINUATION_MARKERS = (
-    "那份",
-    "那你",
-    "刚才",
-    "这个",
-    "这份",
-    "晨报",
-    "汇总",
-    "为什么说",
-    "怎么说",
-    "不一致",
-    "提交",
-    "确认",
-)
-
-
-def _conversation_report_date(
-    *,
-    user_messages: tuple[str, ...],
-    recent_messages: tuple[Any, ...],
-    server_now,
-    timezone: str,
-) -> date | None:
-    local_today = server_now.astimezone(ZoneInfo(timezone)).date()
-    current_text = "\n".join(user_messages).strip()
-    explicit_current = _explicit_report_date(
-        current_text,
-        local_today=local_today,
-    )
-    if explicit_current is not None:
-        return explicit_current
-    compact = re.sub(r"\s+", "", current_text)
-    if not any(
-        marker in compact
-        for marker in _REPORT_DATE_CONTINUATION_MARKERS
-    ):
-        return None
-    for message in reversed(recent_messages):
-        resolved = _explicit_report_date(
-            str(getattr(message, "content", "") or ""),
-            local_today=local_today,
-        )
-        if resolved is not None:
-            return resolved
-    return None
-
-
-def _explicit_report_date(
-    text_value: str,
-    *,
-    local_today: date,
-) -> date | None:
-    if not _EXPLICIT_REPORT_DATE_PATTERN.search(text_value):
-        return None
-    from app.services.report_service import _resolve_date_from_text
-
-    return _resolve_date_from_text(text_value, local_today)
-
-
-def _turn_requests_historical_confirmation(
-    *,
-    user_messages: tuple[str, ...],
-    recent_messages: tuple[Any, ...],
-) -> bool:
-    current_text = re.sub(
-        r"[\s，。！？、,.!?;；：:]",
-        "",
-        "\n".join(user_messages),
-    )
-    if any(marker in current_text for marker in ("提交", "确认")):
-        return True
-    if current_text in {
-        "可以",
-        "可以的",
-        "没问题",
-        "就这样",
-        "对",
-        "是的",
-    }:
-        return True
-    if any(
-        marker in current_text
-        for marker in ("那份", "这份", "刚才")
-    ):
-        recent = recent_messages[-6:]
-        prior_user_confirmation = any(
-            str(getattr(message, "role", "") or "") == "user"
-            and any(
-                marker
-                in str(getattr(message, "content", "") or "")
-                for marker in ("提交", "确认")
-            )
-            for message in recent
-        )
-        assistant_date_clarification = any(
-            str(getattr(message, "role", "") or "")
-            == "assistant"
-            and any(
-                marker
-                in str(getattr(message, "content", "") or "")
-                for marker in ("哪天", "哪一天", "日期", "哪份")
-            )
-            for message in recent
-        )
-        if prior_user_confirmation and assistant_date_clarification:
-            return True
-    if not _EXPLICIT_REPORT_DATE_PATTERN.search(current_text):
-        return False
-    for message in reversed(recent_messages[-4:]):
-        content = str(getattr(message, "content", "") or "")
-        role = str(getattr(message, "role", "") or "")
-        if "提交" not in content and "确认" not in content:
-            continue
-        if role == "user" or any(
-            marker in content
-            for marker in ("哪天", "哪一天", "日期", "哪份")
-        ):
-            return True
-    return False
-
-
-def _attach_conversation_report_date(
-    context: Any,
-    *,
-    report_date: date | None,
-) -> Any:
-    if report_date is None:
-        return context
-    glossary = dict(context.business_glossary)
-    glossary["conversation_report_date"] = report_date.isoformat()
-    return context.model_copy(update={"business_glossary": glossary})
 
 
 def _attach_performance_glossary(

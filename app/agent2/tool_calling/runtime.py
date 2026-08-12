@@ -15,7 +15,7 @@ from app.agent2.tool_calling.idempotency import build_write_idempotency_key
 from app.agent2.tool_calling.registry import TOOL_REGISTRY
 from app.agent2.tool_calling.validation import (
     BoundCall,
-    DateResolution,
+    DateResolution as DateResolution,
     DateResolverPort,
     NativeToolCall,
     ShadowCallBinder,
@@ -233,7 +233,10 @@ def conflicting_tool_call_ids(
             if seen_item_ids.intersection(item.target_item_ids):
                 group_conflict = True
             seen_item_ids.update(item.target_item_ids)
-            if definition.confirmation_policy != "none" and len(group) > 1:
+            if (
+                definition.confirmation_policy != "none"
+                and len(group) > 1
+            ):
                 group_conflict = True
             if definition.conflict_policy == "item_content":
                 add_items = {

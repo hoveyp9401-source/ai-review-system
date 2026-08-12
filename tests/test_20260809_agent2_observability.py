@@ -35,6 +35,26 @@ from app.stream_runner import (
 )
 
 
+@pytest.mark.asyncio
+async def test_canary_delivery_reports_whether_sender_was_called() -> None:
+    calls: list[str] = []
+
+    async def sender() -> None:
+        calls.append("sent")
+
+    enabled = SimpleNamespace(messages_enabled=True)
+    suppressed = SimpleNamespace(messages_enabled=False)
+
+    assert await canary_service.deliver_canary_message_if_enabled(
+        enabled, sender
+    ) is True
+    assert calls == ["sent"]
+    assert await canary_service.deliver_canary_message_if_enabled(
+        suppressed, sender
+    ) is False
+    assert calls == ["sent"]
+
+
 def test_stream_timing_uses_agent2_model_attempts_as_authoritative_evidence(
     caplog,
 ) -> None:
@@ -239,17 +259,25 @@ async def test_successful_canary_turn_exposes_actual_model_call_evidence(
     )
     monkeypatch.setattr(
         canary_service,
-        "_attach_conversation_report_date",
-        lambda context, **kwargs: context,
-    )
-    monkeypatch.setattr(
-        canary_service,
         "_should_apply_personal_salutation",
         lambda receipts: False,
     )
 
+    class Savepoint:
+        is_active = True
+
+        async def commit(self):
+            self.is_active = False
+
+        async def rollback(self):
+            self.is_active = False
+
+    class Session:
+        async def begin_nested(self):
+            return Savepoint()
+
     outcome = await canary_service.process_tool_call_canary_ingress(
-        SimpleNamespace(),
+        Session(),
         user=SimpleNamespace(
             id="user-1",
             name="测试用户",

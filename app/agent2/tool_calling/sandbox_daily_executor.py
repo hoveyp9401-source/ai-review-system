@@ -128,17 +128,33 @@ class SandboxDailyExecutor:
         request: SandboxHandlerRequest,
     ) -> SandboxHandlerOutcome:
         arguments = self._arguments(request, AddDailyItemsArgs)
-        report_date = (
-            default_daily_write_date(
+        if arguments.date_selection == "server_default":
+            report_date = default_daily_write_date(
                 now=self._context.now,
                 timezone=self._context.timezone,
             )
-            if arguments.date_selection == "server_default"
-            else self._resolve(
+        elif arguments.date_selection == "trusted_report":
+            report_id = str(arguments.report_id)
+            trusted = await self._owned_report(report_id, required=True)
+            report_date = date.fromisoformat(str(trusted["report_date"]))
+        elif arguments.date_selection == "agent2_semantic":
+            report_date = arguments.proposed_date
+            local_today = self._context.now.astimezone(
+                ZoneInfo(self._context.timezone)
+            ).date()
+            default_date = default_daily_write_date(
+                now=self._context.now,
+                timezone=self._context.timezone,
+            )
+            if report_date not in {default_date, local_today}:
+                raise SandboxExecutionError(
+                    "UNTRUSTED_SEMANTIC_REPORT_DATE"
+                )
+        else:
+            report_date = self._resolve(
                 arguments.date_expression,
                 arguments.proposed_date,
             )
-        )
         report_id = self._report_id(report_date)
         report = await self._owned_report(report_id, required=False)
         before_version = int(report["version"]) if report is not None else 0

@@ -166,6 +166,9 @@ def _safe_model_audit(payload: object) -> dict[str, object]:
             {
                 "iteration": turn.get("iteration"),
                 "message": _safe_message_summary(turn.get("raw_assistant_message")),
+                "reasoning_content_sha256": turn.get(
+                    "reasoning_content_sha256"
+                ),
                 "response_metadata": turn.get("response_metadata"),
                 "tool_results": turn.get("tool_results"),
             }
@@ -213,31 +216,8 @@ def _compact_daily_date_votes(
                         }
                     )
                     continue
-                if call.get("name") != "review_daily_report_dates":
-                    continue
-                decisions = arguments.get("decisions")
-                if not isinstance(decisions, list):
-                    continue
-                for decision in decisions:
-                    if not isinstance(decision, dict):
-                        continue
-                    votes.append(
-                        {
-                            "iteration": turn.get("iteration"),
-                            "review_attempt": metadata.get(
-                                "daily_write_date_semantic_review_attempt"
-                            ),
-                            "kind": "semantic_review",
-                            "binding": decision.get("binding"),
-                            "evidence": decision.get("evidence"),
-                            "observed_time_expression": decision.get(
-                                "observed_time_expression"
-                            ),
-                            "proposed_report_date": decision.get(
-                                "proposed_report_date"
-                            ),
-                        }
-                    )
+                # Reporting-date meaning is owned by the main Agent2 tool call.
+                # There is deliberately no independent date reviewer to count.
     return votes
 
 
@@ -389,6 +369,9 @@ async def _turn(
                     {
                         "iteration": turn.iteration,
                         "message": _safe_message_summary(turn.raw_assistant_message),
+                        "reasoning_content_sha256": (
+                            turn.reasoning_content_sha256
+                        ),
                         "response_metadata": turn.response_metadata,
                         "tool_results": turn.tool_results,
                     }

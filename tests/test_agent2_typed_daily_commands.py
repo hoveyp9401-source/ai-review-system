@@ -576,7 +576,7 @@ def test_same_message_replayed_three_times_has_one_business_write():
     assert working.version == 1
 
 
-def test_validator_blocks_operation_instructions_and_qa_from_daily_payload():
+def test_validator_does_not_interpret_natural_language_payload_semantics():
     report_id = uuid4()
     owner_id = uuid4()
     snapshot = DailyReportMutationSnapshot(
@@ -601,10 +601,14 @@ def test_validator_blocks_operation_instructions_and_qa_from_daily_payload():
 
         result = execute_typed_daily_command(command, snapshot=snapshot, actor_user_id=owner_id)
 
-        assert result.validation.status == "blocked"
-        assert result.validation.reason_code == "forbidden_payload"
-        assert result.should_write_db is False
-        assert result.after == snapshot
+        assert result.validation.status == "authorized"
+        assert result.should_write_db is True
+        assert result.after.today_work == (payload,)
+
+    # Whether either string is a real daily-report fact, a question, or an
+    # operation request belongs to Agent2's model review before this
+    # deterministic executor is called. Reintroducing text-pattern checks here
+    # would create an Agent1-style semantic side door.
 
 
 def test_compiler_resolves_unique_exact_text_delete_to_item_id():

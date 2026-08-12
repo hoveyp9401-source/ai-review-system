@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import admin, debug, performance, reports, tasks, webhook
+from app.api import admin, performance, reports, tasks, webhook
 from app.config import get_settings
 from app.llm.client import LLMClient
 from app.llm.extractor import DailyReportExtractor, TeamSummaryGenerator
@@ -74,7 +74,6 @@ def create_app() -> FastAPI:
     app.include_router(performance.router)
     app.include_router(reports.router)
     app.include_router(tasks.router)
-    app.include_router(debug.router)
     app.include_router(legal_ops_router)
     app.include_router(legal_ops_data_intake_router)
     app.include_router(legal_daily_dashboard_router)

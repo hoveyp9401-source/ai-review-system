@@ -8,11 +8,7 @@ import pytest
 
 from app.config import Settings
 from app.agent2.tool_calling.canary_config import canary_system_prompt
-from app.agent2.tool_calling.canary_service import (
-    _conversation_report_date,
-    process_tool_call_canary_ingress,
-    _turn_requests_historical_confirmation,
-)
+from app.agent2.tool_calling.canary_service import process_tool_call_canary_ingress
 from app.agent2.tool_calling.context import TrustedRecentMessage
 from app.agent2.tool_calling.production_store import (
     _select_recent_messages_with_scheduled_outbound,
@@ -21,9 +17,6 @@ from app.agent2.tool_calling.canary_service import (
     _canary_execution_failure_reason,
 )
 from app.agent2.tool_calling.receipt_reply import canary_block_message
-from app.agent2.tool_calling.production_daily_executor import (
-    ProductionDailyExecutor,
-)
 from app.agent2.tool_calling.registry import TOOL_REGISTRY
 from app.scheduler.jobs import (
     _load_preferred_salutations,
@@ -84,110 +77,24 @@ def test_preferred_salutation_loader_uses_only_one_valid_value() -> None:
     assert values == {first_user: "四哥"}
 
 
-@pytest.mark.parametrize(
-    "utterance",
-    ("可以，提交", "提交刚才那份", "确认这份"),
-)
-def test_conversation_date_focus_carries_historical_confirmation(
-    utterance: str,
-) -> None:
-    now = datetime(2026, 8, 4, 10, 0, tzinfo=UTC)
-    recent = (
-        _message("assistant", "这是2026-08-03的日报草稿。", "a1"),
-    )
-
-    focused = _conversation_report_date(
-        user_messages=(utterance,),
-        recent_messages=recent,
-        server_now=now,
-        timezone="Asia/Shanghai",
-    )
-
-    assert focused == date(2026, 8, 3)
-    assert _turn_requests_historical_confirmation(
-        user_messages=(utterance,),
-        recent_messages=recent,
-    )
-
-
-@pytest.mark.parametrize(
-    "utterance",
-    ("昨天的", "8月3日的", "就刚才那份"),
-)
-def test_date_clarification_answer_keeps_confirmation_authority(
-    utterance: str,
-) -> None:
-    recent = (
-        _message("assistant", "这是2026-08-03的日报草稿。", "a0"),
-        _message("user", "可以，提交", "u1"),
-        _message("assistant", "请告诉我要提交哪一天的日报。", "a1"),
-    )
-
-    assert _turn_requests_historical_confirmation(
-        user_messages=(utterance,),
-        recent_messages=recent,
-    )
-
-
-@pytest.mark.parametrize(
-    "utterance",
-    (
-        "那你的晨报怎么说他没交",
-        "那份汇总怎么不一致",
-        "你早上为什么说他没交",
-    ),
-)
-def test_managed_daily_followup_reuses_last_explicit_date(
-    utterance: str,
-) -> None:
-    focused = _conversation_report_date(
-        user_messages=(utterance,),
-        recent_messages=(
-            _message("assistant", "查询日期：2026-08-03，刘聪已完成。", "a1"),
-        ),
-        server_now=datetime(2026, 8, 4, 11, 0, tzinfo=UTC),
-        timezone="Asia/Shanghai",
-    )
-
-    assert focused == date(2026, 8, 3)
-    assert "conversation_report_date" in inspect.getsource(
-        ProductionDailyExecutor.query_managed_daily_reports
-    )
-
-
-def test_unrelated_turn_does_not_inherit_old_report_date() -> None:
-    focused = _conversation_report_date(
-        user_messages=("你好",),
-        recent_messages=(
-            _message("assistant", "查询日期：2026-08-03。", "a1"),
-        ),
-        server_now=datetime(2026, 8, 4, 11, 0, tzinfo=UTC),
-        timezone="Asia/Shanghai",
-    )
-
-    assert focused is None
-
-
 def test_prompt_and_registry_allow_safe_historical_continuity() -> None:
     prompt = canary_system_prompt()
-    assert "conversation_report_date" in prompt
+    assert "recent_operations" in prompt
+    assert "report_reference" in prompt
     assert "daily-briefing:" in prompt
     assert "historical report" in TOOL_REGISTRY["confirm_report"].description
-    assert (
-        "conversation_report_date"
-        in TOOL_REGISTRY["query_managed_daily_reports"].description
-    )
+    assert "conversation_report_date" not in prompt
+    assert "conversation_report_date" not in TOOL_REGISTRY[
+        "query_managed_daily_reports"
+    ].description
 
 
-def test_explicit_historical_date_does_not_eagerly_load_report_content() -> None:
+def test_agent2_ingress_has_no_pre_model_phrase_based_report_focus() -> None:
     source = inspect.getsource(process_tool_call_canary_ingress)
-    guarded_block = source[
-        source.index("conversation_report_date = _conversation_report_date") :
-        source.index("context = await TrustedContextAssembler")
-    ]
 
-    assert "explicit_history_dates=(conversation_report_date,)" in guarded_block
-    assert "_turn_requests_historical_confirmation" in guarded_block
+    assert "_conversation_report_date" not in source
+    assert "_turn_requests_historical_confirmation" not in source
+    assert "_attach_conversation_report_date" not in source
 
 
 def test_dated_historical_edit_uses_agent2_read_then_write_contract() -> None:

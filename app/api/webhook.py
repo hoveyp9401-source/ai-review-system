@@ -73,6 +73,9 @@ from app.agent2.tool_calling.canary_service import (
     process_tool_call_canary_ingress,
     resolve_tool_call_canary_route,
 )
+from app.agent2.tool_calling.turn_batching import (
+    prepare_recoverable_ingress_payload,
+)
 from app.agent2.case_report_projection_runtime import (
     project_committed_case_followup_facts,
 )
@@ -301,10 +304,13 @@ async def dingtalk_webhook(
             return _encrypt_response(crypto, error_resp)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    message_type = str(
+        payload.get("msgtype") or payload.get("msgType") or "text"
+    )
+
     # If audio/voice message without auto-recognition text, try ASR
     if not incoming.text:
-        msg_type = payload.get("msgtype") or payload.get("msgType") or ""
-        if msg_type in ("audio", "voice"):
+        if message_type in ("audio", "voice"):
             download_code = extract_voice_download_code(payload)
             if download_code:
                 robot = request.app.state.dingtalk_robot
@@ -319,13 +325,20 @@ async def dingtalk_webhook(
                         type(exc).__name__,
                     )
 
+    persisted_payload = prepare_recoverable_ingress_payload(
+        payload,
+        text=incoming.text,
+        message_type=message_type,
+        voice_download_seconds=0.0,
+        voice_transcribe_seconds=0.0,
+    )
     idempotency_key = build_idempotency_key(payload, incoming)
     event, inserted = await create_webhook_event_once(
         session,
         idempotency_key=idempotency_key,
         external_message_id=incoming.message_id,
         dingtalk_user_id=incoming.dingtalk_user_id,
-        payload=payload,
+        payload=persisted_payload,
     )
     await session.commit()
 

@@ -32,6 +32,7 @@ from app.agent2.tool_calling.context import (
     TrustedClearPending,
     TrustedRecentMessage,
     TrustedRecentOperation,
+    TrustedReportReference,
     TrustedReportItem,
     TrustedReportSnapshot,
 )
@@ -40,6 +41,10 @@ from app.agent2.tool_calling.outbound_context import (
     trusted_recent_outbound_message,
 )
 from app.agent2.tool_calling.registry import ToolDefinition
+from app.agent2.tool_calling.turn_batching import (
+    INGRESS_META_KEY,
+    is_recoverable_ingress_payload,
+)
 from app.agent2.tool_calling.validation import DateResolution
 from app.agent2.memory import (
     PreferredSalutationValue,
@@ -67,6 +72,39 @@ from app.services.dingtalk import extract_voice_text
 _RECENT_MESSAGE_MAX_AGE = timedelta(hours=2)
 _SCHEDULED_OUTBOUND_MAX_AGE = timedelta(hours=16)
 _RECENT_OPERATION_MAX_AGE = timedelta(hours=2)
+
+
+def _trusted_report_reference_from_receipt(
+    row: "ToolCallCanaryReceipt",
+) -> TrustedReportReference | None:
+    if (
+        row.status not in {"success", "no_op"}
+        or row.target_type != "daily_report"
+        or not row.target_id
+        or row.after_version is None
+    ):
+        return None
+    facts = row.safe_user_facts if isinstance(row.safe_user_facts, dict) else {}
+    snapshot = facts.get("report_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    try:
+        reference = TrustedReportReference(
+            report_id=uuid.UUID(str(snapshot.get("report_id") or "")),
+            report_date=date.fromisoformat(
+                str(snapshot.get("report_date") or "")
+            ),
+            report_version=int(snapshot.get("version")),
+            report_status=str(snapshot.get("status") or ""),
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        str(reference.report_id) != row.target_id
+        or reference.report_version != row.after_version
+    ):
+        return None
+    return reference
 
 
 class ToolCallCanaryClearPending(Base):
@@ -510,8 +548,10 @@ class ProductionContextStore:
                 )
             ).all()
         )
-        return tuple(
-            TrustedRecentOperation(
+        operations: list[TrustedRecentOperation] = []
+        for row in reversed(rows):
+            operations.append(
+                TrustedRecentOperation(
                 tenant_id=row.tenant_id,
                 user_id=uuid.UUID(row.user_id),
                 conversation_id=row.conversation_id,
@@ -525,10 +565,11 @@ class ProductionContextStore:
                 before_version=row.before_version,
                 after_version=row.after_version,
                 affected_item_ids=tuple(row.affected_item_ids or ()),
+                report_reference=_trusted_report_reference_from_receipt(row),
                 occurred_at=row.created_at,
             )
-            for row in reversed(rows)
-        )
+            )
+        return tuple(operations)
 
     async def permission_allowed(
         self,
@@ -710,6 +751,13 @@ def _text_content(
 ) -> str:
     if not isinstance(payload, dict):
         return ""
+    if is_recoverable_ingress_payload(payload):
+        ingress_meta = payload.get(INGRESS_META_KEY)
+        if isinstance(ingress_meta, dict):
+            recovered = ingress_meta.get("text")
+            if isinstance(recovered, str) and recovered.strip():
+                content = recovered.strip()
+                return content if max_length is None else content[:max_length]
     recognized_voice = extract_voice_text(payload)
     if recognized_voice:
         return (
@@ -723,8 +771,9 @@ def _text_content(
     elif isinstance(text, str):
         value = text
     else:
-        value = payload.get("content") or payload.get("message") or ""
-    content = str(value).strip()
+        fallback = payload.get("content") or payload.get("message") or ""
+        value = fallback if isinstance(fallback, str) else ""
+    content = value.strip() if isinstance(value, str) else ""
     return content if max_length is None else content[:max_length]
 
 

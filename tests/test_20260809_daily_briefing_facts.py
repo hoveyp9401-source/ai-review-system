@@ -426,9 +426,6 @@ async def test_production_executor_forwards_the_principal_timezone() -> None:
             source_message_id="message",
             timezone="Asia/Shanghai",
         ),
-        business_glossary={
-            "conversation_report_date": REPORT_DATE.isoformat(),
-        },
         allowed_tool_names=frozenset({"query_daily_briefing_facts"}),
         gate_decisions={"query_daily_briefing_facts": True},
     )
@@ -450,13 +447,22 @@ async def test_production_executor_forwards_the_principal_timezone() -> None:
         bound_calls={},
         source_channel="test",
         source_text_hash="0" * 64,
-        date_resolver=object(),
+        date_resolver=SimpleNamespace(
+            resolve=lambda **kwargs: SimpleNamespace(
+                resolved_date=REPORT_DATE,
+                candidate_matches=True,
+                error_code=None,
+            )
+        ),
         daily_briefing_fact_query=query,
     )
     request = ProductionHandlerRequest(
         tool_call_id="briefing-call",
         tool_name="query_daily_briefing_facts",
-        arguments=QueryDailyBriefingFactsArgs(),
+        arguments=QueryDailyBriefingFactsArgs(
+            report_date_expression="2026-08-07",
+            proposed_report_date=REPORT_DATE,
+        ),
         executor=executor,
         memory_executor=object(),
     )

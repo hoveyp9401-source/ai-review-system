@@ -63,6 +63,12 @@ class CurrentTurnSource:
                 self._validate_evidence(item.source_evidence)
             for item in typed.empty_field_evidence:
                 self._validate_evidence(item.source_evidence)
+            if typed.date_evidence is not None:
+                source = self._validate_evidence(typed.date_evidence)
+                if typed.date_evidence.exact_quote not in source:
+                    raise CurrentTurnSourceEvidenceError(
+                        "CURRENT_DATE_EVIDENCE_MISMATCH"
+                    )
             return
         if tool_name == "correct_daily_report_date":
             typed_correction = CorrectDailyReportDateArgs.model_validate(
