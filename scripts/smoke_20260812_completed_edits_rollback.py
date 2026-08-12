@@ -115,13 +115,20 @@ async def _run_case(*, llm_client: LLMClient, case) -> dict[str, object]:
             ) != original_submission:
                 raise AssertionError("completed submission metadata changed")
             tool_receipts = await _receipts(session, source_message_id)
-            if [row.tool_name for row in tool_receipts] != [expected_tool]:
+            actual_tools = [row.tool_name for row in tool_receipts]
+            expected_tools = (
+                ["query_report_by_date", expected_tool]
+                if case_name in {"edit", "delete", "move"}
+                else [expected_tool]
+            )
+            if actual_tools != expected_tools:
                 raise AssertionError(
-                    {"tools": [row.tool_name for row in tool_receipts]}
+                    {"tools": actual_tools, "expected_tools": expected_tools}
                 )
-            if not tool_receipts[0].changed or tool_receipts[0].status != "success":
+            write_receipt = tool_receipts[-1]
+            if not write_receipt.changed or write_receipt.status != "success":
                 raise AssertionError("tool receipt did not record one successful change")
-            typed_ids = tuple(tool_receipts[0].typed_receipt_ids or ())
+            typed_ids = tuple(write_receipt.typed_receipt_ids or ())
             if not typed_ids:
                 raise AssertionError("tool receipt is not linked to typed audit")
             typed_rows = list(
@@ -153,7 +160,7 @@ async def _run_case(*, llm_client: LLMClient, case) -> dict[str, object]:
             return {
                 "name": case_name,
                 "status": "pass",
-                "tool": expected_tool,
+                "tools": actual_tools,
                 "typed_commands": [row.command_type for row in typed_rows],
                 "business_result": outcome.user_visible_result,
                 "submission_metadata_preserved": True,

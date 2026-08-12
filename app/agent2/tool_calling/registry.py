@@ -282,7 +282,10 @@ TOOL_REGISTRY = MappingProxyType(
             "query_report_by_date",
             "Resolve a date on the server and return the owned report snapshot. Use only when "
             "the current user_message explicitly requests retrieval or display of a report or "
-            "record. This is not a default confirmation, truth-checking, or wording-review "
+            "record, or explicitly asks to change content in a dated owned report whose trusted "
+            "snapshot is not already injected. In that second case, call this read tool first; "
+            "after its successful trusted result, call the exact content-write tool in the next "
+            "model loop. This is not a default confirmation, truth-checking, or wording-review "
             "tool. Do not call "
             "merely to interpret an ambiguous current user_message, and do not duplicate a "
             "trusted snapshot already injected. Never use this as a preparatory call before "

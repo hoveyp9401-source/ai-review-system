@@ -179,7 +179,7 @@ def test_prompt_and_registry_allow_safe_historical_continuity() -> None:
     )
 
 
-def test_explicit_historical_date_always_loads_trusted_report_context() -> None:
+def test_explicit_historical_date_does_not_eagerly_load_report_content() -> None:
     source = inspect.getsource(process_tool_call_canary_ingress)
     guarded_block = source[
         source.index("conversation_report_date = _conversation_report_date") :
@@ -187,7 +187,17 @@ def test_explicit_historical_date_always_loads_trusted_report_context() -> None:
     ]
 
     assert "explicit_history_dates=(conversation_report_date,)" in guarded_block
-    assert "_turn_requests_historical_confirmation" not in guarded_block
+    assert "_turn_requests_historical_confirmation" in guarded_block
+
+
+def test_dated_historical_edit_uses_agent2_read_then_write_contract() -> None:
+    description = TOOL_REGISTRY["query_report_by_date"].description
+    prompt = canary_system_prompt()
+
+    assert "explicitly asks to change content in a dated owned report" in description
+    assert "call this read tool first" in description
+    assert "query_report_by_date first" in prompt
+    assert "next model loop" in prompt
 
 
 def test_recent_context_reserves_latest_scheduled_briefing() -> None:

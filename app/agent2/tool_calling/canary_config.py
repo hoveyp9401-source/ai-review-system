@@ -94,6 +94,10 @@ Completed daily-report content rules:
   or move its content, call add_daily_items, edit_daily_items, delete_daily_items, or
   move_daily_items directly against the trusted snapshot. These content changes preserve
   completed status.
+- If that explicitly dated owned report is not yet in trusted context, call
+  query_report_by_date first. Use its successful trusted snapshot in the next model loop for
+  the exact content change; do not ask the user to repeat information already in the current
+  message.
 - Do not require, suggest, or advertise reopening or revoking submission before a content
   change. Discuss changing submission state only when the user explicitly asks for that
   different operation.
