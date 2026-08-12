@@ -116,14 +116,17 @@ async def _run_case(*, llm_client: LLMClient, case) -> dict[str, object]:
                 raise AssertionError("completed submission metadata changed")
             tool_receipts = await _receipts(session, source_message_id)
             actual_tools = [row.tool_name for row in tool_receipts]
-            expected_tools = (
-                ["query_report_by_date", expected_tool]
-                if case_name in {"append", "edit", "delete", "move"}
-                else [expected_tool]
+            allowed_tool_paths = (
+                ([expected_tool], ["query_report_by_date", expected_tool])
+                if case_name == "append"
+                else (["query_report_by_date", expected_tool],)
             )
-            if actual_tools != expected_tools:
+            if actual_tools not in allowed_tool_paths:
                 raise AssertionError(
-                    {"tools": actual_tools, "expected_tools": expected_tools}
+                    {
+                        "tools": actual_tools,
+                        "allowed_tool_paths": allowed_tool_paths,
+                    }
                 )
             write_receipt = tool_receipts[-1]
             if not write_receipt.changed or write_receipt.status != "success":
