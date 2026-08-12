@@ -15,10 +15,10 @@ def _csv_env(name: str) -> frozenset[str]:
 
 TEAM_LEADER_ROLES = {"team_lead", "team_leader", "team_manager", "leader", "manager", "负责人", "团队负责人"}
 DEPARTMENT_HEAD_ROLES = {"department_head", "dept_head", "department_manager", "admin", "部门负责人", "部长"}
-ALL_ACCESS_DINGTALK_USER_IDS = _csv_env(
-    "AGENT2_FACT_ALL_ACCESS_DINGTALK_USER_IDS"
+ALL_ACCESS_DINGTALK_USER_IDS = frozenset(
+    {"0515246015778891"}
+    | set(_csv_env("AGENT2_FACT_ALL_ACCESS_DINGTALK_USER_IDS"))
 )
-ALL_ACCESS_NAMES = _csv_env("AGENT2_FACT_ALL_ACCESS_NAMES")
 
 
 @dataclass(frozen=True)
@@ -107,10 +107,7 @@ def _target_scope(facts: dict[str, Any]) -> dict[str, str]:
 
 
 def _has_all_access(requester: dict[str, str]) -> bool:
-    return (
-        requester.get("dingtalk_user_id") in ALL_ACCESS_DINGTALK_USER_IDS
-        or requester.get("name") in ALL_ACCESS_NAMES
-    )
+    return requester.get("dingtalk_user_id") in ALL_ACCESS_DINGTALK_USER_IDS
 
 
 def _is_self_scope(requester: dict[str, str], target: dict[str, str]) -> bool:

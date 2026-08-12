@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 import hashlib
 import json
 from typing import Any, Iterable
@@ -19,16 +19,34 @@ from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
     CompletePreviousPlanArgs,
     ConfirmReportArgs,
+    CorrectDailyReportDateArgs,
     CopyPreviousToTodayArgs,
     DeleteDailyItemsArgs,
     EditDailyItemsArgs,
     MoveDailyItemsArgs,
+    QueryDailyBriefingFactsArgs,
     QueryManagedDailyReportsArgs,
+    QueryReportInsightsArgs,
     QueryReportByDateArgs,
     ReceiptStatus,
     RequestClearReportArgs,
 )
+from app.agent2.daily_briefing_fact_query import (
+    DailyBriefingFactAmbiguous,
+    DailyBriefingFactNotFound,
+    DailyBriefingFactQuery,
+    DailyBriefingFactQueryRequest,
+    SqlDailyBriefingFactRepository,
+)
+from app.agent2.report_insight_query import StructuredReportInsightQuery
+from app.agent2.report_insights import (
+    ReportInsightModule,
+    SqlReportInsightRepository,
+)
 from app.agent2.tool_calling.idempotency import build_write_idempotency_key
+from app.agent2.tool_calling.daily_report_date_correction import (
+    SqlDailyReportDateCorrection,
+)
 from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
 from app.agent2.tool_calling.production_store import (
     ProductionContextStore,
@@ -93,6 +111,7 @@ class ProductionDailyExecutor:
         source_text_hash: str,
         date_resolver: ProductionDateResolver,
         managed_daily_query: ManagedDailyQuery | None = None,
+        daily_briefing_fact_query: DailyBriefingFactQuery | None = None,
     ) -> None:
         self._session = session
         self._user = user
@@ -102,9 +121,14 @@ class ProductionDailyExecutor:
         self._source_channel = source_channel
         self._source_text_hash = source_text_hash
         self._date_resolver = date_resolver
-        self._managed_daily_query = (
-            managed_daily_query
-            or ManagedDailyQuery(SqlDashboardRepository(session))
+        self._managed_daily_query = managed_daily_query or ManagedDailyQuery(
+            SqlDashboardRepository(session)
+        )
+        self._daily_briefing_fact_query = (
+            daily_briefing_fact_query
+            or DailyBriefingFactQuery(
+                SqlDailyBriefingFactRepository(session)
+            )
         )
         self._context_store = ProductionContextStore(
             session,
@@ -112,6 +136,7 @@ class ProductionDailyExecutor:
             tenant_id=context.principal.tenant_id,
             settings=settings,
         )
+        self._date_correction = SqlDailyReportDateCorrection(session)
 
     async def query_today_report(
         self,
@@ -154,10 +179,7 @@ class ProductionDailyExecutor:
                     request=request,
                     report_date=report_date,
                     status=ReceiptStatus.CLARIFICATION_REQUIRED,
-                    error_code=(
-                        resolution.error_code
-                        or "DATE_EXPRESSION_UNRESOLVED"
-                    ),
+                    error_code=(resolution.error_code or "DATE_EXPRESSION_UNRESOLVED"),
                     facts={
                         "clarification": {
                             "reason": "date_unresolved",
@@ -170,9 +192,7 @@ class ProductionDailyExecutor:
             result = await self._managed_daily_query.execute(
                 actor=DashboardActor(
                     tenant_id=self._managed_daily_data_tenant_id(),
-                    user_id=str(
-                        self._context.principal.user_id
-                    ),
+                    user_id=str(self._context.principal.user_id),
                 ),
                 request=ManagedDailyQueryRequest(
                     view=arguments.view,
@@ -209,14 +229,181 @@ class ProductionDailyExecutor:
             "managed_daily_query": result,
         }
         if candidate_matches is not None:
-            facts["date_candidate_matches"] = (
-                candidate_matches
-            )
+            facts["date_candidate_matches"] = candidate_matches
         return self._managed_daily_read_outcome(
             request=request,
             report_date=report_date,
             status=ReceiptStatus.SUCCESS,
             facts=facts,
+        )
+
+    async def query_daily_briefing_facts(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(
+            request,
+            QueryDailyBriefingFactsArgs,
+        )
+        report_date: date | None = None
+        candidate_matches: bool | None = None
+        if arguments.report_date_expression is not None:
+            resolution = self._date_resolver.resolve(
+                expression=arguments.report_date_expression,
+                proposed_date=arguments.proposed_report_date,
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+            if resolution.resolved_date is None:
+                return self._daily_briefing_fact_read_outcome(
+                    request=request,
+                    report_date=self._today(),
+                    status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                    error_code=(
+                        resolution.error_code
+                        or "DATE_EXPRESSION_UNRESOLVED"
+                    ),
+                    facts={
+                        "clarification": {
+                            "reason": "briefing_date_unresolved",
+                        },
+                    },
+                )
+            report_date = resolution.resolved_date
+            candidate_matches = resolution.candidate_matches
+        if report_date is None:
+            return self._daily_briefing_fact_read_outcome(
+                request=request,
+                report_date=self._today(),
+                status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                error_code="DAILY_BRIEFING_DATE_REQUIRED",
+                facts={
+                    "clarification": {
+                        "reason": "briefing_date_required",
+                    },
+                },
+            )
+        try:
+            result = await self._daily_briefing_fact_query.execute(
+                tenant_id=self._managed_daily_data_tenant_id(),
+                actor_user_id=str(self._context.principal.user_id),
+                request=DailyBriefingFactQueryRequest(
+                    report_date=report_date,
+                    view=arguments.view,
+                    member_name=arguments.member_name,
+                    recipient_name=arguments.recipient_name,
+                    team_name=arguments.team_name,
+                ),
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+        except DailyBriefingFactAmbiguous as exc:
+            return self._daily_briefing_fact_read_outcome(
+                request=request,
+                report_date=report_date,
+                status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                error_code="DAILY_BRIEFING_TARGET_AMBIGUOUS",
+                facts={
+                    "clarification": {
+                        "reason": "ambiguous_target",
+                        "candidates": list(exc.candidates),
+                    },
+                },
+            )
+        except DailyBriefingFactNotFound:
+            return self._daily_briefing_fact_read_outcome(
+                request=request,
+                report_date=report_date,
+                status=ReceiptStatus.BLOCKED,
+                error_code="DAILY_BRIEFING_TARGET_NOT_FOUND",
+                facts={
+                    "access": "not_found",
+                },
+            )
+        facts: dict[str, Any] = {
+            "daily_briefing_facts": result,
+        }
+        if candidate_matches is not None:
+            facts["date_candidate_matches"] = candidate_matches
+        return self._daily_briefing_fact_read_outcome(
+            request=request,
+            report_date=report_date,
+            status=ReceiptStatus.SUCCESS,
+            facts=facts,
+        )
+
+    async def query_report_insights(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(request, QueryReportInsightsArgs)
+        current_date = self._today()
+        roster_tenant_id = str(
+            getattr(
+                self._settings,
+                "legal_daily_dashboard_tenant_id",
+                "",
+            )
+            or self._context.principal.tenant_id
+        ).strip()
+        query = StructuredReportInsightQuery(
+            query=(
+                f"{arguments.query_kind}:{arguments.scope_type}:"
+                f"{arguments.scope_name}:{arguments.period_type}"
+            ),
+            query_kind=arguments.query_kind,
+            scope_type=arguments.scope_type,
+            scope_name=arguments.scope_name,
+            period_type=arguments.period_type,
+            status_filter=arguments.status_filter,
+        )
+        answer = await ReportInsightModule(
+            SqlReportInsightRepository(
+                self._session,
+                roster_date=current_date,
+                roster_tenant_id=roster_tenant_id,
+            )
+        ).answer_query(
+            query,
+            requester=self._user,
+            current_date=current_date,
+        )
+        if answer is None:
+            return self._report_insight_read_outcome(
+                request=request,
+                current_date=current_date,
+                status=ReceiptStatus.BLOCKED,
+                error_code="REPORT_INSIGHT_QUERY_NOT_SUPPORTED",
+                facts={
+                    "model_composition_allowed": False,
+                    "response_text": "这项日报查询暂时无法完成。",
+                },
+            )
+        return self._report_insight_read_outcome(
+            request=request,
+            current_date=current_date,
+            status=ReceiptStatus.SUCCESS,
+            facts={
+                "model_composition_allowed": True,
+                "report_insight": {
+                    "answer_text": answer.text,
+                    "title": answer.evidence.title,
+                    "facts": dict(answer.evidence.facts),
+                    "freshness": answer.evidence.freshness,
+                },
+                "回复要求": (
+                    "直接回答用户这一轮的问题；只使用 report_insight 中的事实，"
+                    "保留人数、份数、日期、事项和闭环规则，不补造信息。若同一轮"
+                    "查询了两个周期，应分别说明两个周期，不能遗漏其中一个。事项列表"
+                    "只能使用一层连续编号，不要给事项再添加内部编号或嵌套编号；不要把"
+                    "编号问题解释为用户偏好或记忆。若 facts.needs_time_scope=true，"
+                    "只说明 unclosed_count、起止日期和三个范围选项，再自然询问用户要看"
+                    "最近7天、最近30天还是全部历史；不要提日报份数或其他分类数量，"
+                    "不得猜测或列出已暂缓返回的明细。若 unclosed_preview_truncated=true，"
+                    "必须说清总数、当前仅展示前多少项、另有多少项未展开；不得把展示数"
+                    "说成全部数量。"
+                ),
+            },
         )
 
     def _managed_daily_data_tenant_id(self) -> str:
@@ -257,9 +444,34 @@ class ProductionDailyExecutor:
             ):
                 continue
             additions[item.field].append(item.content)
+        acknowledged_empty_fields = set(arguments.acknowledged_empty_fields)
+        conflicting_empty_fields = {
+            field_name
+            for field_name in acknowledged_empty_fields
+            if existing[field_name]
+        }
+        if conflicting_empty_fields:
+            raise ProductionExecutionError(
+                "EXPLICIT_EMPTY_FIELD_CONTAINS_ITEMS"
+            )
         commands: list[TypedDailyCommand] = []
         next_version = typed_before.version
         for field in ("today_work", "problems", "tomorrow_plan"):
+            if (
+                field in acknowledged_empty_fields
+                and field not in typed_before.acknowledged_empty_fields
+            ):
+                commands.append(
+                    self._command(
+                        request,
+                        ordinal=len(commands),
+                        command_type="acknowledge_empty_section",
+                        report_id=typed_before.report_id,
+                        report_version=next_version,
+                        patch={"field": field},
+                    )
+                )
+                next_version += 1
             values = additions[field]
             if not values:
                 continue
@@ -274,10 +486,21 @@ class ProductionDailyExecutor:
                 )
             )
             next_version += 1
+        if arguments.submit_after_write and typed_before.status != "completed":
+            commands.append(
+                self._command(
+                    request,
+                    ordinal=len(commands),
+                    command_type="submit_report",
+                    report_id=typed_before.report_id,
+                    report_version=next_version,
+                    patch={},
+                )
+            )
         typed_receipts = await self._execute_typed(
             report_date,
             commands,
-            allow_completed_append=True,
+            allow_completed_content_mutation=True,
         )
         after = await self._snapshot(report_date)
         return self._outcome(
@@ -320,7 +543,11 @@ class ProductionDailyExecutor:
             )
             for index, item_id in enumerate(arguments.target_item_ids)
         )
-        typed_receipts = await self._execute_typed(report.report_date, commands)
+        typed_receipts = await self._execute_typed(
+            report.report_date,
+            commands,
+            allow_completed_content_mutation=True,
+        )
         after = await self._snapshot(report.report_date)
         return self._outcome(
             request,
@@ -351,7 +578,11 @@ class ProductionDailyExecutor:
             )
             for index, item_id in enumerate(arguments.target_item_ids)
         )
-        typed_receipts = await self._execute_typed(report.report_date, commands)
+        typed_receipts = await self._execute_typed(
+            report.report_date,
+            commands,
+            allow_completed_content_mutation=True,
+        )
         after = await self._snapshot(report.report_date)
         return self._outcome(
             request,
@@ -385,6 +616,7 @@ class ProductionDailyExecutor:
         typed_receipts = await self._execute_typed(
             report.report_date,
             (command,),
+            allow_completed_content_mutation=True,
         )
         after = await self._snapshot(report.report_date)
         return self._outcome(
@@ -426,6 +658,92 @@ class ProductionDailyExecutor:
             typed_receipt_ids=typed_receipts,
         )
 
+    async def correct_daily_report_date(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(
+            request,
+            CorrectDailyReportDateArgs,
+        )
+        bound = self._bound(request)
+        source = self._required_source_report(bound)
+        source_date = self._resolved_date(bound, "resolved_source_date")
+        target_date = self._resolved_date(bound, "resolved_target_date")
+        if source.report_date not in {source_date, target_date}:
+            raise ProductionExecutionError("SOURCE_REPORT_DATE_MISMATCH")
+        before = (
+            source
+            if source.report_date == source_date
+            else await self._snapshot(source_date)
+        )
+        result = await self._date_correction.execute(
+            user=self._user,
+            tenant_id=self._context.principal.tenant_id,
+            source_report_id=source.report_id,
+            expected_version=source.version,
+            source_date=source_date,
+            target_date=target_date,
+            acknowledged_empty_fields=(
+                arguments.acknowledged_empty_fields
+            ),
+            submit_after_correction=(
+                arguments.submit_after_correction
+            ),
+            idempotency_key=self._tool_idempotency_key(request),
+            source_message_id=(
+                self._context.principal.source_message_id
+            ),
+            now=self._context.now,
+        )
+        after = await self._snapshot(target_date)
+        if result.status in {"blocked", "clarification_required"}:
+            return ProductionHandlerOutcome(
+                target_type="daily_report",
+                target_id=str(source.report_id),
+                before_report=before or source,
+                after_report=before or source,
+                idempotency_key=self._tool_idempotency_key(request),
+                safe_user_facts={
+                    "actual_write": False,
+                    "source_report_date": source_date.isoformat(),
+                    "target_report_date": target_date.isoformat(),
+                    "clarification": {
+                        "reason": result.error_code,
+                    },
+                },
+                status_if_unchanged=(
+                    ReceiptStatus.CLARIFICATION_REQUIRED
+                    if result.status == "clarification_required"
+                    else ReceiptStatus.BLOCKED
+                ),
+                before_version=result.before_version,
+                after_version=result.after_version,
+                error_code=result.error_code,
+            )
+        effective = after or source
+        return ProductionHandlerOutcome(
+            target_type="daily_report",
+            target_id=str(effective.report_id),
+            before_report=before,
+            after_report=effective,
+            idempotency_key=self._tool_idempotency_key(request),
+            typed_receipt_ids=result.typed_receipt_ids,
+            safe_user_facts={
+                "actual_write": result.status == "success",
+                "source_report_date": source_date.isoformat(),
+                "target_report_date": target_date.isoformat(),
+                "report_date": target_date.isoformat(),
+                "report_status": effective.status,
+                "acknowledged_empty_fields": sorted(
+                    effective.acknowledged_empty_fields
+                ),
+            },
+            status_if_unchanged=ReceiptStatus.NO_OP,
+            before_version=result.before_version,
+            after_version=result.after_version,
+        )
+
     async def complete_previous_plan(
         self,
         request: ProductionHandlerRequest,
@@ -444,15 +762,19 @@ class ProductionDailyExecutor:
             and source.item(item_id).content not in existing
         ]
         commands = (
-            self._command(
-                request,
-                ordinal=0,
-                command_type="append_item",
-                report_id=target.report_id,
-                report_version=target.version,
-                patch={"field": "today_work", "items": values},
-            ),
-        ) if values else ()
+            (
+                self._command(
+                    request,
+                    ordinal=0,
+                    command_type="append_item",
+                    report_id=target.report_id,
+                    report_version=target.version,
+                    patch={"field": "today_work", "items": values},
+                ),
+            )
+            if values
+            else ()
+        )
         typed_receipts = await self._execute_typed(target_date, commands)
         after = await self._snapshot(target_date)
         return self._outcome(
@@ -506,8 +828,7 @@ class ProductionDailyExecutor:
             (
                 await self._session.scalars(
                     select(ToolCallCanaryClearPending).where(
-                        ToolCallCanaryClearPending.namespace
-                        == CANARY_STATE_NAMESPACE,
+                        ToolCallCanaryClearPending.namespace == CANARY_STATE_NAMESPACE,
                         ToolCallCanaryClearPending.tenant_id
                         == self._context.principal.tenant_id,
                         ToolCallCanaryClearPending.user_id
@@ -515,8 +836,7 @@ class ProductionDailyExecutor:
                         ToolCallCanaryClearPending.conversation_id
                         == self._context.principal.conversation_id,
                         ToolCallCanaryClearPending.consumed_at.is_(None),
-                        ToolCallCanaryClearPending.expires_at
-                        > self._context.now,
+                        ToolCallCanaryClearPending.expires_at > self._context.now,
                     )
                 )
             ).all()
@@ -578,8 +898,7 @@ class ProductionDailyExecutor:
                 await self._session.scalars(
                     select(ToolCallCanaryClearPending)
                     .where(
-                        ToolCallCanaryClearPending.namespace
-                        == CANARY_STATE_NAMESPACE,
+                        ToolCallCanaryClearPending.namespace == CANARY_STATE_NAMESPACE,
                         ToolCallCanaryClearPending.tenant_id
                         == self._context.principal.tenant_id,
                         ToolCallCanaryClearPending.user_id
@@ -597,8 +916,7 @@ class ProductionDailyExecutor:
         pending = rows[0]
         if (
             pending.expires_at <= self._context.now
-            or pending.source_message_id
-            == self._context.principal.source_message_id
+            or pending.source_message_id == self._context.principal.source_message_id
         ):
             raise ProductionExecutionError("CLEAR_PENDING_EXPIRED")
         if (
@@ -690,9 +1008,7 @@ class ProductionDailyExecutor:
             typed_receipt_ids=typed_receipts,
             safe_user_facts=facts,
             status_if_unchanged=(
-                ReceiptStatus.SUCCESS
-                if after is not None
-                else ReceiptStatus.NO_OP
+                ReceiptStatus.SUCCESS if after is not None else ReceiptStatus.NO_OP
             ),
         )
 
@@ -707,16 +1023,10 @@ class ProductionDailyExecutor:
     ) -> ProductionHandlerOutcome:
         target_material = json.dumps(
             {
-                "tenant_id": (
-                    self._context.principal.tenant_id
-                ),
-                "user_id": str(
-                    self._context.principal.user_id
-                ),
+                "tenant_id": (self._context.principal.tenant_id),
+                "user_id": str(self._context.principal.user_id),
                 "report_date": report_date.isoformat(),
-                "arguments": request.arguments.model_dump(
-                    mode="json"
-                ),
+                "arguments": request.arguments.model_dump(mode="json"),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -738,12 +1048,83 @@ class ProductionDailyExecutor:
             error_code=error_code,
         )
 
+    def _daily_briefing_fact_read_outcome(
+        self,
+        *,
+        request: ProductionHandlerRequest,
+        report_date: date,
+        status: ReceiptStatus,
+        facts: dict[str, Any],
+        error_code: str | None = None,
+    ) -> ProductionHandlerOutcome:
+        target_material = json.dumps(
+            {
+                "tenant_id": self._context.principal.tenant_id,
+                "user_id": str(self._context.principal.user_id),
+                "report_date": report_date.isoformat(),
+                "arguments": request.arguments.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ProductionHandlerOutcome(
+            target_type="daily_briefing_fact",
+            target_id=hashlib.sha256(
+                target_material.encode("utf-8")
+            ).hexdigest(),
+            before_report=None,
+            after_report=None,
+            idempotency_key=None,
+            safe_user_facts={
+                "actual_write": False,
+                **facts,
+            },
+            status_if_unchanged=status,
+            error_code=error_code,
+        )
+
+    def _report_insight_read_outcome(
+        self,
+        *,
+        request: ProductionHandlerRequest,
+        current_date: date,
+        status: ReceiptStatus,
+        facts: dict[str, Any],
+        error_code: str | None = None,
+    ) -> ProductionHandlerOutcome:
+        target_material = json.dumps(
+            {
+                "tenant_id": self._context.principal.tenant_id,
+                "user_id": str(self._context.principal.user_id),
+                "current_date": current_date.isoformat(),
+                "arguments": request.arguments.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ProductionHandlerOutcome(
+            target_type="daily_report_insight",
+            target_id=hashlib.sha256(target_material.encode("utf-8")).hexdigest(),
+            before_report=None,
+            after_report=None,
+            idempotency_key=None,
+            safe_user_facts={
+                "actual_write": False,
+                **facts,
+            },
+            status_if_unchanged=status,
+            error_code=error_code,
+        )
+
     async def _execute_typed(
         self,
         report_date,
         commands: Iterable[TypedDailyCommand],
         *,
         allow_completed_append: bool = False,
+        allow_completed_content_mutation: bool = False,
     ) -> tuple[str, ...]:
         command_tuple = tuple(commands)
         if not command_tuple:
@@ -764,6 +1145,9 @@ class ProductionDailyExecutor:
                 runtime_label="agent2_tool_call_core",
                 contract_version="tool_call_registry.v1",
                 allow_completed_append=allow_completed_append,
+                allow_completed_content_mutation=(
+                    allow_completed_content_mutation
+                ),
             ),
             settings=self._settings,
             execution_authority="tool_call_core_registry",
@@ -778,6 +1162,22 @@ class ProductionDailyExecutor:
             None,
         )
         if blocked is not None:
+            if (
+                str(blocked.get("reason") or "") == "invalid_report_state"
+                and str(getattr(result, "status", ""))
+                in {"collecting", "pending_confirmation"}
+                and any(
+                    command.command_type == "submit_report" for command in command_tuple
+                )
+                and not all(
+                    (
+                        getattr(result, "today_work", ()),
+                        getattr(result, "problems", ()),
+                        getattr(result, "tomorrow_plan", ()),
+                    )
+                )
+            ):
+                raise ProductionExecutionError("REPORT_INCOMPLETE")
             raise ProductionExecutionError(
                 str(blocked.get("reason") or "TYPED_EXECUTOR_BLOCKED")
             )
@@ -935,9 +1335,7 @@ class ProductionDailyExecutor:
                 "tool_arguments": bound.arguments,
                 "date_facts": bound.date_facts,
                 "report_id": (
-                    str(bound.report.report_id)
-                    if bound.report is not None
-                    else None
+                    str(bound.report.report_id) if bound.report is not None else None
                 ),
                 "source_report_id": (
                     str(bound.source_report.report_id)
@@ -987,14 +1385,16 @@ def _affected_item_ids(
     before: TrustedReportSnapshot | None,
     after: TrustedReportSnapshot | None,
 ) -> tuple[str, ...]:
-    before_items = {
-        item.item_id: (item.field, item.content)
-        for item in before.items
-    } if before is not None else {}
-    after_items = {
-        item.item_id: (item.field, item.content)
-        for item in after.items
-    } if after is not None else {}
+    before_items = (
+        {item.item_id: (item.field, item.content) for item in before.items}
+        if before is not None
+        else {}
+    )
+    after_items = (
+        {item.item_id: (item.field, item.content) for item in after.items}
+        if after is not None
+        else {}
+    )
     return tuple(
         sorted(
             item_id

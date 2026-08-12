@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from datetime import date
 from enum import StrEnum
-from typing import Any, Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.agent2.memory import (
+    AssistantPreferredNameValue,
     OutputFormatPreferenceValue,
     PreferredSalutationValue,
     TogglePreferenceValue,
@@ -39,12 +40,52 @@ DateExpression = Annotated[str, Field(min_length=1, max_length=128)]
 ItemId = Annotated[str, Field(min_length=1, max_length=256)]
 ReportField = Literal["today_work", "problems", "tomorrow_plan"]
 PersonalMemoryKey = Literal[
+    "assistant.preferred_name",
     "response.verbosity",
     "response.output_format",
     "response.preferred_salutation",
     "report.show_updated_snapshot",
     "report.show_item_numbers",
 ]
+
+
+class CurrentUserMessageEvidence(StrictContract):
+    source_message_index: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=20,
+            description=(
+                "One-based sequence of the current user_message or current "
+                "ordered user_messages fragment that supplies this value."
+            ),
+        ),
+    ]
+
+
+class DailyReportDateEvidence(CurrentUserMessageEvidence):
+    exact_quote: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=1000,
+            description=(
+                "Exact current-message text that lets Agent2 choose the "
+                "reporting date instead of the server default."
+            ),
+        ),
+    ]
+
+
+class PersonalMemorySourceEvidence(CurrentUserMessageEvidence):
+    intent: Literal[
+        "explicit_preference",
+        "explicit_remember_request",
+        "assistant_name_assignment",
+        "assistant_name_correction",
+        "user_salutation_assignment",
+        "user_salutation_correction",
+    ]
 
 
 class QueryTodayReportArgs(StrictContract):
@@ -59,20 +100,46 @@ class QueryReportByDateArgs(StrictContract):
 class QueryManagedDailyReportsArgs(StrictContract):
     report_date_expression: DateExpression | None = None
     proposed_report_date: date | None = None
-    view: Literal[
-        "member_report",
-        "team_reports",
-        "missing_submissions",
-        "department_summary",
+    view: Annotated[
+        Literal[
+            "member_report",
+            "team_reports",
+            "missing_submissions",
+            "department_summary",
+        ],
+        Field(
+            description=(
+                "Exact single-date view requested by the current user. "
+                "missing_submissions may target either all people or one "
+                "explicitly named team via team_name."
+            )
+        ),
     ]
     member_name: Annotated[
-        str,
-        Field(min_length=1, max_length=256),
-    ] | None = None
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description=(
+                "Exact person name copied from the current user's requested "
+                "scope. Required for member_report."
+            ),
+        ),
+    ] = None
     team_name: Annotated[
-        str,
-        Field(min_length=1, max_length=256),
-    ] | None = None
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description=(
+                "Exact team or organization scope named by the current user. "
+                "For team_reports and for a team-scoped missing_submissions "
+                "request this MUST be supplied; '中心直属' is a valid exact "
+                "scope. Omit only when the user explicitly asks for the whole "
+                "department, center, or all people."
+            ),
+        ),
+    ] = None
 
     @model_validator(mode="after")
     def enforce_view_and_date_contract(
@@ -101,6 +168,122 @@ class QueryManagedDailyReportsArgs(StrictContract):
             raise ValueError(
                 "department_summary cannot select one team"
             )
+        return self
+
+
+class QueryDailyBriefingFactsArgs(StrictContract):
+    view: Literal["member_classification", "recipient_delivery"] = (
+        "member_classification"
+    )
+    report_date_expression: DateExpression | None = None
+    proposed_report_date: date | None = None
+    member_name: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description=(
+                "Exact member named by the current user. Omit only when "
+                "member_classification refers to the authenticated user."
+            ),
+        ),
+    ] = None
+    recipient_name: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description=(
+                "Exact briefing recipient named by the current user. Omit "
+                "for the authenticated user's own received briefing."
+            ),
+        ),
+    ] = None
+    team_name: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description="Exact team scope named by the current user.",
+        ),
+    ] = None
+
+    @model_validator(mode="after")
+    def enforce_briefing_fact_contract(
+        self,
+    ) -> "QueryDailyBriefingFactsArgs":
+        if (self.report_date_expression is None) != (
+            self.proposed_report_date is None
+        ):
+            raise ValueError(
+                "report date expression and proposed date must be supplied together"
+            )
+        if self.view == "recipient_delivery" and self.member_name is not None:
+            raise ValueError(
+                "member_name is valid only for member_classification"
+            )
+        return self
+
+
+class QueryReportInsightsArgs(StrictContract):
+    query_kind: Literal[
+        "report_count",
+        "recent_work",
+        "period_work",
+        "recent_attention",
+        "unclosed_work",
+    ]
+    scope_type: Literal["person", "organization"]
+    scope_name: Annotated[str, Field(min_length=1, max_length=256)]
+    period_type: Literal[
+        "unspecified",
+        "all_history",
+        "recent_7_days",
+        "recent_30_days",
+        "current_week",
+        "previous_week",
+    ]
+    status_filter: Literal["all_saved", "completed"] = "all_saved"
+
+    @model_validator(mode="after")
+    def enforce_insight_contract(self) -> "QueryReportInsightsArgs":
+        if self.query_kind == "report_count":
+            if self.scope_type != "person" or self.period_type != "all_history":
+                raise ValueError(
+                    "report_count requires person scope over all_history"
+                )
+            return self
+        if self.status_filter != "all_saved":
+            raise ValueError(
+                "status_filter=completed is valid only for report_count"
+            )
+        if self.query_kind == "recent_work":
+            if self.scope_type != "person" or self.period_type in {
+                "all_history",
+                "unspecified",
+            }:
+                raise ValueError(
+                    "recent_work requires person scope and a bounded period"
+                )
+            return self
+        if self.query_kind == "period_work":
+            if self.scope_type != "organization" or self.period_type not in {
+                "current_week",
+                "previous_week",
+            }:
+                raise ValueError(
+                    "period_work requires organization scope and a week period"
+                )
+            return self
+        if self.query_kind == "recent_attention":
+            if (
+                self.scope_type != "organization"
+                or self.period_type != "recent_7_days"
+            ):
+                raise ValueError(
+                    "recent_attention requires organization scope over recent_7_days"
+                )
+            return self
         return self
 
 
@@ -135,12 +318,115 @@ class QueryDefendantPerformanceArgs(StrictContract):
 class DailyItemInput(StrictContract):
     field: ReportField
     content: NonEmptyText
+    source_evidence: CurrentUserMessageEvidence
+
+
+class DailyEmptyFieldEvidence(StrictContract):
+    field: ReportField
+    source_evidence: CurrentUserMessageEvidence
 
 
 class AddDailyItemsArgs(StrictContract):
-    date_expression: DateExpression
-    proposed_date: date
-    items: tuple[DailyItemInput, ...] = Field(min_length=1, max_length=30)
+    date_selection: Literal[
+        "server_default",
+        "agent2_semantic",
+        "user_explicit",
+        "trusted_report",
+    ] = (
+        "server_default"
+    )
+    date_expression: DateExpression | None = None
+    proposed_date: date | None = None
+    report_id: UUID | None = None
+    expected_version: int | None = Field(default=None, ge=0)
+    date_evidence: DailyReportDateEvidence | None = None
+    items: tuple[DailyItemInput, ...] = Field(default=(), max_length=30)
+    acknowledged_empty_fields: tuple[ReportField, ...] = Field(
+        default=(),
+        max_length=3,
+    )
+    empty_field_evidence: tuple[DailyEmptyFieldEvidence, ...] = Field(
+        default=(),
+        max_length=3,
+    )
+    submit_after_write: bool = False
+
+    @model_validator(mode="after")
+    def require_content_or_explicit_empty_acknowledgement(
+        self,
+    ) -> "AddDailyItemsArgs":
+        if self.date_selection == "trusted_report":
+            if self.report_id is None or self.expected_version is None:
+                raise ValueError(
+                    "trusted-report selection requires report_id and expected_version"
+                )
+            if (
+                self.date_expression is not None
+                or self.proposed_date is not None
+                or self.date_evidence is not None
+            ):
+                raise ValueError(
+                    "trusted-report selection cannot carry a date expression"
+                )
+        elif self.date_selection == "agent2_semantic":
+            if self.proposed_date is None or self.date_evidence is None:
+                raise ValueError(
+                    "Agent2 semantic date selection requires a proposed date "
+                    "and exact current-message evidence"
+                )
+            if self.report_id is not None or self.expected_version is not None:
+                raise ValueError(
+                    "only trusted-report selection may carry a report binding"
+                )
+        elif self.date_selection == "user_explicit":
+            if self.date_expression is None or self.proposed_date is None:
+                raise ValueError(
+                    "an explicit report date requires an expression and proposed date"
+                )
+            if self.report_id is not None or self.expected_version is not None:
+                raise ValueError(
+                    "only trusted-report selection may carry a report binding"
+                )
+            if self.date_evidence is None:
+                raise ValueError(
+                    "an explicit report date requires exact current-message evidence"
+                )
+        else:
+            if self.report_id is not None or self.expected_version is not None:
+                raise ValueError(
+                    "only trusted-report selection may carry a report binding"
+                )
+            if self.date_evidence is not None:
+                raise ValueError(
+                    "the server default cannot carry semantic date evidence"
+                )
+        if (
+            not self.items
+            and not self.acknowledged_empty_fields
+            and not self.submit_after_write
+        ):
+            raise ValueError(
+                "report content, an explicitly empty field, or submission is required"
+            )
+        if len(self.acknowledged_empty_fields) != len(
+            set(self.acknowledged_empty_fields)
+        ):
+            raise ValueError("explicitly empty fields must be unique")
+        evidence_fields = tuple(
+            item.field for item in self.empty_field_evidence
+        )
+        if len(evidence_fields) != len(set(evidence_fields)):
+            raise ValueError("empty-field evidence must be unique by field")
+        if set(evidence_fields) != set(self.acknowledged_empty_fields):
+            raise ValueError(
+                "every explicitly empty field requires matching current-message evidence"
+            )
+        item_fields = {item.field for item in self.items}
+        if item_fields.intersection(self.acknowledged_empty_fields):
+            raise ValueError(
+                "one report field cannot contain items and be explicitly empty"
+            )
+        return self
 
 
 class _VersionedItemTarget(StrictContract):
@@ -176,10 +462,47 @@ class MoveDailyItemsArgs(_VersionedItemTarget):
 
 
 class CopyPreviousToTodayArgs(StrictContract):
-    report_id: UUID
-    expected_version: int = Field(ge=0)
     source_date_expression: DateExpression
     proposed_source_date: date
+
+
+class CorrectDailyReportDateArgs(StrictContract):
+    """One model-decided correction, executed atomically by the server."""
+
+    source_date_expression: DateExpression
+    proposed_source_date: date
+    target_date_expression: DateExpression
+    proposed_target_date: date
+    acknowledged_empty_fields: tuple[ReportField, ...] = Field(
+        default=(),
+        max_length=3,
+    )
+    empty_field_evidence: tuple[DailyEmptyFieldEvidence, ...] = Field(
+        default=(),
+        max_length=3,
+    )
+    submit_after_correction: bool = False
+
+    @model_validator(mode="after")
+    def require_distinct_dates_and_unique_empty_fields(
+        self,
+    ) -> "CorrectDailyReportDateArgs":
+        if self.proposed_source_date == self.proposed_target_date:
+            raise ValueError("source and target report dates must differ")
+        if len(self.acknowledged_empty_fields) != len(
+            set(self.acknowledged_empty_fields)
+        ):
+            raise ValueError("explicitly empty fields must be unique")
+        evidence_fields = tuple(
+            item.field for item in self.empty_field_evidence
+        )
+        if len(evidence_fields) != len(set(evidence_fields)):
+            raise ValueError("empty-field evidence must be unique by field")
+        if set(evidence_fields) != set(self.acknowledged_empty_fields):
+            raise ValueError(
+                "every explicitly empty field requires matching current-message evidence"
+            )
+        return self
 
 
 class CompletePreviousPlanArgs(_VersionedItemTarget):
@@ -208,11 +531,13 @@ class QueryPersonalMemoryArgs(StrictContract):
 class RememberPersonalMemoryArgs(StrictContract):
     memory_key: PersonalMemoryKey
     value: (
-        VerbosityPreferenceValue
+        AssistantPreferredNameValue
+        | VerbosityPreferenceValue
         | TogglePreferenceValue
         | OutputFormatPreferenceValue
         | PreferredSalutationValue
     )
+    source_evidence: PersonalMemorySourceEvidence
 
     @model_validator(mode="after")
     def value_must_match_the_selected_key(
@@ -223,6 +548,40 @@ class RememberPersonalMemoryArgs(StrictContract):
             self.memory_key,
             self.value,
         )
+        assistant_name_intents = {
+            "assistant_name_assignment",
+            "assistant_name_correction",
+        }
+        user_salutation_intents = {
+            "user_salutation_assignment",
+            "user_salutation_correction",
+        }
+        preference_intents = {
+            "explicit_preference",
+            "explicit_remember_request",
+        }
+        intent = self.source_evidence.intent
+        if (
+            self.memory_key == "assistant.preferred_name"
+            and intent not in assistant_name_intents
+        ):
+            raise ValueError(
+                "assistant name memory requires assistant-role assignment evidence"
+            )
+        if (
+            self.memory_key == "response.preferred_salutation"
+            and intent not in user_salutation_intents
+        ):
+            raise ValueError(
+                "user salutation memory requires user-role assignment evidence"
+            )
+        if self.memory_key not in {
+            "assistant.preferred_name",
+            "response.preferred_salutation",
+        } and intent not in preference_intents:
+            raise ValueError(
+                "response preference memory requires explicit preference evidence"
+            )
         return self
 
 

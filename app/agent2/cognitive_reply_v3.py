@@ -5,6 +5,7 @@ from typing import Any
 
 from app.agent2.assistant_responder import AssistantReply
 from app.agent2.assistant_tools import build_tool_assisted_reply
+from app.agent2.report_insights import report_insight_reply_from_context
 from app.agent2.semantic_interpreter_v3 import report_type_from_meta_opening
 from app.utils.json import extract_json_object
 from app.workflows.intake import WORKFLOW_CHAT, WORKFLOW_INTERNAL_QA, WORKFLOW_LEGAL_RESEARCH
@@ -58,6 +59,10 @@ async def build_cognitive_side_reply_v3(
     context_pack: Any | None = None,
 ) -> str:
     """Compose a read-only reply from Agent2 semantic segments, never Shadow/Agent1."""
+
+    report_insight_reply = report_insight_reply_from_context(context_pack)
+    if report_insight_reply:
+        return report_insight_reply
 
     segments = tuple(getattr(decision, "segments", ()) or ())
     for report_type, intent in (

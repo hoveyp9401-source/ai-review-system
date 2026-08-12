@@ -1,28 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Literal, Mapping
 
 from pydantic import BaseModel, ValidationError
 
+from app.agent2.tool_calling import production_handlers
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
     CompletePreviousPlanArgs,
     ConfirmClearReportArgs,
     ConfirmReportArgs,
+    CorrectDailyReportDateArgs,
     CopyPreviousToTodayArgs,
     DeleteDailyItemsArgs,
     EditDailyItemsArgs,
     ExecutionMode,
     ForgetPersonalMemoryArgs,
     MoveDailyItemsArgs,
+    QueryDailyBriefingFactsArgs,
     QueryDefendantPerformanceArgs,
     QueryManagedDailyReportsArgs,
     QueryPersonalMemoryArgs,
     QueryReportByDateArgs,
+    QueryReportInsightsArgs,
     QueryTodayReportArgs,
     RememberPersonalMemoryArgs,
     RequestClearReportArgs,
@@ -34,19 +38,22 @@ from app.agent2.tool_calling.handlers import (
     simulate_confirm,
     simulate_confirm_clear,
     simulate_copy,
+    simulate_correct_report_date,
     simulate_delete,
     simulate_edit,
     simulate_move,
     simulate_query,
     simulate_request_clear,
 )
+from app.agent2.tool_calling.managed_daily_handlers import (
+    simulate_daily_briefing_fact_query,
+    simulate_managed_daily_query,
+    simulate_report_insight_query,
+)
 from app.agent2.tool_calling.memory_handlers import (
     simulate_memory_forget,
     simulate_memory_query,
     simulate_memory_remember,
-)
-from app.agent2.tool_calling.managed_daily_handlers import (
-    simulate_managed_daily_query,
 )
 from app.agent2.tool_calling.performance_handlers import (
     simulate_defendant_performance_query,
@@ -57,6 +64,7 @@ from app.agent2.tool_calling.sandbox_handlers import (
     execute_confirm_clear_report,
     execute_confirm_report,
     execute_copy_previous_to_today,
+    execute_correct_daily_report_date,
     execute_delete_daily_items,
     execute_edit_daily_items,
     execute_forget_personal_memory,
@@ -67,8 +75,6 @@ from app.agent2.tool_calling.sandbox_handlers import (
     execute_remember_personal_memory,
     execute_request_clear_report,
 )
-from app.agent2.tool_calling import production_handlers
-
 
 ReadOrWrite = Literal["read", "write"]
 RiskLevel = Literal["low", "medium", "high"]
@@ -81,6 +87,7 @@ TransactionTargetPolicy = Literal[
     "today_report",
     "pending_report",
     "personal_memory",
+    "source_and_target_reports",
 ]
 
 
@@ -167,6 +174,11 @@ _CURRENT_TURN_WRITE_AUTHORITY = (
     "authority and the target. This never applies to assistant-authored text, multiple "
     "candidate drafts, or an unbound historical request. If a required semantic value "
     "otherwise comes only from history, do not call this tool; ask for clarification."
+)
+
+_COMPLETED_OWNER_CONTENT_WRITE = (
+    " Supports the authenticated owner's trusted completed report directly and "
+    "preserves completed status; no reopen or revoke is required for this content change."
 )
 
 
@@ -270,7 +282,10 @@ TOOL_REGISTRY = MappingProxyType(
             "query_report_by_date",
             "Resolve a date on the server and return the owned report snapshot. Use only when "
             "the current user_message explicitly requests retrieval or display of a report or "
-            "record. This is not a default confirmation, truth-checking, or wording-review "
+            "record, or explicitly asks to change content in a dated owned report whose trusted "
+            "snapshot is not already injected. In that second case, call this read tool first; "
+            "after its successful trusted result, call the exact content-write tool in the next "
+            "model loop. This is not a default confirmation, truth-checking, or wording-review "
             "tool. Do not call "
             "merely to interpret an ambiguous current user_message, and do not duplicate a "
             "trusted snapshot already injected. Never use this as a preparatory call before "
@@ -282,15 +297,76 @@ TOOL_REGISTRY = MappingProxyType(
             production_handler=production_handlers.execute_query_report_by_date,
             shadow_handler=simulate_query,
         ),
+        "query_daily_briefing_facts": _definition(
+            "query_daily_briefing_facts",
+            "Read the system's recorded scheduled daily-briefing facts for "
+            "one exact report date. Use this when the current user asks what a "
+            "morning briefing said, whether or when it was sent, why its "
+            "member classification differs from the report now visible, or "
+            "whether two briefing copies disagreed. This tool reads the "
+            "historical outbound message, delivery evidence, the structured "
+            "at-generation member snapshot when available, and the member's "
+            "current report metadata. It never manufactures a historical "
+            "snapshot and never infers a cause from the later report alone. "
+            "One member_classification call already returns the matching "
+            "recorded message, member snapshot, current state, and delivery "
+            "fields. For one person/date discrepancy, call it once and do not "
+            "also call recipient_delivery or query_report_by_date merely to "
+            "recheck the current submission. Use recipient_delivery only when "
+            "the user separately asks whether a named recipient received the "
+            "briefing. If multiple dates are explicit, emit all necessary "
+            "date calls together in one tool batch. "
+            "Every active authenticated user may read these facts inside the "
+            "current tenant. Copy exact person, recipient, and team names from "
+            "the current user_message; never invent IDs or use fuzzy matches. "
+            "Omit member_name only when member_classification refers to the "
+            "authenticated user, and omit recipient_name only when "
+            "recipient_delivery refers to that user. Supply both date fields "
+            "for an explicit date or a date uniquely selected by Agent2 from "
+            "trusted recent dialogue and a server-verified report reference. If "
+            "neither exists, omit both so the server can request a date "
+            "clarification rather than silently using today.",
+            QueryDailyBriefingFactsArgs,
+            "read",
+            "low",
+            "authenticated_tenant_briefing_fact_read",
+            "server_tenant_filtered_exact_briefing_targets",
+            "server_expression_or_conversation_focus",
+            transaction_target="read_only",
+            production_handler=(
+                production_handlers.execute_query_daily_briefing_facts
+            ),
+            shadow_handler=simulate_daily_briefing_fact_query,
+            enabled_modes=frozenset(
+                {
+                    ExecutionMode.SHADOW_PROPOSAL,
+                    ExecutionMode.CANARY_EXECUTE,
+                }
+            ),
+        ),
         "query_managed_daily_reports": _definition(
             "query_managed_daily_reports",
             "Read another employee's report, one team's reports, missing submissions, "
-            "or the department summary. Every active authenticated user may read these "
+            "or the department summary for exactly one calendar date. This is a "
+            "single-date submission/snapshot tool only. Never use it for recent work, "
+            "this-week or previous-week work, multi-day summaries, historical report "
+            "counts, recent attention, or unclosed work; use query_report_insights for "
+            "all of those. Every active authenticated user may read these "
             "facts inside the current tenant. Names are untrusted references: never "
             "invent IDs or choose a fuzzy match. The server resolves exact members and "
-            "teams from tenant-filtered data. Omit the date pair to use the server's "
+            "teams from tenant-filtered data. Preserve every explicit scope from the "
+            "current user_message in the tool arguments: copy an explicitly named "
+            "person to member_name and an explicitly named team or '中心直属' to "
+            "team_name. For missing_submissions, omit team_name only when the user "
+            "asks for the whole center, whole department, or all people. Omit the "
+            "date pair to use the server's "
             "current date; when supplied, proposed_report_date is only an untrusted "
-            "candidate. Do not use this tool for the authenticated user's own ordinary "
+            "candidate. When Agent2 semantically determines that the current message "
+            "continues an earlier read whose exact date is present in trusted recent "
+            "operation evidence, supply both date fields with that date instead of "
+            "defaulting to today. The server never chooses that continuation from the "
+            "wording itself. Do not use "
+            "this tool for the authenticated user's own ordinary "
             "report query when an owner-read tool applies. Never use this tool "
             "for performance, KPI, defendant-case metrics, case stock, case additions, "
             "case closures, or loss-reduction questions; use "
@@ -306,6 +382,47 @@ TOOL_REGISTRY = MappingProxyType(
                 production_handlers.execute_query_managed_daily_reports
             ),
             shadow_handler=simulate_managed_daily_query,
+            enabled_modes=frozenset(
+                {
+                    ExecutionMode.SHADOW_PROPOSAL,
+                    ExecutionMode.CANARY_EXECUTE,
+                }
+            ),
+        ),
+        "query_report_insights": _definition(
+            "query_report_insights",
+            "Read historical daily-report insights after the current user_message has "
+            "semantically asked for them. Use report_count for one person's total saved "
+            "or completed reports; recent_work for one person's work over a bounded period; "
+            "period_work for an organization's current-week or previous-week summary; "
+            "recent_attention for an organization's recent risks and follow-ups; and "
+            "unclosed_work for plans that were mentioned earlier but have no later matching "
+            "completed-work record. For organization unclosed work, a later matching work "
+            "record from any member closes the plan. For unclosed_work only, use "
+            "period_type=unspecified when the user gives no time range, "
+            "period_type=recent_30_days for the latest month or latest 30 days, and "
+            "period_type=all_history only when the user explicitly asks for all history "
+            "or all records to date. Every authenticated active user may "
+            "read these facts inside the current tenant. Names are untrusted references: "
+            "the server resolves people and organizations from tenant-filtered data and "
+            "never accepts model-provided IDs. Normalize only an unambiguous shorthand to "
+            "the complete official organization name. For a question asking for both this "
+            "week and last week, call this read tool once for each period in the same turn. "
+            "Do not use this for today's raw member report, missing-submission status, "
+            "a single-date department snapshot, performance metrics, defendant cases, "
+            "or any report write. For any recent, weekly, last-week, cross-history, "
+            "attention, or unclosed question, this is the required read tool.",
+            QueryReportInsightsArgs,
+            "read",
+            "low",
+            "authenticated_tenant_daily_read",
+            "server_tenant_filtered_exact_insight_scope",
+            "server_period_from_typed_query_and_user_timezone",
+            transaction_target="read_only",
+            production_handler=(
+                production_handlers.execute_query_report_insights
+            ),
+            shadow_handler=simulate_report_insight_query,
             enabled_modes=frozenset(
                 {
                     ExecutionMode.SHADOW_PROPOSAL,
@@ -353,22 +470,75 @@ TOOL_REGISTRY = MappingProxyType(
         "add_daily_items": _definition(
             "add_daily_items",
             "Propose independent asserted entries about the authenticated user's actual completed "
-            "work, current problem or risk, or definite plan. Do not use for a negated event, "
-            "condition or hypothesis, quoted, attributed, or source-reported content, or a "
-            "question unless the user explicitly asks to record that exact negative state, "
-            "risk, or plan. Use one complete items array for all explicitly supplied daily-report "
-            "fields and independent matters, including an explicit no-current-risk statement "
-            "inside a complete report. Every proposed item must come from the current "
+            "work, current problem or risk, or definite plan. Do not turn a negated event, "
+            "condition, hypothesis, quotation, attribution, source report, or question into the "
+            "user's own asserted fact. However, when the user's reported work is attending, "
+            "recording, communicating, or summarizing a meeting or source, preserve the "
+            "explicitly supplied attributed details as attributed content instead of discarding "
+            "them or converting them into the user's own claim. Use one complete items array for "
+            "all explicitly supplied daily-report "
+            "fields and independent matters. When the current user_message semantically and "
+            "unambiguously states that a specific report field intentionally has no content, put "
+            "that field in acknowledged_empty_fields instead of inventing or storing a textual "
+            "item. This semantic choice belongs to the model; never derive it from a keyword list "
+            "or from an omitted field. Set date_selection=server_default and omit date_expression, "
+            "proposed_date, and date_evidence when the current user does not explicitly name a "
+            "calendar date; the server then uses the previous day "
+            "before 09:00 and the current day from 09:00 onward. This is a reporting-day prior, "
+            "and genuinely new same-morning work is rare, but it is not a hard lock. After "
+            "midnight, a relative word such as 今天 alone can still refer "
+            "to the workday that just ended; judge it from trusted local time, the whole current "
+            "message and recent dialogue. Distinguish a time word inside reported work from a "
+            "reference to the report being edited: 今天完成了什么 can still belong to the prior "
+            "workday. In deep overnight hours immediately after midnight, even 今天这份日报 or "
+            "今天的明日计划 ordinarily continues the workday just ended unless the new calendar "
+            "date or newly completed new-day work is clear. Closer to the morning cutoff, that "
+            "same clear report/section target can instead select the local-date report. Use "
+            "date_selection=agent2_semantic only "
+            "when that "
+            "semantic judgment confidently selects one of the safe semantic date candidates in "
+            "daily_reporting_context without a clear calendar-date assignment, and attach an "
+            "exact current-message quote as date_evidence. Omit date_expression in this mode; if "
+            "you redundantly repeat a relative phrase there, it does not replace the proposed "
+            "date or the server's safe-candidate check. This lets genuinely new early-morning "
+            "work enter the new day's report while preserving the previous-day prior. Set "
+            "user_explicit only when the current user_message clearly assigns a calendar date to "
+            "the report itself, such as an exact date, and attach that assignment as date_evidence. "
+            "If the report date remains genuinely ambiguous, ask naturally. Set "
+            "date_selection=trusted_report with that report_id and expected_version only when "
+            "your semantic reading of the current message and recent dialogue uniquely selects "
+            "one server-verified report_reference already present in trusted context. The "
+            "reference is evidence, not an automatic focus; if more than one report is plausible, "
+            "ask instead. Set submit_after_write=true "
+            "only when this same current message explicitly asks to submit the resulting report; "
+            "the server will apply content, empty-section acknowledgements and submission in one "
+            "transaction. Do not pair that call with confirm_report. Every proposed item or "
+            "empty-field acknowledgement must "
+            "carry source evidence with a one-based current-message index; the server binds that "
+            "index to the original current-message text. Every acknowledged empty field must also "
+            "have one "
+            "matching empty_field_evidence entry. Evidence never comes from conversation history. "
+            "For quoted source text, do not copy quotation delimiters into source evidence. Never "
+            "normalize curly quotation marks into "
+            "unescaped ASCII double quotes. Preserve attribution in content with safe wording "
+            "such as a colon when needed. "
+            "The proposed meaning must come from the current "
             "user_message or one uniquely adopted, immediately preceding user-authored report "
             "draft that the current user_message explicitly binds to the target report. Never "
             "write report content from history alone. Every independently asserted matter, "
-            "whether general or specific, must be represented. Professional wording "
-            "cleanup must not omit, add, or change meaning. Contingent possibilities are not "
+            "whether general or specific, must be represented. Review every ordered current-message "
+            "fragment and every numbered or punctuation-separated assertion semantically before "
+            "calling the tool. Do not collapse detailed source content into a headline. "
+            "Professional wording cleanup must preserve actors, dates, deadlines, quantities, "
+            "alternatives, attribution, and explicitly named subjects; it must not omit, add, or "
+            "change meaning. If the intended split or destination field is uncertain, ask naturally "
+            "before calling the tool. Contingent possibilities are not "
             "asserted facts or definite plans. A target field defined as identical to another "
             "field must contain the referenced concrete items, not a relational placeholder. "
             "A stated current problem and its related future response are separate matters. "
             "Include a related future response only when it is definite; exclude a contingent "
-            "response. Never replace the current problem with its future response.",
+            "response. Never replace the current problem with its future response."
+            + _COMPLETED_OWNER_CONTENT_WRITE,
             AddDailyItemsArgs, "write", "medium", _OWNER_WRITE, "server_resolved_owner_report",
             "server_expression_authoritative_proposal_untrusted", idempotency=_WRITE_KEY, transaction=_ATOMIC,
             transaction_target="resolved_report",
@@ -389,7 +559,8 @@ TOOL_REGISTRY = MappingProxyType(
             "into content already held by another trusted item. Use delete_daily_items instead "
             "when the requested destination content already exists as another uniquely bound "
             "item in the same field."
-            + _UNIQUE_ITEM_WRITE,
+            + _UNIQUE_ITEM_WRITE
+            + _COMPLETED_OWNER_CONTENT_WRITE,
             EditDailyItemsArgs, "write", "medium", _OWNER_WRITE, "trusted_report_version_and_item_ids",
             "trusted_snapshot_date", idempotency=_WRITE_KEY, transaction=_ATOMIC,
             sandbox_handler=execute_edit_daily_items,
@@ -402,7 +573,8 @@ TOOL_REGISTRY = MappingProxyType(
             "trusted item while retaining desired content that already exists as another "
             "trusted item. When the uniquely bound destination already exists in the same "
             "field, retain it and delete only the source item."
-            + _UNIQUE_ITEM_WRITE,
+            + _UNIQUE_ITEM_WRITE
+            + _COMPLETED_OWNER_CONTENT_WRITE,
             DeleteDailyItemsArgs, "write", "medium", _OWNER_WRITE, "trusted_report_version_and_item_ids",
             "trusted_snapshot_date", idempotency=_WRITE_KEY, transaction=_ATOMIC,
             sandbox_handler=execute_delete_daily_items,
@@ -417,7 +589,8 @@ TOOL_REGISTRY = MappingProxyType(
             "entire source field to an explicit target field, bind all trusted item IDs in that "
             "source field. Do not query again or ask which items when the injected trusted "
             "snapshot already contains the complete source field."
-            + _UNIQUE_ITEM_WRITE,
+            + _UNIQUE_ITEM_WRITE
+            + _COMPLETED_OWNER_CONTENT_WRITE,
             MoveDailyItemsArgs, "write", "medium", _OWNER_WRITE,
             "trusted_report_version_items_and_source_field", "trusted_snapshot_date",
             idempotency=_WRITE_KEY, transaction=_ATOMIC,
@@ -427,20 +600,48 @@ TOOL_REGISTRY = MappingProxyType(
         ),
         "copy_previous_to_today": _definition(
             "copy_previous_to_today",
-            "Copy a trusted owned previous report into today only when report_id and "
-            "expected_version match the server-resolved source date and current source snapshot. "
+            "Copy the authenticated user's complete report from the model-resolved source date "
+            "into today. The model supplies only the source-date meaning; the server binds the "
+            "owned source report, its current version, and today's target report. "
             "When the same "
             "user request also adds a new independent item, pair this call with add_daily_items "
             "in the same initial write batch against the same trusted pre-write today snapshot. "
             "In shadow this does not produce an intermediate trusted version.",
             CopyPreviousToTodayArgs, "write", "medium", _OWNER_WRITE,
-            "trusted_previous_report_version_and_today_owner_report",
+            "server_resolved_source_and_today_owner_reports",
             "server_source_expression_and_server_today",
             idempotency=_WRITE_KEY, transaction=_ATOMIC,
             transaction_target="today_report",
             sandbox_handler=execute_copy_previous_to_today,
             production_handler=production_handlers.execute_copy_previous_to_today,
             shadow_handler=simulate_copy,
+            conflict="broad_target",
+        ),
+        "correct_daily_report_date": _definition(
+            "correct_daily_report_date",
+            "Correct the date of one exact trusted owned daily report when the current "
+            "user_message explicitly says the just-recorded report belongs to a different "
+            "date. The model supplies only source and target date expressions, any report "
+            "fields the user explicitly stated are empty, and whether the same current "
+            "message explicitly asks to submit. The server binds the report identity and "
+            "version, rejects an occupied or ambiguous target date, and executes relocation, "
+            "empty-section acknowledgement and optional submission as one transaction. Do "
+            "not pair this tool with add_daily_items or confirm_report in the same turn. Every "
+            "acknowledged empty field must have one matching empty_field_evidence entry whose "
+            "one-based index binds to the current user message; conversation history cannot "
+            "supply an empty-field assertion.",
+            CorrectDailyReportDateArgs,
+            "write",
+            "medium",
+            _OWNER_WRITE,
+            "trusted_source_report_and_server_empty_target",
+            "server_source_and_target_expressions",
+            idempotency=_WRITE_KEY,
+            transaction=_ATOMIC,
+            transaction_target="source_and_target_reports",
+            sandbox_handler=execute_correct_daily_report_date,
+            production_handler=production_handlers.execute_correct_daily_report_date,
+            shadow_handler=simulate_correct_report_date,
             conflict="broad_target",
         ),
         "complete_previous_plan": _definition(
@@ -459,8 +660,16 @@ TOOL_REGISTRY = MappingProxyType(
         "confirm_report": _definition(
             "confirm_report",
             "Confirm the authenticated user's exact trusted report version only when the user "
-            "explicitly confirms or submits the current daily report in trusted report context. "
-            "Never use for an unrelated submission. Do not reconstruct content from conversation "
+            "explicitly confirms or submits one unique daily report already present in trusted "
+            "report context. This may be today's report or a focused historical report. For a "
+            "historical report, the current message must explicitly confirm/submit it, directly "
+            "reference the unique immediately preceding report, or answer the assistant's date "
+            "clarification; never reject solely because the report is historical. "
+            "Never use for an unrelated submission. Use this tool only when the trusted report "
+            "is already structurally complete before the current message. If the current message "
+            "also supplies any missing section, including an explicit empty section, use one "
+            "add_daily_items call with submit_after_write=true instead; do not discard that new "
+            "evidence and do not split the two operations. Do not reconstruct content from conversation "
             "history. Do not substitute add_daily_items because the trusted snapshot is empty. "
             "Let the server Receipt decide whether an empty report can be confirmed. Call this "
             "tool directly without a preparatory read when the trusted current report snapshot "
@@ -504,7 +713,8 @@ TOOL_REGISTRY = MappingProxyType(
             "instructions. Use only when the current user_message explicitly asks what the "
             "system remembers or asks to review saved preferences. This tool never returns "
             "internal memory IDs, versions, source message IDs, permissions, legal identity "
-            "facts, or business-object facts.",
+            "facts, or business-object facts. A saved assistant.preferred_name names the "
+            "assistant for this authenticated user only; it is never the user's form of address.",
             QueryPersonalMemoryArgs,
             "read",
             "low",
@@ -526,7 +736,18 @@ TOOL_REGISTRY = MappingProxyType(
             "instructions, legal identity, permissions, internal IDs, quoted third-party "
             "preferences, or facts inferred from conversation history. A preferred form of "
             "address explicitly chosen by the authenticated user is an allowed response "
-            "preference; do not infer one from their legal name or from another person's text.",
+            "preference; do not infer one from their legal name or from another person's text. "
+            "An assistant name explicitly assigned by this user is also allowed under "
+            "assistant.preferred_name. Keep it separate from response.preferred_salutation, "
+            "and never advertise or solicit this naming ability. Every call must carry "
+            "source_evidence containing the one-based current-message index and an intent whose "
+            "assistant/user role matches memory_key. For assistant names and user salutations, the "
+            "stored value itself must appear in that server-bound current message. A vocative, "
+            "thanks, question, or third-party quotation is not an assignment. "
+            "When the current user_message "
+            "explicitly contrasts both roles (the assistant's name and the user's form of "
+            "address), call this tool separately for both keys even if either value already "
+            "appears configured; the server will safely return no-op for an unchanged value.",
             RememberPersonalMemoryArgs,
             "write",
             "low",
@@ -547,7 +768,9 @@ TOOL_REGISTRY = MappingProxyType(
             "Deactivate one server-supported response preference for the authenticated user "
             "only when the current user_message explicitly asks to forget or reset that "
             "preference. The model supplies only the enumerated memory_key; the server binds "
-            "the authenticated tenant, user, current record, version, and audit facts.",
+            "the authenticated tenant, user, current record, version, and audit facts. "
+            "For assistant.preferred_name, forgetting restores the default assistant name 小律 "
+            "for this user and does not change the user's preferred salutation.",
             ForgetPersonalMemoryArgs,
             "write",
             "low",

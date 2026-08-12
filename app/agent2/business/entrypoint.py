@@ -19,31 +19,17 @@ class Agent2EntrypointResolution:
     route_audit_pending: bool = False
 
 
-RuntimeOwner = Literal[
-    "agent1",
-    "agent2_primary",
-    "legacy_agent2_daily",
-    "blocked",
-]
+RuntimeOwner = Literal["agent2_primary", "blocked"]
 
 
 def decide_runtime_owner(
     decision: RouteDecision,
-    *,
-    phase2_control_plane_enabled: bool,
-    legacy_agent2_daily_enabled: bool,
 ) -> RuntimeOwner:
-    """Choose exactly one message owner across old and new control planes."""
+    """Allow only the formal Agent2 runtime to own a business message."""
 
-    if decision.route == "blocked":
-        return "blocked"
     if decision.route == "agent2_primary":
         return "agent2_primary"
-    if phase2_control_plane_enabled:
-        return "agent1"
-    if legacy_agent2_daily_enabled:
-        return "legacy_agent2_daily"
-    return "agent1"
+    return "blocked"
 
 
 async def resolve_agent2_entrypoint(
@@ -55,7 +41,7 @@ async def resolve_agent2_entrypoint(
 ) -> Agent2EntrypointResolution:
     if not bool(getattr(settings, "agent2_business_phase2_enabled", False)):
         return Agent2EntrypointResolution(
-            RouteDecision("", "agent1", "agent2_business_phase2_disabled"),
+            RouteDecision("", "blocked", "agent2_business_phase2_disabled"),
             None,
         )
     allowed_tenants = parse_tenant_allowlist(
@@ -63,7 +49,7 @@ async def resolve_agent2_entrypoint(
     )
     if not allowed_tenants:
         return Agent2EntrypointResolution(
-            RouteDecision("", "agent1", "no_test_tenant_allowlist"),
+            RouteDecision("", "blocked", "agent2_business_tenant_allowlist_missing"),
             None,
         )
     bindings = (
@@ -79,7 +65,7 @@ async def resolve_agent2_entrypoint(
     ).all()
     if not bindings:
         return Agent2EntrypointResolution(
-            RouteDecision("", "agent1", "identity_outside_agent2_test_tenants"),
+            RouteDecision("", "blocked", "agent2_identity_binding_missing"),
             None,
         )
     if len(bindings) != 1:

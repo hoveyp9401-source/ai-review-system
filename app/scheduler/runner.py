@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import signal
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -13,7 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
 from app.agent2.business.models import Agent2IdentityBinding
-from app.models import Agent2ConversationState
+from app.models import Agent2ConversationState, ReportInteractionEvent
 from app.agent2.business.notifications import (
     dispatch_notification_batch,
     reconcile_sent_notification_outcomes,
@@ -34,8 +37,10 @@ from app.db import AsyncSessionLocal
 from app.llm.client import LLMClient
 from app.llm.extractor import TeamSummaryGenerator
 from app.scheduler.jobs import (
+    ReminderDispatchEvidence,
     auto_submit_due_pending_reports,
     ensure_daily_submission_obligations,
+    reconcile_pending_scheduler_deliveries,
     remind_missing_reports,
     send_user_message,
 )
@@ -45,6 +50,24 @@ from app.utils.time import today_in_timezone
 
 logger = logging.getLogger(__name__)
 DAILY_BRIEFING_SAFE_MESSAGE_CHARS = 3600
+_DAILY_BRIEFING_DISPATCH_CONTRACT = "segmented-daily-briefing-v1"
+_DAILY_BRIEFING_EVENT_ACTIONS = frozenset(
+    {
+        "daily_briefing_failed",
+        "daily_briefing_delivery_pending",
+        "daily_briefing_sent",
+    }
+)
+
+
+class DailyBriefingResumeConflict(RuntimeError):
+    """Recorded segments do not match the briefing that would be resumed."""
+
+
+@dataclass(frozen=True)
+class _DailyBriefingResumeState:
+    next_part_index: int = 1
+    dispatches: tuple[dict[str, object], ...] = ()
 
 
 def resolve_followup_conversation_id(
@@ -104,6 +127,7 @@ async def run_scheduler() -> None:
                 settings,
                 current_date,
             )
+            await session.commit()
             await remind_missing_reports(session, settings, robot, current_date)
             await session.commit()
 
@@ -121,6 +145,7 @@ async def run_scheduler() -> None:
                 settings,
                 current_date,
             )
+            await session.commit()
             await remind_missing_reports(
                 session,
                 settings,
@@ -132,19 +157,32 @@ async def run_scheduler() -> None:
 
     async def auto_submit_job() -> None:
         current_date = today_in_timezone(settings.timezone)
-        if _scheduler_paused(settings, current_date):
-            logger.info("auto submit skipped by scheduler pause date=%s", current_date.isoformat())
+        report_date = _auto_submit_report_date(current_date)
+        if report_date is None:
+            logger.info(
+                "auto submit skipped by reporting calendar current_date=%s",
+                current_date.isoformat(),
+            )
+            return
+        if _scheduler_paused(settings, current_date) or _scheduler_paused(
+            settings, report_date
+        ):
+            logger.info(
+                "auto submit skipped by scheduler pause current_date=%s report_date=%s",
+                current_date.isoformat(),
+                report_date.isoformat(),
+            )
             return
         async with AsyncSessionLocal() as session:
             await ensure_daily_submission_obligations(
                 session,
                 settings,
-                current_date,
+                report_date,
             )
             await auto_submit_due_pending_reports(
                 session,
                 settings,
-                report_date=current_date,
+                report_date=report_date,
             )
             await session.commit()
 
@@ -170,6 +208,22 @@ async def run_scheduler() -> None:
             )
             await session.commit()
 
+    async def scheduler_delivery_reconciliation_job() -> None:
+        async with AsyncSessionLocal() as session:
+            result = await reconcile_pending_scheduler_deliveries(
+                session,
+                robot,
+            )
+            await session.commit()
+        if result["checked"]:
+            logger.info(
+                "scheduler delivery reconciliation checked=%s verified=%s pending=%s failed=%s",
+                result["checked"],
+                result["verified"],
+                result["still_pending"],
+                result["failed"],
+            )
+
     async def catchup_reminder_job() -> None:
         current_date = today_in_timezone(settings.timezone)
         report_date = _catchup_reminder_report_date(current_date)
@@ -189,6 +243,7 @@ async def run_scheduler() -> None:
                 settings,
                 report_date,
             )
+            await session.commit()
             await remind_missing_reports(session, settings, robot, report_date, reminder_kind="catchup")
             await session.commit()
 
@@ -205,25 +260,41 @@ async def run_scheduler() -> None:
                 summary_date.isoformat(),
             )
             return
-        async with AsyncSessionLocal() as session:
+        async with AsyncSessionLocal() as state_session:
             await ensure_daily_submission_obligations(
-                session,
+                state_session,
                 settings,
                 summary_date,
             )
             await auto_submit_due_pending_reports(
-                session,
+                state_session,
                 settings,
                 report_date=summary_date,
             )
-            briefings = await summary_service.build_daily_briefings(session, summary_date)
-            sent = await _send_daily_briefings(robot, briefings)
+            await state_session.commit()
+        async with AsyncSessionLocal() as delivery_session:
+            briefings = await summary_service.build_daily_briefings(
+                delivery_session,
+                summary_date,
+            )
+            sent = await _send_daily_briefings(
+                robot,
+                briefings,
+                session=delivery_session,
+                report_date=summary_date,
+            )
+            await delivery_session.commit()
             logger.info("daily briefing sent date=%s sent=%s", summary_date.isoformat(), sent)
+        async with AsyncSessionLocal() as summary_session:
             try:
-                await summary_service.generate_for_date(session, summary_date)
+                await summary_service.generate_for_date(
+                    summary_session,
+                    summary_date,
+                )
+                await summary_session.commit()
             except Exception:
                 logger.exception("daily summary generation failed after briefing send")
-            await session.commit()
+                await summary_session.rollback()
 
     async def agent2_notification_job() -> None:
         tenant_ids = _configured_agent2_business_tenant_ids(settings)
@@ -524,6 +595,14 @@ async def run_scheduler() -> None:
         replace_existing=True,
         max_instances=1,
     )
+    scheduler.add_job(
+        scheduler_delivery_reconciliation_job,
+        IntervalTrigger(minutes=5, timezone=settings.timezone),
+        id="daily_report_delivery_reconciliation",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     if settings.agent2_travel_notification_worker_enabled or (
         settings.agent2_case_followup_enabled and settings.agent2_case_followup_send_enabled
     ):
@@ -550,32 +629,478 @@ async def run_scheduler() -> None:
     await llm_client.close()
 
 
-async def _send_daily_briefings(robot: DingTalkRobotClient, briefings: dict) -> int:
+async def _send_daily_briefings(
+    robot: DingTalkRobotClient,
+    briefings: dict,
+    *,
+    session=None,
+    report_date: date | None = None,
+) -> int:
     sent = 0
     messages = [*briefings.get("team_messages", [])]
     if briefings.get("department_message"):
         messages.append(briefings["department_message"])
+    target_report_date = (
+        _briefing_report_date(
+            briefings,
+            report_date=report_date,
+        )
+        if session is not None
+        else None
+    )
+    resume_events_by_user = (
+        await _load_daily_briefing_resume_events(
+            session,
+            messages=messages,
+            report_date=target_report_date,
+        )
+        if session is not None
+        else {}
+    )
     for item in messages:
-        user_ids = [user.get("dingtalk_user_id") for user in item.get("recipients", []) if user.get("dingtalk_user_id")]
-        if not user_ids:
-            continue
         title = f"{item.get('team_name') or item.get('department_name') or '部门'}晨报"
-        message_parts = _split_daily_briefing_text(item.get("text") or "")
-        for index, message_part in enumerate(message_parts, start=1):
-            part_title = (
-                title
-                if len(message_parts) == 1
-                else f"{title}（{index}/{len(message_parts)}）"
+        message_text = str(item.get("text") or "")
+        message_parts = _split_daily_briefing_text(message_text)
+        message_sha256 = _daily_briefing_text_sha256(message_text)
+        part_sha256s = tuple(
+            _daily_briefing_text_sha256(part) for part in message_parts
+        )
+        for recipient in item.get("recipients", []):
+            dingtalk_user_id = str(
+                recipient.get("dingtalk_user_id") or ""
+            ).strip()
+            if not dingtalk_user_id:
+                continue
+            recipient_uuid = _daily_briefing_recipient_uuid(recipient)
+            if session is not None and recipient_uuid is None:
+                logger.error(
+                    "daily briefing blocked: invalid recipient user id dingtalk_user_id=%s",
+                    dingtalk_user_id,
+                )
+                continue
+            dispatch_key = _daily_briefing_dispatch_key(
+                item=item,
+                recipient=recipient,
+                report_date=target_report_date,
             )
-            await send_user_message(
-                robot,
-                user_ids,
-                message_part,
-                markdown=True,
-                title=part_title,
+            resume_state = _DailyBriefingResumeState()
+            if session is not None:
+                try:
+                    resume_state = _resolve_daily_briefing_resume_state(
+                        events=resume_events_by_user.get(
+                            recipient_uuid,
+                            (),
+                        ),
+                        dispatch_key=dispatch_key,
+                        message_sha256=message_sha256,
+                        part_sha256s=part_sha256s,
+                    )
+                except DailyBriefingResumeConflict:
+                    logger.exception(
+                        "daily briefing resume blocked recipient=%s title=%s",
+                        recipient.get("id"),
+                        title,
+                    )
+                    continue
+            if resume_state.next_part_index > len(message_parts):
+                logger.info(
+                    "daily briefing already provider-accepted recipient=%s title=%s parts=%s",
+                    recipient.get("id"),
+                    title,
+                    len(message_parts),
+                )
+                continue
+            dispatch_evidence: list[
+                tuple[int, ReminderDispatchEvidence]
+            ] = []
+            delivery_error = ""
+            for index in range(
+                resume_state.next_part_index,
+                len(message_parts) + 1,
+            ):
+                message_part = message_parts[index - 1]
+                part_title = (
+                    title
+                    if len(message_parts) == 1
+                    else f"{title}（{index}/{len(message_parts)}）"
+                )
+                try:
+                    dispatch_evidence.append(
+                        (
+                            index,
+                            await send_user_message(
+                                robot,
+                                [dingtalk_user_id],
+                                message_part,
+                                markdown=True,
+                                title=part_title,
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    delivery_error = exc.__class__.__name__
+                    logger.exception(
+                        "daily briefing delivery failed recipient=%s title=%s part=%s/%s",
+                        recipient.get("id"),
+                        title,
+                        index,
+                        len(message_parts),
+                    )
+                    break
+            completed_part_count = (
+                resume_state.next_part_index
+                - 1
+                + len(dispatch_evidence)
             )
-            sent += len(user_ids)
+            if (
+                not delivery_error
+                and completed_part_count == len(message_parts)
+            ):
+                sent += 1
+            if session is not None:
+                recorded_event = _record_daily_briefing_events(
+                    session,
+                    item=item,
+                    recipient=recipient,
+                    title=title,
+                    report_date=target_report_date,
+                    dispatch_key=dispatch_key,
+                    message_sha256=message_sha256,
+                    part_sha256s=part_sha256s,
+                    resumed_from_part_index=(
+                        resume_state.next_part_index
+                    ),
+                    prior_dispatches=resume_state.dispatches,
+                    dispatch_evidence=dispatch_evidence,
+                    intended_part_count=len(message_parts),
+                    delivery_error=delivery_error,
+                )
+                if recorded_event is not None:
+                    resume_events_by_user.setdefault(
+                        recorded_event.user_id,
+                        [],
+                    ).append(recorded_event)
     return sent
+
+
+def _daily_briefing_text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _daily_briefing_dispatch_key(
+    *,
+    item: dict,
+    recipient: dict,
+    report_date: date | None,
+) -> str:
+    scope = str(item.get("scope") or "").strip()
+    scope_ref = (
+        str(item.get("team_id") or item.get("team_name") or "").strip()
+        if scope == "team"
+        else scope
+    )
+    identity = {
+        "contract": _DAILY_BRIEFING_DISPATCH_CONTRACT,
+        "report_date": report_date.isoformat() if report_date else "",
+        "recipient_user_id": str(recipient.get("id") or "").strip(),
+        "dingtalk_user_id": str(
+            recipient.get("dingtalk_user_id") or ""
+        ).strip(),
+        "scope": scope,
+        "scope_ref": scope_ref,
+    }
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return _daily_briefing_text_sha256(encoded)
+
+
+def _daily_briefing_recipient_uuid(recipient: dict) -> UUID | None:
+    try:
+        return UUID(str(recipient.get("id") or ""))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+async def _load_daily_briefing_resume_events(
+    session,
+    *,
+    messages: list[dict],
+    report_date: date,
+) -> dict[UUID, list[ReportInteractionEvent]]:
+    scalars = getattr(session, "scalars", None)
+    if not callable(scalars):
+        raise TypeError(
+            "daily briefing audit session must support scalar queries"
+        )
+    user_ids = tuple(
+        dict.fromkeys(
+            user_id
+            for item in messages
+            for recipient in item.get("recipients", [])
+            if (
+                user_id := _daily_briefing_recipient_uuid(recipient)
+            )
+        )
+    )
+    if not user_ids:
+        return {}
+    events = tuple(
+        (
+            await scalars(
+                select(ReportInteractionEvent)
+                .where(
+                    ReportInteractionEvent.user_id.in_(user_ids),
+                    ReportInteractionEvent.report_date == report_date,
+                    ReportInteractionEvent.backend_action.in_(
+                        _DAILY_BRIEFING_EVENT_ACTIONS
+                    ),
+                )
+                .order_by(ReportInteractionEvent.created_at)
+            )
+        ).all()
+    )
+    by_user: dict[UUID, list[ReportInteractionEvent]] = {}
+    for event in events:
+        by_user.setdefault(event.user_id, []).append(event)
+    return by_user
+
+
+def _resolve_daily_briefing_resume_state(
+    *,
+    events: tuple[ReportInteractionEvent, ...]
+    | list[ReportInteractionEvent],
+    dispatch_key: str,
+    message_sha256: str,
+    part_sha256s: tuple[str, ...],
+) -> _DailyBriefingResumeState:
+    accepted: dict[int, dict[str, object]] = {}
+    for event in events:
+        payload = dict(event.llm_decision_json or {})
+        if (
+            payload.get("dispatch_contract")
+            != _DAILY_BRIEFING_DISPATCH_CONTRACT
+            or str(payload.get("dispatch_key") or "") != dispatch_key
+        ):
+            continue
+        raw_dispatches = payload.get("attempt_dispatches")
+        if not isinstance(raw_dispatches, list):
+            raise DailyBriefingResumeConflict(
+                "recorded briefing attempt has no segment evidence"
+            )
+        if (
+            str(payload.get("message_sha256") or "")
+            != message_sha256
+            or tuple(payload.get("part_sha256s") or ())
+            != part_sha256s
+        ):
+            if (
+                not raw_dispatches
+                and payload.get("completed_part_count") == 0
+            ):
+                # No provider acceptance exists, so replacing the unsent
+                # payload cannot duplicate or splice a prior briefing.
+                continue
+            raise DailyBriefingResumeConflict(
+                "recorded briefing content differs from retry content"
+            )
+        attempt_dispatches = [
+            dict(dispatch)
+            for dispatch in raw_dispatches
+            if isinstance(dispatch, dict)
+        ]
+        if len(attempt_dispatches) != len(raw_dispatches):
+            raise DailyBriefingResumeConflict(
+                "recorded briefing segment evidence is malformed"
+            )
+        attempt_indexes = [
+            dispatch.get("part_index") for dispatch in attempt_dispatches
+        ]
+        if payload.get("accepted_part_indexes") != attempt_indexes:
+            raise DailyBriefingResumeConflict(
+                "recorded briefing segment indexes disagree"
+            )
+        for dispatch in attempt_dispatches:
+            part_index = dispatch.get("part_index")
+            if (
+                isinstance(part_index, bool)
+                or not isinstance(part_index, int)
+                or part_index < 1
+                or part_index > len(part_sha256s)
+            ):
+                raise DailyBriefingResumeConflict(
+                    "recorded briefing segment index is invalid"
+                )
+            if (
+                str(dispatch.get("part_sha256") or "")
+                != part_sha256s[part_index - 1]
+                or not str(
+                    dispatch.get("provider_reference") or ""
+                ).strip()
+            ):
+                raise DailyBriefingResumeConflict(
+                    "recorded briefing segment evidence does not match"
+                )
+            if part_index in accepted:
+                raise DailyBriefingResumeConflict(
+                    "a briefing segment has multiple provider acceptances"
+                )
+            accepted[part_index] = dispatch
+        expected_indexes = list(range(1, len(accepted) + 1))
+        if sorted(accepted) != expected_indexes:
+            raise DailyBriefingResumeConflict(
+                "recorded briefing segments are not a contiguous prefix"
+            )
+        completed_part_count = payload.get("completed_part_count")
+        if completed_part_count != len(accepted):
+            raise DailyBriefingResumeConflict(
+                "recorded briefing progress does not match evidence"
+            )
+    ordered_dispatches = tuple(
+        accepted[index] for index in sorted(accepted)
+    )
+    return _DailyBriefingResumeState(
+        next_part_index=len(ordered_dispatches) + 1,
+        dispatches=ordered_dispatches,
+    )
+
+
+def _briefing_report_date(
+    briefings: dict,
+    *,
+    report_date: date | None,
+) -> date:
+    if report_date is not None:
+        return report_date
+    raw_date = str(briefings.get("date") or "").strip()
+    if not raw_date:
+        raise ValueError("daily briefing report date is required for audit")
+    return date.fromisoformat(raw_date)
+
+
+def _record_daily_briefing_events(
+    session,
+    *,
+    item: dict,
+    recipient: dict,
+    title: str,
+    report_date: date,
+    dispatch_key: str,
+    message_sha256: str,
+    part_sha256s: tuple[str, ...],
+    resumed_from_part_index: int,
+    prior_dispatches: tuple[dict[str, object], ...],
+    dispatch_evidence: list[tuple[int, ReminderDispatchEvidence]],
+    intended_part_count: int,
+    delivery_error: str,
+) -> ReportInteractionEvent | None:
+    attempt_dispatches = [
+        {
+            "part_index": part_index,
+            "part_sha256": part_sha256s[part_index - 1],
+            "transport": evidence.channel,
+            "provider_reference": evidence.provider_reference,
+            "delivery_verified": evidence.delivery_verified,
+        }
+        for part_index, evidence in dispatch_evidence
+    ]
+    cumulative_dispatches = [
+        *(dict(dispatch) for dispatch in prior_dispatches),
+        *attempt_dispatches,
+    ]
+    provider_references = [
+        str(dispatch.get("provider_reference") or "")
+        for dispatch in cumulative_dispatches
+    ]
+    transports = list(
+        dict.fromkeys(
+            str(dispatch.get("transport") or "")
+            for dispatch in cumulative_dispatches
+        )
+    )
+    try:
+        user_id = UUID(str(recipient.get("id") or ""))
+    except (TypeError, ValueError, AttributeError):
+        logger.warning(
+            "daily briefing audit skipped: invalid recipient user id"
+        )
+        return None
+    completed_part_count = len(cumulative_dispatches)
+    all_parts_accepted = not delivery_error and (
+        completed_part_count == intended_part_count
+    )
+    delivery_verified = all_parts_accepted and all(
+        dispatch.get("delivery_verified") is True
+        for dispatch in cumulative_dispatches
+    )
+    if delivery_error:
+        backend_action = "daily_briefing_failed"
+        message_status = "failed"
+    elif delivery_verified:
+        backend_action = "daily_briefing_sent"
+        message_status = "delivered"
+    else:
+        backend_action = "daily_briefing_delivery_pending"
+        message_status = "accepted_by_provider"
+    event = ReportInteractionEvent(
+        user_id=user_id,
+        report_id=None,
+        dingtalk_user_id=str(
+            recipient.get("dingtalk_user_id") or ""
+        ),
+        report_date=report_date,
+        message_text=str(item.get("text") or ""),
+        llm_decision_json={
+                "interaction_type": "daily_briefing",
+                "scope": str(item.get("scope") or ""),
+                "title": title,
+                "team_id": str(item.get("team_id") or ""),
+                "team_name": str(item.get("team_name") or ""),
+                "department_name": str(
+                    item.get("department_name") or ""
+                ),
+                "target_report_date": report_date.isoformat(),
+                "business_write": False,
+                "dispatch_contract": (
+                    _DAILY_BRIEFING_DISPATCH_CONTRACT
+                ),
+                "dispatch_key": dispatch_key,
+                "message_sha256": message_sha256,
+                "part_sha256s": list(part_sha256s),
+                "resumed_from_part_index": resumed_from_part_index,
+                "accepted_part_indexes": [
+                    part_index
+                    for part_index, _evidence in dispatch_evidence
+                ],
+                "completed_part_count": completed_part_count,
+                "briefing_snapshot": dict(
+                    item.get("briefing_snapshot") or {}
+                ),
+                "message_status": message_status,
+                "provider_references": provider_references,
+                "provider_reference_available": bool(
+                    provider_references
+                ),
+                "transport": transports,
+                "part_count": completed_part_count,
+                "attempt_part_count": len(dispatch_evidence),
+                "intended_part_count": intended_part_count,
+                "delivery_verified": delivery_verified,
+                "delivery_error": delivery_error,
+                "attempt_dispatches": attempt_dispatches,
+                # Reconciliation needs the entire accepted prefix, including
+                # segments accepted during an earlier interrupted attempt.
+                "dispatches": cumulative_dispatches,
+        },
+        backend_action=backend_action,
+        before_snapshot_json={},
+        after_snapshot_json={},
+    )
+    session.add(event)
+    return event
 
 
 def _split_daily_briefing_text(
@@ -610,6 +1135,13 @@ def _reporting_required_on(target_date: date) -> bool:
 def _catchup_reminder_report_date(current_date: date) -> date | None:
     if not _reporting_required_on(current_date):
         return None
+    report_date = current_date - timedelta(days=1)
+    if not _reporting_required_on(report_date):
+        return None
+    return report_date
+
+
+def _auto_submit_report_date(current_date: date) -> date | None:
     report_date = current_date - timedelta(days=1)
     if not _reporting_required_on(report_date):
         return None

@@ -314,11 +314,22 @@ def _compact_report(
 
 def _compact_scope_payload(raw_scope: dict[str, Any]) -> dict[str, Any]:
     compact_scope = {field: raw_scope.get(field) for field in _SCOPE_FIELDS}
+    raw_new_cases = [
+        item
+        for item in raw_scope.get("period_new_cases") or ()
+        if isinstance(item, dict)
+    ]
+    raw_closed_cases = [
+        item
+        for item in raw_scope.get("period_closed_cases") or ()
+        if isinstance(item, dict)
+    ]
     compact_scope["branches"] = [
         {
             field: branch.get(field)
             for field in (
                 "branch_name",
+                "lawyer_name",
                 "stock_count",
                 "last_year_stock_count",
                 "stock_yoy",
@@ -333,7 +344,36 @@ def _compact_scope_payload(raw_scope: dict[str, Any]) -> dict[str, Any]:
         for branch in raw_scope.get("branches") or ()
         if isinstance(branch, dict)
     ]
+    compact_scope["period_new_cases"] = _compact_case_details(
+        raw_new_cases
+    )
+    compact_scope["period_closed_cases"] = _compact_case_details(
+        raw_closed_cases
+    )
+    compact_scope["period_new_case_total"] = len(raw_new_cases)
+    compact_scope["period_new_cases_truncated"] = len(raw_new_cases) > 100
+    compact_scope["period_closed_case_total"] = len(raw_closed_cases)
+    compact_scope["period_closed_cases_truncated"] = (
+        len(raw_closed_cases) > 100
+    )
     return compact_scope
+
+
+def _compact_case_details(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        {
+            "case_name": str(item.get("case_name") or "").strip(),
+            "branch_name": str(item.get("branch_name") or "").strip(),
+            "lawyer_name": str(item.get("lawyer_name") or "").strip(),
+            "register_date": str(item.get("register_date") or "").strip(),
+            "close_date": str(item.get("close_date") or "").strip(),
+        }
+        for item in value[:100]
+        if isinstance(item, dict)
+        and str(item.get("case_name") or "").strip()
+    ]
 
 
 async def _unique_active_user_name(

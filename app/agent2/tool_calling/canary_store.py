@@ -199,7 +199,7 @@ class ToolCallCanaryControlRepository:
         await self._session.flush()
         return control
 
-    async def rollback_to_agent1(
+    async def disable_runtime_fail_closed(
         self,
         *,
         control_key: str,

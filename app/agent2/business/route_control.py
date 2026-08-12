@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent2.business.models import RouteControlAudit, TenantRouteControl
 
 
-RouteMode = Literal["agent1", "agent2_shadow", "agent2_canary", "agent2_primary"]
-ResolvedRoute = Literal["agent1", "agent2_shadow", "agent2_primary", "blocked"]
+RouteMode = Literal["agent2_primary"]
+ResolvedRoute = Literal["agent2_primary", "blocked"]
 
 
 @dataclass(frozen=True)
@@ -25,15 +25,22 @@ def decide_route(
     control: TenantRouteControl | None, *, tenant_id: str, user_id: str
 ) -> RouteDecision:
     if control is None or control.tenant_id != tenant_id:
-        return RouteDecision(tenant_id, "agent1", "no_tenant_cutover_control")
+        return RouteDecision(tenant_id, "blocked", "no_tenant_cutover_control")
     if control.route_mode == "agent2_canary":
         if user_id in set(control.canary_user_ids or []):
             return RouteDecision(tenant_id, "agent2_primary", "canary_user", control.agent1_rollback_enabled)
-        return RouteDecision(tenant_id, "agent1", "outside_canary", control.agent1_rollback_enabled)
+        return RouteDecision(tenant_id, "blocked", "outside_canary", control.agent1_rollback_enabled)
+    if control.route_mode == "agent2_primary":
+        return RouteDecision(
+            tenant_id,
+            "agent2_primary",
+            "tenant_route_mode:agent2_primary",
+            control.agent1_rollback_enabled,
+        )
     return RouteDecision(
         tenant_id,
-        control.route_mode,  # type: ignore[arg-type]
-        f"tenant_route_mode:{control.route_mode}",
+        "blocked",
+        f"agent2_only_rejected_route_mode:{control.route_mode}",
         control.agent1_rollback_enabled,
     )
 
@@ -41,19 +48,12 @@ def decide_route(
 def decide_agent2_failure(
     decision: RouteDecision, *, explicit_rollback_requested: bool
 ) -> RouteDecision:
-    if decision.route != "agent2_primary":
+    if decision.route == "blocked":
         return decision
-    if explicit_rollback_requested and decision.agent1_rollback_enabled:
-        return RouteDecision(
-            decision.tenant_id,
-            "agent1",
-            "explicit_audited_emergency_rollback",
-            True,
-        )
     return RouteDecision(
         decision.tenant_id,
         "blocked",
-        "agent2_failure_no_automatic_agent1_fallback",
+        "agent2_failure_no_agent1_fallback",
         decision.agent1_rollback_enabled,
     )
 

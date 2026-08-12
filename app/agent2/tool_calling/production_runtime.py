@@ -1,25 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import logging
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import select, text
 
+from app.agent2.tool_calling.canary_store import ToolCallCanaryControl
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedContext,
     TrustedReportSnapshot,
 )
-from app.agent2.tool_calling.canary_store import ToolCallCanaryControl
 from app.agent2.tool_calling.contracts import (
     ExecutionMode,
     ReceiptStatus,
     ToolReceipt,
 )
+from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
 from app.agent2.tool_calling.production_contracts import (
     ProductionExecutionCapability,
     ProductionRuntimeResult,
@@ -30,13 +31,13 @@ from app.agent2.tool_calling.production_daily_executor import (
     ProductionHandlerOutcome,
 )
 from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
-from app.agent2.tool_calling.production_memory_executor import (
-    ProductionPersonalMemoryExecutor,
-)
 from app.agent2.tool_calling.production_memory_evidence import (
     is_personal_memory_call,
     personal_memory_evidence_matches,
     personal_memory_safe_user_facts,
+)
+from app.agent2.tool_calling.production_memory_executor import (
+    ProductionPersonalMemoryExecutor,
 )
 from app.agent2.tool_calling.production_performance_executor import (
     ProductionPerformanceExecutor,
@@ -62,7 +63,6 @@ from app.agent2.tool_calling.validation import (
     ShadowCallBinder,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +78,12 @@ class _PreparedCall:
     arguments_hash: str
     request_fingerprint: str
     operation_fingerprint: str
+
+
+@dataclass(frozen=True)
+class _PendingExecution:
+    transaction: Any
+    committed_result: ProductionRuntimeResult
 
 
 class ProductionRuntime:
@@ -98,7 +104,12 @@ class ProductionRuntime:
         capability: ProductionExecutionCapability,
         source_channel: str,
         source_text_hash: str,
+        current_turn_source: CurrentTurnSource,
     ) -> "ProductionRuntimeSession":
+        if current_turn_source.sha256 != source_text_hash:
+            raise ProductionCapabilityError(
+                "CURRENT_TURN_SOURCE_HASH_MISMATCH"
+            )
         _validate_capability(
             context=context,
             capability=capability,
@@ -125,6 +136,7 @@ class ProductionRuntime:
                 self._date_resolver,
                 read_port,
                 execution_mode=ExecutionMode.CANARY_EXECUTE,
+                current_turn_source=current_turn_source,
             ),
             date_resolver=self._date_resolver,
         )
@@ -155,13 +167,25 @@ class ProductionRuntimeSession:
         self._source_text_hash = source_text_hash
         self._binder = binder
         self._date_resolver = date_resolver
+        self._pending_execution: _PendingExecution | None = None
 
     async def execute(
         self,
         tool_calls: tuple[NativeToolCall, ...],
         *,
         commit_to_outer_transaction: bool = True,
+        defer_finalization: bool = False,
     ) -> ProductionRuntimeResult:
+        if self._pending_execution is not None:
+            return ProductionRuntimeResult(
+                status="failed",
+                error_code="PENDING_TRANSACTION_REQUIRES_FINALIZATION",
+            )
+        if defer_finalization and not commit_to_outer_transaction:
+            return ProductionRuntimeResult(
+                status="failed",
+                error_code="INVALID_TRANSACTION_FINALIZATION_MODE",
+            )
         if not isinstance(tool_calls, tuple) or not tool_calls or any(
             not isinstance(call, NativeToolCall) for call in tool_calls
         ):
@@ -340,10 +364,6 @@ class ProductionRuntimeSession:
                     generated.append(receipt)
                 receipts = tuple(generated)
 
-            if commit_to_outer_transaction:
-                await nested.commit()
-            else:
-                await nested.rollback()
             successful_ids = frozenset(
                 call.tool_call_id
                 for call, receipt in zip(tool_calls, receipts, strict=True)
@@ -354,38 +374,49 @@ class ProductionRuntimeSession:
                 [item.bound for item in prepared],
                 successful_ids,
             )
-            return ProductionRuntimeResult(
+            committed_result = ProductionRuntimeResult(
                 status="success",
                 receipts=receipts,
                 transaction_opened=True,
-                committed_to_outer_transaction=commit_to_outer_transaction,
-                rolled_back=not commit_to_outer_transaction,
+                committed_to_outer_transaction=True,
+                rolled_back=False,
                 handler_call_count=handler_call_count,
-                business_write_count=(
-                    business_write_count
-                    if commit_to_outer_transaction
-                    else 0
-                ),
-                pending_write_count=(
-                    pending_write_count
-                    if commit_to_outer_transaction
-                    else 0
-                ),
-                memory_write_count=(
-                    memory_write_count
-                    if commit_to_outer_transaction
-                    else 0
-                ),
-                memory_audit_write_count=(
-                    memory_audit_write_count
-                    if commit_to_outer_transaction
-                    else 0
-                ),
+                business_write_count=business_write_count,
+                pending_write_count=pending_write_count,
+                memory_write_count=memory_write_count,
+                memory_audit_write_count=memory_audit_write_count,
                 receipt_write_count=(
-                    len(receipts)
-                    if commit_to_outer_transaction and handler_call_count
-                    else 0
+                    len(receipts) if handler_call_count else 0
                 ),
+            )
+            if defer_finalization:
+                self._pending_execution = _PendingExecution(
+                    transaction=nested,
+                    committed_result=committed_result,
+                )
+                return replace(
+                    committed_result,
+                    transaction_pending=True,
+                    committed_to_outer_transaction=False,
+                    business_write_count=0,
+                    pending_write_count=0,
+                    memory_write_count=0,
+                    memory_audit_write_count=0,
+                    receipt_write_count=0,
+                )
+            if commit_to_outer_transaction:
+                await nested.commit()
+                return committed_result
+            await nested.rollback()
+            return replace(
+                committed_result,
+                committed_to_outer_transaction=False,
+                rolled_back=True,
+                business_write_count=0,
+                pending_write_count=0,
+                memory_write_count=0,
+                memory_audit_write_count=0,
+                receipt_write_count=0,
             )
         except Exception as exc:
             if nested.is_active:
@@ -406,6 +437,30 @@ class ProductionRuntimeSession:
                 rolled_back=True,
                 handler_call_count=handler_call_count,
             )
+
+    async def commit_pending(self) -> ProductionRuntimeResult:
+        pending = self._pending_execution
+        if pending is None:
+            raise ProductionExecutionError("PENDING_TRANSACTION_REQUIRED")
+        try:
+            await pending.transaction.commit()
+        except Exception:
+            if pending.transaction.is_active:
+                await pending.transaction.rollback()
+            raise
+        finally:
+            self._pending_execution = None
+        return pending.committed_result
+
+    async def rollback_pending(self) -> None:
+        pending = self._pending_execution
+        if pending is None:
+            return
+        try:
+            if pending.transaction.is_active:
+                await pending.transaction.rollback()
+        finally:
+            self._pending_execution = None
 
     async def _lock_turn(self) -> None:
         principal = self._context.principal
@@ -679,6 +734,10 @@ def _prepare_call(
 ) -> _PreparedCall:
     arguments_hash = _sha256(bound.arguments)
     principal = context.principal
+    is_date_correction = (
+        bound.call.tool_name == "correct_daily_report_date"
+    )
+    relocation_report = bound.source_report or bound.report
     base = {
         "tenant_id": principal.tenant_id,
         "user_id": str(principal.user_id),
@@ -688,22 +747,40 @@ def _prepare_call(
         "arguments": bound.arguments,
         "server_binding": {
             "report_id": (
-                str(bound.report.report_id)
-                if bound.report is not None
-                else None
+                str(relocation_report.report_id)
+                if is_date_correction and relocation_report is not None
+                else (
+                    str(bound.report.report_id)
+                    if bound.report is not None
+                    else None
+                )
             ),
             "report_version": (
-                bound.report.version if bound.report is not None else None
+                None
+                if is_date_correction
+                else (
+                    bound.report.version
+                    if bound.report is not None
+                    else None
+                )
             ),
             "source_report_id": (
-                str(bound.source_report.report_id)
-                if bound.source_report is not None
-                else None
+                str(relocation_report.report_id)
+                if is_date_correction and relocation_report is not None
+                else (
+                    str(bound.source_report.report_id)
+                    if bound.source_report is not None
+                    else None
+                )
             ),
             "source_report_version": (
-                bound.source_report.version
-                if bound.source_report is not None
-                else None
+                None
+                if is_date_correction
+                else (
+                    bound.source_report.version
+                    if bound.source_report is not None
+                    else None
+                )
             ),
             "date_facts": bound.date_facts,
         },
@@ -745,17 +822,27 @@ def _canary_failure_receipt(receipt: ToolReceipt) -> ToolReceipt:
 def _safe_report_snapshot(
     report: TrustedReportSnapshot,
 ) -> dict[str, object]:
-    fields: dict[str, list[str]] = {
+    fields: dict[str, list[dict[str, str]]] = {
         "today_work": [],
         "problems": [],
         "tomorrow_plan": [],
     }
     for item in report.items:
-        fields[item.field].append(item.content)
+        fields[item.field].append(
+            {
+                "item_id": item.item_id,
+                "content": item.content,
+            }
+        )
     return {
+        "report_id": str(report.report_id),
         "report_date": report.report_date.isoformat(),
+        "version": report.version,
         "status": report.status,
         "fields": fields,
+        "acknowledged_empty_fields": sorted(
+            report.acknowledged_empty_fields
+        ),
     }
 
 

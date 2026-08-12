@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from app.agent2.assistant_responder import AssistantReply
 from app.agent2.performance_qa import build_performance_qa_reply
 from app.agent2.rag_qa import build_rag_qa_reply
+from app.agent2.report_insights import report_insight_reply_from_context
 from app.agent2.reply_composer import compose_assistant_reply
 from app.utils.json import extract_json_object
 
@@ -39,6 +40,13 @@ async def build_tool_assisted_reply(
     )
     if assistant_reply is None or assistant_reply.reply_type not in TOOL_REPLY_TYPES:
         return AssistantToolReplyResult(text=fallback, source="static", fallback_used=True)
+    report_insight_reply = report_insight_reply_from_context(safe_context_pack)
+    if report_insight_reply:
+        return AssistantToolReplyResult(
+            text=report_insight_reply,
+            source="report_insight",
+            fallback_used=False,
+        )
     if assistant_reply.reply_type == "internal_qa":
         performance_reply = await build_performance_qa_reply(
             raw_text=raw_text,

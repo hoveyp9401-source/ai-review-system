@@ -115,12 +115,28 @@ class ProductionPerformanceExecutor:
             )
         if result.status == "success":
             arguments = request.arguments
+            facts["model_composition_allowed"] = True
+            facts["回复要求"] = (
+                "直接回答用户这一轮的问题，不复述整份报表；只有用户明确"
+                "要求概览时才展开多个指标。只能使用 performance_facts "
+                "中的当前事实，不自行计算，不展示英文键、事实编号或内部"
+                "说明。连续追问时不要重复称呼、标题和无关指标。若用户问"
+                "“哪几件”，按案件事实逐条列出案件名称、分公司、承办法务"
+                "和日期；不得自行分组、计数、合并或写“其余”。最终回复"
+                "必须把每个准备采用的事实单独放一行，并在行末附"
+                "[依据:事实编号]；一行只能引用一个事实编号。事实编号只能"
+                "来自 performance_facts.claim_catalog。系统会按编号重新"
+                "生成用户可见文字并自动隐藏编号；没有编号的结论、评价或"
+                "补充内容不会发送给用户。"
+            )
+            facts["performance_facts"] = dict(
+                result.fact_packet
+            )
             facts["performance_query"] = {
                 "view": arguments.view,
                 "scope_type": arguments.scope_type,
                 "scope_name": result.scope_name,
                 "mode": arguments.mode,
-                "rule_version": result.rule_version,
             }
         return ProductionHandlerOutcome(
             target_type="performance_report",

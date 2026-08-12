@@ -3,17 +3,30 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent2.memory.module import (
+    PreferredSalutationValue,
+    validate_personal_memory_value,
+)
+from app.agent2.memory.postgres import PersonalMemoryRecord
 from app.config import Settings
+from app.legal_daily_roster import (
+    formal_roster_user_ids_for_exact_scope,
+    load_formal_legal_daily_roster,
+)
 from app.models import DailyReport, ReportInteractionEvent, User
-from app.repositories import list_missing_users
-from app.services.dingtalk import DingTalkRobotClient
+from app.repositories import (
+    acquire_daily_report_advisory_lock,
+    get_report,
+    list_missing_users,
+)
+from app.services.dingtalk import DingTalkDeliveryError, DingTalkRobotClient
 from app.services.state_machine import (
     CONFIRMATION_AUTO_SUBMITTED_TIMEOUT,
     STATUS_COMPLETED,
@@ -35,11 +48,16 @@ logger = logging.getLogger(__name__)
 class ReminderDispatchEvidence:
     channel: str
     provider_reference: str
-    message_status: str = "accepted_by_provider"
+    message_status: str = "delivered"
+    delivery_verified: bool = True
 
 
 class MissingProviderEvidenceError(RuntimeError):
     """The provider call returned but supplied no auditable reference."""
+
+
+class UnverifiedProviderDeliveryError(RuntimeError):
+    """The provider returned a reference without confirming delivery."""
 
 
 async def remind_missing_reports(
@@ -52,7 +70,26 @@ async def remind_missing_reports(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     missing_users = await list_missing_users(session, report_date)
+    roster_tenant_id = str(
+        getattr(settings, "legal_daily_dashboard_tenant_id", "") or ""
+    ).strip()
+    formal_roster = None
+    if roster_tenant_id:
+        formal_roster = await load_formal_legal_daily_roster(
+            session,
+            tenant_id=roster_tenant_id,
+            on_date=report_date,
+        )
+        formal_user_ids = set(formal_roster.user_ids)
+        missing_users = [
+            user for user in missing_users if str(getattr(user, "id", "")) in formal_user_ids
+        ]
     test_user_ids = _configured_test_user_ids(settings)
+    if formal_roster is not None:
+        formal_roster_user_ids_for_exact_scope(
+            formal_roster,
+            test_user_ids,
+        )
     target_users, skipped_real_users = _partition_reminder_users(missing_users, test_user_ids)
     requested_dry_run = bool(dry_run or getattr(settings, "reminder_dry_run", True))
     send_enabled = bool(getattr(settings, "reminder_send_enabled", False))
@@ -72,11 +109,20 @@ async def remind_missing_reports(
     sent_by_group_robot = 0
     sent_by_direct_robot = 0
     sent_by_work_notification = 0
+    delivery_verified_count = 0
+    delivery_pending_count = 0
+    delivery_failed_count = 0
     dry_run_messages: list[dict[str, Any]] = []
     sent_user_ids = []
     sent_evidence_by_user: dict[Any, ReminderDispatchEvidence] = {}
     reports_by_user = await _load_reports_by_user(session, report_date, [user.id for user in target_users])
     target_users = _filter_reminder_users(target_users, reports_by_user, report_date)
+    now = now_in_timezone(settings.timezone)
+    preferred_salutations = await _load_preferred_salutations(
+        session,
+        [user.id for user in target_users],
+        now=now,
+    )
 
     by_team = defaultdict(list)
     for user in target_users:
@@ -85,7 +131,13 @@ async def remind_missing_reports(
     for team, users in by_team.items():
         webhook = team.dingtalk_webhook_url or settings.dingtalk_default_robot_webhook
         secret = team.dingtalk_webhook_secret or settings.dingtalk_default_robot_secret
-        grouped_messages = _group_users_by_reminder_text(report_date, users, reports_by_user, reminder_kind=reminder_kind)
+        grouped_messages = _group_users_by_reminder_text(
+            report_date,
+            users,
+            reports_by_user,
+            reminder_kind=reminder_kind,
+            preferred_salutations=preferred_salutations,
+        )
         has_direct_robot = robot.has_enterprise_app()
         if test_user_ids and has_direct_robot:
             for text, grouped_users in grouped_messages.items():
@@ -93,14 +145,32 @@ async def remind_missing_reports(
                     would_send += len(grouped_users)
                     dry_run_messages.append(_dry_run_message("direct_robot", team, grouped_users, text))
                     continue
-                evidence = await send_user_message(robot, [user.dingtalk_user_id for user in grouped_users], text)
-                sent += len(grouped_users)
-                if evidence.channel == "work_notification":
-                    sent_by_work_notification += len(grouped_users)
-                else:
-                    sent_by_direct_robot += len(grouped_users)
-                sent_user_ids.extend(user.id for user in grouped_users)
-                sent_evidence_by_user.update({user.id: evidence for user in grouped_users})
+                for user in grouped_users:
+                    try:
+                        evidence = await send_user_message(
+                            robot,
+                            [user.dingtalk_user_id],
+                            text,
+                        )
+                    except Exception:
+                        delivery_failed_count += 1
+                        logger.exception(
+                            "daily report reminder failed recipient=%s kind=%s",
+                            user.id,
+                            reminder_kind,
+                        )
+                        continue
+                    sent += 1
+                    if evidence.delivery_verified:
+                        delivery_verified_count += 1
+                    else:
+                        delivery_pending_count += 1
+                    if evidence.channel == "work_notification":
+                        sent_by_work_notification += 1
+                    else:
+                        sent_by_direct_robot += 1
+                    sent_user_ids.append(user.id)
+                    sent_evidence_by_user[user.id] = evidence
         elif test_user_ids:
             for text, grouped_users in grouped_messages.items():
                 dry_run_messages.append(_dry_run_message("skipped_test_requires_direct_robot", team, grouped_users, text))
@@ -112,29 +182,70 @@ async def remind_missing_reports(
                     would_send += len(grouped_users)
                     dry_run_messages.append(_dry_run_message("group_robot", team, grouped_users, text))
                     continue
-                await robot.send_text(
-                    webhook_url=webhook,
-                    secret=secret,
-                    text=text,
-                    at_user_ids=[user.dingtalk_user_id for user in grouped_users],
-                )
+                try:
+                    await robot.send_text(
+                        webhook_url=webhook,
+                        secret=secret,
+                        text=text,
+                        at_user_ids=[
+                            user.dingtalk_user_id for user in grouped_users
+                        ],
+                    )
+                except Exception:
+                    delivery_failed_count += len(grouped_users)
+                    logger.exception(
+                        "group daily report reminder failed team=%s kind=%s",
+                        getattr(team, "id", ""),
+                        reminder_kind,
+                    )
+                    continue
                 sent += len(grouped_users)
                 sent_by_group_robot += len(grouped_users)
                 sent_user_ids.extend(user.id for user in grouped_users)
+                sent_evidence_by_user.update(
+                    {
+                        user.id: ReminderDispatchEvidence(
+                            channel="group_robot",
+                            provider_reference="",
+                            message_status="accepted_by_provider",
+                            delivery_verified=False,
+                        )
+                        for user in grouped_users
+                    }
+                )
+                delivery_pending_count += len(grouped_users)
         elif has_direct_robot:
             for text, grouped_users in grouped_messages.items():
                 if effective_dry_run:
                     would_send += len(grouped_users)
                     dry_run_messages.append(_dry_run_message("direct_robot", team, grouped_users, text))
                     continue
-                evidence = await send_user_message(robot, [user.dingtalk_user_id for user in grouped_users], text)
-                sent += len(grouped_users)
-                if evidence.channel == "work_notification":
-                    sent_by_work_notification += len(grouped_users)
-                else:
-                    sent_by_direct_robot += len(grouped_users)
-                sent_user_ids.extend(user.id for user in grouped_users)
-                sent_evidence_by_user.update({user.id: evidence for user in grouped_users})
+                for user in grouped_users:
+                    try:
+                        evidence = await send_user_message(
+                            robot,
+                            [user.dingtalk_user_id],
+                            text,
+                        )
+                    except Exception:
+                        delivery_failed_count += 1
+                        logger.exception(
+                            "daily report reminder failed recipient=%s kind=%s",
+                            user.id,
+                            reminder_kind,
+                        )
+                        continue
+                    sent += 1
+                    if evidence.delivery_verified:
+                        delivery_verified_count += 1
+                    else:
+                        delivery_pending_count += 1
+                    if evidence.channel == "work_notification":
+                        sent_by_work_notification += 1
+                    else:
+                        sent_by_direct_robot += 1
+                    sent_user_ids.append(user.id)
+                    sent_evidence_by_user[user.id] = evidence
         else:
             for text, grouped_users in grouped_messages.items():
                 dry_run_messages.append(_dry_run_message("skipped_no_channel", team, grouped_users, text))
@@ -142,7 +253,6 @@ async def remind_missing_reports(
             skipped_no_channel += len(users)
 
     if not effective_dry_run and sent_user_ids:
-        now = now_in_timezone(settings.timezone)
         sent_user_id_set = set(sent_user_ids)
         for user in target_users:
             if user.id not in sent_user_id_set:
@@ -160,6 +270,9 @@ async def remind_missing_reports(
                         user,
                         report,
                         reminder_kind=reminder_kind,
+                        preferred_salutation=preferred_salutations.get(
+                            user.id
+                        ),
                     ),
                     llm_decision_json={
                         "interaction_type": "daily_report_reminder",
@@ -168,11 +281,25 @@ async def remind_missing_reports(
                         "business_write": False,
                         "message_status": dispatch_evidence.message_status,
                         "provider_reference": dispatch_evidence.provider_reference,
-                        "provider_reference_available": True,
+                        "provider_reference_available": bool(
+                            dispatch_evidence.provider_reference
+                        ),
                         "provider_message_id_available": False,
                         "transport": dispatch_evidence.channel,
+                        "delivery_verified": dispatch_evidence.delivery_verified,
+                        "dispatches": [
+                            {
+                                "transport": dispatch_evidence.channel,
+                                "provider_reference": dispatch_evidence.provider_reference,
+                                "delivery_verified": dispatch_evidence.delivery_verified,
+                            }
+                        ],
                     },
-                    backend_action="daily_report_reminder_sent",
+                    backend_action=(
+                        "daily_report_reminder_sent"
+                        if dispatch_evidence.delivery_verified
+                        else "daily_report_reminder_delivery_pending"
+                    ),
                     before_snapshot_json={},
                     after_snapshot_json={},
                 )
@@ -210,6 +337,9 @@ async def remind_missing_reports(
         "sent_by_group_robot": sent_by_group_robot,
         "sent_by_direct_robot": sent_by_direct_robot,
         "sent_by_work_notification": sent_by_work_notification,
+        "delivery_verified": delivery_verified_count,
+        "delivery_pending": delivery_pending_count,
+        "delivery_failed": delivery_failed_count,
         "skipped": skipped,
         "dry_run_messages": dry_run_messages,
     }
@@ -219,17 +349,44 @@ async def send_user_message(robot: DingTalkRobotClient, user_ids: list[str], tex
     user_ids = [user_id for user_id in user_ids if user_id]
     if not user_ids:
         raise ValueError("at least one DingTalk user id is required")
+    attempted_channel = "direct_robot_markdown" if markdown else "direct_robot"
     try:
-        if markdown and hasattr(robot, "send_robot_direct_markdown"):
-            result = await robot.send_robot_direct_markdown(user_ids=user_ids, title=title, text=text)
+        if markdown and hasattr(robot, "send_robot_direct_markdown_verified"):
+            result = await robot.send_robot_direct_markdown_verified(
+                user_ids=user_ids,
+                title=title,
+                text=text,
+            )
             return _dispatch_evidence("direct_robot_markdown", result)
+        if markdown and hasattr(robot, "send_robot_direct_markdown"):
+            result = await robot.send_robot_direct_markdown(
+                user_ids=user_ids,
+                title=title,
+                text=text,
+            )
+            return _dispatch_evidence("direct_robot_markdown", result)
+        if hasattr(robot, "send_robot_direct_text_verified"):
+            result = await robot.send_robot_direct_text_verified(
+                user_ids=user_ids,
+                text=text,
+            )
+            return _dispatch_evidence("direct_robot", result)
         if hasattr(robot, "send_robot_direct_text"):
             result = await robot.send_robot_direct_text(user_ids=user_ids, text=text)
             return _dispatch_evidence("direct_robot", result)
         raise AttributeError("robot has no direct send method")
-    except MissingProviderEvidenceError:
+    except DingTalkDeliveryError as exc:
         # The first provider call may already have accepted the message. Do not
         # fall back to a second channel and risk a duplicate notification.
+        if exc.provider_reference and not exc.terminal_failure:
+            return ReminderDispatchEvidence(
+                channel=attempted_channel,
+                provider_reference=exc.provider_reference,
+                message_status="accepted_by_provider",
+                delivery_verified=False,
+            )
+        raise
+    except (MissingProviderEvidenceError, UnverifiedProviderDeliveryError):
         raise
     except Exception as exc:
         logger.warning("direct robot message failed, falling back to work notification: %s", exc)
@@ -259,10 +416,184 @@ def _dispatch_evidence(channel: str, result: Any) -> ReminderDispatchEvidence:
         raise MissingProviderEvidenceError(
             f"DingTalk {channel} response is missing a provider reference"
         )
+    delivery_verified = payload.get("deliveryVerified") is True
     return ReminderDispatchEvidence(
         channel=channel,
         provider_reference=provider_reference,
+        message_status=(
+            "delivered" if delivery_verified else "accepted_by_provider"
+        ),
+        delivery_verified=delivery_verified,
     )
+
+
+async def reconcile_pending_scheduler_deliveries(
+    session: AsyncSession,
+    robot: DingTalkRobotClient,
+    *,
+    now: datetime | None = None,
+    limit: int = 200,
+) -> dict[str, int]:
+    """Verify provider-accepted scheduler messages without ever resending them."""
+
+    checked_at = now or datetime.now(UTC)
+    rows = list(
+        (
+            await session.scalars(
+                select(ReportInteractionEvent)
+                .where(
+                    ReportInteractionEvent.backend_action.in_(
+                        {
+                            "daily_report_reminder_delivery_pending",
+                            "daily_briefing_delivery_pending",
+                        }
+                    )
+                )
+                .order_by(ReportInteractionEvent.created_at)
+                .limit(max(1, limit))
+            )
+        ).all()
+    )
+    verified = 0
+    still_pending = 0
+    failed = 0
+    checked = 0
+    deferred = 0
+    verification_unavailable = False
+    for event in rows:
+        payload = dict(event.llm_decision_json or {})
+        next_check_raw = str(
+            payload.get("next_delivery_check_at") or ""
+        ).strip()
+        if next_check_raw:
+            try:
+                next_check = datetime.fromisoformat(next_check_raw)
+            except ValueError:
+                next_check = None
+            if next_check is not None and next_check.tzinfo is None:
+                next_check = next_check.replace(tzinfo=UTC)
+            if next_check is not None and next_check > checked_at:
+                deferred += 1
+                continue
+        if verification_unavailable:
+            payload["next_delivery_check_at"] = (
+                checked_at + timedelta(hours=6)
+            ).isoformat()
+            payload["delivery_check_deferred_reason"] = (
+                "provider_verification_unavailable"
+            )
+            event.llm_decision_json = payload
+            still_pending += 1
+            deferred += 1
+            continue
+        raw_dispatches = payload.get("dispatches")
+        dispatches = (
+            [dict(item) for item in raw_dispatches if isinstance(item, dict)]
+            if isinstance(raw_dispatches, list)
+            else []
+        )
+        if not dispatches:
+            still_pending += 1
+            continue
+        expected_user_ids = [
+            str(event.dingtalk_user_id or "").strip()
+        ]
+        expected_user_ids = [value for value in expected_user_ids if value]
+        all_verified = bool(expected_user_ids)
+        terminal_failure = False
+        unavailable_for_event = False
+        checked += 1
+        for dispatch in dispatches:
+            provider_reference = str(
+                dispatch.get("provider_reference") or ""
+            ).strip()
+            transport = str(dispatch.get("transport") or "").strip()
+            if not provider_reference:
+                all_verified = False
+                continue
+            try:
+                if transport == "work_notification":
+                    await robot.wait_for_work_notification_delivery(
+                        task_id=provider_reference,
+                        expected_user_ids=expected_user_ids,
+                        attempts=1,
+                        interval_seconds=0,
+                    )
+                else:
+                    await robot.wait_for_robot_direct_delivery(
+                        process_query_key=provider_reference,
+                        expected_user_ids=expected_user_ids,
+                        attempts=1,
+                        interval_seconds=0,
+                    )
+            except DingTalkDeliveryError as exc:
+                all_verified = False
+                terminal_failure = (
+                    terminal_failure or exc.terminal_failure
+                )
+                unavailable_for_event = exc.verification_unavailable
+                verification_unavailable = (
+                    verification_unavailable
+                    or unavailable_for_event
+                )
+                break
+            except Exception:
+                all_verified = False
+                break
+            dispatch["delivery_verified"] = True
+        payload["dispatches"] = dispatches
+        payload["last_delivery_check_at"] = checked_at.isoformat()
+        attempt_count = int(
+            payload.get("delivery_check_attempt_count") or 0
+        ) + 1
+        payload["delivery_check_attempt_count"] = attempt_count
+        if terminal_failure:
+            event.backend_action = (
+                "daily_briefing_failed"
+                if payload.get("interaction_type") == "daily_briefing"
+                else "daily_report_reminder_failed"
+            )
+            payload["message_status"] = "failed"
+            payload["delivery_verified"] = False
+            payload.pop("next_delivery_check_at", None)
+            payload.pop("delivery_check_deferred_reason", None)
+            failed += 1
+        elif all_verified:
+            event.backend_action = (
+                "daily_briefing_sent"
+                if payload.get("interaction_type") == "daily_briefing"
+                else "daily_report_reminder_sent"
+            )
+            payload["message_status"] = "delivered"
+            payload["delivery_verified"] = True
+            payload["delivery_verified_at"] = checked_at.isoformat()
+            payload.pop("next_delivery_check_at", None)
+            payload.pop("delivery_check_deferred_reason", None)
+            verified += 1
+        else:
+            delay_minutes = (
+                360
+                if unavailable_for_event
+                else min(5 * (2 ** (attempt_count - 1)), 360)
+            )
+            payload["next_delivery_check_at"] = (
+                checked_at + timedelta(minutes=delay_minutes)
+            ).isoformat()
+            payload["delivery_check_deferred_reason"] = (
+                "provider_verification_unavailable"
+                if unavailable_for_event
+                else "delivery_not_yet_confirmed"
+            )
+            still_pending += 1
+        event.llm_decision_json = payload
+    return {
+        "loaded": len(rows),
+        "checked": checked,
+        "deferred": deferred,
+        "verified": verified,
+        "still_pending": still_pending,
+        "failed": failed,
+    }
 
 
 def _configured_test_user_ids(settings: Settings) -> set[str]:
@@ -281,9 +612,7 @@ async def ensure_daily_submission_obligations(
 ) -> dict[str, Any]:
     """Persist the server-owned submission scope used by management reads."""
 
-    configured_user_ids = sorted(
-        _configured_test_user_ids(settings)
-    )
+    configured_user_ids = _configured_test_user_ids(settings)
     tenant_id = str(
         getattr(
             settings,
@@ -299,6 +628,17 @@ async def ensure_daily_submission_obligations(
             "inserted": 0,
             "effective_obligations": 0,
         }
+    formal_roster = await load_formal_legal_daily_roster(
+        session,
+        tenant_id=tenant_id,
+        on_date=report_date,
+    )
+    roster_user_ids = sorted(
+        formal_roster_user_ids_for_exact_scope(
+            formal_roster,
+            configured_user_ids,
+        )
+    )
     deadline_at = datetime.combine(
         report_date + timedelta(days=1),
         time(9),
@@ -308,7 +648,7 @@ async def ensure_daily_submission_obligations(
         "tenant_id": tenant_id,
         "report_date": report_date,
         "deadline_at": deadline_at,
-        "configured_user_ids": configured_user_ids,
+        "configured_user_ids": roster_user_ids,
     }
     inserted = (
         await session.execute(
@@ -341,7 +681,7 @@ async def ensure_daily_submission_obligations(
                     TRUE,
                     '',
                     :deadline_at,
-                    'scheduler_test_allowlist',
+                    'formal_legal_daily_roster',
                     TRUE
                 FROM users
                 JOIN LATERAL (
@@ -402,6 +742,10 @@ async def ensure_daily_submission_obligations(
             )
         ).scalar_one()
     )
+    if effective_obligations != formal_roster.member_count:
+        raise RuntimeError(
+            "daily submission obligations do not exactly match the formal roster"
+        )
     return {
         "report_date": report_date.isoformat(),
         "configured_identifiers": len(configured_user_ids),
@@ -465,16 +809,68 @@ async def _load_reports_by_user(
     return {report.user_id: report for report in result.scalars().all()}
 
 
+async def _load_preferred_salutations(
+    session: AsyncSession,
+    user_ids: list,
+    *,
+    now: datetime,
+) -> dict[Any, str]:
+    """Return one unambiguous, active preferred salutation per user."""
+
+    if not user_ids or not hasattr(session, "execute"):
+        return {}
+    result = await session.execute(
+        select(
+            PersonalMemoryRecord.user_id,
+            PersonalMemoryRecord.value_json,
+        ).where(
+            PersonalMemoryRecord.user_id.in_(user_ids),
+            PersonalMemoryRecord.memory_key
+            == "response.preferred_salutation",
+            PersonalMemoryRecord.status == "active",
+            or_(
+                PersonalMemoryRecord.expires_at.is_(None),
+                PersonalMemoryRecord.expires_at > now,
+            ),
+        )
+    )
+    values_by_user: dict[Any, set[str]] = defaultdict(set)
+    for user_id, raw_value in result.all():
+        try:
+            validated = validate_personal_memory_value(
+                "response_preference",
+                "response.preferred_salutation",
+                raw_value,
+            )
+        except ValueError:
+            continue
+        if isinstance(validated, PreferredSalutationValue):
+            values_by_user[user_id].add(validated.salutation)
+    return {
+        user_id: next(iter(values))
+        for user_id, values in values_by_user.items()
+        if len(values) == 1
+    }
+
+
 def _group_users_by_reminder_text(
     report_date: date,
     users: list[User],
     reports_by_user: dict,
     *,
     reminder_kind: str,
+    preferred_salutations: dict[Any, str] | None = None,
 ) -> dict[str, list[User]]:
     grouped: dict[str, list[User]] = defaultdict(list)
+    preferred_salutations = preferred_salutations or {}
     for user in users:
-        text = build_report_reminder_text(report_date, user, reports_by_user.get(user.id), reminder_kind=reminder_kind)
+        text = build_report_reminder_text(
+            report_date,
+            user,
+            reports_by_user.get(user.id),
+            reminder_kind=reminder_kind,
+            preferred_salutation=preferred_salutations.get(user.id),
+        )
         grouped[text].append(user)
     return grouped
 
@@ -537,8 +933,9 @@ def build_report_reminder_text(
     report: DailyReport | None,
     *,
     reminder_kind: str = "daily",
+    preferred_salutation: str | None = None,
 ) -> str:
-    name = user.name
+    name = str(preferred_salutation or "").strip() or user.name
     is_catchup = reminder_kind == "catchup"
     is_second_reminder = reminder_kind == "second"
     period_text = "昨天的复盘" if is_catchup else "今天的复盘"
@@ -570,7 +967,7 @@ def build_report_reminder_text(
     if is_second_reminder:
         return (
             f"{name}，你的{period_text}还有{missing_text}没有填写。"
-            "请方便时补充一下；如果今晚不再补充，后续我会按当前已填写内容自动确认提交。"
+            "请方便时补充一下；如果明早8点前不再补充，我会按当前已填写内容自动确认提交。"
         )
     return (
         f"{name}，你{period_text}我已经记录了一部分，还差{missing_text}。"
@@ -598,29 +995,47 @@ async def auto_submit_due_pending_reports(
     report_date: date | None = None,
 ) -> dict[str, Any]:
     now = now or now_in_timezone(settings.timezone)
-    query = select(DailyReport).where(
+    query = select(
+        DailyReport.user_id,
+        DailyReport.report_date,
+    ).where(
         DailyReport.status.in_(
             [STATUS_PENDING_CONFIRMATION, "collecting"]
         )
     )
     if report_date is not None:
         query = query.where(DailyReport.report_date == report_date)
+    query = query.order_by(DailyReport.report_date, DailyReport.user_id)
     result = await session.execute(query)
-    reports = [
-        report
-        for report in result.scalars().all()
-        if (
-            report_date is None
-            or getattr(report, "report_date", None) == report_date
+    candidate_keys = tuple(
+        dict.fromkeys(
+            (user_id, candidate_date)
+            for user_id, candidate_date in result.all()
         )
-        if _report_has_any_content(report)
-    ]
-    for report in reports:
+    )
+    submitted_reports: list[DailyReport] = []
+    for user_id, candidate_date in candidate_keys:
+        await acquire_daily_report_advisory_lock(
+            session,
+            user_id,
+            candidate_date,
+        )
+        report = await get_report(session, user_id, candidate_date)
+        if report is None or report.status not in {
+            STATUS_PENDING_CONFIRMATION,
+            "collecting",
+        }:
+            continue
+        if report_date is not None and report.report_date != report_date:
+            continue
+        if not _report_has_any_content(report):
+            continue
         mark_report_auto_submitted(report, now)
+        submitted_reports.append(report)
     return {
         "report_date": report_date.isoformat() if report_date else None,
-        "auto_submitted": len(reports),
-        "report_ids": [str(report.id) for report in reports],
+        "auto_submitted": len(submitted_reports),
+        "report_ids": [str(report.id) for report in submitted_reports],
     }
 
 

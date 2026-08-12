@@ -6,7 +6,7 @@ import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
@@ -90,12 +90,48 @@ async def list_reports_between_dates(
     start_date: date,
     end_date: date,
     team_id: uuid.UUID | None = None,
+    *,
+    team_ids: Sequence[uuid.UUID] | None = None,
+    user_ids: Sequence[uuid.UUID] | None = None,
 ) -> list[DailyReport]:
     stmt = select(DailyReport).where(DailyReport.report_date >= start_date, DailyReport.report_date <= end_date)
     if team_id is not None:
         stmt = stmt.where(DailyReport.team_id == team_id)
+    if team_ids is not None:
+        if not team_ids:
+            return []
+        stmt = stmt.where(DailyReport.team_id.in_(team_ids))
+    if user_ids is not None:
+        if not user_ids:
+            return []
+        stmt = stmt.where(DailyReport.user_id.in_(user_ids))
     result = await session.execute(stmt.order_by(DailyReport.report_date.desc(), DailyReport.team_id, DailyReport.user_id))
     return list(result.scalars().all())
+
+
+async def count_daily_reports_by_status(
+    session: AsyncSession,
+    *,
+    user_ids: Sequence[uuid.UUID],
+    end_date: date,
+    team_ids: Sequence[uuid.UUID] | None = None,
+) -> dict[str, int]:
+    if not user_ids:
+        return {}
+    filters = [
+        DailyReport.user_id.in_(user_ids),
+        DailyReport.report_date <= end_date,
+    ]
+    if team_ids is not None:
+        if not team_ids:
+            return {}
+        filters.append(DailyReport.team_id.in_(team_ids))
+    result = await session.execute(
+        select(DailyReport.status, func.count(DailyReport.id))
+        .where(*filters)
+        .group_by(DailyReport.status)
+    )
+    return {str(status or "collecting"): int(count or 0) for status, count in result.all()}
 
 
 async def list_missing_users(session: AsyncSession, report_date: date) -> list[User]:
@@ -415,6 +451,7 @@ async def upsert_daily_report(
     auto_submit_at: datetime | None,
     replace_sections: bool = False,
     report_id_override: uuid.UUID | None = None,
+    preserve_existing_submission: bool = False,
 ) -> DailyReport:
     user_id = user.id
     team_id = user.team_id
@@ -479,6 +516,17 @@ async def upsert_daily_report(
                 raise
             before_snapshot = build_report_interaction_snapshot(existing)
 
+    previous_submission_metadata = (
+        {
+            "confirmation_type": existing.confirmation_type,
+            "confirmed_by_user": existing.confirmed_by_user,
+            "pending_confirmation_at": existing.pending_confirmation_at,
+            "auto_submit_at": existing.auto_submit_at,
+            "submitted_at": existing.submitted_at,
+        }
+        if preserve_existing_submission and existing.status == "completed"
+        else None
+    )
     if replace_sections and not reloaded_after_insert_conflict:
         existing.today_work = today_work
         existing.problems = problems
@@ -503,7 +551,21 @@ async def upsert_daily_report(
     existing.source = source
     existing.llm_model = llm_model
     existing.llm_payload = llm_payload
-    if status == "completed":
+    if previous_submission_metadata is not None and status == "completed":
+        existing.confirmation_type = previous_submission_metadata[
+            "confirmation_type"
+        ]
+        existing.confirmed_by_user = previous_submission_metadata[
+            "confirmed_by_user"
+        ]
+        existing.pending_confirmation_at = previous_submission_metadata[
+            "pending_confirmation_at"
+        ]
+        existing.auto_submit_at = previous_submission_metadata[
+            "auto_submit_at"
+        ]
+        existing.submitted_at = previous_submission_metadata["submitted_at"]
+    elif status == "completed":
         existing.submitted_at = received_at
     else:
         existing.submitted_at = None

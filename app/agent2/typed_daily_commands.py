@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 import hashlib
-import re
 from collections.abc import Collection
 from types import MappingProxyType
 from typing import Any, Literal
@@ -17,6 +16,18 @@ from app.agent2.admission_hashes import admission_claim_hashes_match
 
 REPORT_FIELDS = ("today_work", "problems", "tomorrow_plan")
 DAILY_DRAFT_MUTABLE_STATUSES = frozenset({"collecting", "pending_confirmation"})
+COMPLETED_CONTENT_MUTATION_COMMANDS = frozenset(
+    {
+        "append_item",
+        "acknowledge_empty_section",
+        "edit_item",
+        "delete_item",
+        "merge_items",
+        "move_item",
+        "move_items",
+        "replace_section",
+    }
+)
 DAILY_ADMISSION_OPERATION_CONTRACTS = MappingProxyType({
     "capture_daily_event": ("append_item", ("section", "items")),
     "submit_daily_report": ("submit_report", ("status",)),
@@ -35,6 +46,7 @@ DAILY_ADMISSION_OPERATION_CONTRACTS = MappingProxyType({
 })
 CommandType = Literal[
     "append_item",
+    "acknowledge_empty_section",
     "edit_item",
     "delete_item",
     "merge_items",
@@ -97,6 +109,7 @@ class DailyReportMutationSnapshot:
     problems: tuple[str, ...] = ()
     tomorrow_plan: tuple[str, ...] = ()
     item_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    acknowledged_empty_fields: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -171,6 +184,7 @@ def execute_typed_daily_command(
     executed_idempotency_keys: Collection[str] = (),
     admission_scope: AdmissionExecutionScope | None = None,
     allow_completed_append: bool = False,
+    allow_completed_content_mutation: bool = False,
 ) -> TypedDailyCommandExecution:
     validation = validate_typed_daily_command(
         command,
@@ -179,6 +193,7 @@ def execute_typed_daily_command(
         executed_idempotency_keys=executed_idempotency_keys,
         admission_scope=admission_scope,
         allow_completed_append=allow_completed_append,
+        allow_completed_content_mutation=allow_completed_content_mutation,
     )
     if validation.status == "duplicate":
         return TypedDailyCommandExecution(
@@ -232,15 +247,22 @@ def execute_typed_daily_command(
         fields = REPORT_FIELDS if field_name == "all" else (field_name,)
         after_values = {field: getattr(snapshot, field) for field in REPORT_FIELDS}
         after_item_ids = {field: tuple(snapshot.item_ids.get(field, ())) for field in REPORT_FIELDS}
+        acknowledged_empty_fields = set(snapshot.acknowledged_empty_fields)
         changed = False
         for field in fields:
-            changed = changed or bool(after_values[field])
+            changed = (
+                changed
+                or bool(after_values[field])
+                or field in acknowledged_empty_fields
+            )
             after_values[field] = ()
             after_item_ids[field] = ()
+            acknowledged_empty_fields.discard(field)
         after = replace(
             snapshot,
             version=snapshot.version + (1 if changed else 0),
             item_ids=after_item_ids,
+            acknowledged_empty_fields=frozenset(acknowledged_empty_fields),
             **after_values,
         )
         return TypedDailyCommandExecution(
@@ -270,11 +292,38 @@ def execute_typed_daily_command(
             audit=_audit_record(command, snapshot, after, result="executed", reason=validation.reason_code),
         )
 
+    if command.command_type == "acknowledge_empty_section":
+        field_name = str(command.patch["field"])
+        changed = field_name not in snapshot.acknowledged_empty_fields
+        after = replace(
+            snapshot,
+            version=snapshot.version + (1 if changed else 0),
+            acknowledged_empty_fields=frozenset(
+                {*snapshot.acknowledged_empty_fields, field_name}
+            ),
+        )
+        return TypedDailyCommandExecution(
+            command,
+            validation,
+            snapshot,
+            after,
+            changed=changed,
+            should_write_db=changed,
+            audit=_audit_record(
+                command,
+                snapshot,
+                after,
+                result="executed" if changed else "no_change",
+                reason=validation.reason_code,
+            ),
+        )
+
     if command.command_type == "copy_report":
         sections = command.patch["sections"]
         after_values: dict[str, tuple[str, ...]] = {}
         after_item_ids = {field: tuple(snapshot.item_ids.get(field, ())) for field in REPORT_FIELDS}
         changed = False
+        acknowledged_empty_fields = set(snapshot.acknowledged_empty_fields)
         for field_name in REPORT_FIELDS:
             values = list(getattr(snapshot, field_name))
             ids = list(snapshot.item_ids.get(field_name, ()))
@@ -285,12 +334,14 @@ def execute_typed_daily_command(
                 values.append(clean_value)
                 ids.append(_new_item_id(command, field_name, item_index, clean_value))
                 changed = True
+                acknowledged_empty_fields.discard(field_name)
             after_values[field_name] = tuple(values)
             after_item_ids[field_name] = tuple(ids)
         after = replace(
             snapshot,
             version=snapshot.version + (1 if changed else 0),
             item_ids=after_item_ids,
+            acknowledged_empty_fields=frozenset(acknowledged_empty_fields),
             **after_values,
         )
         return TypedDailyCommandExecution(
@@ -340,6 +391,9 @@ def execute_typed_daily_command(
             snapshot,
             version=snapshot.version + 1,
             item_ids=after_item_ids,
+            acknowledged_empty_fields=frozenset(
+                set(snapshot.acknowledged_empty_fields) - {target_field}
+            ),
             **{
                 source_field: tuple(source_values),
                 target_field: tuple(target_values),
@@ -383,11 +437,15 @@ def execute_typed_daily_command(
         changed = (
             tuple(replacement_items) != tuple(existing_values)
             or tuple(replacement_ids) != tuple(existing_ids)
+            or field_name in snapshot.acknowledged_empty_fields
         )
         after = replace(
             snapshot,
             version=snapshot.version + (1 if changed else 0),
             item_ids=after_item_ids,
+            acknowledged_empty_fields=frozenset(
+                set(snapshot.acknowledged_empty_fields) - {field_name}
+            ),
             **{field_name: tuple(replacement_items)},
         )
         return TypedDailyCommandExecution(
@@ -443,6 +501,9 @@ def execute_typed_daily_command(
             snapshot,
             version=snapshot.version + 1,
             item_ids=after_item_ids,
+            acknowledged_empty_fields=frozenset(
+                set(snapshot.acknowledged_empty_fields) - {target_field}
+            ),
             **{
                 source_field: tuple(source_values),
                 target_field: tuple(target_values),
@@ -509,10 +570,14 @@ def execute_typed_daily_command(
         tuple(values) != tuple(getattr(snapshot, field_name))
         or tuple(ids) != tuple(snapshot.item_ids.get(field_name, ()))
     )
+    acknowledged_empty_fields = set(snapshot.acknowledged_empty_fields)
+    if command.command_type == "append_item" and changed:
+        acknowledged_empty_fields.discard(field_name)
     after = replace(
         snapshot,
         version=snapshot.version + (1 if changed else 0),
         item_ids=after_item_ids,
+        acknowledged_empty_fields=frozenset(acknowledged_empty_fields),
         **{field_name: tuple(values)},
     )
     return TypedDailyCommandExecution(
@@ -533,18 +598,10 @@ def execute_typed_daily_command(
 
 
 def _daily_fact_equivalence_key(value: str, field: str) -> str:
-    """Compare normalized Daily facts while preserving stored user text."""
+    """Deduplicate only literal text; semantic equivalence belongs to Agent2."""
 
-    source = str(value or "").strip()
-    prefixes = {
-        "today_work": r"^(?:(?:今天|今日|当日)(?:工作完成情况|完成情况|工作|完成)?)(?:是|为)?",
-        "problems": r"^(?:碰到|遇到)?(?:问题[与和/]?风险|风险[与和/]?问题|问题|风险)(?:是|为)?",
-        "tomorrow_plan": r"^(?:(?:明天|明日|次日)(?:工作计划|计划|工作|安排)?)(?:是|为)?",
-    }
-    prefix = prefixes.get(str(field or ""))
-    if prefix:
-        source = re.sub(prefix, "", source, count=1).lstrip("：:，,。 ")
-    return re.sub(r"[\s，,。．:：；;]", "", source).casefold()
+    del field
+    return str(value or "").strip().casefold()
 
 
 def validate_typed_daily_command(
@@ -555,6 +612,7 @@ def validate_typed_daily_command(
     executed_idempotency_keys: Collection[str] = (),
     admission_scope: AdmissionExecutionScope | None = None,
     allow_completed_append: bool = False,
+    allow_completed_content_mutation: bool = False,
 ) -> TypedDailyCommandValidation:
     if (
         not isinstance(command.command_type, str)
@@ -711,6 +769,7 @@ def validate_typed_daily_command(
             )
     if command.command_type not in {
         "append_item",
+        "acknowledge_empty_section",
         "delete_item",
         "edit_item",
         "merge_items",
@@ -730,8 +789,6 @@ def validate_typed_daily_command(
         return TypedDailyCommandValidation("blocked", "forbidden_payload", "idempotency key is required")
     if command.idempotency_key in executed_idempotency_keys:
         return TypedDailyCommandValidation("duplicate", "duplicate_message")
-    if _contains_forbidden_payload(command):
-        return TypedDailyCommandValidation("blocked", "forbidden_payload", "payload contains an instruction, question, or chat fragment")
     if command.report_version != snapshot.version:
         return TypedDailyCommandValidation("blocked", "version_conflict")
     if command.command_type == "query_report":
@@ -765,9 +822,18 @@ def validate_typed_daily_command(
     if (
         snapshot.status not in DAILY_DRAFT_MUTABLE_STATUSES
         and not (
-            allow_completed_append
-            and snapshot.status == "completed"
-            and command.command_type == "append_item"
+            snapshot.status == "completed"
+            and (
+                (
+                    allow_completed_append
+                    and command.command_type == "append_item"
+                )
+                or (
+                    allow_completed_content_mutation
+                    and command.command_type
+                    in COMPLETED_CONTENT_MUTATION_COMMANDS
+                )
+            )
         )
     ):
         return TypedDailyCommandValidation("blocked", "invalid_report_state")
@@ -780,8 +846,31 @@ def validate_typed_daily_command(
     if command.command_type == "submit_report":
         if command.target_item_ids or command.patch:
             return TypedDailyCommandValidation("blocked", "forbidden_payload", "submit does not accept targets or patch")
-        if not snapshot.today_work or not snapshot.problems or not snapshot.tomorrow_plan:
+        if any(
+            not getattr(snapshot, field_name)
+            and field_name not in snapshot.acknowledged_empty_fields
+            for field_name in REPORT_FIELDS
+        ):
             return TypedDailyCommandValidation("blocked", "invalid_report_state", "report is incomplete")
+        return TypedDailyCommandValidation("authorized", "exact_target")
+    if command.command_type == "acknowledge_empty_section":
+        if command.target_item_ids or set(command.patch) != {"field"}:
+            return TypedDailyCommandValidation(
+                "blocked",
+                "forbidden_payload",
+                "empty acknowledgement requires one field",
+            )
+        field_name = command.patch.get("field")
+        if field_name not in REPORT_FIELDS:
+            return TypedDailyCommandValidation(
+                "blocked", "forbidden_payload", "empty acknowledgement field is invalid"
+            )
+        if getattr(snapshot, str(field_name)):
+            return TypedDailyCommandValidation(
+                "blocked",
+                "invalid_report_state",
+                "a non-empty field cannot be acknowledged as empty",
+            )
         return TypedDailyCommandValidation("authorized", "exact_target")
     if command.command_type == "append_item":
         if command.target_item_ids:
@@ -993,31 +1082,6 @@ def _locate_item(snapshot: DailyReportMutationSnapshot, target_item_id: str) -> 
 def _new_item_id(command: TypedDailyCommand, field_name: str, item_index: int, value: str) -> str:
     raw = f"{command.command_id}:{field_name}:{item_index}:{value}"
     return f"di_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
-
-
-def _contains_forbidden_payload(command: TypedDailyCommand) -> bool:
-    values: list[str] = []
-    items = command.patch.get("items")
-    if isinstance(items, (list, tuple)):
-        values.extend(str(item).strip() for item in items)
-    if "replacement" in command.patch:
-        values.append(str(command.patch.get("replacement") or "").strip())
-    sections = command.patch.get("sections")
-    if isinstance(sections, dict):
-        for items in sections.values():
-            if isinstance(items, (list, tuple)):
-                values.extend(str(item).strip() for item in items)
-    for value in values:
-        compact = re.sub(r"\s+", "", value.lower())
-        if re.search(r"(?:删除|删掉|移除|合并|改成|修改为|替换为).{0,8}第?\d+(?:条|项|个)?", compact):
-            return True
-        if re.search(r"第?\d+(?:条|项|个)?.{0,8}(?:删除|删掉|移除|合并|改成|修改为|替换为)", compact):
-            return True
-        if "?" in compact or "？" in compact or any(marker in compact for marker in ("是什么", "怎么查", "怎么办", "如何办理")):
-            return True
-        if compact in {"你好", "您好", "哈哈", "哈哈哈", "谢谢", "在吗", "是的", "对的", "确认", "确认提交", "提交日报"}:
-            return True
-    return False
 
 
 def _audit_record(

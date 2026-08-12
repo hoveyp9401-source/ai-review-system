@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import uuid
 import re
-from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,9 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.llm.extractor import TeamSummaryGenerator
 from app.models import DailyReport
-from app.repositories import get_active_teams, get_active_users, list_reports_between_dates, list_reports_for_date, upsert_team_summary
+from app.repositories import get_active_teams, list_reports_for_date, upsert_team_summary
 from app.services.management_daily_briefing import ManagementDailyBriefingService
-from app.services.report_risk import build_report_rows, completion_stats, format_items
+from app.services.report_risk import completion_stats, format_items
 from app.utils.time import now_in_timezone
 
 TEAM_LEADER_ROLES = {"team_lead", "team_leader", "team_manager", "leader", "manager", "负责人", "团队负责人"}
@@ -65,80 +64,22 @@ class SummaryService:
         return generated
 
     async def build_daily_briefings(self, session: AsyncSession, report_date: date) -> dict[str, Any]:
-        if str(
+        tenant_id = str(
             getattr(
                 self.settings,
                 "legal_daily_dashboard_tenant_id",
                 "",
             )
             or ""
-        ).strip():
-            return await ManagementDailyBriefingService(self.settings).build(
-                session,
-                report_date,
+        ).strip()
+        if not tenant_id:
+            raise RuntimeError(
+                "formal legal daily roster is required for management briefings"
             )
-
-        users = await get_active_users(session)
-        teams = await get_active_teams(session)
-        reports = await list_reports_for_date(session, report_date)
-        history = await list_reports_between_dates(session, report_date - timedelta(days=3), report_date - timedelta(days=1))
-        rows = build_report_rows(users, reports, historical_reports=history)
-        rows_by_team: dict[uuid.UUID, list[dict[str, Any]]] = defaultdict(list)
-        for row in rows:
-            rows_by_team[row["user"].team_id].append(row)
-
-        team_messages = []
-        team_detail_messages = []
-        for team in teams:
-            team_rows = rows_by_team.get(team.id, [])
-            recipients = _team_briefing_recipients(team_rows, users, team)
-            team_messages.append(
-                {
-                    "scope": "team",
-                    "team_id": str(team.id),
-                    "team_name": team.name,
-                    "recipients": _serialize_users(recipients),
-                    "target_count": len(recipients),
-                    "stats": completion_stats(team_rows),
-                    "text": build_team_briefing_text(team.name, report_date, team_rows),
-                }
-            )
-            team_detail_messages.append(
-                {
-                    "scope": "team_detail",
-                    "team_id": str(team.id),
-                    "team_name": team.name,
-                    "recipients": _serialize_users(recipients),
-                    "target_count": len(recipients),
-                    "stats": completion_stats(team_rows),
-                    "text": build_team_detail_briefing_text(team.name, report_date, team_rows),
-                }
-            )
-
-        department_recipients = _department_heads(users)
-        department_message = {
-            "scope": "department",
-            "department_name": teams[0].department_name if teams else "法务部",
-            "recipients": _serialize_users(department_recipients),
-            "target_count": len(department_recipients),
-            "stats": completion_stats(rows),
-            "text": build_department_briefing_text(report_date, rows, team_messages),
-        }
-        department_detail_message = {
-            "scope": "department_detail",
-            "department_name": teams[0].department_name if teams else "\u6cd5\u52a1\u90e8",
-            "recipients": _serialize_users(department_recipients),
-            "target_count": len(department_recipients),
-            "stats": completion_stats(rows),
-            "text": build_department_detail_briefing_text(report_date, rows),
-        }
-        return {
-            "date": report_date.isoformat(),
-            "team_messages": team_messages,
-            "team_detail_messages": team_detail_messages,
-            "department_message": department_message,
-            "department_detail_message": department_detail_message,
-        }
+        return await ManagementDailyBriefingService(self.settings).build(
+            session,
+            report_date,
+        )
 
     async def _generate_one(
         self,

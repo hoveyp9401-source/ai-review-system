@@ -1,4 +1,5 @@
 from app.agent2.memory.module import (
+    AssistantPreferredNameValue,
     OutputFormatPreferenceValue,
     PersonalMemoryModule,
     PersonalMemoryReadPort,
@@ -14,6 +15,7 @@ from app.agent2.memory.module import (
 )
 
 __all__ = [
+    "AssistantPreferredNameValue",
     "OutputFormatPreferenceValue",
     "PersonalMemoryModule",
     "PersonalMemoryReadPort",

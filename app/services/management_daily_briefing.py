@@ -9,6 +9,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
+from app.legal_daily_roster import (
+    FORMAL_ROSTER_EFFECTIVE_DATE,
+    FormalLegalDailyRoster,
+    load_formal_legal_daily_roster,
+)
 from app.legal_daily_dashboard.domain import (
     DailyReportRecord,
     DashboardRecords,
@@ -26,6 +31,7 @@ from app.services.report_risk import problems_acknowledged_empty
 from app.utils.time import now_in_timezone
 
 SEPARATOR = "────────────"
+HIDDEN_MISSING_DETAIL_MEMBER_NAME = "赵卫中"
 
 
 @dataclass(frozen=True)
@@ -73,14 +79,27 @@ class ManagementDailyBriefingService:
         if not tenant_id:
             raise ValueError("legal_daily_dashboard_tenant_id is required")
 
+        formal_roster = await load_formal_legal_daily_roster(
+            session,
+            tenant_id=tenant_id,
+            on_date=report_date,
+        )
+        hidden_missing_detail_member_refs = _hidden_missing_detail_member_refs(
+            self._settings,
+            formal_roster=formal_roster,
+        )
         repository = SqlDashboardRepository(session)
-        teams = await repository.list_teams(tenant_id=tenant_id)
+        teams = await repository.list_teams(
+            tenant_id=tenant_id,
+            on_date=report_date,
+        )
         records = await repository.load_records(
             tenant_id=tenant_id,
             team_refs=None,
             start_date=report_date,
             end_date=report_date,
         )
+        _validate_briefing_roster(records, formal_roster=formal_roster)
         recipients, recipient_warnings = await _load_recipients(
             session,
             tenant_id=tenant_id,
@@ -103,6 +122,48 @@ class ManagementDailyBriefingService:
             records=records,
             recipients=(*recipients, *cc_recipients),
             recipient_warnings=(*recipient_warnings, *cc_warnings),
+            hidden_missing_detail_member_refs=hidden_missing_detail_member_refs,
+        )
+
+
+def _validate_briefing_roster(
+    records: DashboardRecords,
+    *,
+    formal_roster: FormalLegalDailyRoster,
+) -> None:
+    record_members = {
+        member.ref: (member.name, member.team_ref)
+        for member in records.members
+    }
+    formal_members = {
+        member.user_id: (member.user_name, member.team_id)
+        for member in formal_roster.members
+    }
+    if len(record_members) != len(records.members) or record_members != formal_members:
+        raise RuntimeError(
+            "management briefing members and teams do not exactly match the formal roster"
+        )
+    if formal_roster.on_date < FORMAL_ROSTER_EFFECTIVE_DATE:
+        return
+    obligations = tuple(
+        obligation
+        for obligation in records.obligations
+        if obligation.report_date == formal_roster.on_date
+    )
+    obligation_scope = {
+        obligation.member_ref: (obligation.team_ref, obligation.data_complete)
+        for obligation in obligations
+    }
+    expected_obligation_scope = {
+        member.user_id: (member.team_id, True)
+        for member in formal_roster.members
+    }
+    if (
+        len(obligation_scope) != len(obligations)
+        or obligation_scope != expected_obligation_scope
+    ):
+        raise RuntimeError(
+            "management briefing obligations do not exactly match the formal roster"
         )
 
 
@@ -114,6 +175,7 @@ def build_management_daily_briefings(
     records: DashboardRecords,
     recipients: tuple[BriefingRecipient, ...],
     recipient_warnings: tuple[str, ...] = (),
+    hidden_missing_detail_member_refs: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     ordered_teams = tuple(sorted(teams, key=_team_sort_key))
     team_views = tuple(
@@ -125,13 +187,18 @@ def build_management_daily_briefings(
         )
         for team in ordered_teams
     )
+    department_direct_view = _build_department_direct_submission_view(
+        teams=ordered_teams,
+        records=records,
+        report_date=report_date,
+        now=now,
+    )
     team_messages: list[dict[str, Any]] = []
     for view in team_views:
         team_recipients = tuple(
             recipient
             for recipient in recipients
-            if recipient.role == "team_lead"
-            and recipient.team_ref == view.team.ref
+            if recipient.role == "team_lead" and recipient.team_ref == view.team.ref
         )
         if not view.has_responsibility_data:
             continue
@@ -144,6 +211,12 @@ def build_management_daily_briefings(
                 "recipients": _serialize_recipients(team_recipients),
                 "target_count": len(team_recipients),
                 "stats": _serialize_submission_stats(view),
+                "briefing_snapshot": _serialize_briefing_snapshot(
+                    report_date=report_date,
+                    generated_at=now,
+                    scope="team",
+                    views=(view,),
+                ),
                 "text": build_team_management_briefing_text(
                     report_date=report_date,
                     now=now,
@@ -159,12 +232,26 @@ def build_management_daily_briefings(
         "department_name": _department_name(teams),
         "recipients": _serialize_recipients(legal_head_recipients),
         "target_count": len(legal_head_recipients),
-        "stats": _aggregate_submission_stats(team_views),
+        "stats": _aggregate_submission_stats(
+            team_views,
+            department_direct_view=department_direct_view,
+        ),
+        "briefing_snapshot": _serialize_briefing_snapshot(
+            report_date=report_date,
+            generated_at=now,
+            scope="department",
+            views=(
+                *team_views,
+                *((department_direct_view,) if department_direct_view else ()),
+            ),
+        ),
         "text": build_department_management_briefing_text(
             report_date=report_date,
             now=now,
             team_views=team_views,
+            department_direct_view=department_direct_view,
             records=records,
+            hidden_missing_detail_member_refs=hidden_missing_detail_member_refs,
         ),
     }
     return {
@@ -184,9 +271,7 @@ def build_team_management_briefing_text(
     view: TeamSubmissionView,
     records: DashboardRecords,
 ) -> str:
-    submitted_report_refs = {
-        report.ref for report in view.submitted_reports
-    }
+    submitted_report_refs = {report.ref for report in view.submitted_reports}
     review_actions = management_review_actions(
         records=records,
         teams={view.team.ref: view.team.name},
@@ -266,13 +351,20 @@ def build_department_management_briefing_text(
     report_date: date,
     now: datetime,
     team_views: tuple[TeamSubmissionView, ...],
+    department_direct_view: TeamSubmissionView | None,
     records: DashboardRecords,
+    hidden_missing_detail_member_refs: frozenset[str] = frozenset(),
 ) -> str:
+    department_views = (
+        (*team_views, department_direct_view)
+        if department_direct_view is not None
+        else team_views
+    )
     member_names = _member_names(records.members)
-    team_names = {team.team.ref: team.team.name for team in team_views}
+    team_names = {view.team.ref: view.team.name for view in department_views}
     submitted_report_refs = {
         report.ref
-        for view in team_views
+        for view in department_views
         for report in view.submitted_reports
     }
     review_actions = management_review_actions(
@@ -313,7 +405,7 @@ def build_department_management_briefing_text(
         team_names=team_names,
     )
     known_views = tuple(
-        view for view in team_views if view.has_responsibility_data
+        view for view in department_views if view.has_responsibility_data
     )
     total_expected = sum(view.expected_count for view in known_views)
     total_submitted = sum(view.submitted_count for view in known_views)
@@ -327,27 +419,20 @@ def build_department_management_briefing_text(
             f"｜责任待核 {total_unknown}"
         ),
     ]
-    team_entries = [
-        _department_team_entry(view)
-        for view in team_views
-    ]
+    team_entries = [_department_team_entry(view) for view in department_views]
     missing_entries = [
-        (
-            f"**{view.team.name}（{len(view.missing_members)}人）**",
-            "、".join(member.name for member in view.missing_members),
+        _department_missing_entry(
+            view,
+            hidden_member_refs=hidden_missing_detail_member_refs,
         )
         for view in known_views
         if view.missing_members
     ]
     if total_unknown:
         unknown_names = "、".join(
-            member.name
-            for view in known_views
-            for member in view.unknown_members
+            member.name for view in known_views for member in view.unknown_members
         )
-        overview_lines.append(
-            f"责任待核：{unknown_names}（不计入未交）"
-        )
+        overview_lines.append(f"责任待核：{unknown_names}（不计入未交）")
 
     blocks = [
         (
@@ -356,7 +441,7 @@ def build_department_management_briefing_text(
         ),
         "\n".join(overview_lines),
         _numbered_section(
-            "一、各团队填报情况",
+            "一、各团队及中心直属填报情况",
             team_entries,
             "本期没有可展示的正式团队。",
         ),
@@ -447,6 +532,43 @@ def _build_team_submission_view(
     )
 
 
+def _build_department_direct_submission_view(
+    *,
+    teams: tuple[TeamRecord, ...],
+    records: DashboardRecords,
+    report_date: date,
+    now: datetime,
+) -> TeamSubmissionView | None:
+    """Build the department-only cohort without creating an eighth team message."""
+
+    official_team_refs = {team.ref for team in teams}
+    direct_team_refs = {
+        member.team_ref
+        for member in records.members
+        if member.team_ref not in official_team_refs
+    }
+    if not direct_team_refs:
+        return None
+    if len(direct_team_refs) != 1:
+        raise ValueError(
+            "department-direct members must resolve to exactly one roster team"
+        )
+    direct_team_ref = next(iter(direct_team_refs))
+    direct_records = records_for_team(records, direct_team_ref)
+    direct_team = TeamRecord(
+        ref=direct_team_ref,
+        name="中心直属",
+        department_name=_department_name(teams),
+        code="department-direct",
+    )
+    return _build_team_submission_view(
+        team=direct_team,
+        records=direct_records,
+        report_date=report_date,
+        now=now,
+    )
+
+
 def _submission_summary_line(view: TeamSubmissionView) -> str:
     parts = [
         f"已交 {view.submitted_count}/{view.expected_count}",
@@ -467,9 +589,7 @@ def _unknown_line(members: tuple[MemberRecord, ...]) -> str:
     if not members:
         return ""
     return (
-        "责任待核："
-        + "、".join(member.name for member in members)
-        + "（不计入未交）"
+        "责任待核：" + "、".join(member.name for member in members) + "（不计入未交）"
     )
 
 
@@ -488,6 +608,25 @@ def _department_team_entry(
     if view.unknown_members:
         detail += f"｜责任待核 {len(view.unknown_members)}"
     return f"**{view.team.name}**", detail
+
+
+def _department_missing_entry(
+    view: TeamSubmissionView,
+    *,
+    hidden_member_refs: frozenset[str],
+) -> tuple[str, str]:
+    """Render missing names without changing the underlying submission totals."""
+
+    visible_members = tuple(
+        member
+        for member in view.missing_members
+        if member.ref not in hidden_member_refs
+    )
+    visible_names = "、".join(member.name for member in visible_members)
+    return (
+        f"**{view.team.name}（{len(view.missing_members)}人）**",
+        visible_names,
+    )
 
 
 def _attention_entries(
@@ -540,9 +679,7 @@ def _attention_entries(
         prefix = _entry_prefix(
             name=name,
             team_name=(
-                str(action.get("team_name") or "")
-                if include_team
-                else team_name
+                str(action.get("team_name") or "") if include_team else team_name
             ),
             include_team=include_team,
         )
@@ -622,9 +759,7 @@ def _quality_entries(
         prefix = _entry_prefix(
             name=name,
             team_name=(
-                str(action.get("team_name") or "")
-                if include_team
-                else team_name
+                str(action.get("team_name") or "") if include_team else team_name
             ),
             include_team=include_team,
         )
@@ -654,7 +789,11 @@ def _numbered_section(
         lines.append(empty_text)
         return "\n\n".join(lines)
     for index, (heading, body) in enumerate(materialized, start=1):
-        lines.append(f"{index}. {heading}\n   {body}")
+        lines.append(
+            f"{index}. {heading}\n   {body}"
+            if body
+            else f"{index}. {heading}"
+        )
     return "\n\n".join(lines)
 
 
@@ -682,11 +821,7 @@ def _sorted_reports(
 ) -> tuple[DailyReportRecord, ...]:
     return tuple(
         sorted(
-            (
-                report
-                for report in reports
-                if report.ref in allowed_report_refs
-            ),
+            (report for report in reports if report.ref in allowed_report_refs),
             key=lambda report: (
                 report.team_ref,
                 report.member_ref,
@@ -708,20 +843,127 @@ def _serialize_submission_stats(
     }
 
 
+def _serialize_briefing_snapshot(
+    *,
+    report_date: date,
+    generated_at: datetime,
+    scope: str,
+    views: tuple[TeamSubmissionView, ...],
+) -> dict[str, Any]:
+    members = [
+        _serialize_member_snapshot(
+            view,
+            member,
+            generated_at=generated_at,
+        )
+        for view in views
+        for member in view.members
+    ]
+    members.sort(
+        key=lambda item: (
+            str(item["team_name"]),
+            str(item["member_name"]),
+            str(item["member_ref"]),
+        )
+    )
+    return {
+        "generated_at": generated_at.isoformat(),
+        "report_date": report_date.isoformat(),
+        "scope": scope,
+        "members": members,
+    }
+
+
+def _serialize_member_snapshot(
+    view: TeamSubmissionView,
+    member: MemberRecord,
+    *,
+    generated_at: datetime,
+) -> dict[str, Any]:
+    report = next(
+        (
+            item
+            for item in view.submitted_reports
+            if item.member_ref == member.ref
+        ),
+        None,
+    )
+    if report is not None:
+        classification = (
+            "submitted"
+            if report.status == "completed"
+            else "pending_confirmation"
+        )
+    elif any(item.ref == member.ref for item in view.missing_members):
+        classification = "missing"
+    elif any(item.ref == member.ref for item in view.unknown_members):
+        classification = "responsibility_unknown"
+    elif any(item.ref == member.ref for item in view.exempt_members):
+        classification = "exempt"
+    else:
+        classification = "unknown"
+    return {
+        "member_ref": member.ref,
+        "member_name": member.name,
+        "team_ref": member.team_ref,
+        "team_name": member.team_name or view.team.name,
+        "classification": classification,
+        "report_status": report.status if report is not None else None,
+        "confirmation_type": (
+            report.confirmation_type if report is not None else None
+        ),
+        "submitted_at": (
+            _iso_in_generation_timezone(
+                report.submitted_at,
+                generated_at,
+            )
+            if report is not None and report.submitted_at is not None
+            else None
+        ),
+    }
+
+
+def _iso_in_generation_timezone(
+    value: datetime,
+    generated_at: datetime,
+) -> str:
+    """Show snapshot times on the same clock as the briefing generation."""
+
+    if value.tzinfo is None or generated_at.tzinfo is None:
+        # Do not let the machine's local timezone silently reinterpret legacy
+        # naive values. Preserve those values exactly instead.
+        return value.isoformat()
+    return value.astimezone(generated_at.tzinfo).isoformat()
+
+
 def _aggregate_submission_stats(
     views: tuple[TeamSubmissionView, ...],
+    *,
+    department_direct_view: TeamSubmissionView | None = None,
 ) -> dict[str, int]:
-    known = tuple(view for view in views if view.has_responsibility_data)
+    department_views = (
+        (*views, department_direct_view)
+        if department_direct_view is not None
+        else views
+    )
+    known = tuple(
+        view for view in department_views if view.has_responsibility_data
+    )
     return {
         "total": sum(view.expected_count for view in known),
         "completed": sum(view.submitted_count for view in known),
         "missing": sum(len(view.missing_members) for view in known),
-        "unknown_responsibility": sum(
-            len(view.unknown_members) for view in known
-        ),
+        "unknown_responsibility": sum(len(view.unknown_members) for view in known),
         "exempt": sum(len(view.exempt_members) for view in known),
         "teams": len(views),
-        "teams_with_responsibility_data": len(known),
+        "teams_with_responsibility_data": sum(
+            view.has_responsibility_data for view in views
+        ),
+        "center_direct_members": (
+            len(department_direct_view.members)
+            if department_direct_view is not None
+            else 0
+        ),
     }
 
 
@@ -752,24 +994,27 @@ def _department_briefing_recipients(
     recipients: tuple[BriefingRecipient, ...],
 ) -> tuple[BriefingRecipient, ...]:
     cc_user_ids = {
-        recipient.id
-        for recipient in recipients
-        if recipient.role == "department_cc"
+        recipient.id for recipient in recipients if recipient.role == "department_cc"
     }
     return _unique_recipients(
         recipient
         for recipient in recipients
-        if (
-            recipient.role == "legal_head"
-            and recipient.id not in cc_user_ids
-        )
+        if (recipient.role == "legal_head" and recipient.id not in cc_user_ids)
         or recipient.role == "department_cc"
     )
 
 
 def _department_name(teams: tuple[TeamRecord, ...]) -> str:
-    del teams
-    return "法务部"
+    names = tuple(
+        dict.fromkeys(
+            team.department_name.strip()
+            for team in teams
+            if team.department_name.strip()
+        )
+    )
+    if len(names) == 1:
+        return names[0]
+    return "法务合约中心"
 
 
 def _team_sort_key(team: TeamRecord) -> tuple[int, int, str]:
@@ -861,11 +1106,7 @@ async def _load_recipients(
             name=str(row.get("user_name") or ""),
             dingtalk_user_id=str(row["dingtalk_user_id"]),
             role=str(row.get("dashboard_role") or ""),
-            team_ref=(
-                str(row["team_ref"])
-                if row.get("team_ref")
-                else None
-            ),
+            team_ref=(str(row["team_ref"]) if row.get("team_ref") else None),
         )
         recipient_key = (
             recipient.role,
@@ -874,8 +1115,7 @@ async def _load_recipients(
         )
         if recipient_key in recipient_keys:
             warnings.append(
-                "overlapping active access assignment ignored for "
-                f"user {recipient.id}"
+                f"overlapping active access assignment ignored for user {recipient.id}"
             )
             continue
         recipient_keys.add(recipient_key)
@@ -886,11 +1126,37 @@ async def _load_recipients(
 def _configured_identifiers(value: object) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
-            item.strip()
-            for item in str(value or "").split(",")
-            if item.strip()
+            item.strip() for item in str(value or "").split(",") if item.strip()
         )
     )
+
+
+def _hidden_missing_detail_member_refs(
+    settings: Settings,
+    *,
+    formal_roster: FormalLegalDailyRoster,
+) -> frozenset[str]:
+    configured = frozenset(
+        _configured_identifiers(
+            getattr(
+                settings,
+                "management_daily_briefing_hidden_missing_detail_user_ids",
+                "",
+            )
+        )
+    )
+    expected = frozenset(
+        {
+            formal_roster.member_by_name(
+                HIDDEN_MISSING_DETAIL_MEMBER_NAME
+            ).user_id
+        }
+    )
+    if configured != expected:
+        raise RuntimeError(
+            "management briefing hidden-detail users must match Zhao Weizhong exactly"
+        )
+    return expected
 
 
 async def _load_department_cc_recipients(

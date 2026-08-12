@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -37,6 +38,7 @@ from app.services.performance_service import (
     submission_metrics,
 )
 from app.services.report_service import DailyReportService
+from app.utils.dingtalk_text import format_dingtalk_plain_text
 from app.utils.time import now_in_timezone
 from app.agent2.assistant_tools import build_tool_assisted_reply
 from app.agent2.case_table_rag import DEFAULT_CASE_RAG_INDEX, CaseTableRagAdapter, find_case_location_hint
@@ -67,7 +69,7 @@ from app.agent2.cognitive_reply_v3 import (
 )
 from app.agent2.tool_calling.canary_service import (
     CanaryIngressExecutionError,
-    build_canary_response_payload,
+    build_canary_persisted_response_payload,
     deliver_cached_canary_message_if_enabled,
     deliver_canary_message_if_enabled,
     process_tool_call_canary_ingress,
@@ -125,9 +127,7 @@ from app.agent2.daily_clarification import (
 )
 from app.agent2.daily_state import set_pending_daily_candidate
 from app.agent2.daily_execution import (
-    agent2_daily_enabled_for_user,
     agent2_daily_report_version,
-    agent2_daily_should_fallback_to_legacy,
     execute_agent2_daily_commands,
 )
 from app.agent2.daily_shadow import evaluate_daily_shadow
@@ -143,7 +143,6 @@ from app.agent2.outcome_adapters import (
     periodic_execution_outcomes,
     text_outcome,
 )
-from app.workflows.gate import GateDecision
 from app.workflows.daily_context import (
     daily_active_task_from_report,
     load_live_daily_context,
@@ -177,6 +176,8 @@ class StreamJob:
     event_id: uuid.UUID | None = None
     idempotency_key: str = ""
     recovered: bool = False
+    persisted_received_at: datetime | None = None
+    worker_dequeued_at_monotonic: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,34 @@ class PersistedStreamIngress:
     status: str
     response_payload: dict[str, Any]
     payload: dict[str, Any]
+    received_at: datetime
+
+
+@dataclass(frozen=True)
+class StreamReplyObservation:
+    elapsed_seconds: float
+    transport_status: str
+    provider_accepted: bool
+    delivery_verified: bool
+    error_type: str = ""
+
+
+class StreamBatchRequiresSerialProcessing(RuntimeError):
+    """The sealed time batch is valid, but its members need original serial handling."""
+
+
+@dataclass(frozen=True)
+class SealedStreamJobBatch:
+    turn_batch: SealedTurnBatch
+    jobs: tuple[StreamJob, ...]
+    wait_seconds: float
+    execution_done: asyncio.Future[str]
+
+    def is_leader(self, job: StreamJob) -> bool:
+        return (
+            job.event_id is not None
+            and self.turn_batch.is_leader(job.event_id)
+        )
 
 
 STREAM_TIMING_FIELDS = (
@@ -198,6 +227,7 @@ STREAM_TIMING_FIELDS = (
     "acquire_report_lock_seconds",
     "llm_intent_seconds",
     "llm_extract_seconds",
+    "agent2_model_elapsed_seconds",
     "report_merge_seconds",
     "db_commit_seconds",
     "dingtalk_send_seconds",
@@ -214,6 +244,20 @@ STREAM_LLM_META_FIELDS = (
     "llm_extract_timeout",
     "llm_fallback_to_pro",
     "llm_fallback_reason",
+)
+
+STREAM_AGENT2_MODEL_META_FIELDS = (
+    "agent2_model_call_count",
+    "agent2_model_request_attempt_count",
+    "agent2_model_transport_retry_count",
+)
+
+STREAM_AGENT2_TOOL_COUNT_FIELDS = (
+    "agent2_tool_success_count",
+    "agent2_tool_no_op_count",
+    "agent2_tool_clarification_count",
+    "agent2_tool_blocked_count",
+    "agent2_tool_failure_count",
 )
 
 STREAM_AGENT_META_FIELDS = (
@@ -264,18 +308,147 @@ def _safe_seconds(value: Any) -> float:
         return 0.0
 
 
+def _safe_nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _add_timing(timings: dict[str, Any], key: str, value: float) -> None:
     timings[key] = round(_safe_seconds(timings.get(key)) + _safe_seconds(value), 4)
 
 
+def _apply_canary_observability(
+    timings: dict[str, Any],
+    outcome: Any,
+) -> None:
+    timings["agent2_model_call_count"] = _safe_nonnegative_int(
+        getattr(outcome, "model_call_count", 0)
+    )
+    timings["agent2_model_request_attempt_count"] = _safe_nonnegative_int(
+        getattr(outcome, "model_request_attempt_count", 0)
+    )
+    timings["agent2_model_transport_retry_count"] = _safe_nonnegative_int(
+        getattr(outcome, "model_transport_retry_count", 0)
+    )
+    timings["agent2_model_elapsed_seconds"] = _safe_seconds(
+        getattr(outcome, "model_elapsed_seconds", 0.0)
+    )
+    timings["agent2_model_result_status"] = str(
+        getattr(outcome, "model_result_status", "not_called")
+        or "not_called"
+    )
+    for timing_field, outcome_field in (
+        ("agent2_tool_success_count", "tool_success_count"),
+        ("agent2_tool_no_op_count", "tool_no_op_count"),
+        (
+            "agent2_tool_clarification_count",
+            "tool_clarification_count",
+        ),
+        ("agent2_tool_blocked_count", "tool_blocked_count"),
+        ("agent2_tool_failure_count", "tool_failure_count"),
+    ):
+        timings[timing_field] = _safe_nonnegative_int(
+            getattr(outcome, outcome_field, 0)
+        )
+    timings["agent2_user_visible_result"] = str(
+        getattr(outcome, "user_visible_result", "unknown")
+        or "unknown"
+    )
+    timings["agent2_reply_formed"] = bool(
+        getattr(outcome, "reply_formed", False)
+    )
+    timings["agent2_message_processing_status"] = "consumed"
+    timings["agent2_business_result_status"] = str(
+        getattr(outcome, "user_visible_result", "unknown")
+        or "unknown"
+    )
+    timings["agent2_business_transaction_status"] = "pending"
+    timings["agent2_business_changed"] = bool(
+        getattr(outcome, "actual_write", False)
+    )
+    timings["agent2_reply_status"] = (
+        "formed"
+        if bool(getattr(outcome, "reply_formed", False))
+        else "missing"
+    )
+
+
+def _apply_reply_observability(
+    timings: dict[str, Any],
+    observation: StreamReplyObservation,
+) -> None:
+    _add_timing(
+        timings,
+        "dingtalk_send_seconds",
+        observation.elapsed_seconds,
+    )
+    timings["agent2_transport_status"] = observation.transport_status
+    timings["agent2_provider_accepted"] = observation.provider_accepted
+    timings["agent2_delivery_verified"] = observation.delivery_verified
+    timings["agent2_transport_error_type"] = observation.error_type
+    timings["agent2_delivery_status"] = (
+        "verified"
+        if observation.delivery_verified
+        else (
+            "suppressed"
+            if observation.transport_status == "suppressed"
+            else (
+                "unverified"
+                if observation.provider_accepted
+                else "not_delivered"
+            )
+        )
+    )
+
+
+def _canary_stream_status(
+    outcome: Any,
+    observation: StreamReplyObservation,
+) -> str:
+    if observation.transport_status == "failed":
+        return "tool_call_canary_reply_failed"
+    if observation.transport_status == "suppressed":
+        return "tool_call_canary_delivery_suppressed"
+    if str(getattr(outcome, "user_visible_result", "")) == "failed":
+        return "tool_call_canary_failed"
+    if str(getattr(outcome, "owner", "")) == "blocked":
+        return "tool_call_canary_blocked"
+    return "tool_call_canary_processed"
+
+
 def _initial_stream_timings(job: StreamJob, started_at: float) -> dict[str, Any]:
     timings = {field: 0.0 for field in STREAM_TIMING_FIELDS}
+    for field in STREAM_AGENT2_MODEL_META_FIELDS:
+        timings[field] = 0
+    for field in STREAM_AGENT2_TOOL_COUNT_FIELDS:
+        timings[field] = 0
+    timings["agent2_user_visible_result"] = "unknown"
+    timings["agent2_reply_formed"] = False
+    timings["agent2_model_result_status"] = "not_called"
+    timings["agent2_message_processing_status"] = "not_consumed"
+    timings["agent2_business_result_status"] = "unknown"
+    timings["agent2_business_transaction_status"] = "not_started"
+    timings["agent2_business_changed"] = False
+    timings["agent2_reply_status"] = "not_formed"
+    timings["agent2_transport_status"] = "not_attempted"
+    timings["agent2_provider_accepted"] = False
+    timings["agent2_delivery_verified"] = False
+    timings["agent2_transport_error_type"] = ""
+    timings["agent2_delivery_status"] = "not_attempted"
     for field in STREAM_LLM_META_FIELDS:
         timings[field] = False if field.endswith("_timeout") or field == "llm_fallback_to_pro" else None
     for field in STREAM_AGENT_META_FIELDS:
         timings[field] = None
     if job.queued_at_monotonic:
-        timings["queue_wait_seconds"] = round(max(0.0, started_at - job.queued_at_monotonic), 4)
+        queue_observed_at = (
+            job.worker_dequeued_at_monotonic or started_at
+        )
+        timings["queue_wait_seconds"] = round(
+            max(0.0, queue_observed_at - job.queued_at_monotonic),
+            4,
+        )
     timings["voice_download_seconds"] = _safe_seconds(job.voice_download_seconds)
     timings["voice_transcribe_seconds"] = _safe_seconds(job.voice_transcribe_seconds)
     return timings
@@ -309,7 +482,28 @@ def _log_stream_timing(
     error: str | None = None,
 ) -> None:
     entered_report_agent = bool(timings.get("entered_report_agent") or timings.get("report_agent_seconds"))
-    entered_llm = bool(timings.get("llm_intent_seconds") or timings.get("llm_extract_seconds") or entered_report_agent)
+    agent2_model_call_count = _safe_nonnegative_int(
+        timings.get("agent2_model_call_count")
+    )
+    agent2_model_request_attempt_count = _safe_nonnegative_int(
+        timings.get("agent2_model_request_attempt_count")
+    )
+    if (
+        timings.get("agent2_message_processing_status")
+        == "consumed"
+    ):
+        entered_llm = bool(
+            agent2_model_call_count
+            or agent2_model_request_attempt_count
+        )
+    else:
+        entered_llm = bool(
+            agent2_model_call_count
+            or agent2_model_request_attempt_count
+            or timings.get("llm_intent_seconds")
+            or timings.get("llm_extract_seconds")
+            or entered_report_agent
+        )
     record: dict[str, Any] = {
         "message_id": job.message.message_id,
         "user_id": dingtalk_user_id,
@@ -325,11 +519,63 @@ def _log_stream_timing(
     }
     for field in STREAM_TIMING_FIELDS:
         record[field] = _safe_seconds(timings.get(field))
+    for field in STREAM_AGENT2_MODEL_META_FIELDS:
+        record[field] = _safe_nonnegative_int(timings.get(field))
+    for field in STREAM_AGENT2_TOOL_COUNT_FIELDS:
+        record[field] = _safe_nonnegative_int(timings.get(field))
+    record["agent2_user_visible_result"] = str(
+        timings.get("agent2_user_visible_result") or "unknown"
+    )
+    record["agent2_reply_formed"] = bool(
+        timings.get("agent2_reply_formed")
+    )
+    record["agent2_model_result_status"] = str(
+        timings.get("agent2_model_result_status") or "not_called"
+    )
+    record["agent2_message_processing_status"] = str(
+        timings.get("agent2_message_processing_status")
+        or "not_consumed"
+    )
+    record["agent2_business_result_status"] = str(
+        timings.get("agent2_business_result_status") or "unknown"
+    )
+    record["agent2_business_transaction_status"] = str(
+        timings.get("agent2_business_transaction_status")
+        or "not_started"
+    )
+    record["agent2_business_changed"] = bool(
+        timings.get("agent2_business_changed")
+    )
+    record["agent2_reply_status"] = str(
+        timings.get("agent2_reply_status") or "not_formed"
+    )
+    record["agent2_transport_status"] = str(
+        timings.get("agent2_transport_status") or "not_attempted"
+    )
+    record["agent2_provider_accepted"] = bool(
+        timings.get("agent2_provider_accepted")
+    )
+    record["agent2_delivery_verified"] = bool(
+        timings.get("agent2_delivery_verified")
+    )
+    record["agent2_transport_error_type"] = str(
+        timings.get("agent2_transport_error_type") or ""
+    )
+    record["agent2_delivery_status"] = str(
+        timings.get("agent2_delivery_status") or "not_attempted"
+    )
     for field in STREAM_LLM_META_FIELDS:
         record[field] = timings.get(field)
     for field in STREAM_AGENT_META_FIELDS:
         record[field] = timings.get(field)
-    logger.info("stream timing %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
+    try:
+        logger.info(
+            "stream timing %s",
+            json.dumps(record, ensure_ascii=False, sort_keys=True),
+        )
+    except Exception:
+        # Monitoring is best-effort and must never change the user-facing turn.
+        pass
 
 
 def _log_immediate_stream_timing(
@@ -426,6 +672,91 @@ def _stream_user_id(message: dingtalk_stream.ChatbotMessage) -> str:
     return message.sender_staff_id or message.sender_id or ""
 
 
+class StreamJobBatchCoordinator:
+    """Keep runtime jobs attached to a semantics-free, time-bounded turn batch."""
+
+    def __init__(self, turn_coordinator: CanaryTurnBatchCoordinator) -> None:
+        self._turn_coordinator = turn_coordinator
+        self._jobs: dict[uuid.UUID, StreamJob] = {}
+        self._execution_done: dict[str, asyncio.Future[str]] = {}
+        self._lock = asyncio.Lock()
+
+    async def collect(self, job: StreamJob) -> SealedStreamJobBatch | None:
+        event_id = job.event_id
+        received_at = job.persisted_received_at
+        dingtalk_user_id = _stream_user_id(job.message).strip()
+        conversation_id = str(
+            getattr(job.message, "conversation_id", "") or ""
+        ).strip()
+        source_message_id = str(
+            job.idempotency_key
+            or _stream_idempotency_key(job.message, job.text)
+        ).strip()
+        if (
+            event_id is None
+            or received_at is None
+            or not dingtalk_user_id
+            or not conversation_id
+            or not source_message_id
+        ):
+            return None
+
+        async with self._lock:
+            existing = self._jobs.get(event_id)
+            if existing is not None and existing is not job:
+                raise RuntimeError("stream batch event is bound to another job")
+            self._jobs[event_id] = job
+
+        started = time.perf_counter()
+        turn_batch = await self._turn_coordinator.collect(
+            fragment=TurnFragment(
+                event_id=event_id,
+                source_message_id=source_message_id,
+                dingtalk_user_id=dingtalk_user_id,
+                conversation_id=conversation_id,
+                text=job.text,
+                received_at=received_at,
+            )
+        )
+        wait_seconds = _elapsed_seconds(started)
+        async with self._lock:
+            try:
+                jobs = tuple(
+                    self._jobs[fragment.event_id]
+                    for fragment in turn_batch.fragments
+                )
+            except KeyError as exc:
+                raise RuntimeError(
+                    "sealed stream batch is missing a runtime job"
+                ) from exc
+            execution_done = self._execution_done.get(turn_batch.batch_id)
+            if execution_done is None:
+                execution_done = asyncio.get_running_loop().create_future()
+                self._execution_done[turn_batch.batch_id] = execution_done
+        return SealedStreamJobBatch(
+            turn_batch=turn_batch,
+            jobs=jobs,
+            wait_seconds=wait_seconds,
+            execution_done=execution_done,
+        )
+
+    async def complete(
+        self,
+        batch: SealedStreamJobBatch,
+        *,
+        mode: str,
+    ) -> None:
+        async with self._lock:
+            execution_done = self._execution_done.pop(
+                batch.turn_batch.batch_id,
+                batch.execution_done,
+            )
+            if not execution_done.done():
+                execution_done.set_result(mode)
+            for event_id in batch.turn_batch.event_ids:
+                self._jobs.pop(event_id, None)
+
+
 async def _send_stream_reply(
     robot: DingTalkRobotClient,
     message: dingtalk_stream.ChatbotMessage,
@@ -473,6 +804,7 @@ async def _persist_stream_ingress(
             status=event.status,
             response_payload=dict(event.response_payload or {}),
             payload=payload if inserted else dict(event.payload or {}),
+            received_at=event.received_at,
         )
 
 
@@ -688,6 +1020,7 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
             queued_at_monotonic=time.perf_counter(),
             event_id=persisted.event_id,
             idempotency_key=persisted.idempotency_key,
+            persisted_received_at=persisted.received_at,
         )
         try:
             self.queue.put_nowait(job)
@@ -820,6 +1153,7 @@ async def _enqueue_recoverable_stream_jobs(
                     event_id=event.id,
                     idempotency_key=event.idempotency_key,
                     recovered=True,
+                    persisted_received_at=event.received_at,
                 )
             except (TypeError, ValueError):
                 logger.exception(
@@ -847,34 +1181,42 @@ async def _reply(
     job: StreamJob,
     text: str,
 ) -> float:
+    observation = await _reply_with_observability(
+        handler,
+        robot,
+        job,
+        text,
+    )
+    return observation.elapsed_seconds
+
+
+async def _reply_with_observability(
+    handler: DailyReviewStreamHandler,
+    robot: DingTalkRobotClient,
+    job: StreamJob,
+    text: str,
+) -> StreamReplyObservation:
     send_start = time.perf_counter()
     try:
         await _send_stream_reply(robot, job.message, text, handler.settings.stream_reply_timeout_seconds)
         send_seconds = _elapsed_seconds(send_start)
         logger.info("stream final reply sent message=%s send_seconds=%s", job.message.message_id, send_seconds)
-        return send_seconds
+        return StreamReplyObservation(
+            elapsed_seconds=send_seconds,
+            transport_status="provider_accepted",
+            provider_accepted=True,
+            delivery_verified=False,
+        )
     except Exception as exc:
         send_seconds = _elapsed_seconds(send_start)
         logger.exception("stream final reply failed: %s", exc)
-        return send_seconds
-
-
-async def _evaluate_stream_legacy_daily_gate(
-    *,
-    session: Any,
-    user: Any,
-    job: StreamJob,
-    performance_service: PerformanceTaskService,
-    settings: Settings,
-) -> GateDecision:
-    _, shadow, _, _ = await _evaluate_stream_daily_shadow(
-        session=session,
-        user=user,
-        job=job,
-        performance_service=performance_service,
-        settings=settings,
-    )
-    return shadow.gate_decision
+        return StreamReplyObservation(
+            elapsed_seconds=send_seconds,
+            transport_status="failed",
+            provider_accepted=False,
+            delivery_verified=False,
+            error_type=type(exc).__name__,
+        )
 
 
 async def _evaluate_stream_daily_shadow(
@@ -1143,13 +1485,7 @@ async def _process_stream_agent2_daily_if_enabled(
         source_message_id=source_message_id,
     )
     await persist_runtime_owner_claim(session, entrypoint)
-    runtime_owner = decide_runtime_owner(
-        entrypoint.decision,
-        phase2_control_plane_enabled=bool(
-            getattr(settings, "agent2_business_phase2_enabled", False)
-        ),
-        legacy_agent2_daily_enabled=agent2_daily_enabled_for_user(settings, user),
-    )
+    runtime_owner = decide_runtime_owner(entrypoint.decision)
     phase2_primary = runtime_owner == "agent2_primary"
     phase2_business_context = (
         build_business_command_context(
@@ -1178,18 +1514,6 @@ async def _process_stream_agent2_daily_if_enabled(
         await session.commit()
         _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
         return "agent2_phase2_entrypoint_blocked"
-    if entrypoint.decision.route == "agent2_shadow":
-        await _evaluate_stream_daily_shadow(
-            session=session,
-            user=user,
-            job=job,
-            performance_service=performance_service,
-            settings=settings,
-            mode_override="protective_gate",
-        )
-        return None
-    if runtime_owner == "agent1":
-        return None
     if phase2_primary and not cognitive_core_v3_enabled(settings):
         reply_text = "当前服务暂时无法处理这条消息，本次没有执行任何业务操作。"
         response_payload = {"msgtype": "text", "text": {"content": reply_text}}
@@ -1628,6 +1952,7 @@ async def _process_stream_agent2_daily_if_enabled(
                         raise RuntimeError(
                             "Agent2 read-only outcome requires verified execution context"
                         )
+                    reply_text = format_dingtalk_plain_text(reply_text)
                     read_only_source_turn_id = str(
                         envelope.message_id or source_message_id
                     )
@@ -1836,7 +2161,9 @@ async def _process_stream_agent2_daily_if_enabled(
             raise RuntimeError("Agent2 Phase 2 primary cannot execute shadow daily commands")
         commands = list(shadow.commands)
         if not commands:
-            return None
+            raise RuntimeError(
+                "non-primary Agent2 route produced no executable daily command"
+            )
         processed_command_names = [command.operation for command in commands]
 
         result = await asyncio.wait_for(
@@ -1852,9 +2179,6 @@ async def _process_stream_agent2_daily_if_enabled(
             ),
             timeout=settings.stream_processing_timeout_seconds,
         )
-        if _agent2_daily_should_fallback_to_legacy(result.command_results):
-            logger.info("agent2 daily edit unresolved, falling back to legacy user_id=%s actions=%s", user.id, result.command_results)
-            return None
     reply_message = result.message
     if phase2_primary and cognitive_v3 is not None:
         outcomes = daily_execution_outcomes(
@@ -1944,10 +2268,6 @@ async def _process_stream_agent2_daily_if_enabled(
         processed_command_names,
     )
     return "agent2_cognitive_v3_processed" if v3_execution_result is not None else "agent2_daily_processed"
-
-
-def _agent2_daily_should_fallback_to_legacy(actions: list[dict[str, Any]]) -> bool:
-    return agent2_daily_should_fallback_to_legacy(actions)
 
 
 def _store_pending_daily_candidate(
@@ -2232,6 +2552,97 @@ def _candidate_travel_status_label(value: str) -> str:
     }.get(str(value or "").strip(), "\u72b6\u6001\u5f85\u786e\u8ba4")
 
 
+def _performance_workflow_claims_batch(
+    active_submissions: list[Any],
+    turn_batch: SealedTurnBatch,
+) -> bool:
+    return any(
+        is_performance_reply_candidate(
+            metrics=submission_metrics(submission),
+            responses=list(submission.responses_json or []),
+            raw_input=fragment.text,
+            status=submission.status,
+        )
+        for fragment in turn_batch.fragments
+        for submission in active_submissions
+    )
+
+
+async def _require_agent2_batch_scope(
+    *,
+    session: Any,
+    user: Any,
+    dingtalk_user_id: str,
+    conversation_id: str,
+    turn_batch: SealedTurnBatch,
+    performance_service: PerformanceTaskService,
+    settings: Settings,
+    now: Any,
+) -> None:
+    """Validate trusted scope facts without interpreting the user's text."""
+
+    if len(turn_batch.fragments) <= 1:
+        return
+    events = list(
+        (
+            await session.scalars(
+                select(WebhookEvent).where(
+                    WebhookEvent.id.in_(turn_batch.event_ids)
+                )
+            )
+        ).all()
+    )
+    if len(events) != len(turn_batch.event_ids):
+        raise StreamBatchRequiresSerialProcessing(
+            "turn batch event set changed before execution"
+        )
+    if any(
+        event.status != "processing"
+        or event.dingtalk_user_id != dingtalk_user_id
+        for event in events
+    ):
+        raise StreamBatchRequiresSerialProcessing(
+            "turn batch event scope changed before execution"
+        )
+
+    # Reuse the existing performance workflow's own claim decision.  This
+    # adds no new wording rules: a claimed fragment stays on the exact serial
+    # path it used before turn batching, while unrelated Agent2 messages can
+    # still share one model turn.
+    active_performance = await performance_service.get_active_submissions(
+        session,
+        user.id,
+    )
+    if _performance_workflow_claims_batch(
+        active_performance,
+        turn_batch,
+    ):
+        raise StreamBatchRequiresSerialProcessing(
+            "performance workflow claimed a turn fragment"
+        )
+    if any(
+        looks_like_performance_reply_template(fragment.text)
+        for fragment in turn_batch.fragments
+    ):
+        raise StreamBatchRequiresSerialProcessing(
+            "performance template requires serial processing"
+        )
+
+    route = await resolve_tool_call_canary_route(
+        session,
+        user=user,
+        dingtalk_user_id=dingtalk_user_id,
+        settings=settings,
+        conversation_id=conversation_id,
+        source_message_id=turn_batch.source_message_id,
+        now=now,
+    )
+    if route.decision.owner != "tool_call_core":
+        raise StreamBatchRequiresSerialProcessing(
+            "Agent2 route is not batchable"
+        )
+
+
 async def _handle_job(
     *,
     job: StreamJob,
@@ -2240,7 +2651,8 @@ async def _handle_job(
     performance_service: PerformanceTaskService,
     report_service: DailyReportService,
     robot: DingTalkRobotClient,
-    turn_batch_coordinator: CanaryTurnBatchCoordinator | None = None,
+    turn_batch: SealedTurnBatch | None = None,
+    turn_batch_wait_seconds: float = 0.0,
 ) -> None:
     started_at = time.perf_counter()
     timings = _initial_stream_timings(job, started_at)
@@ -2253,7 +2665,13 @@ async def _handle_job(
     user_name: str | None = None
     report_id: str | None = None
     error_message: str | None = None
-    turn_batch: SealedTurnBatch | None = None
+    should_log_timing = True
+    if turn_batch is not None:
+        timings["turn_batch_wait_seconds"] = _safe_seconds(
+            turn_batch_wait_seconds
+        )
+        timings["turn_batch_id"] = turn_batch.batch_id
+        timings["turn_batch_size"] = len(turn_batch.fragments)
     logger.info(
         "stream job start idempotency_key=%s user=%s message=%s",
         idempotency_key,
@@ -2355,6 +2773,23 @@ async def _handle_job(
                 return
 
             user_name = user.name
+            conversation_id = str(
+                getattr(job.message, "conversation_id", "") or ""
+            )
+            canary_now = now_in_timezone(
+                user.timezone or settings.timezone
+            )
+            if turn_batch is not None:
+                await _require_agent2_batch_scope(
+                    session=session,
+                    user=user,
+                    dingtalk_user_id=dingtalk_user_id,
+                    conversation_id=conversation_id,
+                    turn_batch=turn_batch,
+                    performance_service=performance_service,
+                    settings=settings,
+                    now=canary_now,
+                )
             logger.info("checking stream performance task user_id=%s", user.id)
             performance_result = await asyncio.wait_for(
                 performance_service.submit_text(
@@ -2367,6 +2802,10 @@ async def _handle_job(
                 timeout=settings.stream_processing_timeout_seconds,
             )
             if performance_result is not None:
+                if turn_batch is not None and len(turn_batch.fragments) > 1:
+                    raise StreamBatchRequiresSerialProcessing(
+                        "performance route changed after batch admission"
+                    )
                 response_payload = {"msgtype": "text", "text": {"content": performance_result.message}}
                 await mark_webhook_event_processed(
                     session,
@@ -2388,7 +2827,26 @@ async def _handle_job(
                 status = "performance_processed"
                 return
 
+            if (
+                turn_batch is not None
+                and len(turn_batch.fragments) > 1
+                and _performance_workflow_claims_batch(
+                    await performance_service.get_active_submissions(
+                        session,
+                        user.id,
+                    ),
+                    turn_batch,
+                )
+            ):
+                raise StreamBatchRequiresSerialProcessing(
+                    "performance route changed after batch admission"
+                )
+
             if looks_like_performance_reply_template(job.text):
+                if turn_batch is not None and len(turn_batch.fragments) > 1:
+                    raise StreamBatchRequiresSerialProcessing(
+                        "performance template changed after batch admission"
+                    )
                 response_payload = {"msgtype": "text", "text": {"content": NO_ACTIVE_PERFORMANCE_TASK_MESSAGE}}
                 await mark_webhook_event_processed(
                     session,
@@ -2403,64 +2861,6 @@ async def _handle_job(
                 _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, NO_ACTIVE_PERFORMANCE_TASK_MESSAGE))
                 status = "performance_no_active_task"
                 return
-
-            conversation_id = str(
-                getattr(job.message, "conversation_id", "") or ""
-            )
-            canary_now = now_in_timezone(
-                user.timezone or settings.timezone
-            )
-            if (
-                turn_batch_coordinator is not None
-                and job.event_id is not None
-            ):
-                try:
-                    route_probe = await resolve_tool_call_canary_route(
-                        session,
-                        user=user,
-                        dingtalk_user_id=dingtalk_user_id,
-                        settings=settings,
-                        conversation_id=conversation_id,
-                        source_message_id=idempotency_key,
-                        now=canary_now,
-                    )
-                except Exception:
-                    route_probe = None
-                    logger.exception(
-                        "turn batch canary route probe failed"
-                    )
-                if (
-                    route_probe is not None
-                    and route_probe.decision.owner == "tool_call_core"
-                ):
-                    batch_started = time.perf_counter()
-                    turn_batch = await turn_batch_coordinator.collect(
-                        fragment=TurnFragment(
-                            event_id=event.id,
-                            source_message_id=idempotency_key,
-                            dingtalk_user_id=dingtalk_user_id,
-                            conversation_id=(
-                                conversation_id
-                                or (
-                                    "dingtalk:dingtalk_stream_text:"
-                                    f"{dingtalk_user_id}"
-                                )
-                            ),
-                            text=job.text,
-                            received_at=event.received_at,
-                        ),
-                    )
-                    timings["turn_batch_wait_seconds"] = _elapsed_seconds(
-                        batch_started
-                    )
-                    if turn_batch is not None:
-                        timings["turn_batch_id"] = turn_batch.batch_id
-                        timings["turn_batch_size"] = len(
-                            turn_batch.fragments
-                        )
-                        if not turn_batch.is_leader(event.id):
-                            status = "tool_call_canary_batched_follower"
-                            return
 
             turn_user_messages = (
                 turn_batch.user_messages
@@ -2495,9 +2895,18 @@ async def _handle_job(
                     user.timezone or settings.timezone
                 ),
             )
+            _apply_canary_observability(timings, tool_call_canary)
+            if (
+                turn_batch is not None
+                and len(turn_batch.fragments) > 1
+                and tool_call_canary.owner != "tool_call_core"
+            ):
+                raise StreamBatchRequiresSerialProcessing(
+                    "Agent2 route changed after batch admission"
+                )
             if tool_call_canary.handled:
                 reply_text = tool_call_canary.message
-                response_payload = build_canary_response_payload(
+                response_payload = build_canary_persisted_response_payload(
                     tool_call_canary
                 )
                 await _mark_canary_turn_closed(
@@ -2514,16 +2923,28 @@ async def _handle_job(
                 )
                 commit_start = time.perf_counter()
                 await session.commit()
+                timings[
+                    "agent2_business_transaction_status"
+                ] = "committed"
                 _add_timing(
                     timings,
                     "db_commit_seconds",
                     _elapsed_seconds(commit_start),
                 )
-                send_seconds = 0.0
+                send_observation = StreamReplyObservation(
+                    elapsed_seconds=0.0,
+                    transport_status=(
+                        "not_attempted"
+                        if tool_call_canary.messages_enabled
+                        else "suppressed"
+                    ),
+                    provider_accepted=False,
+                    delivery_verified=False,
+                )
 
                 async def send_canary_reply() -> None:
-                    nonlocal send_seconds
-                    send_seconds = await _reply(
+                    nonlocal send_observation
+                    send_observation = await _reply_with_observability(
                         handler,
                         robot,
                         job,
@@ -2534,15 +2955,10 @@ async def _handle_job(
                     tool_call_canary,
                     send_canary_reply,
                 )
-                _add_timing(
-                    timings,
-                    "dingtalk_send_seconds",
-                    send_seconds,
-                )
-                status = (
-                    "tool_call_canary_processed"
-                    if tool_call_canary.owner == "tool_call_core"
-                    else "tool_call_canary_blocked"
+                _apply_reply_observability(timings, send_observation)
+                status = _canary_stream_status(
+                    tool_call_canary,
+                    send_observation,
                 )
                 return
 
@@ -2550,141 +2966,25 @@ async def _handle_job(
                 raise RuntimeError(
                     "canary route changed after the turn batch was sealed"
                 )
-
-            agent2_status = None
-            if tool_call_canary.owner != "agent1":
-                agent2_status = await _process_stream_agent2_daily_if_enabled(
-                    session=session,
-                    user=user,
-                    event=event,
-                    job=job,
-                    handler=handler,
-                    robot=robot,
-                    llm_client=report_service.extractor.client,
-                    settings=settings,
-                    performance_service=performance_service,
-                    timings=timings,
-                )
-            if agent2_status is not None:
-                status = agent2_status
-                return
-
-            _, shadow, context_pack, daily_report = await _evaluate_stream_daily_shadow(
-                session=session,
-                user=user,
-                job=job,
-                performance_service=performance_service,
-                settings=settings,
+            raise RuntimeError(
+                "Agent2 Tool-Call Core did not handle a production stream turn"
             )
-            gate_decision = shadow.gate_decision
-            if gate_decision.block_legacy_daily:
-                daily_candidate_clarification = build_daily_candidate_clarification(
-                    raw_text=job.text,
-                    context_pack=context_pack,
-                )
-                reply_text = await _agent2_blocked_reply_text(
-                    shadow=shadow,
-                    raw_text=job.text,
-                    llm_client=report_service.extractor.client,
-                    context_pack=context_pack,
-                    daily_candidate_clarification=daily_candidate_clarification,
-                )
-                if daily_candidate_clarification is not None:
-                    _store_pending_daily_candidate(
-                        daily_report,
-                        daily_candidate_clarification,
-                        settings=settings,
-                    )
-                response_payload = {"msgtype": "text", "text": {"content": reply_text}}
-                await mark_webhook_event_processed(
-                    session,
-                    event,
-                    report_id=None,
-                    response_payload=response_payload,
-                    now=now_in_timezone(settings.timezone),
-                )
-                commit_start = time.perf_counter()
-                await session.commit()
-                _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
-                _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
-                status = "workflow_gate_blocked"
-                return
-
-            logger.info("submitting stream report user_id=%s date_timezone=%s", user.id, user.timezone)
-            result = await asyncio.wait_for(
-                report_service.submit_text(
-                    session,
-                    user=user,
-                    raw_input=job.text,
-                    source="dingtalk_stream_text",
-                ),
-                timeout=settings.stream_processing_timeout_seconds,
-            )
-            _apply_report_timings(timings, result.timings)
-            report_id = result.report_id
-            if not result.report_saved:
-                await maybe_create_report_interaction_event(
-                    session,
-                    user=user,
-                    report=None,
-                    report_date=result.report_date,
-                    message_text=job.text,
-                    llm_decision_json={
-                        "reply_kind": result.reply_kind,
-                        "status": result.status,
-                        "report_saved": result.report_saved,
-                        "timings": result.timings,
-                    },
-                    backend_action=result.reply_kind,
-                    before_snapshot_json={},
-                    after_snapshot_json={
-                        "report_id": result.report_id or "",
-                        "status": result.status,
-                        "today_work_count": len(result.today_work or []),
-                        "problems_count": len(result.problems or []),
-                        "tomorrow_plan_count": len(result.tomorrow_plan or []),
-                        "today_work": list(result.today_work or [])[:20],
-                        "problems": list(result.problems or [])[:20],
-                        "tomorrow_plan": list(result.tomorrow_plan or [])[:20],
-                    },
-                    report_id_override=uuid.UUID(result.report_id) if result.report_id else None,
-                )
-            logger.info(
-                "stream report submitted report_id=%s status=%s score=%s",
-                result.report_id,
-                result.status,
-                result.completeness_score,
-            )
-            response_payload = {"msgtype": "text", "text": {"content": result.message}}
-            await mark_webhook_event_processed(
-                session,
-                event,
-                report_id=uuid.UUID(result.report_id) if result.report_id else None,
-                response_payload=response_payload,
-                now=now_in_timezone(settings.timezone),
-            )
-            commit_start = time.perf_counter()
-            await session.commit()
-            _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
-            logger.info("stream report committed report_id=%s event_key=%s", result.report_id, idempotency_key)
-            _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, result.message))
-            await enqueue_daily_report_outbox_best_effort(
-                session_factory=AsyncSessionLocal,
-                settings=settings,
-                user=user,
-                result=result,
-                raw_text=job.text,
-                source="dingtalk_stream_text",
-                source_id=idempotency_key,
-            )
-            status = "processed"
+        except StreamBatchRequiresSerialProcessing:
+            status = "turn_batch_requires_serial_processing"
+            should_log_timing = False
+            await session.rollback()
+            raise
         except CanaryIngressExecutionError as exc:
             status = "tool_call_canary_failed"
             error_message = exc.error_type
             await session.rollback()
             failure_outcome = exc.outcome()
+            _apply_canary_observability(timings, failure_outcome)
+            timings[
+                "agent2_business_transaction_status"
+            ] = "rolled_back"
             reply_text = failure_outcome.message
-            response_payload = build_canary_response_payload(
+            response_payload = build_canary_persisted_response_payload(
                 failure_outcome
             )
             if event is not None:
@@ -2709,11 +3009,20 @@ async def _handle_job(
                     "db_commit_seconds",
                     _elapsed_seconds(commit_start),
                 )
-            send_seconds = 0.0
+            send_observation = StreamReplyObservation(
+                elapsed_seconds=0.0,
+                transport_status=(
+                    "not_attempted"
+                    if failure_outcome.messages_enabled
+                    else "suppressed"
+                ),
+                provider_accepted=False,
+                delivery_verified=False,
+            )
 
             async def send_canary_failure() -> None:
-                nonlocal send_seconds
-                send_seconds = await _reply(
+                nonlocal send_observation
+                send_observation = await _reply_with_observability(
                     handler,
                     robot,
                     job,
@@ -2724,10 +3033,10 @@ async def _handle_job(
                 failure_outcome,
                 send_canary_failure,
             )
-            _add_timing(
-                timings,
-                "dingtalk_send_seconds",
-                send_seconds,
+            _apply_reply_observability(timings, send_observation)
+            status = _canary_stream_status(
+                failure_outcome,
+                send_observation,
             )
         except LLMOutputError as exc:
             status = "llm_failed"
@@ -2757,6 +3066,13 @@ async def _handle_job(
             status = "failed"
             error_message = exc.__class__.__name__
             await session.rollback()
+            if (
+                timings.get("agent2_business_transaction_status")
+                == "pending"
+            ):
+                timings[
+                    "agent2_business_transaction_status"
+                ] = "rolled_back"
             reply_text = TEXT_PROCESS_FAILED
             logger.exception("stream job failed")
             if event is not None:
@@ -2779,18 +3095,65 @@ async def _handle_job(
                 _add_timing(timings, "db_commit_seconds", _elapsed_seconds(commit_start))
             _add_timing(timings, "dingtalk_send_seconds", await _reply(handler, robot, job, reply_text))
         finally:
-            total_base = job.received_at_monotonic or started_at
-            timings["total_seconds"] = round(max(0.0, time.perf_counter() - total_base), 4)
-            _log_stream_timing(
-                job=job,
-                dingtalk_user_id=dingtalk_user_id,
-                user_name=user_name,
-                timings=timings,
-                status=status,
-                report_id=report_id,
-                error=error_message,
-            )
+            if should_log_timing:
+                total_base = job.received_at_monotonic or started_at
+                timings["total_seconds"] = round(max(0.0, time.perf_counter() - total_base), 4)
+                _log_stream_timing(
+                    job=job,
+                    dingtalk_user_id=dingtalk_user_id,
+                    user_name=user_name,
+                    timings=timings,
+                    status=status,
+                    report_id=report_id,
+                    error=error_message,
+                )
             logger.info("stream job done key=%s", idempotency_key)
+
+
+def _log_batched_stream_follower(
+    *,
+    job: StreamJob,
+    stream_batch: SealedStreamJobBatch,
+    worker_started_at: float,
+) -> None:
+    timings = _initial_stream_timings(job, worker_started_at)
+    timings["turn_batch_wait_seconds"] = _safe_seconds(
+        stream_batch.wait_seconds
+    )
+    timings["turn_batch_id"] = stream_batch.turn_batch.batch_id
+    timings["turn_batch_size"] = len(
+        stream_batch.turn_batch.fragments
+    )
+    total_base = job.received_at_monotonic or worker_started_at
+    timings["total_seconds"] = round(
+        max(0.0, time.perf_counter() - total_base),
+        4,
+    )
+    _log_stream_timing(
+        job=job,
+        dingtalk_user_id=_stream_user_id(job.message),
+        user_name=None,
+        timings=timings,
+        status="tool_call_canary_batched_follower",
+    )
+
+
+async def _observe_batched_stream_follower(
+    *,
+    job: StreamJob,
+    stream_batch: SealedStreamJobBatch,
+    worker_started_at: float,
+) -> None:
+    try:
+        mode = await asyncio.shield(stream_batch.execution_done)
+    except asyncio.CancelledError:
+        return
+    if mode == "combined":
+        _log_batched_stream_follower(
+            job=job,
+            stream_batch=stream_batch,
+            worker_started_at=worker_started_at,
+        )
 
 
 async def _worker(
@@ -2801,23 +3164,102 @@ async def _worker(
     performance_service: PerformanceTaskService,
     report_service: DailyReportService,
     robot: DingTalkRobotClient,
-    turn_batch_coordinator: CanaryTurnBatchCoordinator,
+    turn_batch_coordinator: StreamJobBatchCoordinator | None,
+    conversation_locks: dict[str, asyncio.Lock],
 ) -> None:
     while True:
         job = await queue.get()
+        worker_started_at = time.perf_counter()
+        job = replace(
+            job,
+            worker_dequeued_at_monotonic=worker_started_at,
+        )
         try:
             logger.info("worker=%s processing message=%s", worker_id, job.message.message_id)
-            await _handle_job(
-                job=job,
-                handler=handler,
-                settings=settings,
-                performance_service=performance_service,
-                report_service=report_service,
-                robot=robot,
-                turn_batch_coordinator=turn_batch_coordinator,
+            stream_batch = (
+                await turn_batch_coordinator.collect(job)
+                if turn_batch_coordinator is not None
+                else None
             )
+            if stream_batch is not None and not stream_batch.is_leader(job):
+                asyncio.create_task(
+                    _observe_batched_stream_follower(
+                        job=job,
+                        stream_batch=stream_batch,
+                        worker_started_at=worker_started_at,
+                    )
+                )
+                continue
+            turn_key = _stream_turn_key(job)
+            lock = conversation_locks.setdefault(turn_key, asyncio.Lock())
+            batch_mode = "aborted"
+            try:
+                async with lock:
+                    if stream_batch is None:
+                        await _handle_job(
+                            job=job,
+                            handler=handler,
+                            settings=settings,
+                            performance_service=performance_service,
+                            report_service=report_service,
+                            robot=robot,
+                        )
+                    else:
+                        leader_job = stream_batch.jobs[0]
+                        try:
+                            await _handle_job(
+                                job=leader_job,
+                                handler=handler,
+                                settings=settings,
+                                performance_service=performance_service,
+                                report_service=report_service,
+                                robot=robot,
+                                turn_batch=stream_batch.turn_batch,
+                                turn_batch_wait_seconds=(
+                                    stream_batch.wait_seconds
+                                ),
+                            )
+                            batch_mode = "combined"
+                        except StreamBatchRequiresSerialProcessing:
+                            batch_mode = "serial"
+                            for member_job in stream_batch.jobs:
+                                await _handle_job(
+                                    job=member_job,
+                                    handler=handler,
+                                    settings=settings,
+                                    performance_service=performance_service,
+                                    report_service=report_service,
+                                    robot=robot,
+                                )
+            finally:
+                if (
+                    stream_batch is not None
+                    and turn_batch_coordinator is not None
+                ):
+                    await turn_batch_coordinator.complete(
+                        stream_batch,
+                        mode=batch_mode,
+                    )
         finally:
             queue.task_done()
+
+
+def _stream_turn_key(job: StreamJob) -> str:
+    """Serialize one user's messages inside one conversation in arrival order."""
+
+    message = job.message
+    user_id = str(
+        getattr(message, "sender_staff_id", "")
+        or getattr(message, "sender_id", "")
+        or ""
+    ).strip()
+    conversation_id = str(
+        getattr(message, "conversation_id", "") or ""
+    ).strip()
+    if user_id and conversation_id:
+        return f"{user_id}:{conversation_id}"
+    message_id = str(getattr(message, "message_id", "") or "").strip()
+    return f"unbound:{message_id or id(job)}"
 
 
 async def run_stream() -> None:
@@ -2831,14 +3273,17 @@ async def run_stream() -> None:
     performance_service = PerformanceTaskService(settings)
     report_service = DailyReportService(settings, DailyReportExtractor(llm_client))
     queue: asyncio.Queue[StreamJob] = asyncio.Queue(maxsize=settings.stream_queue_size)
+    conversation_locks: dict[str, asyncio.Lock] = {}
     handler = DailyReviewStreamHandler(queue, robot, settings)
-    turn_batch_coordinator = CanaryTurnBatchCoordinator(
-        quiet_seconds=(
-            settings.agent2_canary_turn_batch_quiet_seconds
-        ),
-        max_window_seconds=(
-            settings.agent2_canary_turn_batch_max_window_seconds
-        ),
+    turn_batch_coordinator = StreamJobBatchCoordinator(
+        CanaryTurnBatchCoordinator(
+            quiet_seconds=(
+                settings.agent2_canary_turn_batch_quiet_seconds
+            ),
+            max_window_seconds=(
+                settings.agent2_canary_turn_batch_max_window_seconds
+            ),
+        )
     )
 
     credential = dingtalk_stream.Credential(settings.dingtalk_app_key, settings.dingtalk_app_secret)
@@ -2856,6 +3301,7 @@ async def run_stream() -> None:
                 report_service,
                 robot,
                 turn_batch_coordinator,
+                conversation_locks,
             )
         )
         for i in range(settings.stream_worker_count)

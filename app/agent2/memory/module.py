@@ -61,6 +61,24 @@ class PreferredSalutationValue(_FrozenModel):
         return value
 
 
+class AssistantPreferredNameValue(_FrozenModel):
+    name: str = Field(min_length=1, max_length=24)
+
+    @field_validator("name")
+    @classmethod
+    def name_must_be_a_single_safe_label(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("assistant preferred name is invalid")
+        if not all(
+            character.isalnum()
+            or character in {" ", "-", "_", "·", "・"}
+            for character in value
+        ):
+            raise ValueError("assistant preferred name is invalid")
+        return value
+
+
 class SavedViewValue(_FrozenModel):
     view_code: str = Field(min_length=1, max_length=128)
     scope: Literal["self"]
@@ -91,6 +109,7 @@ PersonalMemoryValue = (
     | TogglePreferenceValue
     | OutputFormatPreferenceValue
     | PreferredSalutationValue
+    | AssistantPreferredNameValue
     | SavedViewValue
     | TerminologyAliasValue
 )
@@ -314,6 +333,8 @@ def _memory_value_model(
         value_model = OutputFormatPreferenceValue
     elif memory_key == "response.preferred_salutation":
         value_model = PreferredSalutationValue
+    elif memory_key == "assistant.preferred_name":
+        value_model = AssistantPreferredNameValue
     if memory_type == "response_preference":
         if value_model is None:
             raise ValueError(

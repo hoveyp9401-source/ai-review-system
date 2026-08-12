@@ -13,6 +13,7 @@ from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
     CompletePreviousPlanArgs,
     ConfirmReportArgs,
+    CorrectDailyReportDateArgs,
     CopyPreviousToTodayArgs,
     DeleteDailyItemsArgs,
     EditDailyItemsArgs,
@@ -22,6 +23,7 @@ from app.agent2.tool_calling.contracts import (
     RequestClearReportArgs,
 )
 from app.agent2.tool_calling.idempotency import build_write_idempotency_key
+from app.agent2.tool_calling.reporting_date import default_daily_write_date
 from app.agent2.tool_calling.sandbox_contracts import (
     SandboxExecutionContext,
 )
@@ -126,10 +128,33 @@ class SandboxDailyExecutor:
         request: SandboxHandlerRequest,
     ) -> SandboxHandlerOutcome:
         arguments = self._arguments(request, AddDailyItemsArgs)
-        report_date = self._resolve(
-            arguments.date_expression,
-            arguments.proposed_date,
-        )
+        if arguments.date_selection == "server_default":
+            report_date = default_daily_write_date(
+                now=self._context.now,
+                timezone=self._context.timezone,
+            )
+        elif arguments.date_selection == "trusted_report":
+            report_id = str(arguments.report_id)
+            trusted = await self._owned_report(report_id, required=True)
+            report_date = date.fromisoformat(str(trusted["report_date"]))
+        elif arguments.date_selection == "agent2_semantic":
+            report_date = arguments.proposed_date
+            local_today = self._context.now.astimezone(
+                ZoneInfo(self._context.timezone)
+            ).date()
+            default_date = default_daily_write_date(
+                now=self._context.now,
+                timezone=self._context.timezone,
+            )
+            if report_date not in {default_date, local_today}:
+                raise SandboxExecutionError(
+                    "UNTRUSTED_SEMANTIC_REPORT_DATE"
+                )
+        else:
+            report_date = self._resolve(
+                arguments.date_expression,
+                arguments.proposed_date,
+            )
         report_id = self._report_id(report_date)
         report = await self._owned_report(report_id, required=False)
         before_version = int(report["version"]) if report is not None else 0
@@ -150,7 +175,21 @@ class SandboxDailyExecutor:
                 continue
             additions.append(item)
             seen_content.add(content_key)
-        if additions:
+        acknowledged = set(
+            report.get("acknowledged_empty_fields", ())
+            if report is not None
+            else ()
+        )
+        for field_name in arguments.acknowledged_empty_fields:
+            if any(
+                str(item["field"]) == field_name
+                for item in existing_items
+            ):
+                raise SandboxExecutionError(
+                    "EXPLICIT_EMPTY_FIELD_CONTAINS_ITEMS"
+                )
+            acknowledged.add(field_name)
+        if additions or arguments.acknowledged_empty_fields or arguments.submit_after_write:
             if report is None:
                 report = self._new_report(report_id, report_date)
             next_positions = self._next_positions(existing_items)
@@ -185,9 +224,44 @@ class SandboxDailyExecutor:
                     create_only=True,
                 )
                 next_positions[item.field] += 1
+            populated = {
+                str(item["field"])
+                for item in (*existing_items, *(
+                    {
+                        "field": item.field,
+                    }
+                    for item in additions
+                ))
+            }
+            if arguments.submit_after_write and any(
+                field_name not in populated
+                and field_name not in acknowledged
+                for field_name in (
+                    "today_work",
+                    "problems",
+                    "tomorrow_plan",
+                )
+            ):
+                raise SandboxExecutionError("REPORT_INCOMPLETE")
+            version_delta = int(bool(additions)) + len(
+                set(arguments.acknowledged_empty_fields)
+                - set(report.get("acknowledged_empty_fields", ()))
+            )
+            version_delta += int(
+                arguments.submit_after_write
+                and str(report.get("status")) != "completed"
+            )
             await self._save_report(
-                report,
-                version=before_version + 1,
+                {
+                    **report,
+                    "acknowledged_empty_fields": sorted(acknowledged),
+                    "status": (
+                        "completed"
+                        if arguments.submit_after_write
+                        else report["status"]
+                    ),
+                },
+                version=before_version + version_delta,
             )
         return SandboxHandlerOutcome(
             target_type="daily_report",
@@ -342,13 +416,9 @@ class SandboxDailyExecutor:
             arguments.source_date_expression,
             arguments.proposed_source_date,
         )
-        source_id = str(arguments.report_id)
-        if source_id != self._report_id(source_date):
-            raise SandboxExecutionError("SOURCE_REPORT_DATE_MISMATCH")
-        source = await self._versioned_report(
-            source_id,
-            arguments.expected_version,
-        )
+        source_id = self._report_id(source_date)
+        source = await self._owned_report(source_id, required=True)
+        source_version = int(source["version"])
         target_date = self._today()
         target_id = self._report_id(target_date)
         target = await self._owned_report(target_id, required=False)
@@ -393,7 +463,7 @@ class SandboxDailyExecutor:
                         "provenance": {
                             "kind": "sandbox_copy_previous",
                             "source_report_id": source_id,
-                            "source_report_version": arguments.expected_version,
+                            "source_report_version": source_version,
                             "source_item_id": source_item["item_id"],
                         },
                         "created_at": self._now(),
@@ -403,6 +473,103 @@ class SandboxDailyExecutor:
                 )
                 next_positions[str(source_item["field"])] += 1
             await self._save_report(target, version=target_version + 1)
+        return SandboxHandlerOutcome(
+            target_type="daily_report",
+            target_id=target_id,
+            idempotency_key=key,
+        )
+
+    async def correct_daily_report_date(
+        self,
+        request: SandboxHandlerRequest,
+    ) -> SandboxHandlerOutcome:
+        arguments = self._arguments(
+            request,
+            CorrectDailyReportDateArgs,
+        )
+        source_date = self._resolve(
+            arguments.source_date_expression,
+            arguments.proposed_source_date,
+        )
+        target_date = self._resolve(
+            arguments.target_date_expression,
+            arguments.proposed_target_date,
+        )
+        if source_date == target_date:
+            raise SandboxExecutionError(
+                "SOURCE_AND_TARGET_DATE_MUST_DIFFER"
+            )
+        source_id = self._report_id(source_date)
+        target_id = self._report_id(target_date)
+        source = await self._owned_report(source_id, required=True)
+        target = await self._owned_report(target_id, required=False)
+        if target is not None:
+            raise SandboxExecutionError("TARGET_REPORT_ALREADY_EXISTS")
+        source_items = await self._items_for_report(source_id)
+        acknowledged = set(
+            source.get("acknowledged_empty_fields", ())
+        )
+        for field_name in arguments.acknowledged_empty_fields:
+            if any(item["field"] == field_name for item in source_items):
+                raise SandboxExecutionError(
+                    "EXPLICIT_EMPTY_FIELD_CONTAINS_ITEMS"
+                )
+            acknowledged.add(field_name)
+        populated = {str(item["field"]) for item in source_items}
+        if arguments.submit_after_correction and any(
+            field_name not in populated and field_name not in acknowledged
+            for field_name in (
+                "today_work",
+                "problems",
+                "tomorrow_plan",
+            )
+        ):
+            raise SandboxExecutionError("REPORT_INCOMPLETE")
+        key = self._write_key(
+            request,
+            target_object=(
+                f"daily_report_relocation:{source_id}:{target_id}"
+            ),
+            expected_version=int(source["version"]),
+        )
+        version_delta = 1 + len(
+            set(arguments.acknowledged_empty_fields)
+            - set(source.get("acknowledged_empty_fields", ()))
+        )
+        if (
+            arguments.submit_after_correction
+            and str(source.get("status")) != "completed"
+        ):
+            version_delta += 1
+        await self._session.delete_record("daily_reports", source_id)
+        await self._session.upsert_record(
+            "daily_reports",
+            target_id,
+            {
+                **source,
+                "report_id": target_id,
+                "report_date": target_date.isoformat(),
+                "version": int(source["version"]) + version_delta,
+                "status": (
+                    "completed"
+                    if arguments.submit_after_correction
+                    else source["status"]
+                ),
+                "acknowledged_empty_fields": sorted(acknowledged),
+                "updated_at": self._now(),
+            },
+            create_only=True,
+        )
+        for item in source_items:
+            await self._session.upsert_record(
+                "daily_items",
+                str(item["item_id"]),
+                {
+                    **item,
+                    "report_id": target_id,
+                    "updated_at": self._now(),
+                },
+            )
         return SandboxHandlerOutcome(
             target_type="daily_report",
             target_id=target_id,

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CanaryOwner = Literal["existing_runtime", "agent1", "tool_call_core", "blocked"]
+CanaryOwner = Literal["tool_call_core", "blocked"]
 
 
 @dataclass(frozen=True)
@@ -67,24 +67,26 @@ def decide_canary_route(
 
     if control is None:
         return CanaryRouteDecision(
-            owner="existing_runtime",
-            reason="tool_call_canary_not_managed",
+            owner="blocked",
+            reason="tool_call_canary_control_missing",
+            claimed=True,
         )
     if not _identity_targets_control(control, identity):
         return CanaryRouteDecision(
-            owner="existing_runtime",
+            owner="blocked",
             reason="tool_call_canary_identity_not_managed",
+            claimed=True,
         )
     assert identity is not None
     if identity.exact_binding_count != 1:
         return CanaryRouteDecision(
-            owner="agent1",
+            owner="blocked",
             reason="tool_call_canary_identity_ambiguous",
             claimed=True,
         )
     if not control.enabled:
         return CanaryRouteDecision(
-            owner="agent1",
+            owner="blocked",
             reason="tool_call_canary_switch_closed",
             claimed=True,
         )
@@ -95,7 +97,7 @@ def decide_canary_route(
             claimed=True,
         )
 
-    if not 1 <= active_canary_control_limit <= 70:
+    if not 1 <= active_canary_control_limit <= 74:
         return CanaryRouteDecision(
             owner="blocked",
             reason="tool_call_canary_cohort_limit_invalid",

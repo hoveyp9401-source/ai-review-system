@@ -9,6 +9,7 @@ from app.legal_daily_dashboard.domain import (
     DailyReportRecord,
     DashboardActor,
     DashboardRecords,
+    MemberRecord,
     TeamRecord,
 )
 from app.legal_daily_dashboard.repository import DashboardRepository
@@ -56,7 +57,8 @@ class ManagedDailyQuery:
         now: datetime,
     ) -> dict[str, Any]:
         visible_teams = await self._repository.list_member_teams(
-            tenant_id=actor.tenant_id
+            tenant_id=actor.tenant_id,
+            on_date=request.report_date,
         )
         if request.view == "department_summary":
             if (
@@ -72,6 +74,10 @@ class ManagedDailyQuery:
             start_date=request.report_date,
             end_date=request.report_date,
         )
+        query_scope_teams = _query_scope_teams(
+            visible_teams,
+            records.members,
+        )
         if request.view == "department_summary":
             return self._department_summary(
                 report_date=request.report_date,
@@ -81,7 +87,7 @@ class ManagedDailyQuery:
             )
         if request.view == "team_reports":
             team = _resolve_required_team(
-                visible_teams,
+                query_scope_teams,
                 request.team_name,
             )
             return self._team_reports(
@@ -92,19 +98,22 @@ class ManagedDailyQuery:
             )
         if request.view == "missing_submissions":
             selected_team = _resolve_optional_team(
-                visible_teams,
+                query_scope_teams,
                 request.team_name,
             )
             return self._missing_submissions(
                 request=request,
                 records=records,
-                visible_teams=visible_teams,
+                query_scope_teams=query_scope_teams,
                 selected_team=selected_team,
                 now=now,
             )
         if request.view != "member_report" or not request.member_name:
             raise ValueError("unsupported managed daily query")
-        team = _resolve_optional_team(visible_teams, request.team_name)
+        team = _resolve_optional_team(
+            query_scope_teams,
+            request.team_name,
+        )
         candidates = tuple(
             member
             for member in records.members
@@ -115,7 +124,7 @@ class ManagedDailyQuery:
             raise DashboardNotFound("member not found")
         if len(candidates) > 1:
             teams_by_ref = {
-                item.ref: item for item in visible_teams
+                item.ref: item for item in query_scope_teams
             }
             raise ManagedDailyQueryAmbiguous(
                 tuple(
@@ -129,7 +138,7 @@ class ManagedDailyQuery:
                 )
             )
         member = candidates[0]
-        team_by_ref = {item.ref: item for item in visible_teams}
+        team_by_ref = {item.ref: item for item in query_scope_teams}
         member_team = team_by_ref.get(member.team_ref)
         if member_team is None:
             raise DashboardNotFound("member not found")
@@ -168,7 +177,10 @@ class ManagedDailyQuery:
             "submission": {
                 "status": status_label,
                 "submitted_at": (
-                    report.submitted_at.isoformat()
+                    _local_datetime_iso(
+                        report.submitted_at,
+                        now=now,
+                    )
                     if report is not None
                     and report.submitted_at is not None
                     else None
@@ -219,7 +231,10 @@ class ManagedDailyQuery:
                     "name": member.name,
                     "status": status_label,
                     "submitted_at": (
-                        report.submitted_at.isoformat()
+                        _local_datetime_iso(
+                            report.submitted_at,
+                            now=now,
+                        )
                         if report is not None
                         and report.submitted_at is not None
                         else None
@@ -273,15 +288,15 @@ class ManagedDailyQuery:
         *,
         request: ManagedDailyQueryRequest,
         records: DashboardRecords,
-        visible_teams: tuple[TeamRecord, ...],
+        query_scope_teams: tuple[TeamRecord, ...],
         selected_team: TeamRecord | None,
         now: datetime,
     ) -> dict[str, Any]:
-        team_by_ref = {team.ref: team for team in visible_teams}
-        visible_team_refs = (
+        team_by_ref = {team.ref: team for team in query_scope_teams}
+        selected_team_refs = (
             {selected_team.ref}
             if selected_team is not None
-            else set(team_by_ref)
+            else None
         )
         obligation_by_member = {
             item.member_ref: item
@@ -303,7 +318,10 @@ class ManagedDailyQuery:
             "exempt": [],
         }
         for member in records.members:
-            if member.team_ref not in visible_team_refs:
+            if (
+                selected_team_refs is not None
+                and member.team_ref not in selected_team_refs
+            ):
                 continue
             report = report_by_member.get(member.ref)
             state, _, confirmation = classify_submission(
@@ -312,11 +330,11 @@ class ManagedDailyQuery:
                 now=now,
             )
             team = team_by_ref.get(member.team_ref)
-            if team is None:
-                continue
             fact = {
                 "name": member.name,
-                "team_name": team.name,
+                "team_name": (
+                    team.name if team is not None else "未分组"
+                ),
             }
             if state in {"submitted", "pending_confirmation"}:
                 grouped["completed"].append(fact)
@@ -335,7 +353,7 @@ class ManagedDailyQuery:
             "scope_name": (
                 _team_display_label(selected_team)
                 if selected_team is not None
-                else "全部团队"
+                else _department_scope_name(query_scope_teams)
             ),
             "responsibility_data_complete": not grouped[
                 "responsibility_unknown"
@@ -353,6 +371,90 @@ class ManagedDailyQuery:
         }
 
 
+def _query_scope_teams(
+    visible_teams: tuple[TeamRecord, ...],
+    members: tuple[MemberRecord, ...],
+) -> tuple[TeamRecord, ...]:
+    """Add factual non-subdepartment scopes without inventing an eighth team."""
+
+    result = list(visible_teams)
+    known_refs = {team.ref for team in visible_teams}
+    common_department = _department_scope_name(visible_teams)
+    for member in members:
+        if member.team_ref in known_refs:
+            continue
+        raw_name = member.team_name.strip()
+        department_name = (
+            member.department_name.strip()
+            or (
+                common_department
+                if common_department != "全部人员"
+                else ""
+            )
+        )
+        team_name = (
+            "中心直属"
+            if _is_center_direct_scope(
+                team_name=raw_name,
+                department_name=department_name,
+                team_code=member.team_code,
+            )
+            else (raw_name or "未分组")
+        )
+        result.append(
+            TeamRecord(
+                ref=member.team_ref,
+                name=team_name,
+                department_name=department_name,
+                code=member.team_code,
+            )
+        )
+        known_refs.add(member.team_ref)
+    return tuple(result)
+
+
+def _is_center_direct_scope(
+    *,
+    team_name: str,
+    department_name: str,
+    team_code: str,
+) -> bool:
+    normalized_code = team_code.strip().casefold()
+    if normalized_code == "legal-center":
+        return True
+    if not department_name:
+        return False
+    return team_name in {
+        department_name,
+        f"{department_name}（中心层级）",
+    }
+
+
+def _local_datetime_iso(
+    value: datetime,
+    *,
+    now: datetime,
+) -> str:
+    """Expose timestamps in the authenticated query timezone when available."""
+
+    if value.tzinfo is None or now.tzinfo is None:
+        return value.isoformat()
+    return value.astimezone(now.tzinfo).isoformat()
+
+
+def _department_scope_name(
+    teams: tuple[TeamRecord, ...],
+) -> str:
+    names = tuple(
+        dict.fromkeys(
+            team.department_name.strip()
+            for team in teams
+            if team.department_name.strip()
+        )
+    )
+    return names[0] if len(names) == 1 else "全部人员"
+
+
 def _resolve_optional_team(
     teams: tuple[TeamRecord, ...],
     team_name: str | None,
@@ -362,7 +464,8 @@ def _resolve_optional_team(
     candidates = tuple(
         team
         for team in teams
-        if _same_name(team.name, team_name)
+        if _matches_team_name(team.name, team_name)
+        or _same_name(_team_display_label(team), team_name)
         or _same_name(_team_label(team), team_name)
     )
     if not candidates:
@@ -424,7 +527,9 @@ def _team_candidate(
     if team is None:
         return {"team_name": ""}
     candidate = {"team_name": team.name}
-    label = _team_label(team)
+    # Safe user-facing facts may include the business hierarchy, but not
+    # internal storage codes such as ``monthly-admin`` or ``team-01``.
+    label = _team_display_label(team)
     if label != team.name:
         candidate["team_label"] = label
     return candidate
@@ -467,6 +572,25 @@ def _summary_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
 
 def _same_name(left: str, right: str) -> bool:
     return _normalized_name(left) == _normalized_name(right)
+
+
+def _matches_team_name(official_name: str, requested_name: str) -> bool:
+    official = _normalized_name(official_name).replace(" ", "")
+    requested = _normalized_name(requested_name).replace(" ", "")
+    if not official or not requested:
+        return False
+    if official == requested:
+        return True
+    # Accept a conservative organizational abbreviation such as
+    # “综合部” -> “综合管理部”. The resolver still rejects the match when
+    # more than one visible team shares that prefix (for example “法务部”).
+    for suffix in ("中心", "部门", "部", "团队", "组", "室", "科", "处"):
+        if not requested.endswith(suffix) or not official.endswith(suffix):
+            continue
+        prefix = requested[: -len(suffix)]
+        if len(prefix) >= 2 and official.startswith(prefix):
+            return True
+    return False
 
 
 def _normalized_name(value: str) -> str:

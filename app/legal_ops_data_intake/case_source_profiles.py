@@ -38,10 +38,28 @@ class CaseSourceProfile:
     constants: tuple[tuple[str, Any], ...] = ()
     preserve_unlinked_owner: bool = False
     preserve_unlinked_team: bool = False
+    closed_status_header: str = ""
+    closed_status_values: frozenset[str] = frozenset()
+    lifecycle_headers: tuple[str, ...] = ()
+    progress_headers: tuple[str, ...] = ()
+    plan_headers: tuple[str, ...] = ()
+    status_mappings: tuple[tuple[str, str], ...] = ()
 
     @property
     def field_map(self) -> dict[str, str]:
         return {field.key: field.source_header for field in self.fields}
+
+    def is_closed(self, raw: dict[str, Any]) -> bool:
+        if not self.closed_status_header:
+            return False
+        value = str(raw.get(self.closed_status_header) or "").strip()
+        return value in self.closed_status_values
+
+    def canonical_status(self, value: Any) -> str | None:
+        normalized = str(value or "").strip()
+        if not self.status_mappings:
+            return normalized
+        return dict(self.status_mappings).get(normalized)
 
 
 @dataclass(frozen=True)
@@ -76,6 +94,11 @@ class ParsedCaseSource:
                 }
                 for item in self.profile.fields
             ],
+            "daily_snapshot_fields": {
+                "lifecycle": list(self.profile.lifecycle_headers),
+                "progress": list(self.profile.progress_headers),
+                "plan": list(self.profile.plan_headers),
+            },
         }
 
 
@@ -83,7 +106,8 @@ _CANONICAL_COLUMNS = (
     TableColumn("source_case_id", "ERP案件ID", "text", required=True, unique=True),
     TableColumn("case_name", "案件名称", "text", required=True),
     TableColumn("case_number", "案号", "text"),
-    TableColumn("case_type", "案由", "text"),
+    TableColumn("case_type", "案件类型", "text"),
+    TableColumn("cause", "案由", "text"),
     TableColumn("plaintiff", "原告", "text"),
     TableColumn("defendant", "被告", "text"),
     TableColumn("third_party", "第三人", "text"),
@@ -101,7 +125,7 @@ _COLUMNS_BY_KEY = {column.key: column for column in _CANONICAL_COLUMNS}
 
 PLAINTIFF_CASE_MASTER = CaseSourceProfile(
     key="erp_plaintiff_case_master_v1",
-    version="1",
+    version="2",
     label="ERP原告案件底表",
     technical_source_system="ERP_PLAINTIFF_CASES",
     detection_headers=frozenset(
@@ -117,7 +141,7 @@ PLAINTIFF_CASE_MASTER = CaseSourceProfile(
         SourceField("source_case_id", "诉讼仲裁编号"),
         SourceField("case_name", "案件名称"),
         SourceField("case_number", "诉讼或仲裁案号"),
-        SourceField("case_type", "案由"),
+        SourceField("cause", "案由"),
         SourceField("defendant", "对方单位"),
         SourceField("owner_user_id", "承办法务"),
         SourceField("team_id", "法务部门"),
@@ -126,15 +150,54 @@ PLAINTIFF_CASE_MASTER = CaseSourceProfile(
         SourceField("filing_date", "正式立案日期"),
         SourceField("status", "案件状态"),
     ),
-    constants=(("our_litigation_position", "原告"),),
+    constants=(
+        ("case_type", "plaintiff_case"),
+        ("our_litigation_position", "原告"),
+    ),
     preserve_unlinked_owner=True,
     preserve_unlinked_team=True,
+    closed_status_header="案件状态",
+    closed_status_values=frozenset({"结案"}),
+    lifecycle_headers=(
+        "案件状态",
+        "拟诉阶段",
+        "正式立案日期",
+        "保全申请日期",
+        "保全裁定日期",
+        "一审判决时间",
+        "上诉时间",
+        "二审立案日期(年月日)",
+        "二审判决时间",
+        "文书生效时间",
+        "申请执行时间",
+        "执行立案时间",
+        "终结本次执行时间",
+        "破产申请时间",
+        "破产裁定受理时间",
+        "结案流程审批通过时间",
+        "结案时间",
+    ),
+    progress_headers=(
+        "调解情况进展",
+        "本月中旬计划完成情况",
+        "本月下旬计划完成情况",
+        "外部资源协作进展跟踪",
+        "终本后跟踪财产查控情况",
+        "保全结果",
+    ),
+    plan_headers=("本月中旬计划", "本月下旬计划"),
+    status_mappings=(
+        ("拟诉", "intended_filing"),
+        ("在诉", "litigation"),
+        ("执行", "enforcement"),
+        ("结案", "closed"),
+    ),
 )
 
 
 DEFENDANT_CASE_MASTER = CaseSourceProfile(
     key="erp_defendant_case_master_v1",
-    version="1",
+    version="2",
     label="ERP被告案件底表",
     technical_source_system="ERP_DEFENDANT_CASES",
     detection_headers=frozenset(
@@ -150,7 +213,7 @@ DEFENDANT_CASE_MASTER = CaseSourceProfile(
         SourceField("source_case_id", "案件编号"),
         SourceField("case_name", "案件名称"),
         SourceField("case_number", "被告案件受理案号"),
-        SourceField("case_type", "受理案由"),
+        SourceField("cause", "受理案由"),
         SourceField("plaintiff", "原告姓名"),
         SourceField("our_litigation_position", "我司身份"),
         SourceField("owner_user_id", "法务被告案件负责人"),
@@ -162,6 +225,31 @@ DEFENDANT_CASE_MASTER = CaseSourceProfile(
     ),
     preserve_unlinked_owner=True,
     preserve_unlinked_team=True,
+    constants=(("case_type", "defendant_case"),),
+    closed_status_header="是否结案",
+    closed_status_values=frozenset({"是"}),
+    lifecycle_headers=(
+        "被告案件状态名称",
+        "受理日期",
+        "实际开庭日期",
+        "鉴定受理时间",
+        "鉴定报告出具时间",
+        "是否结案",
+        "结案日期",
+    ),
+    progress_headers=(
+        "最新开庭进展",
+        "本月上旬计划完成情况",
+        "本月月度计划完成情况",
+    ),
+    plan_headers=("本月上旬计划", "本月中旬计划", "本月月度计划"),
+    status_mappings=(
+        ("受理", "accepted"),
+        ("开庭", "hearing"),
+        ("审结", "adjudicated"),
+        ("履行", "performance"),
+        ("已结案", "closed"),
+    ),
 )
 
 
@@ -337,6 +425,7 @@ def _parse_selected_rows(
         raw = {header: padded[index] for index, header in enumerate(headers)}
         normalized: dict[str, Any] = {}
         errors: list[RowError] = []
+        source_case_closed = profile.is_closed(raw)
         for column in _CANONICAL_COLUMNS:
             if column.key in constants:
                 normalized[column.key] = constants[column.key]
@@ -346,16 +435,45 @@ def _parse_selected_rows(
             if _is_blank(value):
                 normalized[column.key] = None
                 if column.required:
+                    warning_only = source_case_closed and column.key in {
+                        "case_name",
+                        "owner_user_id",
+                        "team_id",
+                    }
                     errors.append(
                         RowError(
-                            "required",
+                            (
+                                "historical_field_missing"
+                                if warning_only
+                                else "required"
+                            ),
                             column.key,
-                            f"{source_header or column.name}不能为空",
+                            (
+                                f"已结案历史案件缺少{source_header or column.name}，"
+                                "已保留来源记录并标记待核验"
+                                if warning_only
+                                else f"{source_header or column.name}不能为空"
+                            ),
+                            critical=not warning_only,
                         )
                     )
                 continue
             try:
-                normalized[column.key] = normalize_cell_value(value, column)
+                normalized_value = normalize_cell_value(value, column)
+                if column.key == "status":
+                    canonical_status = profile.canonical_status(normalized_value)
+                    if canonical_status is None:
+                        normalized[column.key] = None
+                        errors.append(
+                            RowError(
+                                "unknown_case_status",
+                                column.key,
+                                f"案件状态“{normalized_value}”尚未配置对应阶段",
+                            )
+                        )
+                        continue
+                    normalized_value = canonical_status
+                normalized[column.key] = normalized_value
             except FileValidationError as exc:
                 errors.append(
                     RowError(
@@ -364,6 +482,7 @@ def _parse_selected_rows(
                         str(exc),
                     )
                 )
+        normalized["source_case_closed"] = source_case_closed
         rows.append(
             ParsedRow(
                 row_number=row_number,

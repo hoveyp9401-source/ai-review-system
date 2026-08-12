@@ -9,12 +9,17 @@ from zoneinfo import ZoneInfo
 from app.agent2.memory import TrustedPersonalMemory
 from app.agent2.tool_calling.context import TrustedContext, TrustedReportSnapshot
 from app.agent2.tool_calling.contracts import ExecutionMode, ReceiptStatus, ToolReceipt
+from app.agent2.tool_calling.current_turn_source import (
+    CurrentTurnSource,
+    CurrentTurnSourceEvidenceError,
+)
 from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     ToolArgumentsValidationError,
     UnknownToolError,
     validate_tool_arguments,
 )
+from app.agent2.tool_calling.reporting_date import default_daily_write_date
 
 
 @dataclass(frozen=True)
@@ -88,16 +93,22 @@ class ShadowCallBinder:
         report_read_port: TrustedReportReadPort | None,
         *,
         execution_mode: ExecutionMode = ExecutionMode.SHADOW_PROPOSAL,
+        current_turn_source: CurrentTurnSource | None = None,
     ) -> None:
         self._context = context
         self._date_resolver = date_resolver
         self._report_read_port = report_read_port
         self._execution_mode = execution_mode
+        self._current_turn_source = current_turn_source
         self._session_reports: dict[UUID, TrustedReportSnapshot] = {}
         self._batch_reports_by_date: dict[date, TrustedReportSnapshot] = {}
 
     def begin_batch(self) -> None:
         self._batch_reports_by_date = {}
+
+    @property
+    def current_turn_source(self) -> CurrentTurnSource | None:
+        return self._current_turn_source
 
     def promote_query_results(
         self,
@@ -158,6 +169,18 @@ class ShadowCallBinder:
                 "INVALID_TOOL_ARGUMENTS",
                 validation_errors=exc.errors,
             )
+        if self._current_turn_source is not None:
+            try:
+                self._current_turn_source.validate_tool_arguments(
+                    call.tool_name,
+                    arguments,
+                )
+            except CurrentTurnSourceEvidenceError as exc:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    exc.code,
+                )
         definition = TOOL_REGISTRY[call.tool_name]
         if self._execution_mode not in definition.enabled_modes:
             return None, failure_receipt(
@@ -177,7 +200,82 @@ class ShadowCallBinder:
         source_report: TrustedReportSnapshot | None = None
         resolved_source_date: date | None = None
         date_facts: dict[str, Any] = {}
-        if "date_expression" in arguments:
+        # Agent2 owns the meaning of the current correction message.  The
+        # server still binds both proposed dates to exact owned reports and
+        # enforces target-conflict and transaction safeguards below.
+        model_resolved_correction_dates = (
+            call.tool_name == "correct_daily_report_date"
+            and self._current_turn_source is not None
+        )
+        if (
+            call.tool_name == "add_daily_items"
+            and arguments.get("date_selection") == "server_default"
+        ):
+            resolved_default = default_daily_write_date(
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+            try:
+                report = await self.report_by_date(resolved_default)
+            except _UntrustedReadSnapshotError:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_READ_RESOURCE",
+                )
+            date_facts = {
+                "resolved_date": resolved_default.isoformat(),
+                "date_candidate_matches": True,
+                "date_resolution_basis": "server_default",
+            }
+        elif (
+            call.tool_name == "add_daily_items"
+            and arguments.get("date_selection") == "agent2_semantic"
+        ):
+            proposed_date = date.fromisoformat(str(arguments["proposed_date"]))
+            local_today = self._context.now.astimezone(
+                ZoneInfo(self._context.principal.timezone)
+            ).date()
+            default_date = default_daily_write_date(
+                now=self._context.now,
+                timezone=self._context.principal.timezone,
+            )
+            if proposed_date not in {default_date, local_today}:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_SEMANTIC_REPORT_DATE",
+                )
+            try:
+                report = await self.report_by_date(proposed_date)
+            except _UntrustedReadSnapshotError:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_READ_RESOURCE",
+                )
+            date_facts = {
+                "resolved_date": proposed_date.isoformat(),
+                "date_candidate_matches": True,
+                "date_resolution_basis": "agent2_semantic",
+            }
+        elif (
+            call.tool_name == "add_daily_items"
+            and arguments.get("date_selection") == "trusted_report"
+        ):
+            parsed_report_id = UUID(str(arguments["report_id"]))
+            report = self.report_by_id(parsed_report_id)
+            if report is None:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_REPORT_ID",
+                )
+            date_facts = {
+                "resolved_date": report.report_date.isoformat(),
+                "date_resolution_basis": "trusted_report_reference",
+            }
+        elif "date_expression" in arguments:
             proposed_date = date.fromisoformat(str(arguments["proposed_date"]))
             resolution = self._date_resolver.resolve(
                 expression=str(arguments["date_expression"]),
@@ -202,14 +300,67 @@ class ShadowCallBinder:
             date_facts = {
                 "resolved_date": resolution.resolved_date.isoformat(),
                 "date_candidate_matches": resolution.candidate_matches,
+                "date_resolution_basis": "user_explicit",
             }
+        if "target_date_expression" in arguments:
+            proposed_target_date = date.fromisoformat(
+                str(arguments["proposed_target_date"])
+            )
+            target_resolution = (
+                DateResolution(
+                    proposed_target_date,
+                    candidate_matches=True,
+                )
+                if model_resolved_correction_dates
+                else self._date_resolver.resolve(
+                    expression=str(arguments["target_date_expression"]),
+                    proposed_date=proposed_target_date,
+                    now=self._context.now,
+                    timezone=self._context.principal.timezone,
+                )
+            )
+            if target_resolution.resolved_date is None:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.CLARIFICATION_REQUIRED,
+                    target_resolution.error_code or "DATE_RESOLUTION_FAILED",
+                )
+            try:
+                report = await self.report_by_date(
+                    target_resolution.resolved_date
+                )
+            except _UntrustedReadSnapshotError:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_READ_RESOURCE",
+                )
+            date_facts.update(
+                {
+                    "resolved_target_date": (
+                        target_resolution.resolved_date.isoformat()
+                    ),
+                    "target_date_candidate_matches": (
+                        target_resolution.candidate_matches
+                    ),
+                }
+            )
         if "source_date_expression" in arguments:
-            proposed_source_date = date.fromisoformat(str(arguments["proposed_source_date"]))
-            source_resolution = self._date_resolver.resolve(
-                expression=str(arguments["source_date_expression"]),
-                proposed_date=proposed_source_date,
-                now=self._context.now,
-                timezone=self._context.principal.timezone,
+            proposed_source_date = date.fromisoformat(
+                str(arguments["proposed_source_date"])
+            )
+            source_resolution = (
+                DateResolution(
+                    proposed_source_date,
+                    candidate_matches=True,
+                )
+                if model_resolved_correction_dates
+                else self._date_resolver.resolve(
+                    expression=str(arguments["source_date_expression"]),
+                    proposed_date=proposed_source_date,
+                    now=self._context.now,
+                    timezone=self._context.principal.timezone,
+                )
             )
             if source_resolution.resolved_date is None:
                 return None, failure_receipt(
@@ -226,17 +377,62 @@ class ShadowCallBinder:
                     ReceiptStatus.BLOCKED,
                     "UNTRUSTED_READ_RESOURCE",
                 )
-            date_facts = {
-                "resolved_source_date": source_resolution.resolved_date.isoformat(),
-                "source_date_candidate_matches": source_resolution.candidate_matches,
-            }
+            date_facts.update(
+                {
+                    "resolved_source_date": (
+                        source_resolution.resolved_date.isoformat()
+                    ),
+                    "source_date_candidate_matches": (
+                        source_resolution.candidate_matches
+                    ),
+                }
+            )
             if definition.object_binding_policy in {
                 "server_resolved_source_and_today_owner_reports",
                 "trusted_previous_report_version_and_today_owner_report",
             }:
                 report = self._context.today_report
+            if (
+                definition.object_binding_policy
+                == "server_resolved_source_and_today_owner_reports"
+                and source_report is None
+            ):
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "SOURCE_REPORT_NOT_FOUND",
+                    safe_user_facts={
+                        "source_report_date": (
+                            source_resolution.resolved_date.isoformat()
+                        ),
+                    },
+                )
         if definition.object_binding_policy == "server_today_owner_report":
             report = self._context.today_report
+        if (
+            definition.object_binding_policy
+            == "trusted_source_report_and_server_empty_target"
+            and source_report is None
+            and report is not None
+            and report.report_date
+            == date.fromisoformat(
+                str(date_facts.get("resolved_target_date") or "")
+            )
+        ):
+            # A provider replay can arrive after the first transaction moved
+            # the same report. Bind the stable report at the target so the
+            # production receipt can win idempotently before any new write.
+            source_report = report
+        if (
+            definition.object_binding_policy
+            == "trusted_source_report_and_server_empty_target"
+            and source_report is None
+        ):
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.CLARIFICATION_REQUIRED,
+                "SOURCE_REPORT_NOT_FOUND",
+            )
 
         previous_binding = definition.object_binding_policy in {
             "trusted_previous_report_version_and_plan_item_ids",
@@ -406,13 +602,26 @@ def _locked_historical_report_date(
         return None
     target_date = report.report_date if report is not None else None
     if target_date is None:
-        resolved = date_facts.get("resolved_date")
+        resolved = date_facts.get("resolved_date") or date_facts.get(
+            "resolved_target_date"
+        )
         if isinstance(resolved, str):
             try:
                 target_date = date.fromisoformat(resolved)
             except ValueError:
                 return None
     if target_date is None:
+        return None
+    if (
+        report is not None
+        and report.status == "completed"
+        and getattr(definition, "tool_name", "")
+        in {
+            "edit_daily_items",
+            "delete_daily_items",
+            "move_daily_items",
+        }
+    ):
         return None
     local_now = context.now.astimezone(
         ZoneInfo(context.principal.timezone)

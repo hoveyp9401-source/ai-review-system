@@ -60,6 +60,9 @@ def address_with_preferred_salutation(
         if (
             not remainder
             or unicodedata.category(remainder[0]).startswith("P")
+            or remainder.startswith(
+                ("好", "您好", "你好", "早上好", "上午好", "下午好", "晚上好")
+            )
         ):
             return normalized
     normalized = _remove_opening_vocative(

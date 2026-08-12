@@ -51,6 +51,7 @@ class ProductionRuntimeResult:
     receipts: tuple[ToolReceipt, ...] = ()
     error_code: str | None = None
     transaction_opened: bool = False
+    transaction_pending: bool = False
     committed_to_outer_transaction: bool = False
     rolled_back: bool = False
     handler_call_count: int = 0

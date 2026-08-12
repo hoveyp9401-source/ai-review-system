@@ -18,6 +18,10 @@ const state = {
   performanceReportScopeKey: new URLSearchParams(location.search).get("scope") || "__total__",
   performanceReportDetailTab: "branches",
   pendingSourceMappings: new Map(),
+  caseSnapshotDate: new URLSearchParams(location.search).get("snapshot_date")
+    || new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" }),
+  dailyCaseBatches: [],
+  caseTablePreview: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -186,11 +190,16 @@ async function mutate(button, operation, successMessage, refresh = true) {
     return result;
   } catch (error) {
     showToast(error.message, true);
+    if (error && typeof error === "object") error.legalOpsUiHandled = true;
     throw error;
   } finally {
     setBusy(button, false);
   }
 }
+
+window.addEventListener("unhandledrejection", event => {
+  if (event.reason?.legalOpsUiHandled) event.preventDefault();
+});
 
 async function download(path, filename, button) {
   setBusy(button, true, "准备下载…");
@@ -211,14 +220,40 @@ async function download(path, filename, button) {
 
 const pageTitles = {
   performance: ["绩效板块", "选择板块后，集中维护 Skill、底表和指标"],
+  "case-daily": ["案件每日更新", "用 ERP 原始表核对本地案件主账，确认后再更新"],
   "case-master": ["案件主表导入", "维护 ERP 权威案件字段，不删除本地信息"],
   "case-progress": ["案件进展导入", "先匹配案件，再写入文件来源时间线"],
   batches: ["导入批次记录", "查看每一次上传、校验、发布和操作人"],
   errors: ["导入错误处理", "集中处理无法匹配、格式错误和数据冲突"],
 };
 
+function visibleNavigation() {
+  const items = [];
+  let caseDailyInserted = false;
+  const allowedPages = new Set([
+    "performance", "case-daily", "case-master", "case-progress", "batches", "errors",
+  ]);
+  for (const item of state.shell?.navigation || []) {
+    if (!allowedPages.has(item.code)) continue;
+    if (item.code === "case-daily") {
+      if (!caseDailyInserted) items.push(item);
+      caseDailyInserted = true;
+      continue;
+    }
+    if (["case-master", "case-progress"].includes(item.code)) {
+      if (!caseDailyInserted) {
+        items.push({ code: "case-daily", label: "案件每日更新" });
+        caseDailyInserted = true;
+      }
+      continue;
+    }
+    items.push(item);
+  }
+  return items;
+}
+
 function renderNavigation() {
-  navigation.innerHTML = (state.shell?.navigation || []).map(item => `
+  navigation.innerHTML = visibleNavigation().map(item => `
     <button class="nav-item ${state.page === item.code ? "active" : ""}" data-page="${item.code}" type="button">
       ${escapeHtml(item.code === "performance" ? "绩效板块" : item.label)}
     </button>`).join("");
@@ -241,6 +276,12 @@ async function bootstrap() {
   }
   try {
     state.shell = await api("shell");
+    if (["case-master", "case-progress", "case-candidates"].includes(state.page)) {
+      state.page = "case-daily";
+      const params = new URLSearchParams(location.search);
+      params.set("page", state.page);
+      history.replaceState({}, "", `?${params.toString()}`);
+    }
     loginModal.classList.add("hidden");
     $("#safety-notice").textContent = state.shell.safety_notice;
     $("#identity").textContent = `${state.shell.identity.user_name} · ${state.shell.identity.roles.map(r => r.label).join(" / ")}`;
@@ -258,7 +299,8 @@ async function loadPage() {
   content.innerHTML = `<div class="loading"><span></span>正在加载</div>`;
   try {
     if (state.page === "performance") await loadPerformance();
-    else if (state.page === "case-master") await loadCaseImport("case-master");
+    else if (state.page === "case-daily") await loadCaseDailyUpdate();
+    else if (state.page === "case-master") await loadCaseDailyUpdate();
     else if (state.page === "case-progress") await loadCaseImport("case-progress");
     else if (state.page === "batches") await loadBatches();
     else if (state.page === "errors") await loadErrors();
@@ -575,7 +617,11 @@ function reportTargetNote(target) {
   if (!target || typeof target !== "object") return "";
   const label = target.status_label || target.label || "";
   if (!label) return "";
-  return `<span class="report-target-note ${statusClass(target.status)}">${escapeHtml(label)}</span>`;
+  const targetDisplay = ["achieved", "not_achieved"].includes(String(target.status || ""))
+    ? String(target.target_display || "")
+    : "";
+  const readableLabel = targetDisplay ? `${label}（目标${targetDisplay}）` : label;
+  return `<span class="report-target-note ${statusClass(target.status)}">${escapeHtml(readableLabel)}</span>`;
 }
 
 function renderPerformanceScopeOptions(result, selectedKey) {
@@ -625,10 +671,12 @@ function renderPerformanceReportControls(rule, currentPeriod, savedPreview, read
         ${renderPerformanceScopeOptions(savedPreview, controls.scopeKey)}
       </select>
     </label>
-    <button class="button primary report-refresh" id="refresh-performance-report" type="button" ${canPreview ? "" : "disabled"}>刷新预览</button>
-    <div class="report-export-actions" aria-label="导出报告">
-      <button class="button report-export" data-format="docx" type="button" ${hasReport ? "" : "disabled"}>导出 Word 报告</button>
-      <button class="button report-export" data-format="xlsx" type="button" ${hasReport ? "" : "disabled"}>导出 Excel 明细</button>
+    <div class="report-action-row">
+      <button class="button primary report-refresh" id="refresh-performance-report" type="button" ${canPreview ? "" : "disabled"}>刷新预览</button>
+      <div class="report-export-actions" aria-label="导出报告">
+        <button class="button report-export" data-format="docx" type="button" ${hasReport ? "" : "disabled"}>导出 Word 报告</button>
+        <button class="button report-export" data-format="xlsx" type="button" ${hasReport ? "" : "disabled"}>导出 Excel 明细</button>
+      </div>
     </div>
   </div>
   <div class="report-control-help">
@@ -1033,18 +1081,6 @@ function renderAssignmentErrorSummary(errors) {
   </section>`;
 }
 
-function renderDataQualitySummary(errors) {
-  if (!errors.length) return "";
-  return `<section class="report-data-quality-warning">
-    <strong>有 ${errors.length} 条数据存在完整性问题</strong>
-    <p>已结案但没有结案日期的案件不会计入存量；请按原表行号补充后重新上传。</p>
-    <div class="report-warning-list">${errors.slice(0, 8).map(item => `<div>
-      <strong>原表第 ${Number(item.source_row_number || 0)} 行</strong>
-      <span>${escapeHtml(item.case_name || "案件名称未识别")} · ${escapeHtml(item.message || "数据不完整")}</span>
-    </div>`).join("")}</div>
-  </section>`;
-}
-
 function renderLossMetricSummary(scope) {
   if (String(scope?.scope_type || "") !== "overall") return "";
   const loss = scope?.loss_metrics || {};
@@ -1069,15 +1105,21 @@ function renderLossMetricSummary(scope) {
   </section>`;
 }
 
-function renderReportCaseList(items, emptyText) {
+function renderReportCaseList(items, emptyText, dateKind) {
   if (!items.length) {
     return `<div class="report-detail-empty">${escapeHtml(emptyText)}</div>`;
   }
+  const isClosed = dateKind === "closed";
+  const dateLabel = isClosed ? "结案日期" : "新增日期";
+  const dateKey = isClosed ? "close_date" : "register_date";
   return `<div class="report-case-list">${items.map(item => `<article>
     <div><strong>${escapeHtml(item.case_name || "案件名称未识别")}</strong>
-      <span>${escapeHtml(item.branch_name || "分公司未填写")}</span>
+      <span>${escapeHtml(item.branch_name || "分公司未填写")} · ${escapeHtml(item.lawyer_name || "承办法务未填写")}</span>
     </div>
-    <span class="report-case-owner">${escapeHtml(item.lawyer_name || "承办法务未填写")}</span>
+    <time class="report-case-date" datetime="${escapeHtml(item[dateKey] || "")}">
+      <small>${dateLabel}</small>
+      <strong>${escapeHtml(item[dateKey] || "日期未填写")}</strong>
+    </time>
   </article>`).join("")}</div>`;
 }
 
@@ -1129,9 +1171,6 @@ function renderMetricPreviewResult(result, requestedScopeKey = state.performance
   const period = report.period || {};
   const scope = selectedPerformanceScope(result, requestedScopeKey);
   const errors = Array.isArray(report.assignment_errors) ? report.assignment_errors : [];
-  const dataQualityErrors = Array.isArray(report.data_quality_errors)
-    ? report.data_quality_errors
-    : [];
   if (!scope) {
     return `<div class="report-empty-state">
       <strong>暂时没有可展示的指标</strong>
@@ -1158,7 +1197,6 @@ function renderMetricPreviewResult(result, requestedScopeKey = state.performance
       <span class="badge good">预览已生成</span>
     </header>
     ${renderAssignmentErrorSummary(errors)}
-    ${renderDataQualitySummary(dataQualityErrors)}
     <section class="report-kpi-grid" aria-label="核心指标">
       <article class="report-kpi-card emphasis">
         <span>当前存量</span><strong>${Number(scope.stock_count || 0)}</strong><small>件</small>
@@ -1211,10 +1249,10 @@ function renderMetricPreviewResult(result, requestedScopeKey = state.performance
         </table></div>` : `<div class="report-detail-empty">当前范围没有分公司明细。</div>`}
       </div>
       <div data-report-detail-panel="new" ${detailTab === "new" ? "" : "hidden"}>
-        ${renderReportCaseList(newCases, `${currentLabel}没有新增案件。`)}
+        ${renderReportCaseList(newCases, `${currentLabel}没有新增案件。`, "new")}
       </div>
       <div data-report-detail-panel="closed" ${detailTab === "closed" ? "" : "hidden"}>
-        ${renderReportCaseList(closedCases, `${currentLabel}没有结案案件。`)}
+        ${renderReportCaseList(closedCases, `${currentLabel}没有结案案件。`, "closed")}
       </div>
     </section>
   </div>`;
@@ -2579,14 +2617,574 @@ function showLineage(calculation, item) {
   $("#lineage-back").addEventListener("click", () => showCalculation(calculation));
 }
 
+const CASE_DAILY_SOURCES = [
+  {
+    key: "plaintiff",
+    title: "原告案件",
+    fileLabel: "原告案件底表",
+    profileKey: "erp_plaintiff_case_master_v1",
+    profileLabel: "ERP原告案件底表",
+    stableField: "诉讼仲裁编号",
+    description: "直接上传 ERP 导出的原告案件底表，不用删列、改表头或套模板。",
+  },
+  {
+    key: "defendant",
+    title: "被告案件",
+    fileLabel: "被告案件底表",
+    profileKey: "erp_defendant_case_master_v1",
+    profileLabel: "ERP被告案件底表",
+    stableField: "案件编号",
+    description: "直接上传 ERP 导出的被告案件底表，不用拆分案件资料和进展字段。",
+  },
+];
+
+const dailySnapshotApi = {
+  list: () => api("batches?business_type=case_master&limit=500"),
+  upload: (source, file, snapshotDate) => {
+    const body = new FormData();
+    body.append("file", file);
+    body.append("snapshot_date", snapshotDate);
+    body.append("profile_key", source.profileKey);
+    return api("case-daily-snapshot/upload", { method: "POST", body });
+  },
+  publish: batchNo => api(
+    `case-daily-snapshot/${encodeURIComponent(batchNo)}/publish`,
+    { method: "POST" },
+  ),
+  abandon: batchNo => api(
+    `batches/${encodeURIComponent(batchNo)}/abandon`,
+    { method: "POST" },
+  ),
+  detail: (batchNo, offset = 0, rowStatus = "") => api(
+    `batches/${encodeURIComponent(batchNo)}?offset=${Math.max(0, offset)}&limit=100`
+      + `${rowStatus ? `&row_status=${encodeURIComponent(rowStatus)}` : ""}`,
+  ),
+};
+
+function dailySnapshotMetadata(batch) {
+  const metadata = batch?.daily_snapshot_metadata || batch?.metadata || {};
+  return {
+    enabled: batch?.daily_snapshot === true || metadata.daily_snapshot === true,
+    snapshotDate: String(
+      batch?.snapshot_date
+      || batch?.source_profile?.snapshot_date
+      || metadata.snapshot_date
+      || "",
+    ),
+    profileKey: String(
+      batch?.source_profile_key
+      || batch?.source_profile?.key
+      || metadata.source_profile_key
+      || "",
+    ),
+  };
+}
+
+function dailyBatchSourceKey(batch) {
+  const metadata = dailySnapshotMetadata(batch);
+  const label = String(batch?.source_profile?.label || "");
+  if (metadata.profileKey.includes("plaintiff") || label.includes("原告")) return "plaintiff";
+  if (metadata.profileKey.includes("defendant") || label.includes("被告")) return "defendant";
+  return "";
+}
+
+function isDailySnapshotBatch(batch) {
+  const metadata = dailySnapshotMetadata(batch);
+  return metadata.enabled || Boolean(metadata.snapshotDate);
+}
+
+function dailyBatchForSource(sourceKey) {
+  return state.dailyCaseBatches.find(batch => (
+    dailyBatchSourceKey(batch) === sourceKey
+    && dailySnapshotMetadata(batch).snapshotDate === state.caseSnapshotDate
+  ));
+}
+
+function dailyStatus(batch) {
+  if (!batch) return { label: "未上传", className: "neutral", hint: "等待上传当天原始表格" };
+  if (batch.status === "published") return { label: "已更新", className: "good", hint: "本次核对结果已经写入案件主账" };
+  if (batch.status === "ready") return { label: "待确认", className: "warn", hint: "变化预览已生成，等待确认发布" };
+  if (["validation_failed", "failed", "error"].includes(batch.status)) {
+    return { label: "需处理", className: "bad", hint: "有问题需要查看或修正后重传" };
+  }
+  if (batch.status === "abandoned") return { label: "已放弃", className: "neutral", hint: "可以重新上传当天表格" };
+  return { label: "正在校验", className: "info", hint: "系统正在比较前后版本" };
+}
+
+function dailySummaryObject(batch) {
+  const value = batch?.change_summary || batch?.daily_change_summary || {};
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function dailySummaryNumber(batch, keys, fallbackCount = "") {
+  const summary = dailySummaryObject(batch);
+  for (const key of keys) {
+    const value = Number(summary[key]);
+    if (Number.isFinite(value)) return value;
+  }
+  const fallback = Number(batch?.counts?.[fallbackCount]);
+  return Number.isFinite(fallback) ? fallback : 0;
+}
+
+function dailyMetrics(batch) {
+  return [
+    {
+      label: "新增案件",
+      value: dailySummaryNumber(batch, ["new_cases", "added_cases", "新增案件"], "新增"),
+      tone: "new",
+    },
+    {
+      label: "资料变化",
+      value: dailySummaryNumber(batch, ["master_changes", "case_changes", "主数据变化"], "更新"),
+      tone: "changed",
+    },
+    {
+      label: "进展变化",
+      value: dailySummaryNumber(batch, ["progress_changes", "进展变化"]),
+      tone: "progress",
+    },
+    {
+      label: "计划变化",
+      value: dailySummaryNumber(batch, ["plan_changes", "下一步计划变化", "计划变化"]),
+      tone: "plan",
+    },
+    {
+      label: "无变化",
+      value: dailySummaryNumber(batch, ["unchanged_cases", "无变化"], "跳过"),
+      tone: "quiet",
+    },
+    {
+      label: "待处理",
+      value: dailySummaryNumber(batch, ["error_count", "errors", "阻断错误"], "失败")
+        + dailySummaryNumber(batch, ["conflict_count", "conflicts", "冲突"], "冲突"),
+      tone: "problem",
+    },
+  ];
+}
+
+function dailyProblemMessages(batch) {
+  const result = [];
+  const addMessage = value => {
+    const message = String(value || "").trim();
+    if (message && !result.includes(message)) result.push(message);
+  };
+  const summary = batch?.error_summary;
+  if (typeof summary === "string") addMessage(summary);
+  if (Array.isArray(summary)) {
+    summary.slice(0, 3).forEach(item => {
+      const message = typeof item === "string" ? item : item?.message;
+      addMessage(message);
+    });
+  }
+  const warnings = dailySummaryObject(batch).warnings;
+  if (Array.isArray(warnings)) {
+    warnings.slice(0, 3).forEach(item => {
+      const message = typeof item === "string" ? item : item?.message;
+      addMessage(message);
+    });
+  }
+  if (!result.length && Number(batch?.counts?.提醒 || 0)) {
+    result.push(`有 ${Number(batch.counts.提醒)} 条历史数据提醒，不会直接阻断发布。`);
+  }
+  return result;
+}
+
+function renderDailyUploadForm(source, batch) {
+  const caps = state.shell.identity.capabilities;
+  const actionLabel = batch && batch.status !== "abandoned" ? "替换当天表格" : "上传并核对";
+  return `
+    <form class="daily-upload-form" data-source="${escapeHtml(source.key)}">
+      <label class="daily-file-picker">
+        <span>${batch ? "选择新的原始表格" : "选择原始表格"}</span>
+        <input type="file" accept=".xlsx,.csv" required ${caps.case_upload ? "" : "disabled"} />
+      </label>
+      <span class="daily-selected-file">尚未选择文件</span>
+      <button class="button ${batch ? "" : "primary"}" type="submit" ${caps.case_upload ? "" : "disabled"}>
+        ${actionLabel}
+      </button>
+    </form>`;
+}
+
+function renderDailySourceCard(source, batch) {
+  const status = dailyStatus(batch);
+  const problems = batch ? dailyProblemMessages(batch) : [];
+  const problemCount = batch
+    ? dailySummaryNumber(batch, ["error_count", "errors", "阻断错误"], "失败")
+      + dailySummaryNumber(batch, ["conflict_count", "conflicts", "冲突"], "冲突")
+    : 0;
+  const attentionCount = problemCount + Number(batch?.counts?.提醒 || 0);
+  return `
+    <article class="daily-source-card ${batch ? `is-${escapeHtml(batch.status)}` : "is-empty"}" data-source-card="${escapeHtml(source.key)}">
+      <header class="daily-source-head">
+        <div>
+          <span class="daily-source-kind">${escapeHtml(source.title)}</span>
+          <h3>${escapeHtml(source.fileLabel)}</h3>
+          <p>${escapeHtml(source.description)}</p>
+        </div>
+        <span class="daily-state ${status.className}">${escapeHtml(status.label)}</span>
+      </header>
+      <div class="daily-match-note">
+        系统按“${escapeHtml(source.stableField)}”识别同一案件，并与本地已发布的案件主账逐项核对。
+      </div>
+      ${batch ? `
+        <div class="daily-file-summary">
+          <div><span>当前文件</span><strong>${escapeHtml(batch.file_name)}</strong></div>
+          <div><span>上传时间</span><strong>${formatTime(batch.uploaded_at)}</strong></div>
+          <div><span>当前结果</span><strong>${escapeHtml(status.hint)}</strong></div>
+        </div>
+        <div class="daily-change-grid">
+          ${dailyMetrics(batch).map(item => `<div class="${escapeHtml(item.tone)}">
+            <span>${escapeHtml(item.label)}</span><strong>${item.value}</strong>
+          </div>`).join("")}
+        </div>
+        ${problems.length ? `<div class="daily-warning-box ${problemCount ? "blocking" : ""}">
+          <strong>${problemCount ? "发布前需要处理" : "请留意这些提醒"}</strong>
+          ${problems.map(message => `<p>${escapeHtml(message)}</p>`).join("")}
+        </div>` : ""}
+        <div class="daily-card-actions">
+          <button class="button daily-view" data-batch="${escapeHtml(batch.batch_no)}" type="button">查看变化明细</button>
+          ${attentionCount ? `<button class="button daily-errors" data-batch="${escapeHtml(batch.batch_no)}" type="button">下载问题与提醒</button>` : ""}
+          ${batch.can_publish && state.shell.identity.capabilities.publish
+            ? `<button class="button primary daily-publish" data-batch="${escapeHtml(batch.batch_no)}" type="button">确认更新主账</button>`
+            : ""}
+          ${canAbandonBatch(batch)
+            ? `<button class="text-button danger-text daily-abandon" data-batch="${escapeHtml(batch.batch_no)}" type="button">放弃本次上传</button>`
+            : ""}
+        </div>
+      ` : `
+        <div class="daily-empty-message">
+          <strong>今天还没有上传</strong>
+          <span>选择从 ERP 直接导出的文件即可。</span>
+        </div>
+      `}
+      ${renderDailyUploadForm(source, batch)}
+    </article>`;
+}
+
+function renderDailyOverallSummary(batches) {
+  const active = batches.filter(batch => batch && batch.status !== "abandoned");
+  if (!active.length) {
+    return `
+      <section class="daily-overall-card is-empty">
+        <div>
+          <span class="daily-section-label">本次核对摘要</span>
+          <h3>等待上传当天表格</h3>
+          <p>原告和被告可以分开上传。上传后这里会汇总新增、变化和需要处理的问题。</p>
+        </div>
+      </section>`;
+  }
+  const totals = dailyMetrics({}).map(item => ({ ...item, value: 0 }));
+  active.forEach(batch => {
+    dailyMetrics(batch).forEach((item, index) => { totals[index].value += item.value; });
+  });
+  const published = active.filter(batch => batch.status === "published").length;
+  const ready = active.filter(batch => batch.status === "ready").length;
+  const blocked = active.filter(batch => ["validation_failed", "failed", "error"].includes(batch.status)).length;
+  return `
+    <section class="daily-overall-card">
+      <div class="daily-overall-head">
+        <div>
+          <span class="daily-section-label">本次核对摘要</span>
+          <h3>${active.length} 张表已上传</h3>
+          <p>${published ? `${published} 张已更新主账。` : ""}${ready ? `${ready} 张等待确认。` : ""}${blocked ? `${blocked} 张需要处理。` : ""}</p>
+        </div>
+        <span class="daily-overall-state ${blocked ? "bad" : ready ? "warn" : "good"}">
+          ${blocked ? "需要处理" : ready ? "可以更新主账" : "当天核对完成"}
+        </span>
+      </div>
+      <div class="daily-overall-metrics">
+        ${totals.map(item => `<div><span>${escapeHtml(item.label)}</span><strong>${item.value}</strong></div>`).join("")}
+      </div>
+    </section>`;
+}
+
+async function loadCaseDailyUpdate() {
+  const [batches, caseTableStatus, caseTableHistory, caseTablePending] = await Promise.all([
+    dailySnapshotApi.list(),
+    api("case-tables/status").catch(() => null),
+    api("case-tables/history?limit=12").catch(() => []),
+    api("case-tables/pending?limit=12").catch(() => []),
+  ]);
+  const batchItems = Array.isArray(batches) ? batches : (batches?.items || []);
+  state.dailyCaseBatches = batchItems.filter(isDailySnapshotBatch);
+  const sourceBatches = CASE_DAILY_SOURCES.map(source => dailyBatchForSource(source.key));
+  const uploadedCount = sourceBatches.filter(Boolean).length;
+  content.innerHTML = `
+    ${renderCaseTableWorkspace(
+      caseTableStatus,
+      caseTableHistory,
+      caseTablePending,
+      state.shell.identity.capabilities,
+    )}
+    <div class="section-head case-database-head">
+      <div>
+        <h2>正式案件主账每日更新</h2>
+        <p>这是原有功能：核对 ERP 原始表并更新正式案件主账，与上面的机器人查询底表分开发布。</p>
+      </div>
+    </div>
+    <section class="case-daily-hero">
+      <div>
+        <span class="daily-section-label">每日更新</span>
+        <h2>用原始表格核对案件主账</h2>
+        <p>不用改模板。上传文件只用于逐案核对本地数据；新增和变化先预览，确认后才更新主账。</p>
+      </div>
+      <label class="daily-date-control">数据日期
+        <input id="case-snapshot-date" type="date" value="${escapeHtml(state.caseSnapshotDate)}" />
+      </label>
+    </section>
+    <div class="daily-progress-strip">
+      <div><span>${uploadedCount}</span><strong>/ 2 张已上传</strong></div>
+      <p>原告、被告分别维护，任何一张有问题都不会影响另一张已经发布的数据。</p>
+      <span class="daily-safety-pill">不改 ERP · 不覆盖人工进展</span>
+    </div>
+    <section class="daily-source-grid" aria-label="当天案件原始表格">
+      ${CASE_DAILY_SOURCES.map((source, index) => renderDailySourceCard(source, sourceBatches[index])).join("")}
+    </section>
+    ${renderDailyOverallSummary(sourceBatches)}`;
+  bindCaseTableWorkspace();
+  bindDailyCasePage();
+}
+
+function bindDailyCaseActions(root = document) {
+  root.querySelectorAll(".daily-view").forEach(button => button.addEventListener("click", () => {
+    showDailyBatch(button.dataset.batch);
+  }));
+  root.querySelectorAll(".daily-errors").forEach(button => button.addEventListener("click", () => {
+    download(
+      `batches/${encodeURIComponent(button.dataset.batch)}/errors.xlsx`,
+      "案件每日更新-问题与提醒.xlsx",
+      button,
+    );
+  }));
+  root.querySelectorAll(".daily-publish").forEach(button => button.addEventListener("click", async () => {
+    if (!confirm("确认用本次核对结果更新案件主账？新增案件、资料变化和来源进展会在同一次操作中生效；不会覆盖人工进展。")) return;
+    await mutate(
+      button,
+      () => dailySnapshotApi.publish(button.dataset.batch),
+      "案件主账已按本次核对结果更新",
+    );
+    if (drawer.contains(button)) closeDrawer();
+  }));
+  root.querySelectorAll(".daily-abandon").forEach(button => button.addEventListener("click", async () => {
+    if (!confirm("确认放弃这次尚未发布的上传？之前已经发布的数据不会受影响。")) return;
+    await mutate(
+      button,
+      () => dailySnapshotApi.abandon(button.dataset.batch),
+      "本次上传已放弃",
+    );
+    if (drawer.contains(button)) closeDrawer();
+  }));
+}
+
+function bindDailyCasePage() {
+  $("#case-snapshot-date")?.addEventListener("change", async event => {
+    state.caseSnapshotDate = event.target.value;
+    const params = new URLSearchParams(location.search);
+    params.set("page", "case-daily");
+    params.set("snapshot_date", state.caseSnapshotDate);
+    history.replaceState({}, "", `?${params.toString()}`);
+    await loadCaseDailyUpdate();
+  });
+  document.querySelectorAll(".daily-upload-form").forEach(form => {
+    const fileInput = form.querySelector('input[type="file"]');
+    const fileName = form.querySelector(".daily-selected-file");
+    fileInput?.addEventListener("change", () => {
+      fileName.textContent = fileInput.files?.[0]?.name || "尚未选择文件";
+    });
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const source = CASE_DAILY_SOURCES.find(item => item.key === form.dataset.source);
+      const file = fileInput?.files?.[0];
+      if (!source || !file) {
+        showToast("请先选择当天从 ERP 导出的原始表格", true);
+        return;
+      }
+      const result = await mutate(
+        event.submitter,
+        () => dailySnapshotApi.upload(source, file, state.caseSnapshotDate),
+        "文件已上传，正在与本地案件主账核对",
+        false,
+      );
+      await loadCaseDailyUpdate();
+      if (result?.batch_no) await showDailyBatch(result.batch_no);
+    });
+  });
+  bindDailyCaseActions(content);
+}
+
+const DAILY_FIELD_LABELS = {
+  source_case_id: "ERP案件编号",
+  case_name: "案件名称",
+  case_number: "案号",
+  case_type: "案由",
+  plaintiff: "原告",
+  defendant: "被告",
+  third_party: "第三人",
+  our_litigation_position: "我方诉讼地位",
+  owner_user_id: "承办法务",
+  team_id: "所属团队",
+  court: "法院或仲裁机构",
+  amount: "涉案金额",
+  filing_date: "立案或受理日期",
+  status: "案件状态",
+  erp_updated_at: "ERP更新时间",
+  progress_content: "进展内容",
+  next_plan: "下一步计划",
+};
+
+function dailyVisibleEntries(data, limit = 6) {
+  const entries = [];
+  for (const [key, value] of Object.entries(data || {})) {
+    const hasChinese = [...key].some(character => character.codePointAt(0) > 127);
+    const label = DAILY_FIELD_LABELS[key] || (hasChinese ? key : "");
+    if (!label) continue;
+    entries.push([label, friendlyCellValue(value)]);
+    if (entries.length >= limit) break;
+  }
+  return entries;
+}
+
+const DAILY_CHANGE_GROUPS = [
+  ["master_changes", "master", "资料变化"],
+  ["progress_changes", "progress", "进展变化"],
+  ["plan_changes", "plan", "计划变化"],
+  ["lifecycle_changes", "lifecycle", "阶段变化"],
+];
+
+function dailyChangeSections(change) {
+  return DAILY_CHANGE_GROUPS.map(([key, alias, label]) => ({
+    label,
+    items: Array.isArray(change?.[key])
+      ? change[key]
+      : Array.isArray(change?.[alias]) ? change[alias] : [],
+  })).filter(section => section.items.length);
+}
+
+function renderDailyRowChange(change) {
+  const sections = dailyChangeSections(change);
+  if (!sections.length) return "";
+  return `<div class="daily-row-change">
+    ${sections.map(section => `<section>
+      <h4>${escapeHtml(section.label)}</h4>
+      ${section.items.map(item => {
+        const field = DAILY_FIELD_LABELS[item.field] || item.field || "字段";
+        return `<div class="daily-before-after">
+          <strong>${escapeHtml(field)}</strong>
+          <p><span>原值</span><del>${escapeHtml(friendlyCellValue(item.before))}</del></p>
+          <p><span>新值</span><ins>${escapeHtml(friendlyCellValue(item.after))}</ins></p>
+        </div>`;
+      }).join("")}
+    </section>`).join("")}
+  </div>`;
+}
+
+async function showDailyBatch(batchNo, offset = 0, rowStatus = "valid") {
+  try {
+    const item = await dailySnapshotApi.detail(batchNo, offset, rowStatus);
+    const page = item.row_page || {
+      offset: 0,
+      limit: 100,
+      total: item.rows?.length || 0,
+      has_more: false,
+    };
+    const source = CASE_DAILY_SOURCES.find(candidate => (
+      candidate.key === dailyBatchSourceKey(item)
+    ));
+    const status = dailyStatus(item);
+    const problemCount = dailySummaryNumber(item, ["error_count", "errors", "阻断错误"], "失败")
+      + dailySummaryNumber(item, ["conflict_count", "conflicts", "冲突"], "冲突");
+    const attentionCount = problemCount + Number(item?.counts?.提醒 || 0);
+    drawerContent.innerHTML = `
+      <p class="eyebrow">案件每日更新</p>
+      <h2>${escapeHtml(source?.fileLabel || "案件原始表格")}</h2>
+      <p class="subtle">${escapeHtml(item.file_name)} · 数据日期 ${escapeHtml(dailySnapshotMetadata(item).snapshotDate || state.caseSnapshotDate)} · ${formatTime(item.uploaded_at)}</p>
+      <div class="daily-change-grid drawer-daily-change-grid">
+        ${dailyMetrics(item).map(metric => `<div class="${escapeHtml(metric.tone)}"><span>${escapeHtml(metric.label)}</span><strong>${metric.value}</strong></div>`).join("")}
+      </div>
+      <div class="daily-detail-toolbar">
+        <label>查看
+          <select id="daily-detail-filter">
+            <option value="valid" ${rowStatus === "valid" ? "selected" : ""}>新增和变化</option>
+            <option value="warning" ${rowStatus === "warning" ? "selected" : ""}>只看提醒</option>
+            <option value="error" ${rowStatus === "error" ? "selected" : ""}>只看问题</option>
+            <option value="skipped" ${rowStatus === "skipped" ? "selected" : ""}>没有变化</option>
+            <option value="" ${rowStatus === "" ? "selected" : ""}>全部记录</option>
+          </select>
+        </label>
+        <span class="daily-state ${status.className}">${escapeHtml(status.label)}</span>
+      </div>
+      ${(item.rows || []).length ? `
+        <div class="daily-detail-list">
+          ${item.rows.map(row => {
+            const entries = dailyVisibleEntries(row.data);
+            return `<article class="daily-detail-row ${row.status === "error" ? "has-error" : row.status === "warning" ? "has-warning" : ""}">
+              <header>
+                <span>原表第 ${row.source_row_number || "—"} 行</span>
+                <strong>${escapeHtml(row.change?.["类型"] || row.action_label || row.status_label || "已读取")}</strong>
+              </header>
+              <div class="daily-detail-fields">
+                ${entries.length ? entries.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("") : "<span>原始内容已保存，可下载问题数据核对。</span>"}
+              </div>
+              ${renderDailyRowChange(row.change)}
+              ${(row.errors || []).length ? `<div class="daily-row-messages">${row.errors.map(error => `<p class="${error.severity === "错误" ? "error-text" : "warning-text"}">${escapeHtml(error.message)}</p>`).join("")}</div>` : ""}
+            </article>`;
+          }).join("")}
+        </div>
+      ` : `<div class="daily-empty-message large"><strong>当前没有符合筛选条件的记录</strong><span>可以切换上方筛选继续查看。</span></div>`}
+      <div class="daily-detail-footer">
+        <span class="subtle">共 ${page.total} 条</span>
+        <div>
+          <button class="button" id="daily-detail-prev" ${page.offset > 0 ? "" : "disabled"}>上一页</button>
+          <button class="button" id="daily-detail-next" ${page.has_more ? "" : "disabled"}>下一页</button>
+        </div>
+      </div>
+      <div class="daily-card-actions drawer-daily-actions">
+        ${attentionCount ? `<button class="button daily-errors" data-batch="${escapeHtml(item.batch_no)}" type="button">下载问题与提醒</button>` : ""}
+        ${item.can_publish && state.shell.identity.capabilities.publish
+          ? `<button class="button primary daily-publish" data-batch="${escapeHtml(item.batch_no)}" type="button">确认更新主账</button>`
+          : ""}
+        ${canAbandonBatch(item)
+          ? `<button class="text-button danger-text daily-abandon" data-batch="${escapeHtml(item.batch_no)}" type="button">放弃本次上传</button>`
+          : ""}
+      </div>`;
+    openDrawer();
+    $("#daily-detail-filter")?.addEventListener("change", event => {
+      showDailyBatch(batchNo, 0, event.target.value);
+    });
+    $("#daily-detail-prev")?.addEventListener("click", () => {
+      showDailyBatch(batchNo, Math.max(0, page.offset - page.limit), rowStatus);
+    });
+    $("#daily-detail-next")?.addEventListener("click", () => {
+      showDailyBatch(batchNo, page.offset + page.limit, rowStatus);
+    });
+    bindDailyCaseActions(drawerContent);
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
 async function loadCaseImport(type) {
-  state.batches = await api(`batches?business_type=${type === "case-master" ? "case_master" : "case_progress"}&limit=20`);
   const isMaster = type === "case-master";
+  let caseTableStatus = null;
+  let caseTableHistory = [];
+  let caseTablePending = [];
+  if (isMaster) {
+    state.batches = await api("batches?business_type=case_master&limit=20");
+    [caseTableStatus, caseTableHistory, caseTablePending] = await Promise.all([
+      api("case-tables/status").catch(() => null),
+      api("case-tables/history?limit=12").catch(() => []),
+      api("case-tables/pending?limit=12").catch(() => []),
+    ]);
+  } else {
+    state.batches = await api("batches?business_type=case_progress&limit=20");
+  }
   const caps = state.shell.identity.capabilities;
   content.innerHTML = `
+    ${isMaster ? renderCaseTableWorkspace(caseTableStatus, caseTableHistory, caseTablePending, caps) : ""}
+    ${isMaster ? `<div class="section-head case-database-head"><div><h2>正式案件库导入</h2><p>这是原有功能：把 ERP 案件字段写入系统案件库，与上面的机器人查询底表分开发布。</p></div></div>` : ""}
     <div class="grid">
       <article class="card span-7">
-        <div class="card-head"><div><h2>${isMaster ? "上传案件主表" : "上传案件进展表"}</h2>
+        <div class="card-head"><div><h2>${isMaster ? "上传到正式案件库" : "上传案件进展表"}</h2>
           <p>${isMaster ? "原告案件底表、被告案件底表可以保持原样上传，仪表板和未入库的业务列会原样留痕，但不会误写正式案件字段。" : "案件进展与主表分开上传；先匹配案件，再生成时间线，不会按模糊名称猜测。"}</p></div></div>
         <div class="upload-panel" style="margin-top:18px">
           <form id="case-upload-form">
@@ -2639,6 +3237,7 @@ async function loadCaseImport(type) {
     </div>
     <div class="section-head" style="margin-top:28px"><div><h2>最近批次</h2><p>点击批次可查看逐行预览和错误原因。</p></div></div>
     ${renderBatchTable(state.batches)}`;
+  if (isMaster) bindCaseTableWorkspace(caseTableStatus);
   $("#case-upload-form").addEventListener("submit", async event => {
     event.preventDefault();
     const result = await mutate(event.submitter, () => api(`${type}/upload`, { method: "POST", body: new FormData(event.currentTarget) }), "文件已识别并生成预览", false);
@@ -2648,6 +3247,171 @@ async function loadCaseImport(type) {
   });
   $(".template-case").addEventListener("click", event => download(`templates/${event.currentTarget.dataset.template}`, `${isMaster ? "案件主表" : "案件进展"}模板.xlsx`, event.currentTarget));
   bindBatchButtons();
+}
+
+function renderCaseTableWorkspace(status, history, pending, caps) {
+  const tables = new Map((status?.tables || []).map(item => [item.table_kind, item]));
+  const defendant = tables.get("defendant") || {};
+  const plaintiff = tables.get("plaintiff") || {};
+  const visiblePending = (pending || []).filter(item => item.batch_no !== state.caseTablePreview?.batch_no);
+  return `
+    <section class="case-table-workspace">
+      <div class="case-table-hero">
+        <div>
+          <p class="eyebrow">机器人查询数据</p>
+          <h2>更新案件底表</h2>
+          <p>上传原告或被告案件底表，先核对新增、删除和变更数量，再确认发布。发布后机器人立即使用新数据，不会写回 ERP。</p>
+        </div>
+        <div class="case-table-current">
+          <span>当前版本</span>
+          <strong>${formatTime(status?.published_at)}</strong>
+          <small>${escapeHtml(status?.published_by || "系统已有版本")}</small>
+        </div>
+      </div>
+      <div class="case-table-status-grid">
+        ${renderCaseTableStatusCard(defendant, "被告案件底表")}
+        ${renderCaseTableStatusCard(plaintiff, "原告案件底表")}
+      </div>
+      ${status ? "" : `<div class="notice case-table-warning">机器人底表状态暂时无法读取；下方“正式案件库导入”仍可正常使用。</div>`}
+      <article class="case-table-upload-card">
+        <div>
+          <strong>上传新版底表</strong>
+          <p>文件保持现有 Excel 格式即可。上传只生成检查结果，必须再次确认才会生效。</p>
+        </div>
+        <form id="case-table-sync-form">
+          <label>要更新的底表
+            <select name="table_kind">
+              <option value="defendant">被告案件底表</option>
+              <option value="plaintiff">原告案件底表</option>
+            </select>
+          </label>
+          <label>选择 Excel 文件
+            <input name="file" type="file" accept=".xlsx" required ${caps.case_upload ? "" : "disabled"} />
+          </label>
+          <button class="button primary" type="submit" ${caps.case_upload ? "" : "disabled"}>上传并检查变化</button>
+        </form>
+      </article>
+      <div id="case-table-preview-slot">${state.caseTablePreview ? renderCaseTablePreview(state.caseTablePreview, caps) : ""}</div>
+      ${renderPendingCaseTables(visiblePending, caps)}
+      <details class="case-table-history" ${state.caseTablePreview ? "" : "open"}>
+        <summary>查看发布记录与恢复版本</summary>
+        ${renderCaseTableHistory(history, caps)}
+      </details>
+    </section>`;
+}
+
+function renderPendingCaseTables(pending, caps) {
+  if (!pending?.length) return "";
+  return `
+    <section class="case-table-pending">
+      <div class="section-head"><div><h3>待确认发布</h3><p>上传检查已经完成；有发布权限的人员可在这里接手确认。</p></div></div>
+      <div class="stack">${pending.map(item => renderCaseTablePreview(item, caps)).join("")}</div>
+    </section>`;
+}
+
+function renderCaseTableStatusCard(item, fallbackLabel) {
+  return `
+    <article>
+      <div><span class="case-table-dot"></span><strong>${escapeHtml(item.label || fallbackLabel)}</strong></div>
+      <b>${Number(item.document_count || 0).toLocaleString("zh-CN")} 件</b>
+      <small title="${escapeHtml(item.file_name || "")}">${escapeHtml(item.file_name || "尚未识别来源文件")}</small>
+    </article>`;
+}
+
+function renderCaseTablePreview(preview, caps) {
+  const counts = preview.counts || {};
+  const hasRemoved = Number(counts.removed || 0) > 0;
+  return `
+    <article class="case-table-preview ${preview.errors?.length ? "has-errors" : ""}">
+      <div class="case-table-preview-head">
+        <div>
+          <p class="eyebrow">更新检查结果</p>
+          <h3>${escapeHtml(preview.table_label || "案件底表")} · ${escapeHtml(preview.file_name || "")}</h3>
+          <small class="subtle">上传人 ${escapeHtml(preview.created_by || "—")} · ${formatTime(preview.created_at)}</small>
+        </div>
+        <span class="badge ${statusClass(preview.status)}">${escapeHtml(preview.status_label || "待确认")}</span>
+      </div>
+      <div class="case-table-change-grid">
+        <div><span>当前</span><strong>${Number(counts.current || 0).toLocaleString("zh-CN")}</strong></div>
+        <div><span>上传后</span><strong>${Number(counts.uploaded || 0).toLocaleString("zh-CN")}</strong></div>
+        <div class="added"><span>新增</span><strong>+${Number(counts.added || 0).toLocaleString("zh-CN")}</strong></div>
+        <div class="${hasRemoved ? "removed" : ""}"><span>删除</span><strong>-${Number(counts.removed || 0).toLocaleString("zh-CN")}</strong></div>
+        <div><span>内容变更</span><strong>${Number(counts.changed || 0).toLocaleString("zh-CN")}</strong></div>
+      </div>
+      ${(preview.errors || []).map(message => `<div class="notice error-text">${escapeHtml(message)}</div>`).join("")}
+      ${(preview.warnings || []).map(message => `<div class="notice case-table-warning">${escapeHtml(message)}</div>`).join("")}
+      ${hasRemoved ? `<div class="notice case-table-warning"><strong>请重点核对：</strong>本次会减少 ${Number(counts.removed).toLocaleString("zh-CN")} 件案件。</div>` : ""}
+      <div class="case-table-preview-actions">
+        <span>这里只更新机器人查询底表，不修改正式案件库。</span>
+        ${preview.can_publish && caps.publish ? `<button class="button primary publish-case-table" data-batch="${escapeHtml(preview.batch_no)}" data-removed="${Number(counts.removed || 0)}">确认发布给机器人</button>` : ""}
+      </div>
+    </article>`;
+}
+
+function renderCaseTableHistory(history, caps) {
+  if (!history?.length) return `<div class="empty compact-empty">还没有发布记录</div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>发布时间</th><th>说明</th><th>数据量</th><th>操作人</th><th>操作</th></tr></thead><tbody>
+    ${history.map(item => `<tr>
+      <td>${formatTime(item.published_at)}${item.is_current ? `<div><span class="badge good">当前版本</span></div>` : ""}</td>
+      <td>${escapeHtml(item.reason || "案件底表版本")}<div class="subtle">${escapeHtml(item.version_id || "")}</div></td>
+      <td>被告 ${Number(item.table_counts?.defendant_case_table || 0).toLocaleString("zh-CN")} · 原告 ${Number(item.table_counts?.plaintiff_case_table || 0).toLocaleString("zh-CN")}</td>
+      <td>${escapeHtml(item.published_by || "—")}</td>
+      <td>${!item.is_current && item.can_restore && caps.publish ? `<button class="button restore-case-table" data-version="${escapeHtml(item.version_id)}">恢复此版本</button>` : "—"}</td>
+    </tr>`).join("")}
+  </tbody></table></div>`;
+}
+
+function bindCaseTableWorkspace() {
+  $("#case-table-sync-form")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const result = await mutate(
+      event.submitter,
+      () => api("case-tables/upload", { method: "POST", body: new FormData(event.currentTarget) }),
+      "文件已检查，请核对变化后再发布",
+      false,
+    );
+    state.caseTablePreview = result;
+    $("#case-table-preview-slot").innerHTML = renderCaseTablePreview(
+      result,
+      state.shell.identity.capabilities,
+    );
+    bindCaseTablePublish();
+    $("#case-table-preview-slot").scrollIntoView({ behavior: "smooth", block: "center" });
+  });
+  bindCaseTablePublish();
+  document.querySelectorAll(".restore-case-table").forEach(button => button.addEventListener("click", async () => {
+    if (!confirm("确认恢复这个历史版本？恢复会生成一条新的发布记录，之后仍可再次恢复。")) return;
+    await mutate(
+      button,
+      () => api(`case-tables/versions/${encodeURIComponent(button.dataset.version)}/restore`, { method: "POST" }),
+      "历史版本已恢复，机器人现在使用该版本",
+      false,
+    );
+    state.caseTablePreview = null;
+    await loadPage();
+  }));
+}
+
+function bindCaseTablePublish() {
+  document.querySelectorAll(".publish-case-table:not([data-bound])").forEach(button => {
+    button.dataset.bound = "true";
+    button.addEventListener("click", async event => {
+      const button = event.currentTarget;
+      const removed = Number(button.dataset.removed || 0);
+      const question = removed
+        ? `本次会减少 ${removed} 件案件。确认已经核对变化，并发布给机器人？`
+        : "确认已经核对变化，并发布给机器人？";
+      if (!confirm(question)) return;
+      await mutate(
+        button,
+        () => api(`case-tables/${encodeURIComponent(button.dataset.batch)}/publish`, { method: "POST" }),
+        "案件底表已发布，机器人已切换到新版本",
+        false,
+      );
+      state.caseTablePreview = null;
+      await loadPage();
+    });
+  });
 }
 
 function renderBatchTable(batches) {

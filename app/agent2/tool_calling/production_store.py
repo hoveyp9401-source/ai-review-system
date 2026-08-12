@@ -18,6 +18,8 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    and_,
+    or_,
     select,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
@@ -30,10 +32,19 @@ from app.agent2.tool_calling.context import (
     TrustedClearPending,
     TrustedRecentMessage,
     TrustedRecentOperation,
+    TrustedReportReference,
     TrustedReportItem,
     TrustedReportSnapshot,
 )
+from app.agent2.tool_calling.outbound_context import (
+    OUTBOUND_CONTEXT_BACKEND_ACTION,
+    trusted_recent_outbound_message,
+)
 from app.agent2.tool_calling.registry import ToolDefinition
+from app.agent2.tool_calling.turn_batching import (
+    INGRESS_META_KEY,
+    is_recoverable_ingress_payload,
+)
 from app.agent2.tool_calling.validation import DateResolution
 from app.agent2.memory import (
     PreferredSalutationValue,
@@ -48,11 +59,52 @@ from app.agent2.personal_memory_reply import (
 )
 from app.agent2.typed_daily_executor import build_typed_daily_snapshot
 from app.db import Base
-from app.models import Agent2DailyCommandReceipt, DailyReport, User, WebhookEvent
+from app.models import (
+    Agent2DailyCommandReceipt,
+    DailyReport,
+    ReportInteractionEvent,
+    User,
+    WebhookEvent,
+)
+from app.services.dingtalk import extract_voice_text
 
 
 _RECENT_MESSAGE_MAX_AGE = timedelta(hours=2)
+_SCHEDULED_OUTBOUND_MAX_AGE = timedelta(hours=16)
 _RECENT_OPERATION_MAX_AGE = timedelta(hours=2)
+
+
+def _trusted_report_reference_from_receipt(
+    row: "ToolCallCanaryReceipt",
+) -> TrustedReportReference | None:
+    if (
+        row.status not in {"success", "no_op"}
+        or row.target_type != "daily_report"
+        or not row.target_id
+        or row.after_version is None
+    ):
+        return None
+    facts = row.safe_user_facts if isinstance(row.safe_user_facts, dict) else {}
+    snapshot = facts.get("report_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    try:
+        reference = TrustedReportReference(
+            report_id=uuid.UUID(str(snapshot.get("report_id") or "")),
+            report_date=date.fromisoformat(
+                str(snapshot.get("report_date") or "")
+            ),
+            report_version=int(snapshot.get("version")),
+            report_status=str(snapshot.get("status") or ""),
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        str(reference.report_id) != row.target_id
+        or reference.report_version != row.after_version
+    ):
+        return None
+    return reference
 
 
 class ToolCallCanaryClearPending(Base):
@@ -341,7 +393,39 @@ class ProductionContextStore:
                 )
             ).all()
         )
-        messages: list[TrustedRecentMessage] = []
+        outbound_rows = list(
+            (
+                await self._session.scalars(
+                    select(ReportInteractionEvent)
+                    .where(
+                        ReportInteractionEvent.user_id
+                        == request.user_id,
+                        or_(
+                            ReportInteractionEvent.backend_action
+                            == "daily_briefing_sent",
+                            and_(
+                                ReportInteractionEvent.backend_action
+                                == OUTBOUND_CONTEXT_BACKEND_ACTION,
+                                ReportInteractionEvent.llm_decision_json[
+                                    "conversation_id"
+                                ].astext
+                                == request.conversation_id,
+                            ),
+                        ),
+                        ReportInteractionEvent.created_at
+                        >= request.server_now
+                        - _SCHEDULED_OUTBOUND_MAX_AGE,
+                    )
+                    .order_by(
+                        ReportInteractionEvent.created_at.desc()
+                    )
+                    .limit(max(1, min(limit, 3)))
+                )
+            ).all()
+        )
+        timed_messages: list[
+            tuple[datetime, int, TrustedRecentMessage, bool]
+        ] = []
         salutations = await _server_rendered_salutations(
             self._session,
             tenant_id=request.tenant_id,
@@ -357,11 +441,16 @@ class ProductionContextStore:
                 continue
             user_content = _text_content(row.payload)
             if user_content:
-                messages.append(
-                    TrustedRecentMessage(
-                        role="user",
-                        content=user_content,
-                        source_message_id=row.idempotency_key,
+                timed_messages.append(
+                    (
+                        row.received_at,
+                        0,
+                        TrustedRecentMessage(
+                            role="user",
+                            content=user_content,
+                            source_message_id=row.idempotency_key,
+                        ),
+                        False,
                     )
                 )
             assistant_content = _text_content(
@@ -374,16 +463,59 @@ class ProductionContextStore:
                     salutations=salutations,
                 )[:4000]
             if assistant_content:
-                messages.append(
-                    TrustedRecentMessage(
-                        role="assistant",
-                        content=assistant_content,
-                        source_message_id=(
-                            f"{row.idempotency_key}:assistant"
+                timed_messages.append(
+                    (
+                        row.received_at,
+                        1,
+                        TrustedRecentMessage(
+                            role="assistant",
+                            content=assistant_content,
+                            source_message_id=(
+                                f"{row.idempotency_key}:assistant"
+                            ),
                         ),
+                        False,
                     )
                 )
-        return tuple(messages[-limit:])
+        for row in outbound_rows:
+            if row.backend_action == OUTBOUND_CONTEXT_BACKEND_ACTION:
+                message = trusted_recent_outbound_message(
+                    row,
+                    request=request,
+                    dingtalk_user_id=self._user.dingtalk_user_id,
+                )
+                if message is None:
+                    continue
+                timed_messages.append(
+                    (
+                        row.created_at,
+                        2,
+                        message,
+                        True,
+                    )
+                )
+                continue
+            content = str(getattr(row, "message_text", "") or "").strip()
+            if not content:
+                continue
+            timed_messages.append(
+                (
+                    row.created_at,
+                    2,
+                    TrustedRecentMessage(
+                        role="assistant",
+                        content=content[:4000],
+                        source_message_id=(
+                            f"daily-briefing:{row.id}"
+                        ),
+                    ),
+                    True,
+                )
+            )
+        return _select_recent_messages_with_scheduled_outbound(
+            timed_messages,
+            limit=limit,
+        )
 
     async def load_recent_operations(
         self,
@@ -416,8 +548,10 @@ class ProductionContextStore:
                 )
             ).all()
         )
-        return tuple(
-            TrustedRecentOperation(
+        operations: list[TrustedRecentOperation] = []
+        for row in reversed(rows):
+            operations.append(
+                TrustedRecentOperation(
                 tenant_id=row.tenant_id,
                 user_id=uuid.UUID(row.user_id),
                 conversation_id=row.conversation_id,
@@ -431,10 +565,11 @@ class ProductionContextStore:
                 before_version=row.before_version,
                 after_version=row.after_version,
                 affected_item_ids=tuple(row.affected_item_ids or ()),
+                report_reference=_trusted_report_reference_from_receipt(row),
                 occurred_at=row.created_at,
             )
-            for row in reversed(rows)
-        )
+            )
+        return tuple(operations)
 
     async def permission_allowed(
         self,
@@ -586,6 +721,29 @@ def _event_matches_request(
     )
 
 
+def _select_recent_messages_with_scheduled_outbound(
+    timed_messages: list[
+        tuple[datetime, int, TrustedRecentMessage, bool]
+    ],
+    *,
+    limit: int,
+) -> tuple[TrustedRecentMessage, ...]:
+    if limit <= 0 or not timed_messages:
+        return ()
+    ordered = sorted(timed_messages, key=lambda item: (item[0], item[1]))
+    selected = ordered[-limit:]
+    outbound = [item for item in ordered if item[3]]
+    if outbound and outbound[-1] not in selected:
+        if limit == 1:
+            selected = [outbound[-1]]
+        else:
+            selected = sorted(
+                [outbound[-1], *selected[-(limit - 1) :]],
+                key=lambda item: (item[0], item[1]),
+            )
+    return tuple(item[2] for item in selected)
+
+
 def _text_content(
     payload: Any,
     *,
@@ -593,14 +751,29 @@ def _text_content(
 ) -> str:
     if not isinstance(payload, dict):
         return ""
+    if is_recoverable_ingress_payload(payload):
+        ingress_meta = payload.get(INGRESS_META_KEY)
+        if isinstance(ingress_meta, dict):
+            recovered = ingress_meta.get("text")
+            if isinstance(recovered, str) and recovered.strip():
+                content = recovered.strip()
+                return content if max_length is None else content[:max_length]
+    recognized_voice = extract_voice_text(payload)
+    if recognized_voice:
+        return (
+            recognized_voice
+            if max_length is None
+            else recognized_voice[:max_length]
+        )
     text = payload.get("text")
     if isinstance(text, dict):
         value = text.get("content") or text.get("text") or ""
     elif isinstance(text, str):
         value = text
     else:
-        value = payload.get("content") or payload.get("message") or ""
-    content = str(value).strip()
+        fallback = payload.get("content") or payload.get("message") or ""
+        value = fallback if isinstance(fallback, str) else ""
+    content = value.strip() if isinstance(value, str) else ""
     return content if max_length is None else content[:max_length]
 
 
@@ -916,6 +1089,7 @@ def trusted_snapshot_from_report(
         version=typed.version,
         status=typed.status,
         items=tuple(items),
+        acknowledged_empty_fields=typed.acknowledged_empty_fields,
         provenance=provenance,
     )
 

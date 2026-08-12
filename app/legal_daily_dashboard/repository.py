@@ -28,12 +28,18 @@ class DashboardRepository(Protocol):
         on_date: date,
     ) -> DashboardScope | None: ...
 
-    async def list_teams(self, *, tenant_id: str) -> tuple[TeamRecord, ...]: ...
+    async def list_teams(
+        self,
+        *,
+        tenant_id: str,
+        on_date: date | None = None,
+    ) -> tuple[TeamRecord, ...]: ...
 
     async def list_member_teams(
         self,
         *,
         tenant_id: str,
+        on_date: date | None = None,
     ) -> tuple[TeamRecord, ...]: ...
 
     async def load_records(
@@ -95,16 +101,22 @@ class InMemoryDashboardRepository:
         del on_date
         return self._scopes.get((actor.tenant_id, actor.user_id))
 
-    async def list_teams(self, *, tenant_id: str) -> tuple[TeamRecord, ...]:
-        del tenant_id
+    async def list_teams(
+        self,
+        *,
+        tenant_id: str,
+        on_date: date | None = None,
+    ) -> tuple[TeamRecord, ...]:
+        del tenant_id, on_date
         return self._teams
 
     async def list_member_teams(
         self,
         *,
         tenant_id: str,
+        on_date: date | None = None,
     ) -> tuple[TeamRecord, ...]:
-        del tenant_id
+        del tenant_id, on_date
         return self._teams
 
     async def load_records(

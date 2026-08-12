@@ -31,12 +31,10 @@ from app.services.dingtalk import (
 from app.services.dingtalk_crypto import DingTalkCallbackCrypto
 from app.services.performance_service import (
     NO_ACTIVE_PERFORMANCE_TASK_MESSAGE,
-    PERFORMANCE_PENDING_CONFIRMATION,
-    is_performance_reply_candidate,
     looks_like_performance_reply_template,
-    submission_metrics,
 )
 from app.services.report_service import DailyReportService
+from app.utils.dingtalk_text import format_dingtalk_plain_text
 from app.utils.time import now_in_timezone
 from app.agent2.cognitive_runtime_v3 import (
     admission_block_reply,
@@ -66,12 +64,17 @@ from app.agent2.context_pack import build_agent2_context_pack
 from app.agent2.performance_knowledge import attach_live_performance_catalog
 from app.agent2.tool_calling.canary_service import (
     CanaryIngressExecutionError,
+    build_canary_persisted_response_payload,
     build_canary_response_payload,
+    canary_provider_response_payload,
     canary_route_suppresses_delivery,
     deliver_canary_message_if_enabled,
     is_canary_message_delivery_suppressed,
     process_tool_call_canary_ingress,
     resolve_tool_call_canary_route,
+)
+from app.agent2.tool_calling.turn_batching import (
+    prepare_recoverable_ingress_payload,
 )
 from app.agent2.case_report_projection_runtime import (
     project_committed_case_followup_facts,
@@ -95,7 +98,6 @@ from app.agent2.business.policy import BusinessEffectPolicy
 from app.agent2.daily_shadow import evaluate_daily_shadow
 from app.agent2.daily_execution import (
     Agent2DailyExecutionResult,
-    agent2_daily_enabled_for_user,
     agent2_daily_report_version,
     execute_agent2_daily_commands,
 )
@@ -103,7 +105,6 @@ from app.agent2.typed_daily_executor import execute_typed_agent2_daily_commands
 from app.agent2.report_sql_executor import (
     execute_periodic_report_commands,
 )
-from app.agent2.workflow_audit import create_agent2_workflow_audit_event
 from app.agent2.operation_outcomes import OutcomeReplyComposer
 from app.agent2.operation_outcome_store import persist_operation_outcomes
 from app.agent2.outcome_adapters import (
@@ -112,12 +113,7 @@ from app.agent2.outcome_adapters import (
     periodic_execution_outcomes,
     text_outcome,
 )
-from app.workflows.intake import (
-    ActiveWorkflowTask,
-    IncomingMessageEnvelope,
-    WORKFLOW_MONTHLY_REPORT,
-)
-from app.workflows.gate import GateDecision
+from app.workflows.intake import IncomingMessageEnvelope
 from app.workflows.daily_context import (
     build_live_daily_active_task,
     daily_active_task_from_report,
@@ -308,10 +304,13 @@ async def dingtalk_webhook(
             return _encrypt_response(crypto, error_resp)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    message_type = str(
+        payload.get("msgtype") or payload.get("msgType") or "text"
+    )
+
     # If audio/voice message without auto-recognition text, try ASR
     if not incoming.text:
-        msg_type = payload.get("msgtype") or payload.get("msgType") or ""
-        if msg_type in ("audio", "voice"):
+        if message_type in ("audio", "voice"):
             download_code = extract_voice_download_code(payload)
             if download_code:
                 robot = request.app.state.dingtalk_robot
@@ -326,18 +325,27 @@ async def dingtalk_webhook(
                         type(exc).__name__,
                     )
 
+    persisted_payload = prepare_recoverable_ingress_payload(
+        payload,
+        text=incoming.text,
+        message_type=message_type,
+        voice_download_seconds=0.0,
+        voice_transcribe_seconds=0.0,
+    )
     idempotency_key = build_idempotency_key(payload, incoming)
     event, inserted = await create_webhook_event_once(
         session,
         idempotency_key=idempotency_key,
         external_message_id=incoming.message_id,
         dingtalk_user_id=incoming.dingtalk_user_id,
-        payload=payload,
+        payload=persisted_payload,
     )
     await session.commit()
 
     if not inserted:
-        resp = event.response_payload
+        resp = canary_provider_response_payload(
+            event.response_payload
+        )
         if not resp:
             duplicate_user = await get_active_user_by_dingtalk_id(
                 session,
@@ -396,13 +404,6 @@ async def dingtalk_webhook(
             return response_payload
 
         performance_service = getattr(request.app.state, "performance_service", None)
-        await _observe_workflow_route(
-            session=session,
-            user=user,
-            incoming=incoming,
-            performance_service=performance_service,
-            settings=settings,
-        )
         if performance_service is not None:
             performance_result = await performance_service.submit_text(
                 session,
@@ -498,16 +499,9 @@ async def dingtalk_webhook(
                 read_only=not tool_call_canary.actual_write,
                 command_results=[],
             )
-        elif tool_call_canary.owner == "agent1":
-            agent2_result = None
         else:
-            agent2_result = await _submit_webhook_agent2_if_enabled(
-                session=session,
-                user=user,
-                incoming=incoming,
-                settings=settings,
-                message_id=idempotency_key,
-                llm_client=ingress_llm_client,
+            raise RuntimeError(
+                "Agent2 Tool-Call Core did not handle a production webhook turn"
             )
         if agent2_result is not None:
             response_payload = (
@@ -515,11 +509,18 @@ async def dingtalk_webhook(
                 if tool_call_canary.handled
                 else dingtalk_text_response(agent2_result.message)
             )
+            persisted_response_payload = (
+                build_canary_persisted_response_payload(
+                    tool_call_canary
+                )
+                if tool_call_canary.handled
+                else response_payload
+            )
             await mark_webhook_event_processed(
                 session,
                 event,
                 report_id=uuid.UUID(agent2_result.report_id) if agent2_result.report_id else None,
-                response_payload=response_payload,
+                response_payload=persisted_response_payload,
                 now=now_in_timezone(settings.timezone),
             )
             await session.commit()
@@ -556,61 +557,17 @@ async def dingtalk_webhook(
                 return PlainTextResponse("ok")
             return response_payload
 
-        gate_decision = await _evaluate_legacy_daily_gate(
-            session=session,
-            user=user,
-            incoming=incoming,
-            performance_service=performance_service,
-            settings=settings,
+        raise RuntimeError(
+            "Agent2 Tool-Call Core response was not returned by webhook ingress"
         )
-        if gate_decision.block_legacy_daily:
-            response_payload = dingtalk_text_response(gate_decision.reply_text or "这句我先不写入日报，请补充说明。")
-            await mark_webhook_event_processed(
-                session,
-                event,
-                report_id=None,
-                response_payload=response_payload,
-                now=now_in_timezone(settings.timezone),
-            )
-            await session.commit()
-            if is_encrypted and crypto:
-                robot = request.app.state.dingtalk_robot
-                try:
-                    if incoming.session_webhook:
-                        await robot.send_session_webhook_text(session_webhook=incoming.session_webhook, text=response_payload["text"]["content"])
-                    else:
-                        await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=response_payload["text"]["content"])
-                except Exception as send_exc:
-                    _log_runtime_failure("dingtalk_async_gate_reply_failed", send_exc)
-                return _encrypted_success(crypto)
-            return response_payload
-
-        report_service: DailyReportService = request.app.state.report_service
-        result = await report_service.submit_text(
-            session, user=user, raw_input=incoming.text, source=incoming.source,
-        )
-        response_payload = dingtalk_text_response(result.message)
-        await mark_webhook_event_processed(
-            session, event, report_id=uuid.UUID(result.report_id) if result.report_id else None,
-            response_payload=response_payload, now=now_in_timezone(settings.timezone),
-        )
-        await session.commit()
-        if is_encrypted and crypto:
-            robot = request.app.state.dingtalk_robot
-            try:
-                if incoming.session_webhook:
-                    await robot.send_session_webhook_text(session_webhook=incoming.session_webhook, text=result.message)
-                else:
-                    await robot.send_robot_direct_text(user_ids=[incoming.dingtalk_user_id], text=result.message)
-            except Exception as send_exc:
-                _log_runtime_failure("dingtalk_async_reply_failed", send_exc)
-            return _encrypted_success(crypto)
-        return response_payload
     except CanaryIngressExecutionError as exc:
         await session.rollback()
         failure_outcome = exc.outcome()
         response_payload = build_canary_response_payload(
             failure_outcome
+        )
+        persisted_response_payload = (
+            build_canary_persisted_response_payload(failure_outcome)
         )
         async with session.begin():
             event = await session.merge(event)
@@ -618,7 +575,7 @@ async def dingtalk_webhook(
                 session,
                 event,
                 error_message=exc.error_type,
-                response_payload=response_payload,
+                response_payload=persisted_response_payload,
                 now=now_in_timezone(settings.timezone),
             )
         if is_canary_message_delivery_suppressed(response_payload):
@@ -670,13 +627,7 @@ async def _submit_webhook_agent2_if_enabled(
         source_message_id=message_id,
     )
     await persist_runtime_owner_claim(session, entrypoint)
-    runtime_owner = decide_runtime_owner(
-        entrypoint.decision,
-        phase2_control_plane_enabled=bool(
-            getattr(settings, "agent2_business_phase2_enabled", False)
-        ),
-        legacy_agent2_daily_enabled=agent2_daily_enabled_for_user(settings, user),
-    )
+    runtime_owner = decide_runtime_owner(entrypoint.decision)
     phase2_primary = runtime_owner == "agent2_primary"
     phase2_business_context = (
         build_business_command_context(
@@ -700,8 +651,6 @@ async def _submit_webhook_agent2_if_enabled(
             read_only=True,
             command_results=[],
         )
-    if runtime_owner == "agent1":
-        return None
     daily_context = await load_live_daily_context(session, user, settings)
     daily_report = daily_context.report
     report_date = daily_context.report_date
@@ -1204,6 +1153,7 @@ async def _submit_webhook_agent2_if_enabled(
                     raise RuntimeError(
                         "Agent2 read-only outcome requires verified execution context"
                     )
+                message = format_dingtalk_plain_text(message)
                 outcomes = (text_outcome(message, source_turn_id=message_id),)
                 await persist_operation_outcomes(
                     session,
@@ -1239,103 +1189,3 @@ async def _submit_webhook_agent2_if_enabled(
         message_id=message_id,
         expected_report_version=agent2_daily_report_version(daily_report),
     )
-
-
-async def _observe_workflow_route(
-    *,
-    session: AsyncSession,
-    user: Any,
-    incoming: Any,
-    performance_service: Any,
-    settings: Settings,
-) -> None:
-    await _evaluate_legacy_daily_gate(
-        session=session,
-        user=user,
-        incoming=incoming,
-        performance_service=performance_service,
-        settings=settings,
-        observe_only_log=True,
-    )
-
-
-async def _evaluate_legacy_daily_gate(
-    *,
-    session: AsyncSession,
-    user: Any,
-    incoming: Any,
-    performance_service: Any,
-    settings: Settings,
-    observe_only_log: bool = False,
-) -> GateDecision:
-    active_tasks: list[ActiveWorkflowTask] = []
-    if performance_service is not None:
-        try:
-            active_submission = await performance_service.get_active_submission(session, user.id)
-            if active_submission is not None:
-                metrics = submission_metrics(active_submission)
-                responses = list(active_submission.responses_json or [])
-                reply_candidate = is_performance_reply_candidate(
-                    metrics=metrics,
-                    responses=responses,
-                    raw_input=incoming.text,
-                    status=active_submission.status,
-                )
-                active_tasks.append(
-                    ActiveWorkflowTask(
-                        workflow=WORKFLOW_MONTHLY_REPORT,
-                        task_id=str(active_submission.task_id),
-                        status=str(active_submission.status or ""),
-                        reply_candidate=reply_candidate,
-                        awaiting_confirmation=active_submission.status == PERFORMANCE_PENDING_CONFIRMATION,
-                        reason="performance submission is active",
-                        metadata={"submission_id": str(active_submission.id)},
-                    )
-                )
-        except Exception as exc:
-            _log_runtime_failure(
-                "workflow_route_performance_task_lookup_skipped", exc
-            )
-
-    try:
-        daily_task = await build_live_daily_active_task(session, user, settings)
-        if daily_task is not None:
-            active_tasks.append(daily_task)
-    except Exception as exc:
-        _log_runtime_failure("workflow_route_daily_task_lookup_skipped", exc)
-
-    envelope = IncomingMessageEnvelope(
-        sender_id=str(getattr(user, "id", "") or ""),
-        sender_name=str(getattr(user, "name", "") or ""),
-        dingtalk_user_id=str(getattr(incoming, "dingtalk_user_id", "") or ""),
-        source=str(getattr(incoming, "source", "") or ""),
-        raw_text=str(getattr(incoming, "text", "") or ""),
-        message_id=str(getattr(incoming, "message_id", "") or ""),
-        conversation_id=str(getattr(incoming, "conversation_id", "") or ""),
-        active_tasks=tuple(active_tasks),
-    )
-    mode = "observe_only" if observe_only_log else getattr(settings, "workflow_intake_mode", "observe_only")
-    shadow = evaluate_daily_shadow(envelope, mode=mode)
-    gate_decision = shadow.gate_decision
-    observation = envelope.observation_base()
-    summary = shadow.summary()
-    logger.info(
-        "workflow_shadow_observation source_message_hash=%s selected_workflow=%s "
-        "command_count=%d adapter_result_count=%d block_legacy_daily=%s",
-        str(observation.get("raw_text_hash") or ""),
-        str(getattr(shadow.route, "workflow", "") or ""),
-        int(summary.get("command_count") or 0),
-        int(summary.get("adapter_result_count") or 0),
-        bool(gate_decision.block_legacy_daily),
-    )
-    await create_agent2_workflow_audit_event(
-        session=session,
-        user=user,
-        incoming=incoming,
-        settings=settings,
-        envelope=envelope,
-        shadow=shadow,
-        mode=mode,
-        observe_only_log=observe_only_log,
-    )
-    return gate_decision

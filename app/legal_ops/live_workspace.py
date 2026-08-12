@@ -10,9 +10,12 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent2.business.models import Agent2Case, Agent2IdentityBinding, PeriodicReport, TravelIntent
-from app.models import DailyReport
-
+from app.agent2.business.models import (
+    Agent2Case,
+    Agent2IdentityBinding,
+    PeriodicReport,
+    TravelIntent,
+)
 from app.legal_ops.business_labels import (
     case_stage_label,
     case_type_label,
@@ -20,6 +23,7 @@ from app.legal_ops.business_labels import (
     source_label,
     travel_status_label,
 )
+from app.models import DailyReport
 
 
 def _case_business_facts(case: dict[str, Any]) -> list[dict[str, str]]:
@@ -42,6 +46,22 @@ def _case_business_facts(case: dict[str, Any]) -> list[dict[str, str]]:
         if value:
             facts.append({"label": label, "value": value})
     return facts
+
+
+def _case_owner_name(case: dict[str, Any], identities: dict[str, str]) -> str:
+    """Prefer an account name, but keep the source workbook's readable owner."""
+    owner_user_id = str(case.get("owner_user_id") or "")
+    bound_name = str(identities.get(owner_user_id) or "").strip()
+    if bound_name:
+        return bound_name
+    source = case.get("source_json")
+    if not isinstance(source, dict):
+        source = {}
+    for key in ("owner_display_name", "owner_source_value"):
+        source_name = str(source.get(key) or "").strip()
+        if source_name:
+            return source_name
+    return "未识别负责人"
 
 
 def project_case_workspace(
@@ -138,7 +158,7 @@ def project_case_workspace(
                 "stage": case_stage_label(raw_type, raw_stage),
                 "stage_code": raw_stage,
                 "node": str(lifecycle.get("node") or "暂未记录"),
-                "owner_name": identities.get(str(item.get("owner_user_id") or ""), "未识别负责人"),
+                "owner_name": _case_owner_name(item, identities),
                 "assignment": (
                     "本人负责"
                     if principal_user_id
@@ -290,6 +310,7 @@ def project_case_detail(
                 "can_edit": bool(
                     node.get("progress_id")
                     and not node.get("deleted")
+                    and str(node.get("content_origin") or "") == "human_record"
                     and editable_actor_user_id
                     and str(node.get("reporter_id") or "")
                     == editable_actor_user_id
@@ -374,7 +395,7 @@ def project_case_detail(
         "case_number": str(case.get("case_number") or case.get("external_case_id") or "暂未记录"),
         "case_type": case_type_label(case_type),
         "stage": case_stage_label(case_type, current_stage),
-        "owner_name": identity_names.get(str(case.get("owner_user_id") or ""), "未识别负责人"),
+        "owner_name": _case_owner_name(case, identity_names),
         "assignment": (
             "本人负责"
             if editable_actor_user_id
@@ -522,7 +543,7 @@ def project_report_center(
                     "value": str(value),
                 }
                 for index, value in enumerate(
-                    (sections.get(field_name) if isinstance(sections.get(field_name), list) else [])
+                    sections.get(field_name) if isinstance(sections.get(field_name), list) else []
                 )
             ]
             for field_name, refs in raw_item_ids.items()

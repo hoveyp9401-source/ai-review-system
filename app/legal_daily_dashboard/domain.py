@@ -41,6 +41,9 @@ class MemberRecord:
     ref: str
     name: str
     team_ref: str
+    team_name: str = ""
+    department_name: str = ""
+    team_code: str = ""
 
 
 @dataclass(frozen=True)

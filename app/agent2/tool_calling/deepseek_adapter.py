@@ -4,12 +4,29 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field, replace
+from time import perf_counter
 from typing import Any
+from uuid import UUID
 
 import httpx
 
 from app.agent2.tool_calling.context import TrustedContext
 from app.agent2.tool_calling.contracts import ExecutionMode, ToolReceipt
+from app.agent2.tool_calling.daily_briefing_reply import (
+    daily_briefing_composer_messages,
+    daily_briefing_reply_retry_instruction,
+    render_daily_briefing_reply,
+    validate_daily_briefing_reply,
+)
+from app.agent2.tool_calling.daily_incomplete_confirm_review import (
+    daily_incomplete_confirm_review_messages,
+    incomplete_confirm_review_targets,
+    validate_daily_incomplete_confirm_replacements,
+)
+from app.agent2.tool_calling.managed_daily_reply import (
+    managed_daily_reply_retry_instruction,
+    validate_managed_daily_reply,
+)
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
 from app.agent2.tool_calling.receipt_reply import (
     finalize_canary_content,
@@ -28,6 +45,12 @@ from app.agent2.tool_calling.runtime import (
     TurnExecutionPlan,
     merge_turn_plans,
 )
+from app.agent2.tool_calling.write_reply import (
+    model_safe_user_facts,
+    validate_write_reply,
+    write_reply_protocol,
+    write_reply_retry_instruction,
+)
 
 _TEXTUAL_TOOL_PROTOCOL_MARKERS = (
     "<｜DSML｜tool_calls",
@@ -43,13 +66,14 @@ class DeepSeekToolCallingError(RuntimeError):
         self,
         message: str,
         *,
-        raw_tool_call_audit: tuple["RawToolCallAudit", ...] = (),
+        raw_tool_call_audit: tuple[RawToolCallAudit, ...] = (),
         model_call_count: int = 0,
         turn_plan: TurnExecutionPlan | None = None,
-        model_turns: tuple["ModelTurnAudit", ...] = (),
+        model_turns: tuple[ModelTurnAudit, ...] = (),
         request_attempt_count: int = 0,
         transport_retry_count: int = 0,
         transport_errors: tuple[dict[str, Any], ...] = (),
+        model_elapsed_seconds: float = 0.0,
     ) -> None:
         super().__init__(message)
         self.raw_tool_call_audit = raw_tool_call_audit
@@ -59,6 +83,10 @@ class DeepSeekToolCallingError(RuntimeError):
         self.request_attempt_count = request_attempt_count
         self.transport_retry_count = transport_retry_count
         self.transport_errors = transport_errors
+        self.model_elapsed_seconds = max(
+            0.0,
+            float(model_elapsed_seconds),
+        )
 
 
 class DeepSeekTimeoutError(DeepSeekToolCallingError):
@@ -226,8 +254,13 @@ class DeepSeekToolCallingAdapter:
         runtime: ShadowRuntime,
         thinking_enabled: bool = False,
     ) -> DeepSeekToolCallingResult:
-        if type(runtime) is not ShadowRuntime or runtime.mode != ExecutionMode.SHADOW_PROPOSAL:
-            raise TypeError("run_shadow_turn requires the exact zero-write ShadowRuntime capability")
+        if (
+            type(runtime) is not ShadowRuntime
+            or runtime.mode != ExecutionMode.SHADOW_PROPOSAL
+        ):
+            raise TypeError(
+                "run_shadow_turn requires the exact zero-write ShadowRuntime capability"
+            )
         session = runtime.open_session(context)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -252,6 +285,7 @@ class DeepSeekToolCallingAdapter:
         iterations = 0
         tool_loops = 0
         write_batch_seen = False
+        managed_daily_reply_retry_count = 0
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
         while True:
@@ -259,7 +293,11 @@ class DeepSeekToolCallingAdapter:
             try:
                 completion = await self._complete(
                     messages,
-                    tool_schemas=[] if write_batch_seen else tool_schemas,
+                    tool_schemas=(
+                        []
+                        if (write_batch_seen or managed_daily_reply_retry_count)
+                        else tool_schemas
+                    ),
                     thinking_enabled=thinking_enabled,
                 )
                 model_turns.append(
@@ -303,7 +341,11 @@ class DeepSeekToolCallingAdapter:
                     )
                 turn_plan = merge_turn_plans(context, tuple(plans))
                 if turn_plan is not None:
-                    _assert_shadow_plan(turn_plan, context, expected_receipt_count=len(turn_plan.tool_calls))
+                    _assert_shadow_plan(
+                        turn_plan,
+                        context,
+                        expected_receipt_count=len(turn_plan.tool_calls),
+                    )
                 final_content, model_hash = finalize_shadow_content(content, turn_plan)
                 return DeepSeekToolCallingResult(
                     final_content=final_content,
@@ -402,12 +444,14 @@ class DeepSeekToolCallingAdapter:
     ) -> DeepSeekCanaryResult:
         if (
             context.namespace != "agent2.tool_calling.canary.v1"
-            or getattr(runtime_session, "mode", None)
-            != ExecutionMode.CANARY_EXECUTE
+            or getattr(runtime_session, "mode", None) != ExecutionMode.CANARY_EXECUTE
         ):
             raise TypeError(
                 "run_canary_turn requires a Canary context and runtime session"
             )
+        briefing_user_question = (
+            "\n".join(user_messages) if user_messages else user_text
+        )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {
@@ -433,171 +477,613 @@ class DeepSeekToolCallingAdapter:
         iterations = 0
         tool_loops = 0
         write_batch_seen = False
+        briefing_fact_batch_seen = False
+        daily_briefing_reply_retry_count = 0
+        managed_daily_reply_retry_count = 0
+        write_reply_retry_count = 0
+        tool_argument_repair_count = 0
+        incomplete_confirm_review_count = 0
+        daily_submit_section_review_count = 0
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
-        while True:
-            iterations += 1
-            try:
-                completion = await self._complete(
-                    messages,
-                    tool_schemas=[] if write_batch_seen else tool_schemas,
-                    thinking_enabled=thinking_enabled,
-                )
-                model_turns.append(
-                    _model_turn_audit(
-                        iterations,
-                        completion.message,
-                        response_metadata=completion.metadata,
-                    )
-                )
-                parsed = _parse_assistant_turn(completion.message)
-                audits.extend(parsed.audit)
-                protocol_warning = _validate_completion_protocol(
-                    completion,
-                    parsed,
-                    allow_usable_direct_text=True,
-                )
-                if protocol_warning is not None:
-                    model_turns[-1] = replace(
-                        model_turns[-1],
-                        response_metadata={
-                            **model_turns[-1].response_metadata,
-                            "protocol_warning": protocol_warning,
-                        },
-                    )
-            except DeepSeekToolCallingError as exc:
-                raise _with_canary_turn_state(
-                    exc,
-                    audits=audits,
-                    model_turns=model_turns,
-                ) from exc
+        async def rollback_pending() -> None:
+            if not runtime_results or not runtime_results[-1].transaction_pending:
+                return
+            rollback = getattr(runtime_session, "rollback_pending", None)
+            if rollback is not None:
+                await rollback()
 
-            if not parsed.tool_calls:
-                content = parsed.assistant_message.get("content")
-                if not isinstance(content, str):
+        async def commit_pending() -> None:
+            if not runtime_results or not runtime_results[-1].transaction_pending:
+                return
+            commit = getattr(runtime_session, "commit_pending", None)
+            if commit is None:
+                raise ProductionRuntimeExecutionError(
+                    "production runtime cannot finalize a pending turn"
+                )
+            committed = await commit()
+            if (
+                not isinstance(committed, ProductionRuntimeResult)
+                or committed.status != "success"
+                or committed.transaction_pending
+                or not committed.committed_to_outer_transaction
+                or committed.receipts != runtime_results[-1].receipts
+            ):
+                raise ProductionRuntimeExecutionError(
+                    "production runtime returned an invalid finalization result"
+                )
+            runtime_results[-1] = committed
+
+        try:
+            while True:
+                iterations += 1
+                try:
+                    completion = await self._complete(
+                        messages,
+                        tool_schemas=(
+                            []
+                            if (
+                                write_batch_seen
+                                or briefing_fact_batch_seen
+                                or daily_briefing_reply_retry_count
+                                or managed_daily_reply_retry_count
+                                or write_reply_retry_count
+                            )
+                            else tool_schemas
+                        ),
+                        thinking_enabled=(thinking_enabled or briefing_fact_batch_seen),
+                    )
+                    model_turns.append(
+                        _model_turn_audit(
+                            iterations,
+                            completion.message,
+                            response_metadata=completion.metadata,
+                        )
+                    )
+                    parsed = _parse_assistant_turn(completion.message)
+                    audits.extend(parsed.audit)
+                    protocol_warning = _validate_completion_protocol(
+                        completion,
+                        parsed,
+                        allow_usable_direct_text=True,
+                        allow_empty_terminal_for_retry=(
+                            (
+                                briefing_fact_batch_seen
+                                and daily_briefing_reply_retry_count == 0
+                            )
+                            or (write_batch_seen and write_reply_retry_count < 2)
+                        ),
+                    )
+                    if protocol_warning is not None:
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "protocol_warning": protocol_warning,
+                            },
+                        )
+                except (
+                    MalformedToolCallError,
+                    InvalidNativeToolArgumentsError,
+                ) as exc:
+                    if (
+                        tool_argument_repair_count == 0
+                        and not write_batch_seen
+                        and not briefing_fact_batch_seen
+                    ):
+                        audits.extend(exc.raw_tool_call_audit)
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "pre_execution_tool_argument_repair": True,
+                                "tool_argument_error_type": type(exc).__name__,
+                            },
+                        )
+                        messages.append(_pre_execution_tool_argument_repair_message())
+                        tool_argument_repair_count += 1
+                        continue
+                    raise _with_canary_turn_state(
+                        exc,
+                        audits=audits,
+                        model_turns=model_turns,
+                    ) from exc
+                except DeepSeekToolCallingError as exc:
+                    raise _with_canary_turn_state(
+                        exc,
+                        audits=audits,
+                        model_turns=model_turns,
+                    ) from exc
+
+                if not parsed.tool_calls:
+                    content = parsed.assistant_message.get("content")
+                    if not isinstance(content, str):
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "assistant response has neither tool calls nor text content"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+                    if any(
+                        marker in content for marker in _TEXTUAL_TOOL_PROTOCOL_MARKERS
+                    ):
+                        error = (
+                            ToolCallsAfterWriteBatchError(
+                                "textual tool protocol appeared after the write batch closed"
+                            )
+                            if write_batch_seen
+                            else MalformedToolCallError(
+                                "textual tool protocol is not a native Tool Call"
+                            )
+                        )
+                        raise _with_canary_turn_state(
+                            error,
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+
+                    reply_for_validation = content
+                    write_validation_errors: tuple[str, ...] = ()
+                    briefing_validation_errors: tuple[str, ...] = ()
+                    briefing_envelope = None
+                    if write_batch_seen:
+                        envelope, write_validation_errors = validate_write_reply(
+                            content, tuple(receipts)
+                        )
+                        if envelope is not None:
+                            reply_for_validation = envelope.reply
+                    elif briefing_fact_batch_seen:
+                        (
+                            briefing_envelope,
+                            briefing_validation_errors,
+                        ) = validate_daily_briefing_reply(
+                            content,
+                            tuple(receipts),
+                        )
+                        if briefing_envelope is not None:
+                            reply_for_validation = render_daily_briefing_reply(
+                                briefing_envelope
+                            )
+                    managed_validation_errors = (
+                        validate_managed_daily_reply(
+                            reply_for_validation,
+                            tuple(receipts),
+                        )
+                        if not write_validation_errors
+                        and not briefing_validation_errors
+                        else ()
+                    )
+                    validation_errors = (
+                        *write_validation_errors,
+                        *briefing_validation_errors,
+                        *managed_validation_errors,
+                    )
+                    if validation_errors:
+                        validation_metadata = {
+                            "terminal_reply_validation": list(validation_errors),
+                        }
+                        if briefing_fact_batch_seen:
+                            validation_metadata["daily_briefing_reply_validation"] = (
+                                list(validation_errors)
+                            )
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                **validation_metadata,
+                            },
+                        )
+                        if write_batch_seen:
+                            if write_reply_retry_count < 2:
+                                if content.strip():
+                                    messages.append(parsed.assistant_message)
+                                messages.append(
+                                    {
+                                        "role": "system",
+                                        "content": write_reply_retry_instruction(
+                                            tuple(validation_errors),
+                                            tuple(receipts),
+                                        ),
+                                    }
+                                )
+                                model_turns[-1] = replace(
+                                    model_turns[-1],
+                                    response_metadata={
+                                        **model_turns[-1].response_metadata,
+                                        "write_reply_validation": list(
+                                            validation_errors
+                                        ),
+                                        "write_reply_retry": True,
+                                    },
+                                )
+                                write_reply_retry_count += 1
+                                continue
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "write reply failed receipt validation"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            )
+                        if briefing_fact_batch_seen:
+                            if daily_briefing_reply_retry_count < 2:
+                                messages = daily_briefing_composer_messages(
+                                    user_question=briefing_user_question,
+                                    receipts=tuple(receipts),
+                                )
+                                messages.append(
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            daily_briefing_reply_retry_instruction(
+                                                tuple(validation_errors),
+                                                tuple(receipts),
+                                                retry_number=(
+                                                    daily_briefing_reply_retry_count + 1
+                                                ),
+                                            )
+                                        ),
+                                    }
+                                )
+                                model_turns[-1] = replace(
+                                    model_turns[-1],
+                                    response_metadata={
+                                        **model_turns[-1].response_metadata,
+                                        "daily_briefing_reply_validation": list(
+                                            validation_errors
+                                        ),
+                                        "daily_briefing_reply_retry": True,
+                                    },
+                                )
+                                daily_briefing_reply_retry_count += 1
+                                continue
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "daily briefing reply failed evidence validation"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            )
+                        if managed_daily_reply_retry_count == 0:
+                            messages.append(parsed.assistant_message)
+                            messages.append(
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        managed_daily_reply_retry_instruction(
+                                            tuple(validation_errors)
+                                        )
+                                    ),
+                                }
+                            )
+                            model_turns[-1] = replace(
+                                model_turns[-1],
+                                response_metadata={
+                                    **model_turns[-1].response_metadata,
+                                    "managed_daily_reply_validation": list(
+                                        validation_errors
+                                    ),
+                                    "managed_daily_reply_retry": True,
+                                },
+                            )
+                            managed_daily_reply_retry_count += 1
+                            continue
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "managed daily reply failed factual validation"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+
+                    if write_batch_seen:
+                        await commit_pending()
+                    final_content, model_hash = finalize_canary_content(
+                        (
+                            reply_for_validation
+                            if briefing_envelope is not None
+                            else content
+                        ),
+                        tuple(receipts),
+                        write_batch_seen=write_batch_seen,
+                        personal_memory=context.personal_memory,
+                    )
+                    return DeepSeekCanaryResult(
+                        final_content=final_content,
+                        model_content_sha256=model_hash,
+                        iterations=iterations,
+                        raw_tool_call_audit=tuple(audits),
+                        receipts=tuple(receipts),
+                        runtime_results=tuple(runtime_results),
+                        model_turns=tuple(model_turns),
+                        request_attempt_count=sum(
+                            int(item.response_metadata.get("request_attempt_count", 1))
+                            for item in model_turns
+                        ),
+                        transport_retry_count=sum(
+                            int(item.response_metadata.get("transport_retry_count", 0))
+                            for item in model_turns
+                        ),
+                    )
+
+                if tool_loops >= self._max_tool_loops:
+                    raise _with_canary_turn_state(
+                        MaxToolLoopsExceeded("maximum tool-call loops exceeded"),
+                        audits=audits,
+                        model_turns=model_turns,
+                    )
+                if (
+                    briefing_fact_batch_seen
+                    or daily_briefing_reply_retry_count
+                    or managed_daily_reply_retry_count
+                    or write_reply_retry_count
+                ):
                     raise _with_canary_turn_state(
                         DeepSeekResponseError(
-                            "assistant response has neither tool calls nor text content"
+                            "a terminal reply retry emitted a tool call"
                         ),
                         audits=audits,
                         model_turns=model_turns,
                     )
-                if any(marker in content for marker in _TEXTUAL_TOOL_PROTOCOL_MARKERS):
-                    error = (
-                        ToolCallsAfterWriteBatchError(
-                            "textual tool protocol appeared after the write batch closed"
-                        )
-                        if write_batch_seen
-                        else MalformedToolCallError(
-                            "textual tool protocol is not a native Tool Call"
-                        )
-                    )
+                if write_batch_seen:
                     raise _with_canary_turn_state(
-                        error,
+                        ToolCallsAfterWriteBatchError(
+                            "a user turn may contain only one complete write-tool batch"
+                        ),
                         audits=audits,
                         model_turns=model_turns,
                     )
-                final_content, model_hash = finalize_canary_content(
-                    content,
-                    tuple(receipts),
-                    write_batch_seen=write_batch_seen,
-                    personal_memory=context.personal_memory,
+                current_has_write = any(
+                    TOOL_REGISTRY[call.tool_name].read_or_write == "write"
+                    for call in parsed.tool_calls
                 )
-                return DeepSeekCanaryResult(
-                    final_content=final_content,
-                    model_content_sha256=model_hash,
-                    iterations=iterations,
-                    raw_tool_call_audit=tuple(audits),
-                    receipts=tuple(receipts),
-                    runtime_results=tuple(runtime_results),
-                    model_turns=tuple(model_turns),
-                    request_attempt_count=sum(
-                        int(
-                            item.response_metadata.get(
-                                "request_attempt_count", 1
-                            )
-                        )
-                        for item in model_turns
-                    ),
-                    transport_retry_count=sum(
-                        int(
-                            item.response_metadata.get(
-                                "transport_retry_count", 0
-                            )
-                        )
-                        for item in model_turns
-                    ),
-                )
-
-            if tool_loops >= self._max_tool_loops:
-                raise _with_canary_turn_state(
-                    MaxToolLoopsExceeded(
-                        "maximum tool-call loops exceeded"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
-                )
-            if write_batch_seen:
-                raise _with_canary_turn_state(
-                    ToolCallsAfterWriteBatchError(
-                        "a user turn may contain only one complete write-tool batch"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
-                )
-            try:
-                _reject_repeated_calls(
+                incomplete_confirm_targets = incomplete_confirm_review_targets(
                     parsed.tool_calls,
-                    seen_ids=seen_ids,
-                    seen_fingerprints=seen_fingerprints,
-                    audit=(),
+                    context=context,
                 )
-            except DeepSeekToolCallingError as exc:
-                raise _with_canary_turn_state(
-                    exc,
-                    audits=audits,
-                    model_turns=model_turns,
-                ) from exc
+                if incomplete_confirm_review_count == 0 and incomplete_confirm_targets:
+                    model_turns[-1] = replace(
+                        model_turns[-1],
+                        response_metadata={
+                            **model_turns[-1].response_metadata,
+                            "pre_execution_incomplete_confirm_review": True,
+                            "draft_executed": False,
+                        },
+                    )
+                    incomplete_confirm_review_count += 1
+                    review_tool_names = frozenset(
+                        {"add_daily_items", "confirm_report"}
+                    ).intersection(context.allowed_tool_names)
+                    try:
+                        review_completion = await self._complete(
+                            daily_incomplete_confirm_review_messages(
+                                ordered_messages=user_messages or (user_text,),
+                                targets=incomplete_confirm_targets,
+                            ),
+                            tool_schemas=deepseek_tool_schemas(review_tool_names),
+                            thinking_enabled=True,
+                        )
+                        iterations += 1
+                        model_turns.append(
+                            _model_turn_audit(
+                                iterations,
+                                review_completion.message,
+                                response_metadata={
+                                    **review_completion.metadata,
+                                    "incomplete_confirm_semantic_review": True,
+                                },
+                            )
+                        )
+                        reviewed = _parse_assistant_turn(review_completion.message)
+                        _validate_completion_protocol(
+                            review_completion,
+                            reviewed,
+                        )
+                        audits.extend(reviewed.audit)
+                        validate_daily_incomplete_confirm_replacements(
+                            targets=incomplete_confirm_targets,
+                            replacements=tuple(
+                                (call.tool_name, call.arguments)
+                                for call in reviewed.tool_calls
+                            ),
+                            allowed_tool_names=context.allowed_tool_names,
+                        )
+                    except ValueError as exc:
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "incomplete confirm semantic review returned an invalid replacement"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
+                    except DeepSeekToolCallingError as exc:
+                        raise _with_canary_turn_state(
+                            exc,
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
+                    parsed = _merge_reviewed_calls(
+                        original=parsed,
+                        targets=tuple(
+                            target.original_call
+                            for target in incomplete_confirm_targets
+                        ),
+                        replacements=reviewed.tool_calls,
+                        assistant_message=reviewed.assistant_message,
+                        review_audit=reviewed.audit,
+                    )
+                    current_has_write = any(
+                        TOOL_REGISTRY[call.tool_name].read_or_write == "write"
+                        for call in parsed.tool_calls
+                    )
+                if (
+                    daily_submit_section_review_count == 0
+                    and _needs_daily_submit_section_review(
+                        parsed.tool_calls,
+                        context=context,
+                    )
+                ):
+                    review_targets = _daily_submit_section_review_targets(
+                        parsed.tool_calls,
+                        context=context,
+                    )
+                    model_turns[-1] = replace(
+                        model_turns[-1],
+                        response_metadata={
+                            **model_turns[-1].response_metadata,
+                            "pre_execution_daily_section_review": True,
+                            "draft_executed": False,
+                        },
+                    )
+                    daily_submit_section_review_count += 1
+                    reviewed: _ParsedAssistantTurn | None = None
+                    review_feedback: dict[str, Any] | None = None
+                    for review_attempt in range(1, 3):
+                        try:
+                            review_completion = await self._complete(
+                                _daily_submit_section_review_messages(
+                                    user_text=user_text,
+                                    user_messages=user_messages,
+                                    calls=review_targets,
+                                    structural_feedback=review_feedback,
+                                ),
+                                tool_schemas=deepseek_tool_schemas(
+                                    frozenset({"add_daily_items"})
+                                ),
+                                thinking_enabled=thinking_enabled,
+                            )
+                            iterations += 1
+                            model_turns.append(
+                                _model_turn_audit(
+                                    iterations,
+                                    review_completion.message,
+                                    response_metadata={
+                                        **review_completion.metadata,
+                                        "daily_section_semantic_review": True,
+                                        "daily_section_semantic_review_attempt": review_attempt,
+                                    },
+                                )
+                            )
+                            reviewed = _parse_assistant_turn(review_completion.message)
+                            _validate_completion_protocol(
+                                review_completion,
+                                reviewed,
+                            )
+                            audits.extend(reviewed.audit)
+                        except DeepSeekToolCallingError as exc:
+                            raise _with_canary_turn_state(
+                                exc,
+                                audits=audits,
+                                model_turns=model_turns,
+                            ) from exc
+                        if _is_complete_daily_submit_section_review(
+                            reviewed.tool_calls,
+                            expected_count=len(review_targets),
+                            context=context,
+                        ):
+                            break
+                        if review_attempt == 2:
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "daily submit semantic review did not return complete corrected submissions"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            )
+                        review_feedback = _daily_submit_section_review_feedback(
+                            reviewed.tool_calls,
+                            expected_count=len(review_targets),
+                            context=context,
+                        )
+                    if reviewed is None:
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "daily submit semantic review produced no result"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+                    parsed = _merge_daily_submit_section_review(
+                        original=parsed,
+                        reviewed=reviewed,
+                        context=context,
+                    )
+                    current_has_write = any(
+                        TOOL_REGISTRY[call.tool_name].read_or_write == "write"
+                        for call in parsed.tool_calls
+                    )
+                try:
+                    _reject_repeated_calls(
+                        parsed.tool_calls,
+                        seen_ids=seen_ids,
+                        seen_fingerprints=seen_fingerprints,
+                        audit=(),
+                    )
+                except DeepSeekToolCallingError as exc:
+                    raise _with_canary_turn_state(
+                        exc,
+                        audits=audits,
+                        model_turns=model_turns,
+                    ) from exc
 
-            current_has_write = any(
-                TOOL_REGISTRY[call.tool_name].read_or_write == "write"
-                for call in parsed.tool_calls
-            )
-            messages.append(parsed.assistant_message)
-            runtime_result = await runtime_session.execute(parsed.tool_calls)
-            if (
-                not isinstance(runtime_result, ProductionRuntimeResult)
-                or runtime_result.status == "failed"
-                or len(runtime_result.receipts) != len(parsed.tool_calls)
-            ):
-                code = (
-                    runtime_result.error_code
-                    if isinstance(runtime_result, ProductionRuntimeResult)
-                    else "INVALID_PRODUCTION_RUNTIME_RESULT"
+                messages.append(parsed.assistant_message)
+                runtime_result = (
+                    await runtime_session.execute(
+                        parsed.tool_calls,
+                        defer_finalization=True,
+                    )
+                    if current_has_write
+                    else await runtime_session.execute(parsed.tool_calls)
                 )
-                raise _with_canary_turn_state(
-                    ProductionRuntimeExecutionError(
-                        f"production runtime failed closed: {code}"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
+                if (
+                    not isinstance(runtime_result, ProductionRuntimeResult)
+                    or runtime_result.status == "failed"
+                    or len(runtime_result.receipts) != len(parsed.tool_calls)
+                ):
+                    code = (
+                        runtime_result.error_code
+                        if isinstance(runtime_result, ProductionRuntimeResult)
+                        else "INVALID_PRODUCTION_RUNTIME_RESULT"
+                    )
+                    raise _with_canary_turn_state(
+                        ProductionRuntimeExecutionError(
+                            f"production runtime failed closed: {code}"
+                        ),
+                        audits=audits,
+                        model_turns=model_turns,
+                    )
+                runtime_results.append(runtime_result)
+                receipts.extend(runtime_result.receipts)
+                tool_results = _canary_tool_result_messages(
+                    parsed.tool_calls,
+                    runtime_result.receipts,
+                    write_batch_closed=current_has_write,
                 )
-            runtime_results.append(runtime_result)
-            receipts.extend(runtime_result.receipts)
-            tool_results = _canary_tool_result_messages(
-                parsed.tool_calls,
-                runtime_result.receipts,
-                write_batch_closed=current_has_write,
-            )
-            messages.extend(tool_results)
-            if current_has_write:
-                messages.append(_canary_post_write_protocol_message())
-            model_turns[-1] = replace(
-                model_turns[-1],
-                tool_results=tuple(tool_results),
-            )
-            tool_loops += 1
-            write_batch_seen = write_batch_seen or current_has_write
+                messages.extend(tool_results)
+                if current_has_write:
+                    messages.append(
+                        _canary_post_write_protocol_message(tuple(receipts))
+                    )
+                current_has_briefing_fact = any(
+                    call.tool_name == "query_daily_briefing_facts"
+                    for call in parsed.tool_calls
+                )
+                model_turns[-1] = replace(
+                    model_turns[-1],
+                    tool_results=tuple(tool_results),
+                )
+                if current_has_briefing_fact and not current_has_write:
+                    messages = daily_briefing_composer_messages(
+                        user_question=briefing_user_question,
+                        receipts=tuple(receipts),
+                    )
+                    briefing_fact_batch_seen = True
+                tool_loops += 1
+                write_batch_seen = write_batch_seen or current_has_write
+        except BaseException:
+            await rollback_pending()
+            raise
 
     async def _complete(
         self,
@@ -606,6 +1092,7 @@ class DeepSeekToolCallingAdapter:
         tool_schemas: list[dict[str, Any]],
         thinking_enabled: bool,
     ) -> _CompletionResponse:
+        completion_started = perf_counter()
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -617,6 +1104,12 @@ class DeepSeekToolCallingAdapter:
                 payload["tool_choice"] = "auto"
         if thinking_enabled:
             payload["thinking"] = {"type": "enabled"}
+            # DeepSeek maps lower labels to this same supported low-cost
+            # thinking tier. Send it explicitly so model comparisons and
+            # production behavior cannot silently depend on provider defaults.
+            payload["reasoning_effort"] = "high"
+        if _server_requests_json_object(messages):
+            payload["response_format"] = {"type": "json_object"}
         transport_errors: list[dict[str, Any]] = []
         response: httpx.Response | None = None
         for attempt in range(1, self._max_request_attempts + 1):
@@ -652,9 +1145,19 @@ class DeepSeekToolCallingAdapter:
                     request_attempt_count=attempt,
                     transport_retry_count=attempt - 1,
                     transport_errors=tuple(transport_errors),
+                    model_elapsed_seconds=round(
+                        max(0.0, perf_counter() - completion_started),
+                        4,
+                    ),
                 ) from exc
         if response is None:
-            raise DeepSeekResponseError("DeepSeek request produced no response")
+            raise DeepSeekResponseError(
+                "DeepSeek request produced no response",
+                model_elapsed_seconds=round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
+            )
         request_attempt_count = len(transport_errors) + 1
         transport_retry_count = len(transport_errors)
         try:
@@ -667,6 +1170,10 @@ class DeepSeekToolCallingAdapter:
                 request_attempt_count=request_attempt_count,
                 transport_retry_count=transport_retry_count,
                 transport_errors=tuple(transport_errors),
+                model_elapsed_seconds=round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
             ) from exc
         if not isinstance(message, dict):
             raise DeepSeekResponseError(
@@ -674,6 +1181,22 @@ class DeepSeekToolCallingAdapter:
                 request_attempt_count=request_attempt_count,
                 transport_retry_count=transport_retry_count,
                 transport_errors=tuple(transport_errors),
+                model_elapsed_seconds=round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
+            )
+        served_model = str(body.get("model") or "").strip()
+        if served_model != self._model:
+            raise DeepSeekResponseError(
+                "DeepSeek served an unexpected model",
+                request_attempt_count=request_attempt_count,
+                transport_retry_count=transport_retry_count,
+                transport_errors=tuple(transport_errors),
+                model_elapsed_seconds=round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
             )
         canonical_body = json.dumps(
             body,
@@ -685,7 +1208,7 @@ class DeepSeekToolCallingAdapter:
             message=message,
             metadata={
                 "response_id": body.get("id"),
-                "served_model": body.get("model"),
+                "served_model": served_model,
                 "created": body.get("created"),
                 "finish_reason": choice.get("finish_reason"),
                 "usage": body.get("usage"),
@@ -695,8 +1218,45 @@ class DeepSeekToolCallingAdapter:
                 "request_attempt_count": request_attempt_count,
                 "transport_retry_count": transport_retry_count,
                 "transport_errors": transport_errors,
+                "elapsed_seconds": round(
+                    max(0.0, perf_counter() - completion_started),
+                    4,
+                ),
             },
         )
+
+
+def _server_requests_json_object(messages: list[dict[str, Any]]) -> bool:
+    """Recognize only the server-owned terminal write protocol."""
+
+    for message in reversed(messages):
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        protocol = payload.get("canary_turn_protocol")
+        if not isinstance(protocol, dict):
+            continue
+        contract = protocol.get("terminal_response_contract")
+        if not isinstance(contract, dict):
+            continue
+        if (
+            protocol.get("final_response_required") is True
+            and (
+                protocol.get("write_batch_closed") is True
+                or protocol.get("briefing_fact_batch_closed") is True
+            )
+            and contract.get("format") == "json_object"
+        ):
+            return True
+    return False
 
 
 def _parse_assistant_turn(message: dict[str, Any]) -> _ParsedAssistantTurn:
@@ -741,9 +1301,7 @@ def _transport_error_audit(
     retryable: bool,
 ) -> dict[str, Any]:
     status_code = (
-        error.response.status_code
-        if isinstance(error, httpx.HTTPStatusError)
-        else None
+        error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
     )
     return {
         "attempt": attempt,
@@ -758,6 +1316,7 @@ def _validate_completion_protocol(
     parsed: _ParsedAssistantTurn,
     *,
     allow_usable_direct_text: bool = False,
+    allow_empty_terminal_for_retry: bool = False,
 ) -> str | None:
     finish_reason = completion.metadata.get("finish_reason")
     if parsed.tool_calls:
@@ -780,6 +1339,8 @@ def _validate_completion_protocol(
         )
     content = parsed.assistant_message.get("content")
     if not isinstance(content, str) or not content.strip():
+        if allow_empty_terminal_for_retry and isinstance(content, str):
+            return "empty_terminal_response_for_retry"
         raise DeepSeekResponseError("DeepSeek returned an empty terminal response")
     return None
 
@@ -926,6 +1487,267 @@ def _post_write_protocol_message() -> dict[str, str]:
     }
 
 
+def _pre_execution_tool_argument_repair_message() -> dict[str, str]:
+    return {
+        "role": "system",
+        "content": (
+            "上一条原生工具调用尚未执行，也没有产生任何写入。其 arguments "
+            "不是合法 JSON 或未满足当前工具结构。请重新读取当前用户消息与当前工具 "
+            "schema，重新生成一次合法的原生工具调用。所有字符串必须正确 JSON 转义，"
+            "所有必填来源凭证必须完整。source_evidence 只填写必填的 "
+            "source_message_index，不要复制原文或引号。不要把中文弯引号改成英文双引号。"
+            "日报 content 可用冒号保留引述归属，不要把未转义引号放进 JSON 字符串。"
+            "不要改用文本描述工具调用，也不要假称已经执行。"
+        ),
+    }
+
+
+def _needs_daily_submit_section_review(
+    calls: tuple[NativeToolCall, ...],
+    *,
+    context: TrustedContext,
+) -> bool:
+    """Request model review when an atomic submit draft does not cover all sections."""
+
+    return bool(_daily_submit_section_review_targets(calls, context=context))
+
+
+def _daily_submit_section_review_targets(
+    calls: tuple[NativeToolCall, ...],
+    *,
+    context: TrustedContext,
+) -> tuple[NativeToolCall, ...]:
+    """Select only incomplete atomic daily submissions; preserve every other intent."""
+
+    return tuple(
+        call for call in calls if _is_incomplete_daily_submit(call, context=context)
+    )
+
+
+def _is_incomplete_daily_submit(
+    call: NativeToolCall,
+    *,
+    context: TrustedContext,
+) -> bool:
+    """Check structural section coverage without interpreting user language."""
+
+    if call.tool_name != "add_daily_items":
+        return False
+    arguments = call.arguments
+    if not bool(arguments.get("submit_after_write", False)):
+        return False
+    return bool(_missing_daily_submit_sections(call, context=context))
+
+
+def _missing_daily_submit_sections(
+    call: NativeToolCall,
+    *,
+    context: TrustedContext,
+) -> tuple[str, ...]:
+    all_sections = ("today_work", "problems", "tomorrow_plan")
+    covered_sections = {
+        str(item.get("field") or "")
+        for item in call.arguments.get("items", ())
+        if isinstance(item, dict)
+    }
+    covered_sections.update(
+        str(field_name)
+        for field_name in call.arguments.get(
+            "acknowledged_empty_fields",
+            (),
+        )
+    )
+    if call.arguments.get("date_selection") == "trusted_report":
+        raw_report_id = call.arguments.get("report_id")
+        try:
+            report_id = UUID(str(raw_report_id))
+        except (TypeError, ValueError):
+            report_id = None
+        report = context.report_by_id(report_id) if report_id is not None else None
+        if (
+            report is not None
+            and call.arguments.get("expected_version") == report.version
+        ):
+            covered_sections.update(item.field for item in report.items)
+            covered_sections.update(report.acknowledged_empty_fields)
+    return tuple(section for section in all_sections if section not in covered_sections)
+
+
+def _is_complete_daily_submit_section_review(
+    calls: tuple[NativeToolCall, ...],
+    *,
+    expected_count: int,
+    context: TrustedContext,
+) -> bool:
+    return len(calls) == expected_count and all(
+        call.tool_name == "add_daily_items"
+        and bool(call.arguments.get("submit_after_write", False))
+        and not _missing_daily_submit_sections(call, context=context)
+        for call in calls
+    )
+
+
+def _daily_submit_section_review_feedback(
+    calls: tuple[NativeToolCall, ...],
+    *,
+    expected_count: int,
+    context: TrustedContext,
+) -> dict[str, Any]:
+    """Describe only structural validation failures for one bounded model retry."""
+
+    return {
+        "expected_call_count": expected_count,
+        "received_call_count": len(calls),
+        "calls": [
+            {
+                "sequence": index,
+                "tool_name": call.tool_name,
+                "submit_after_write": bool(
+                    call.arguments.get("submit_after_write", False)
+                ),
+                "missing_sections": list(
+                    _missing_daily_submit_sections(call, context=context)
+                ),
+            }
+            for index, call in enumerate(calls, start=1)
+        ],
+        "instruction": (
+            "The previous independent review remained structurally incomplete. "
+            "Reread the exact user messages and return a complete corrected "
+            "submission. Do not infer meaning from this validation record."
+        ),
+    }
+
+
+def _merge_daily_submit_section_review(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+    context: TrustedContext,
+) -> _ParsedAssistantTurn:
+    """Replace only reviewed daily submissions and keep unrelated model calls intact."""
+
+    return _merge_reviewed_calls(
+        original=original,
+        targets=_daily_submit_section_review_targets(
+            original.tool_calls,
+            context=context,
+        ),
+        replacements=reviewed.tool_calls,
+        assistant_message=reviewed.assistant_message,
+        review_audit=reviewed.audit,
+    )
+
+
+def _merge_reviewed_calls(
+    *,
+    original: _ParsedAssistantTurn,
+    targets: tuple[NativeToolCall, ...],
+    replacements: tuple[NativeToolCall, ...],
+    assistant_message: dict[str, Any],
+    review_audit: tuple[RawToolCallAudit, ...],
+) -> _ParsedAssistantTurn:
+    if len(targets) != len(replacements):
+        raise ValueError("review targets and replacements must have equal length")
+    target_object_ids = {id(call) for call in targets}
+    replacement_iterator = iter(replacements)
+    merged_calls = tuple(
+        next(replacement_iterator) if id(call) in target_object_ids else call
+        for call in original.tool_calls
+    )
+    # The reviewer may replace an unexecuted tool draft, but it is not a new
+    # conversational authority. Preserve the main Agent2 turn (especially its
+    # reasoning_content) so the next tool-loop request continues from the
+    # user's original semantic decision rather than from an isolated review.
+    # The reviewer message remains available in model-turn audit only.
+    _ = assistant_message
+    merged_message = {
+        key: value
+        for key, value in original.assistant_message.items()
+        if key in {"role", "content", "reasoning_content"}
+    }
+    merged_message["role"] = "assistant"
+    merged_message["content"] = merged_message.get("content") or ""
+    merged_message["tool_calls"] = [
+        {
+            "id": call.tool_call_id,
+            "type": "function",
+            "function": {
+                "name": call.tool_name,
+                "arguments": json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        for call in merged_calls
+    ]
+    return _ParsedAssistantTurn(
+        assistant_message=merged_message,
+        tool_calls=merged_calls,
+        audit=(*original.audit, *review_audit),
+    )
+
+
+def _daily_submit_section_review_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    calls: tuple[NativeToolCall, ...],
+    structural_feedback: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    draft_calls = [
+        {
+            "tool_name": call.tool_name,
+            "arguments": call.arguments,
+        }
+        for call in calls
+    ]
+    ordered_messages = user_messages or (user_text,)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the isolated Agent2 semantic reviewer for one "
+                "unexecuted daily-report submission draft. Reread the exact "
+                "user messages independently; do not inherit the draft's "
+                "wording or field split. Treat today_work, problems, and "
+                "tomorrow_plan as three separate semantic sections, including "
+                "ordinary conversational assertions that a section has no "
+                "content. A clear assertion that no current problem or risk "
+                "exists is an explicit empty problems section even when it "
+                "appears beside work content. It must not be stored inside a "
+                "work item. Distinguish that from denial of a work event. "
+                "This is semantic judgment, never phrase or keyword matching. "
+                "Preserve all actors, facts, dates, plans, and source-evidence "
+                "bindings. Return only one complete corrected native tool-call "
+                "batch using the supplied tools. The draft has not executed."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "unexecuted_draft_calls": draft_calls,
+                    "previous_review_structural_feedback": structural_feedback,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
 def _canary_tool_result_messages(
     calls: tuple[NativeToolCall, ...],
     receipts: tuple[ToolReceipt, ...],
@@ -938,6 +1760,7 @@ def _canary_tool_result_messages(
             "execution_mode": ExecutionMode.CANARY_EXECUTE.value,
             "final_response_required": True,
             "final_response_source": "safe_user_facts_only",
+            "terminal_response_contract": write_reply_protocol(receipts),
             "further_tool_calls_allowed": False,
             "same_turn_pending_confirmation_allowed": False,
             "write_batch_closed": True,
@@ -951,12 +1774,12 @@ def _canary_tool_result_messages(
             "tool_call_id": call.tool_call_id,
             "content": json.dumps(
                 {
-                    "safe_user_facts": receipt.safe_user_facts,
-                    **(
-                        {"turn_protocol": turn_protocol}
-                        if turn_protocol
-                        else {}
+                    "safe_user_facts": (
+                        model_safe_user_facts(receipt)
+                        if write_batch_closed
+                        else receipt.safe_user_facts
                     ),
+                    **({"turn_protocol": turn_protocol} if turn_protocol else {}),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -967,7 +1790,9 @@ def _canary_tool_result_messages(
     ]
 
 
-def _canary_post_write_protocol_message() -> dict[str, str]:
+def _canary_post_write_protocol_message(
+    receipts: tuple[ToolReceipt, ...],
+) -> dict[str, str]:
     return {
         "role": "system",
         "content": json.dumps(
@@ -976,7 +1801,7 @@ def _canary_post_write_protocol_message() -> dict[str, str]:
                     "execution_mode": ExecutionMode.CANARY_EXECUTE.value,
                     "final_response_required": True,
                     "final_response_source": "safe_user_facts_only",
-                    "deterministic_write_reply": True,
+                    "terminal_response_contract": write_reply_protocol(receipts),
                     "further_tool_calls_allowed": False,
                     "native_or_textual_tool_calls_allowed": False,
                     "same_turn_pending_confirmation_allowed": False,
@@ -1003,6 +1828,7 @@ def _with_accumulated_audit(
         request_attempt_count=error.request_attempt_count,
         transport_retry_count=error.transport_retry_count,
         transport_errors=error.transport_errors,
+        model_elapsed_seconds=error.model_elapsed_seconds,
     )
 
 
@@ -1012,10 +1838,16 @@ def _with_canary_turn_state(
     audits: list[RawToolCallAudit],
     model_turns: list[ModelTurnAudit],
 ) -> DeepSeekToolCallingError:
+    failed_completion_count = int(
+        error.request_attempt_count > 0 and not error.model_turns
+    )
     return type(error)(
         str(error),
         raw_tool_call_audit=tuple(audits) + error.raw_tool_call_audit,
-        model_call_count=len(model_turns),
+        model_call_count=max(
+            error.model_call_count,
+            len(model_turns) + failed_completion_count,
+        ),
         model_turns=tuple(model_turns) + error.model_turns,
         request_attempt_count=sum(
             int(turn.response_metadata.get("request_attempt_count", 1))
@@ -1030,11 +1862,13 @@ def _with_canary_turn_state(
         transport_errors=tuple(
             transport_error
             for turn in model_turns
-            for transport_error in turn.response_metadata.get(
-                "transport_errors", ()
-            )
+            for transport_error in turn.response_metadata.get("transport_errors", ())
         )
         + error.transport_errors,
+        model_elapsed_seconds=round(
+            _model_turn_elapsed_seconds(model_turns) + error.model_elapsed_seconds,
+            4,
+        ),
     )
 
 
@@ -1068,7 +1902,26 @@ def _with_turn_state(
         )
         + error.transport_retry_count,
         transport_errors=prior_transport_errors + error.transport_errors,
+        model_elapsed_seconds=round(
+            _model_turn_elapsed_seconds(model_turns) + error.model_elapsed_seconds,
+            4,
+        ),
     )
+
+
+def _model_turn_elapsed_seconds(
+    model_turns: list[ModelTurnAudit],
+) -> float:
+    elapsed = 0.0
+    for turn in model_turns:
+        try:
+            elapsed += max(
+                0.0,
+                float(turn.response_metadata.get("elapsed_seconds") or 0.0),
+            )
+        except (TypeError, ValueError):
+            continue
+    return elapsed
 
 
 def _model_turn_audit(
@@ -1104,9 +1957,7 @@ def _model_turn_audit(
             if reasoning_text is not None
             else None
         ),
-        response_metadata=json.loads(
-            json.dumps(response_metadata, ensure_ascii=False)
-        ),
+        response_metadata=json.loads(json.dumps(response_metadata, ensure_ascii=False)),
     )
 
 
@@ -1117,9 +1968,13 @@ def _assert_shadow_plan(
     expected_receipt_count: int,
 ) -> None:
     if type(plan) is not TurnExecutionPlan:
-        raise ShadowCapabilityViolationError("ShadowRuntime returned an invalid plan type")
+        raise ShadowCapabilityViolationError(
+            "ShadowRuntime returned an invalid plan type"
+        )
     if len(plan.receipts) != expected_receipt_count:
-        raise ShadowCapabilityViolationError("ShadowRuntime returned a receipt count mismatch")
+        raise ShadowCapabilityViolationError(
+            "ShadowRuntime returned a receipt count mismatch"
+        )
     if (
         plan.mode != ExecutionMode.SHADOW_PROPOSAL
         or plan.namespace != context.namespace
@@ -1129,7 +1984,9 @@ def _assert_shadow_plan(
         or plan.conversation_state_write_count
         or plan.message_send_count
     ):
-        raise ShadowCapabilityViolationError("ShadowRuntime violated zero-write plan invariants")
+        raise ShadowCapabilityViolationError(
+            "ShadowRuntime violated zero-write plan invariants"
+        )
     for receipt in plan.receipts:
         if (
             not isinstance(receipt, ToolReceipt)

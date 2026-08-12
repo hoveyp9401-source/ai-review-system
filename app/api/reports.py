@@ -14,6 +14,7 @@ from app.agent2.assistant_tools import build_tool_assisted_reply
 from app.agent2.case_table_rag import CaseTableRagAdapter, DEFAULT_CASE_RAG_INDEX
 from app.agent2.business.entrypoint import (
     build_business_command_context,
+    decide_runtime_owner,
     resolve_agent2_entrypoint,
 )
 from app.agent2.context_pack import Agent2ContextPack, build_agent2_context_pack
@@ -56,9 +57,7 @@ from app.agent2.turn_runtime import (
 )
 from app.agent2.daily_execution import (
     Agent2DailyExecutionResult,
-    agent2_daily_enabled_for_user,
     agent2_daily_report_version,
-    agent2_daily_should_fallback_to_legacy,
     execute_agent2_daily_commands,
 )
 from app.agent2.daily_shadow import DailyShadowEvaluation, evaluate_daily_shadow
@@ -146,52 +145,37 @@ async def submit_manual_report(
             )
         await session.commit()
         return agent2_response
-
-    try:
-        result = await service.submit_text(
-            session,
-            user=user,
-            raw_input=body.raw_input,
-            source=body.source,
-            report_date=body.report_date,
-        )
-    except Exception as exc:
-        await session.rollback()
-        if event is not None:
-            async with session.begin():
-                event = await session.merge(event)
-                await mark_webhook_event_failed(
-                    session,
-                    event,
-                    error_message=str(exc),
-                    response_payload={"status": "failed", "message": "Report parsing failed; data was not saved."},
-                    now=now_in_timezone(user.timezone),
-                )
-        raise
     response = {
-        "report_id": result.report_id,
-        "report_date": result.report_date.isoformat(),
-        "status": result.status,
-        "completeness_score": result.completeness_score,
-        "missing_sections": result.missing_sections,
-        "message": result.message,
-        "confirmation_type": result.confirmation_type,
-        "confirmed_by_user": result.confirmed_by_user,
-        "quality_warning": result.quality_warning,
-        "reply_kind": result.reply_kind,
-        "structured": result.structured.model_dump(),
+        "report_id": None,
+        "report_date": (
+            body.report_date
+            or now_in_timezone(user.timezone).date()
+        ).isoformat(),
+        "status": "agent2_unavailable",
+        "completeness_score": 0,
+        "missing_sections": [],
+        "message": "当前 Agent2 暂时无法处理，本次没有写入任何内容，请稍后再试。",
+        "confirmation_type": "none",
+        "confirmed_by_user": False,
+        "quality_warning": None,
+        "reply_kind": "agent2_unavailable_fail_closed",
+        "structured": {
+            "today_work": [],
+            "problems": [],
+            "tomorrow_plan": [],
+        },
         "merged_report": {
-            "today_work": result.today_work,
-            "problems": result.problems,
-            "tomorrow_plan": result.tomorrow_plan,
-            "section_status": result.section_status,
+            "today_work": [],
+            "problems": [],
+            "tomorrow_plan": [],
+            "section_status": {},
         },
     }
     if event is not None:
         await mark_webhook_event_processed(
             session,
             event,
-            report_id=uuid.UUID(result.report_id) if result.report_id else None,
+            report_id=None,
             response_payload=response,
             now=now_in_timezone(user.timezone),
         )
@@ -208,39 +192,36 @@ async def _submit_manual_agent2_if_applicable(
     llm_client: Any | None = None,
     message_id: str = "",
     conversation_id: str = "",
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     settings = get_settings()
     received_at = now_in_timezone(getattr(user, "timezone", None) or settings.timezone)
-    entrypoint = None
-    phase2_primary = False
-    phase2_business_context = None
-    if settings.agent2_business_phase2_enabled:
-        entrypoint = await resolve_agent2_entrypoint(
-            session,
-            settings=settings,
-            dingtalk_user_id=str(getattr(user, "dingtalk_user_id", "") or ""),
-            source_message_id=message_id,
-        )
-        phase2_primary = entrypoint.decision.route == "agent2_primary"
-        if phase2_primary and entrypoint.binding is not None:
-            phase2_business_context = build_business_command_context(
-                entrypoint.binding,
-                source_message_id=message_id,
-                source_channel="manual_text",
-                occurred_at=received_at,
-                conversation_id=conversation_id,
-            )
-    if entrypoint is not None and entrypoint.decision.route == "agent2_shadow":
-        return None
-    route_blocked = (
-        entrypoint is not None and entrypoint.decision.route == "blocked"
+    entrypoint = await resolve_agent2_entrypoint(
+        session,
+        settings=settings,
+        dingtalk_user_id=str(getattr(user, "dingtalk_user_id", "") or ""),
+        source_message_id=message_id,
     )
-    if (
-        not route_blocked
-        and not phase2_primary
-        and not _manual_should_use_agent2(settings, user)
-    ):
-        return None
+    runtime_owner = decide_runtime_owner(entrypoint.decision)
+    phase2_primary = runtime_owner == "agent2_primary"
+    phase2_business_context = None
+    if phase2_primary and entrypoint.binding is not None:
+        phase2_business_context = build_business_command_context(
+            entrypoint.binding,
+            source_message_id=message_id,
+            source_channel="manual_text",
+            occurred_at=received_at,
+            conversation_id=conversation_id,
+        )
+    route_blocked = runtime_owner == "blocked" or (
+        phase2_primary and phase2_business_context is None
+    )
+    if route_blocked:
+        return _manual_route_blocked_response(
+            None,
+            report_date or received_at.date(),
+            message="当前账号或所属组织信息无法唯一确认，本次没有执行任何业务操作。",
+            reply_kind="agent2_entrypoint_blocked",
+        )
 
     active_tasks = []
     daily_task = await build_live_daily_active_task(session, user, settings)
@@ -263,13 +244,6 @@ async def _submit_manual_agent2_if_applicable(
         fallback=received_at.date(),
     )
     existing = await get_report(session, user.id, target_report_date)
-    if entrypoint is not None and entrypoint.decision.route == "blocked":
-        return _manual_route_blocked_response(
-            existing,
-            target_report_date,
-            message="当前账号或所属组织信息无法唯一确认，本次没有执行任何业务操作。",
-            reply_kind="agent2_entrypoint_blocked",
-        )
     if phase2_primary and not cognitive_core_v3_enabled(settings):
         return _manual_route_blocked_response(
             existing,
@@ -611,7 +585,12 @@ async def _submit_manual_agent2_if_applicable(
 
     commands = list(shadow.commands)
     if not commands:
-        return None
+        return _manual_route_blocked_response(
+            existing,
+            target_report_date,
+            message="Agent2未形成可执行命令，本次没有写入任何内容。",
+            reply_kind="agent2_no_executable_command",
+        )
     report_for_version = existing
     result = await execute_agent2_daily_commands(
         session,
@@ -624,8 +603,6 @@ async def _submit_manual_agent2_if_applicable(
         message_id=message_id,
         expected_report_version=agent2_daily_report_version(report_for_version),
     )
-    if agent2_daily_should_fallback_to_legacy(result.command_results):
-        return None
     return _agent2_result_manual_response(result)
 
 
@@ -689,12 +666,6 @@ async def _resolve_manual_context_knowledge(
         [CaseTableRagAdapter(DEFAULT_CASE_RAG_INDEX)],
     )
     return tuple(resolution.evidence)
-
-
-def _manual_should_use_agent2(settings: Any, user: Any) -> bool:
-    # The trusted Settings allowlist is the sole authority for the legacy
-    # daily Agent2 gate; request payload never reaches this decision.
-    return agent2_daily_enabled_for_user(settings, user)
 
 
 def _daily_task_report_date(task: Any, *, fallback: date) -> date:

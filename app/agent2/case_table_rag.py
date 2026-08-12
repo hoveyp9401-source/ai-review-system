@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from datetime import date, timedelta
 import json
-from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from contextlib import closing
+from dataclasses import dataclass, field, replace
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any
 
 from app.agent2.context_pack import KnowledgeEvidenceFrame
 from app.agent2.fact_contracts import build_case_table_fact_contract
 from app.agent2.fact_permissions import evaluate_case_fact_permission
 from app.agent2.knowledge_resolver import KnowledgeQuery
-
 
 DEFAULT_CASE_RAG_INDEX = Path("data/rag_indexes/case_tables/case_index.sqlite")
 
@@ -75,7 +76,7 @@ def write_case_table_index(
         sqlite_target.unlink()
 
     normalized = [_case_document(document) for document in documents if _case_document(document).text]
-    with sqlite3.connect(sqlite_target) as conn:
+    with closing(sqlite3.connect(sqlite_target)) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             """
@@ -1010,6 +1011,9 @@ def _strip_metric_period_words(text: str) -> str:
         "\u5f53\u5b63\u5ea6",
         "\u8fd9\u4e2a\u5b63\u5ea6",
         "\u5b63\u5ea6",
+        "\u8fd9\u4e2a\u6708",
+        "\u672c\u6708",
+        "\u5f53\u6708",
         "\u6708\u5ea6",
         "\u6570\u636e",
         "\u540c\u6bd4\u6570\u636e",
@@ -1025,7 +1029,19 @@ def _strip_metric_period_words(text: str) -> str:
 
 def _is_metric_period_text(value: str) -> bool:
     text = str(value or "")
-    return _contains_any(text, ("\u5b63\u5ea6", "\u6708\u5ea6", "\u6570\u636e", "\u540c\u6bd4", "\u73af\u6bd4"))
+    return _contains_any(
+        text,
+        (
+            "\u5b63\u5ea6",
+            "\u8fd9\u4e2a\u6708",
+            "\u672c\u6708",
+            "\u5f53\u6708",
+            "\u6708\u5ea6",
+            "\u6570\u636e",
+            "\u540c\u6bd4",
+            "\u73af\u6bd4",
+        ),
+    )
 
 
 def _case_count_query_spec(text: str, *, metadata: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -1102,6 +1118,8 @@ def _case_count_query_spec(text: str, *, metadata: dict[str, Any] | None = None)
         table_type = "plaintiff_case_table"
     elif recent_spec is not None and not all_cases:
         table_type = str(recent_spec.get("table_type") or "")
+    if table_type and has_quantitative_marker and not assignee_name and not department and not group_by:
+        all_cases = True
     if metric_mode:
         table_type = "defendant_case_table"
     if metric_mode and query_mode == "count" and _asks_case_list(value):

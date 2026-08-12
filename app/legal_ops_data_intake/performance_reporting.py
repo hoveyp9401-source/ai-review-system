@@ -10,10 +10,11 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
 
 from docx import Document
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Inches, Pt, RGBColor
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
@@ -163,11 +164,10 @@ def build_defendant_performance_report(
         if period.view == "month"
         else _weekly_loss_not_applicable()
     )
-    # Unresolved ownership changes which team receives a case, so it blocks a
-    # target conclusion. A closed row without a close date is still handled by
-    # the Skill's fixed rule (excluded from stock) and remains traceable as a
-    # maintenance warning, but it does not make the configured target unknown.
-    target_data_incomplete = bool(assignment_errors)
+    # A missing close date is still kept in the maintenance trace, but the
+    # Skill already defines that row as excluded from stock. It must not hide
+    # an otherwise deterministic target conclusion from business readers.
+    data_incomplete = bool(assignment_errors)
     teams = sorted({item.team_name for item in cases})
     total_key = str((rule_spec.get("subject") or {}).get("total_key") or "__total__")
     total_label = str((rule_spec.get("subject") or {}).get("total_label") or "整体")
@@ -179,7 +179,7 @@ def build_defendant_performance_report(
             period,
             targets,
             scope_type="overall",
-            data_incomplete=target_data_incomplete,
+            data_incomplete=data_incomplete,
             loss_metrics=loss_metrics,
         )
     ]
@@ -191,7 +191,7 @@ def build_defendant_performance_report(
             period,
             targets,
             scope_type="team",
-            data_incomplete=target_data_incomplete,
+            data_incomplete=data_incomplete,
         )
         for team in teams
     )
@@ -204,7 +204,7 @@ def build_defendant_performance_report(
             period,
             targets,
             scope_type="person",
-            data_incomplete=target_data_incomplete,
+            data_incomplete=data_incomplete,
         )
         for lawyer in lawyers
     ]
@@ -216,7 +216,7 @@ def build_defendant_performance_report(
             "mapped_row_count": len(cases),
             "assignment_error_count": len(assignment_errors),
             "data_quality_error_count": len(data_quality_errors),
-            "target_conclusions_available": not target_data_incomplete,
+            "target_conclusions_available": not data_incomplete,
             "loss_metrics": loss_metrics,
             "scopes": scopes,
             "personal_scopes": personal_scopes,
@@ -231,7 +231,7 @@ def export_defendant_performance_xlsx(
     *,
     scope_key: str,
 ) -> bytes:
-    """Export the same three-sheet business workbook used by team leaders."""
+    """Export a readable overview plus the auditable business detail sheets."""
 
     payload = report.as_dict()
     scope = _selected_scope(payload, scope_key)
@@ -240,8 +240,9 @@ def export_defendant_performance_xlsx(
     period_new_label = "本周新增" if weekly else "本月新增"
     period_closed_label = "本周结案" if weekly else "本月结案"
     workbook = Workbook()
-    stock = workbook.active
-    stock.title = "存量"
+    overview = workbook.active
+    overview.title = "指标概览"
+    stock = workbook.create_sheet("存量")
     additions = workbook.create_sheet("新增")
     combined = workbook.create_sheet("综合汇总")
     export_sheets = [stock, additions, combined]
@@ -388,23 +389,43 @@ def export_defendant_performance_xlsx(
             ]
         )
         export_sheets.append(loss)
+
+    new_case_details = workbook.create_sheet("新增案件明细")
+    new_case_details.append(
+        ["新增日期", "分公司", "对接法务", "案件名称", "原表行号"]
+    )
+    for item in scope.get("period_new_cases") or ():
+        new_case_details.append(
+            [
+                _excel_date(item.get("register_date")),
+                safe_excel_cell(item.get("branch_name")),
+                safe_excel_cell(item.get("lawyer_name")),
+                safe_excel_cell(item.get("case_name")),
+                item.get("source_row_number"),
+            ]
+        )
+    export_sheets.append(new_case_details)
+
+    closed_case_details = workbook.create_sheet("结案案件明细")
+    closed_case_details.append(
+        ["结案日期", "分公司", "对接法务", "案件名称", "原表行号"]
+    )
+    for item in scope.get("period_closed_cases") or ():
+        closed_case_details.append(
+            [
+                _excel_date(item.get("close_date")),
+                safe_excel_cell(item.get("branch_name")),
+                safe_excel_cell(item.get("lawyer_name")),
+                safe_excel_cell(item.get("case_name")),
+                item.get("source_row_number"),
+            ]
+        )
+    export_sheets.append(closed_case_details)
+
+    _populate_excel_overview(overview, scope=scope, period=period)
+    _style_excel_overview(overview)
     for sheet in export_sheets:
         _style_export_sheet(sheet)
-    warning_rows = _export_warning_rows(payload)
-    if warning_rows:
-        warning_sheet = workbook.create_sheet("数据完整性提示", 0)
-        warning_sheet.append(["问题类型", "原表行", "案件/归属值", "说明"])
-        for warning in warning_rows:
-            warning_sheet.append(
-                [
-                    safe_excel_cell(warning["type"]),
-                    warning["source_row_number"],
-                    safe_excel_cell(warning["subject"]),
-                    safe_excel_cell(warning["message"]),
-                ]
-            )
-        _style_export_sheet(warning_sheet)
-        warning_sheet.sheet_properties.tabColor = "D97706"
     stream = io.BytesIO()
     workbook.save(stream)
     return stream.getvalue()
@@ -436,34 +457,42 @@ def export_defendant_performance_docx(
     title_run.bold = True
     title_run.font.size = Pt(18)
 
-    document.add_paragraph(
+    period_line = document.add_paragraph(
         "统计周期："
         f"{starts_on.year}年{starts_on.month}月{starts_on.day}日"
         f" — {ends_on.month}月{ends_on.day}日"
         f"（截止{ends_on:%m月%d日}）"
     )
-    document.add_paragraph("（归属口径：底表分公司→对接人→法务团队映射链）")
-    warning_rows = _export_warning_rows(payload)
-    if warning_rows:
-        warning = document.add_paragraph()
-        warning_text = (
-            f"数据完整性提醒：有 {len(warning_rows)} 条记录待确认。"
+    period_line.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    attribution = document.add_paragraph(
+        "归属口径：底表分公司→对接人→法务团队映射链"
+    )
+    attribution.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in (*period_line.runs, *attribution.runs):
+        run.font.size = Pt(9)
+        run.font.color.rgb = RGBColor(89, 89, 89)
+
+    conclusion = document.add_paragraph()
+    conclusion.paragraph_format.space_before = Pt(8)
+    conclusion.paragraph_format.space_after = Pt(8)
+    conclusion_run = conclusion.add_run("核心结论：")
+    conclusion_run.bold = True
+    conclusion.add_run(
+        _target_summary_text(
+            "存量同比",
+            scope.get("stock_yoy"),
+            scope.get("stock_target"),
         )
-        if not bool(payload.get("target_conclusions_available", True)):
-            warning_text += (
-                "当前数量仍可查看，但“达到/未达到目标”结论暂不展示。"
-            )
-        else:
-            warning_text += "目标结论仍按已配置的确定性口径展示。"
-        run = warning.add_run(warning_text)
-        run.bold = True
-        run.font.color.rgb = RGBColor(176, 82, 26)
-        for item in warning_rows[:10]:
-            document.add_paragraph(
-                f"原表第{item['source_row_number'] or '—'}行："
-                f"{item['subject']}；{item['message']}",
-                style="List Bullet",
-            )
+    )
+    conclusion.add_run("；")
+    conclusion.add_run(
+        _target_summary_text(
+            "年度累计新增同比",
+            scope.get("new_yoy"),
+            scope.get("new_target"),
+        )
+    )
+    conclusion.add_run("。")
 
     _add_section_heading(document, "一、存量")
     document.add_paragraph(
@@ -583,13 +612,19 @@ def export_defendant_performance_docx(
         f"{_chinese_section_number(next_section)}、"
         f"{current_label}结案明细（{period_dates}）",
     )
-    document.add_paragraph(f"{current_label}结案 {scope['period_closed_count']} 件。")
+    closed_count = document.add_paragraph(
+        f"{current_label}结案 {scope['period_closed_count']} 件。"
+    )
+    closed_count.paragraph_format.keep_with_next = bool(
+        scope["period_closed_cases"]
+    )
     if scope["period_closed_cases"]:
         _add_business_table(
             document,
-            ["分公司", "对接法务", "案件名称"],
+            ["结案日期", "分公司", "对接法务", "案件名称"],
             [
                 [
+                    item["close_date"],
                     item["branch_name"],
                     item["lawyer_name"],
                     item["case_name"],
@@ -597,19 +632,25 @@ def export_defendant_performance_docx(
                 for item in scope["period_closed_cases"]
             ],
         )
+    else:
+        document.add_paragraph(f"{current_label}无结案案件。")
 
     _add_section_heading(
         document,
         f"{_chinese_section_number(next_section + 1)}、"
         f"{current_label}新增明细（{period_dates}）",
     )
-    document.add_paragraph(f"{current_label}新增 {scope['period_new_count']} 件。")
+    new_count = document.add_paragraph(
+        f"{current_label}新增 {scope['period_new_count']} 件。"
+    )
+    new_count.paragraph_format.keep_with_next = bool(scope["period_new_cases"])
     if scope["period_new_cases"]:
         _add_business_table(
             document,
-            ["分公司", "对接法务", "案件名称"],
+            ["新增日期", "分公司", "对接法务", "案件名称"],
             [
                 [
+                    item["register_date"],
                     item["branch_name"],
                     item["lawyer_name"],
                     item["case_name"],
@@ -617,9 +658,168 @@ def export_defendant_performance_docx(
                 for item in scope["period_new_cases"]
             ],
         )
+    else:
+        document.add_paragraph(f"{current_label}无新增案件。")
 
     document.core_properties.title = f"{scope_label}被告案件{period_name}报"
     document.core_properties.subject = "被告绩效指标及案件明细"
+    stream = io.BytesIO()
+    document.save(stream)
+    return stream.getvalue()
+
+
+def _export_skill_monthly_docx(
+    payload: dict[str, Any],
+    scope: dict[str, Any],
+) -> bytes:
+    """Generate the monthly briefing in the structure declared by SKILL.md."""
+
+    period = dict(payload["period"])
+    ends_on = date.fromisoformat(str(period["ends_on"]))
+    overall = scope.get("scope_type") == "overall"
+    scope_label = "被告案件" if overall else f"{scope['scope_name']}被告案件"
+    stock_target = _target_magnitude(scope.get("stock_target"))
+    new_target = _target_magnitude(scope.get("new_target"))
+
+    document = Document()
+    _configure_skill_monthly_document_styles(document)
+    title = document.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _skill_run(
+        title,
+        "被告案件月度简报" if overall else f"{scope['scope_name']}被告案件月度简报",
+        bold=True,
+        size=18,
+    )
+
+    heading = document.add_paragraph()
+    if stock_target is not None and new_target is not None:
+        heading_text = (
+            "一、案件存量下降"
+            f"{_compact_decimal(stock_target)}%、新增案件数量下降"
+            f"{_compact_decimal(new_target)}%"
+        )
+    else:
+        heading_text = "一、案件存量与新增案件目标完成情况"
+    _skill_run(heading, heading_text, bold=True)
+    heading.paragraph_format.keep_with_next = True
+
+    _add_skill_rate_line(
+        document,
+        prefix=f"截止{ends_on:%m月%d日}，{scope_label}新增",
+        count=int(scope.get("year_to_date_new_count") or 0),
+        rate=scope.get("new_yoy"),
+        target=scope.get("new_target"),
+    )
+    _add_skill_rate_line(
+        document,
+        prefix=f"截止{ends_on:%m月%d日}，{scope_label}存量",
+        count=int(scope.get("stock_count") or 0),
+        rate=scope.get("stock_yoy"),
+        target=scope.get("stock_target"),
+    )
+
+    target_line = document.add_paragraph()
+    _skill_run(target_line, "■ ")
+    if stock_target is not None and new_target is not None:
+        effective_period = _target_period_label(
+            scope.get("stock_target"),
+            scope.get("new_target"),
+        )
+        _skill_run(target_line, f"计划{effective_period}，{scope_label}存量同比下降")
+        _skill_number(target_line, _compact_decimal(stock_target))
+        _skill_run(target_line, f"%，计划{effective_period}，新增案件数量同比下降")
+        _skill_number(target_line, _compact_decimal(new_target))
+        _skill_run(target_line, "%。")
+    else:
+        _skill_run(target_line, "当前目标值尚未在规则中配置。")
+
+    team_heading = document.add_paragraph()
+    _skill_run(team_heading, "各团队完成情况：", bold=True)
+    team_heading.paragraph_format.keep_with_next = True
+    team_scopes = [
+        item
+        for item in payload.get("scopes") or ()
+        if isinstance(item, dict) and item.get("scope_type") == "team"
+    ]
+    if not overall:
+        team_scopes = [scope]
+    for team in team_scopes:
+        _add_skill_team_line(document, team)
+
+    section_two = document.add_paragraph()
+    _skill_run(section_two, f"二、{ends_on:%m}月综合数据", bold=True)
+    section_two.paragraph_format.keep_with_next = True
+    _add_skill_rate_line(
+        document,
+        prefix=f"{scope_label}新增",
+        count=int(scope.get("year_to_date_new_count") or 0),
+        rate=scope.get("new_yoy"),
+        target=scope.get("new_target"),
+    )
+    _add_skill_rate_line(
+        document,
+        prefix=f"{scope_label}存量",
+        count=int(scope.get("stock_count") or 0),
+        rate=scope.get("stock_yoy"),
+        target=scope.get("stock_target"),
+    )
+
+    section_three = document.add_paragraph()
+    _skill_run(section_three, "三、本月减损情况", bold=True)
+    section_three.paragraph_format.keep_with_next = True
+    loss_line = document.add_paragraph()
+    _skill_run(loss_line, "■ ")
+    loss_metrics = (
+        scope.get("loss_metrics")
+        if isinstance(scope.get("loss_metrics"), dict)
+        else {}
+    )
+    comprehensive = (
+        loss_metrics.get("comprehensive_loss_rate")
+        if isinstance(loss_metrics.get("comprehensive_loss_rate"), dict)
+        else {}
+    )
+    substantial = (
+        loss_metrics.get("substantial_loss_amount")
+        if isinstance(loss_metrics.get("substantial_loss_amount"), dict)
+        else {}
+    )
+    if overall and comprehensive.get("status") == "calculated":
+        _skill_run(loss_line, "本月被告案件综合减损率")
+        _skill_number(
+            loss_line,
+            str(comprehensive.get("value") or "0.00"),
+        )
+        _skill_run(loss_line, "%，实质性减损金额累计完成")
+        if substantial.get("status") == "calculated":
+            _skill_number(
+                loss_line,
+                str(substantial.get("value_wan") or "0.00"),
+            )
+            _skill_run(loss_line, "万元；")
+        else:
+            _skill_run(
+                loss_line,
+                str(substantial.get("status_label") or "暂不可计算"),
+            )
+    elif overall:
+        _skill_run(
+            loss_line,
+            str(
+                comprehensive.get("status_label")
+                or "本月减损指标暂不可计算"
+            ),
+        )
+    else:
+        _skill_run(loss_line, "减损指标按法务部门整体口径统计。")
+
+    document.core_properties.title = (
+        "被告案件月度简报"
+        if overall
+        else f"{scope['scope_name']}被告案件月度简报"
+    )
+    document.core_properties.subject = "按绩效 Skill 生成的被告案件月度报告"
     stream = io.BytesIO()
     document.save(stream)
     return stream.getvalue()
@@ -906,8 +1106,24 @@ def _scope_report(
         last_year_start,
         period.last_year_cutoff,
     )
-    period_new = _new_between(cases, period.starts_on, period.ends_on)
-    period_closed = _closed_between(cases, period.starts_on, period.ends_on)
+    period_new = sorted(
+        _new_between(cases, period.starts_on, period.ends_on),
+        key=lambda item: (
+            item.register_date,
+            item.branch_name,
+            item.case_name,
+            item.source_row_number or 0,
+        ),
+    )
+    period_closed = sorted(
+        _closed_between(cases, period.starts_on, period.ends_on),
+        key=lambda item: (
+            item.close_date or date.min,
+            item.branch_name,
+            item.case_name,
+            item.source_row_number or 0,
+        ),
+    )
     stock_yoy_value = _change_rate(len(current_stock), len(last_year_stock))
     stock_period_value = _change_rate(len(current_stock), len(previous_stock))
     new_yoy_value = _change_rate(
@@ -1055,6 +1271,8 @@ def _case_detail(item: _CaseRow) -> dict[str, Any]:
         "branch_name": item.branch_name,
         "lawyer_name": item.lawyer_name,
         "case_name": item.case_name,
+        "register_date": item.register_date.isoformat(),
+        "close_date": item.close_date.isoformat() if item.close_date else None,
         "source_row_number": item.source_row_number,
     }
 
@@ -1067,30 +1285,6 @@ def _selected_scope(
         if str(scope.get("scope_key") or "") == str(scope_key or ""):
             return dict(scope)
     raise PerformanceReportError("未找到要导出的团队或整体范围")
-
-
-def _export_warning_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = [
-        {
-            "type": "团队归属待确认",
-            "source_row_number": item.get("source_row_number"),
-            "subject": str(item.get("source_value") or "未识别值"),
-            "message": str(item.get("message") or "无法确认团队归属"),
-        }
-        for item in payload.get("assignment_errors") or ()
-        if isinstance(item, dict)
-    ]
-    rows.extend(
-        {
-            "type": "数据完整性问题",
-            "source_row_number": item.get("source_row_number"),
-            "subject": str(item.get("case_name") or "案件名称未识别"),
-            "message": str(item.get("message") or "原始数据不完整"),
-        }
-        for item in payload.get("data_quality_errors") or ()
-        if isinstance(item, dict)
-    )
-    return rows
 
 
 def _arrow_rate(rate: dict[str, Any]) -> str:
@@ -1110,6 +1304,356 @@ def _sentence_rate(rate: dict[str, Any]) -> str:
     return display or "暂不可比"
 
 
+def _target_summary_text(
+    metric_label: str,
+    rate: Any,
+    target: Any,
+) -> str:
+    actual_text = _sentence_rate(rate if isinstance(rate, dict) else {})
+    if not isinstance(target, dict):
+        return f"{metric_label}{actual_text}"
+    target_display = str(target.get("target_display") or "").strip()
+    target_text = (
+        _sentence_rate({"display": target_display}) if target_display else ""
+    )
+    status = str(target.get("status") or "")
+    gap = _target_gap_points(rate, target)
+    if status == "achieved" and gap is not None:
+        return (
+            f"{metric_label}{actual_text}，达到目标"
+            f"（目标{target_text}），超过目标 {gap:.2f} 个百分点"
+        )
+    if status == "not_achieved" and gap is not None:
+        return (
+            f"{metric_label}{actual_text}，未达到目标"
+            f"（目标{target_text}），距离目标还差 {gap:.2f} 个百分点"
+        )
+    if target_text:
+        return f"{metric_label}{actual_text}（目标{target_text}）"
+    return f"{metric_label}{actual_text}"
+
+
+def _target_gap_points(rate: Any, target: Any) -> Decimal | None:
+    rate_value = _rate_decimal(rate)
+    if rate_value is None or not isinstance(target, dict):
+        return None
+    try:
+        target_value = Decimal(str(target.get("target_value")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return abs(rate_value - target_value).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+
+
+def _excel_target_gap_text(rate: Any, target: Any) -> str | None:
+    if not isinstance(target, dict):
+        return None
+    gap = _target_gap_points(rate, target)
+    if gap is None:
+        return None
+    status = str(target.get("status") or "")
+    if status == "achieved":
+        return f"超过目标{gap:.2f}个百分点"
+    if status == "not_achieved":
+        return f"距离目标还差{gap:.2f}个百分点"
+    return None
+
+
+def _excel_date(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _populate_excel_overview(
+    sheet: Any,
+    *,
+    scope: dict[str, Any],
+    period: dict[str, Any],
+) -> None:
+    weekly = str(period.get("view") or "") == "week"
+    period_name = "周报" if weekly else "月报"
+    current_label = "本周" if weekly else "本月"
+    scope_label = (
+        "法务部门整体"
+        if str(scope.get("scope_name") or "") == "整体"
+        else str(scope.get("scope_name") or "")
+    )
+    starts_on = date.fromisoformat(str(period["starts_on"]))
+    ends_on = date.fromisoformat(str(period["ends_on"]))
+
+    sheet.merge_cells("A1:G1")
+    sheet["A1"] = f"{scope_label}被告案件{period_name}"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "查看范围"
+    sheet.merge_cells("C2:D2")
+    sheet["C2"] = scope_label
+    sheet.merge_cells("E2:F2")
+    sheet["E2"] = "统计维度"
+    sheet["G2"] = "周维度" if weekly else "月维度"
+    sheet.merge_cells("A3:B3")
+    sheet["A3"] = "统计期间"
+    sheet.merge_cells("C3:G3")
+    sheet["C3"] = (
+        f"{starts_on.year}年{starts_on.month}月{starts_on.day}日"
+        f" — {ends_on.month}月{ends_on.day}日"
+    )
+
+    sheet.merge_cells("A5:G5")
+    sheet["A5"] = "核心指标"
+    sheet.append(
+        [
+            "指标",
+            "当前数量",
+            "同比",
+            "环比/本期",
+            "目标",
+            "完成情况",
+            "差距说明",
+        ]
+    )
+    stock_target = (
+        scope.get("stock_target")
+        if isinstance(scope.get("stock_target"), dict)
+        else {}
+    )
+    new_target = (
+        scope.get("new_target")
+        if isinstance(scope.get("new_target"), dict)
+        else {}
+    )
+    sheet.append(
+        [
+            "案件存量",
+            int(scope.get("stock_count") or 0),
+            str((scope.get("stock_yoy") or {}).get("display") or ""),
+            str(
+                (scope.get("stock_period_change") or {}).get("display") or ""
+            ),
+            str(stock_target.get("target_display") or ""),
+            str(stock_target.get("status_label") or ""),
+            _excel_target_gap_text(scope.get("stock_yoy"), stock_target),
+        ]
+    )
+    sheet.append(
+        [
+            "年度累计新增",
+            int(scope.get("year_to_date_new_count") or 0),
+            str((scope.get("new_yoy") or {}).get("display") or ""),
+            None,
+            str(new_target.get("target_display") or ""),
+            str(new_target.get("status_label") or ""),
+            _excel_target_gap_text(scope.get("new_yoy"), new_target),
+        ]
+    )
+    sheet.append(
+        [
+            f"{current_label}新增",
+            int(scope.get("period_new_count") or 0),
+            None,
+            f"{starts_on:%m月%d日}—{ends_on:%m月%d日}",
+            None,
+            None,
+            None,
+        ]
+    )
+    sheet.append(
+        [
+            f"{current_label}结案",
+            int(scope.get("period_closed_count") or 0),
+            None,
+            f"{starts_on:%m月%d日}—{ends_on:%m月%d日}",
+            None,
+            None,
+            None,
+        ]
+    )
+
+    next_row = 12
+    loss_metrics = (
+        scope.get("loss_metrics")
+        if isinstance(scope.get("loss_metrics"), dict)
+        else {}
+    )
+    if not weekly and scope.get("scope_type") == "overall" and loss_metrics:
+        comprehensive = (
+            loss_metrics.get("comprehensive_loss_rate")
+            if isinstance(loss_metrics.get("comprehensive_loss_rate"), dict)
+            else {}
+        )
+        substantial = (
+            loss_metrics.get("substantial_loss_amount")
+            if isinstance(loss_metrics.get("substantial_loss_amount"), dict)
+            else {}
+        )
+        sheet.merge_cells(
+            start_row=next_row,
+            start_column=1,
+            end_row=next_row,
+            end_column=7,
+        )
+        sheet.cell(next_row, 1, "部门整体减损")
+        sheet.cell(next_row + 1, 1, "综合减损率")
+        sheet.cell(
+            next_row + 1,
+            2,
+            comprehensive.get("display")
+            or comprehensive.get("status_label")
+            or "暂不可计算",
+        )
+        sheet.cell(
+            next_row + 1,
+            3,
+            f"纳入{int(comprehensive.get('eligible_case_count') or 0)}件",
+        )
+        sheet.cell(next_row + 2, 1, "实质减损金额")
+        sheet.cell(
+            next_row + 2,
+            2,
+            substantial.get("display")
+            or substantial.get("status_label")
+            or "暂不可计算",
+        )
+        sheet.cell(
+            next_row + 2,
+            3,
+            f"纳入{int(substantial.get('eligible_case_count') or 0)}件",
+        )
+        next_row += 5
+
+    sheet.merge_cells(
+        start_row=next_row,
+        start_column=1,
+        end_row=next_row,
+        end_column=7,
+    )
+    sheet.cell(next_row, 1, "说明")
+    sheet.merge_cells(
+        start_row=next_row + 1,
+        start_column=1,
+        end_row=next_row + 1,
+        end_column=7,
+    )
+    sheet.cell(
+        next_row + 1,
+        1,
+        "归属按“底表分公司→法务对接人→团队”映射；"
+        "详细计算结果及逐案记录请查看后续工作表。",
+    )
+
+
+def _style_excel_overview(sheet: Any) -> None:
+    navy = "1F4E78"
+    blue = "4477C2"
+    pale_blue = "DCE6F1"
+    border = Border(
+        left=Side(style="thin", color="B8C4D1"),
+        right=Side(style="thin", color="B8C4D1"),
+        top=Side(style="thin", color="B8C4D1"),
+        bottom=Side(style="thin", color="B8C4D1"),
+    )
+    for row in sheet.iter_rows():
+        for cell in row:
+            cell.font = Font(name="Microsoft YaHei", size=10)
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+    sheet["A1"].fill = PatternFill("solid", fgColor=navy)
+    sheet["A1"].font = Font(
+        name="Microsoft YaHei",
+        color="FFFFFF",
+        bold=True,
+        size=18,
+    )
+    sheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    sheet.row_dimensions[1].height = 34
+    for row_number in (2, 3):
+        for cell in sheet[row_number]:
+            cell.border = border
+            cell.alignment = Alignment(
+                horizontal="left",
+                vertical="center",
+                wrap_text=True,
+            )
+        label_columns = (1, 5) if row_number == 2 else (1,)
+        for column in label_columns:
+            cell = sheet.cell(row_number, column)
+            cell.fill = PatternFill("solid", fgColor=pale_blue)
+            cell.font = Font(name="Microsoft YaHei", bold=True, size=10)
+    for row_number in range(1, sheet.max_row + 1):
+        first_value = str(sheet.cell(row_number, 1).value or "")
+        if first_value in {"核心指标", "部门整体减损", "说明"}:
+            for cell in sheet[row_number]:
+                cell.fill = PatternFill("solid", fgColor=pale_blue)
+                cell.font = Font(
+                    name="Microsoft YaHei",
+                    color=navy,
+                    bold=True,
+                    size=11,
+                )
+            sheet.row_dimensions[row_number].height = 24
+    for cell in sheet[6]:
+        cell.fill = PatternFill("solid", fgColor=blue)
+        cell.font = Font(
+            name="Microsoft YaHei",
+            color="FFFFFF",
+            bold=True,
+            size=10,
+        )
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    for row_number in range(7, 11):
+        for cell in sheet[row_number]:
+            cell.border = border
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+    for row_number in range(1, sheet.max_row + 1):
+        status_cell = sheet.cell(row_number, 6)
+        status = str(status_cell.value or "")
+        if status == "达到目标":
+            status_cell.fill = PatternFill("solid", fgColor="E2F0D9")
+            status_cell.font = Font(
+                name="Microsoft YaHei",
+                color="2E7D32",
+                bold=True,
+            )
+        elif status == "未达到目标":
+            status_cell.fill = PatternFill("solid", fgColor="FCE4D6")
+            status_cell.font = Font(
+                name="Microsoft YaHei",
+                color="C62828",
+                bold=True,
+            )
+    widths = {
+        "A": 22,
+        "B": 13,
+        "C": 16,
+        "D": 20,
+        "E": 16,
+        "F": 15,
+        "G": 29,
+    }
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    for row_number in range(2, sheet.max_row + 1):
+        sheet.row_dimensions[row_number].height = max(
+            sheet.row_dimensions[row_number].height or 0,
+            23,
+        )
+    sheet.sheet_view.showGridLines = False
+    sheet.freeze_panes = "A7"
+    sheet.page_setup.orientation = "landscape"
+    sheet.page_setup.fitToWidth = 1
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+
+
 def _style_export_sheet(sheet: Any) -> None:
     header_fill = PatternFill("solid", fgColor="4477C2")
     header_font = Font(color="FFFFFF", bold=True, size=12)
@@ -1120,18 +1664,34 @@ def _style_export_sheet(sheet: Any) -> None:
         top=Side(style="thin", color="303030"),
         bottom=Side(style="thin", color="303030"),
     )
+    for row in sheet.iter_rows():
+        for cell in row:
+            cell.border = border
+            cell.font = Font(name="Microsoft YaHei", size=10)
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
     for cell in sheet[1]:
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    for row in sheet.iter_rows():
-        for cell in row:
-            cell.border = border
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-    for cell in sheet[sheet.max_row]:
-        cell.font = total_font
+    if str(sheet.cell(sheet.max_row, 1).value or "") == "合计":
+        for cell in sheet[sheet.max_row]:
+            cell.font = total_font
+            cell.fill = PatternFill("solid", fgColor="DCE6F1")
+    if sheet.title in {"新增案件明细", "结案案件明细"}:
+        for row_number in range(2, sheet.max_row + 1):
+            sheet.cell(row_number, 1).number_format = "yyyy-mm-dd"
+            sheet.cell(row_number, 4).alignment = Alignment(
+                horizontal="left",
+                vertical="center",
+                wrap_text=True,
+            )
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
+    sheet.sheet_view.showGridLines = False
     for index in range(1, sheet.max_column + 1):
         widest = max(
             len(str(sheet.cell(row=row, column=index).value or ""))
@@ -1144,6 +1704,11 @@ def _style_export_sheet(sheet: Any) -> None:
             36,
         )
     sheet.row_dimensions[1].height = 25
+    sheet.page_setup.orientation = (
+        "landscape" if sheet.max_column >= 7 else "portrait"
+    )
+    sheet.page_setup.fitToWidth = 1
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
 
 
 def _configure_document_styles(document: Document) -> None:
@@ -1159,10 +1724,162 @@ def _configure_document_styles(document: Document) -> None:
         section.right_margin = Pt(50)
 
 
+def _configure_skill_monthly_document_styles(document: Document) -> None:
+    normal = document.styles["Normal"]
+    normal.font.name = "Microsoft YaHei"
+    normal.font.size = Pt(16)
+    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+    normal.paragraph_format.line_spacing = Pt(23)
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.space_after = Pt(0)
+    for section in document.sections:
+        section.top_margin = Pt(42)
+        section.bottom_margin = Pt(42)
+        section.left_margin = Pt(50)
+        section.right_margin = Pt(50)
+
+
+def _skill_run(
+    paragraph: Any,
+    text: Any,
+    *,
+    bold: bool = False,
+    size: int = 16,
+    color: RGBColor | None = None,
+    underline: bool = False,
+) -> Any:
+    run = paragraph.add_run(str(text))
+    run.font.name = "Microsoft YaHei"
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+    run.font.size = Pt(size)
+    run.bold = bold
+    run.underline = underline
+    if color is not None:
+        run.font.color.rgb = color
+    return run
+
+
+def _skill_number(paragraph: Any, value: Any) -> Any:
+    return _skill_run(
+        paragraph,
+        value,
+        bold=True,
+        color=RGBColor(0, 0, 255),
+        underline=True,
+    )
+
+
+def _target_magnitude(target: Any) -> Decimal | None:
+    if not isinstance(target, dict):
+        return None
+    try:
+        return abs(Decimal(str(target.get("target_value"))))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _compact_decimal(value: Decimal) -> str:
+    normalized = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if normalized == normalized.to_integral():
+        return str(int(normalized))
+    return f"{normalized:.2f}"
+
+
+def _target_period_label(*targets: Any) -> str:
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        label = str(target.get("effective_period") or "").strip()
+        if label:
+            return label.removesuffix("目标").strip()
+    return "当前考核期"
+
+
+def _rate_decimal(rate: Any) -> Decimal | None:
+    if not isinstance(rate, dict):
+        return None
+    try:
+        return Decimal(str(rate.get("value")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _skill_rate_phrase(
+    paragraph: Any,
+    rate: Any,
+    *,
+    decline_word: str = "下降",
+) -> None:
+    value = _rate_decimal(rate)
+    if value is None:
+        _skill_run(paragraph, "暂不可比")
+        return
+    if value < 0:
+        _skill_run(paragraph, decline_word, color=RGBColor(117, 189, 66))
+    elif value > 0:
+        _skill_run(paragraph, "增长", color=RGBColor(255, 0, 0))
+    else:
+        _skill_run(paragraph, "持平")
+    _skill_run(paragraph, " ")
+    _skill_number(paragraph, f"{abs(value):.2f}")
+    _skill_run(paragraph, "%")
+
+
+def _add_skill_rate_line(
+    document: Document,
+    *,
+    prefix: str,
+    count: int,
+    rate: Any,
+    target: Any,
+) -> None:
+    paragraph = document.add_paragraph()
+    _skill_run(paragraph, f"■ {prefix}")
+    _skill_number(paragraph, count)
+    _skill_run(paragraph, "件，同比")
+    _skill_rate_phrase(paragraph, rate, decline_word="降低")
+
+    rate_value = _rate_decimal(rate)
+    target_value = None
+    if isinstance(target, dict):
+        try:
+            target_value = Decimal(str(target.get("target_value")))
+        except (InvalidOperation, TypeError, ValueError):
+            target_value = None
+    status = str(target.get("status") or "") if isinstance(target, dict) else ""
+    if (
+        rate_value is not None
+        and target_value is not None
+        and status in {"achieved", "not_achieved"}
+    ):
+        _skill_run(paragraph, "，较目标值")
+        achieved = status == "achieved"
+        _skill_run(
+            paragraph,
+            "高" if achieved else "低",
+            color=RGBColor(117, 189, 66) if achieved else RGBColor(255, 0, 0),
+        )
+        _skill_run(paragraph, " ")
+        _skill_number(paragraph, f"{abs(rate_value - target_value):.2f}")
+        _skill_run(paragraph, "个百分点；")
+    else:
+        _skill_run(paragraph, "；")
+
+
+def _add_skill_team_line(document: Document, team: dict[str, Any]) -> None:
+    paragraph = document.add_paragraph()
+    _skill_run(paragraph, f"■ {team.get('scope_name') or '未命名团队'}：")
+    _skill_run(paragraph, "存量")
+    _skill_rate_phrase(paragraph, team.get("stock_yoy"))
+    _skill_run(paragraph, "，新增")
+    _skill_rate_phrase(paragraph, team.get("new_yoy"))
+
+
 def _add_section_heading(document: Document, text: str) -> None:
     paragraph = document.add_paragraph()
     paragraph.paragraph_format.space_before = Pt(10)
     paragraph.paragraph_format.space_after = Pt(4)
+    paragraph.paragraph_format.keep_with_next = True
     run = paragraph.add_run(text)
     run.bold = True
     run.font.size = Pt(12)
@@ -1185,24 +1902,135 @@ def _add_business_table(
 ) -> None:
     table = document.add_table(rows=1, cols=len(headers))
     table.style = "Table Grid"
-    table.autofit = True
+    table.autofit = False
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    column_widths = _business_table_column_widths(headers)
+    _set_docx_table_geometry(table, column_widths)
+    _set_docx_row_repeat_header(table.rows[0])
+    _set_docx_row_cant_split(table.rows[0])
+    narrative_columns = {
+        index for index, header in enumerate(headers) if header == "案件名称"
+    }
     for index, header in enumerate(headers):
         cell = table.rows[0].cells[index]
         cell.text = str(header)
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        _set_docx_cell_margins(cell)
         _shade_docx_cell(cell, "3566B4")
         for run in cell.paragraphs[0].runs:
             run.bold = True
             run.font.color.rgb = RGBColor(255, 255, 255)
+            run.font.size = Pt(9.5)
         cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-    for row_index, values in enumerate(rows):
+        cell.paragraphs[0].paragraph_format.keep_with_next = True
+        cell.paragraphs[0].paragraph_format.space_before = Pt(0)
+        cell.paragraphs[0].paragraph_format.space_after = Pt(0)
+    for values in rows:
         cells = table.add_row().cells
+        _set_docx_row_cant_split(table.rows[-1])
         for index, value in enumerate(values):
             cells[index].text = str(value if value is not None else "")
-            cells[index].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-        if row_index == len(rows) - 1:
+            cells[index].width = Inches(column_widths[index])
+            cells[index].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            _set_docx_cell_margins(cells[index])
+            paragraph = cells[index].paragraphs[0]
+            paragraph.alignment = (
+                WD_ALIGN_PARAGRAPH.LEFT
+                if index in narrative_columns
+                else WD_ALIGN_PARAGRAPH.CENTER
+            )
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.paragraph_format.line_spacing = 1
+            for run in paragraph.runs:
+                run.font.size = Pt(9)
+        if values and str(values[0] or "").strip() == "合计":
             for cell in cells:
                 for run in cell.paragraphs[0].runs:
                     run.bold = True
+
+
+def _business_table_column_widths(headers: list[str]) -> list[float]:
+    if len(headers) == 4 and headers[-1] == "案件名称":
+        return [1.05, 1.40, 1.00, 3.55]
+    if len(headers) == 6:
+        return [1.50, 1.10, 1.10, 1.10, 1.10, 1.10]
+    width = 7.0 / max(len(headers), 1)
+    return [width for _ in headers]
+
+
+def _set_docx_table_geometry(table: Any, widths_in: list[float]) -> None:
+    widths = [round(width * 1440) for width in widths_in]
+    total_width = sum(widths)
+    properties = table._tbl.tblPr
+    table_width = properties.find(qn("w:tblW"))
+    if table_width is None:
+        table_width = OxmlElement("w:tblW")
+        properties.append(table_width)
+    table_width.set(qn("w:type"), "dxa")
+    table_width.set(qn("w:w"), str(total_width))
+    table_indent = properties.find(qn("w:tblInd"))
+    if table_indent is None:
+        table_indent = OxmlElement("w:tblInd")
+        properties.append(table_indent)
+    table_indent.set(qn("w:type"), "dxa")
+    table_indent.set(qn("w:w"), "120")
+    layout = properties.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        properties.append(layout)
+    layout.set(qn("w:type"), "fixed")
+
+    grid = table._tbl.tblGrid
+    for child in list(grid):
+        grid.remove(child)
+    for width in widths:
+        column = OxmlElement("w:gridCol")
+        column.set(qn("w:w"), str(width))
+        grid.append(column)
+    for row in table.rows:
+        for index, cell in enumerate(row.cells):
+            cell.width = Inches(widths_in[index])
+            properties = cell._tc.get_or_add_tcPr()
+            cell_width = properties.find(qn("w:tcW"))
+            if cell_width is None:
+                cell_width = OxmlElement("w:tcW")
+                properties.append(cell_width)
+            cell_width.set(qn("w:type"), "dxa")
+            cell_width.set(qn("w:w"), str(widths[index]))
+
+
+def _set_docx_cell_margins(cell: Any) -> None:
+    properties = cell._tc.get_or_add_tcPr()
+    margins = properties.find(qn("w:tcMar"))
+    if margins is None:
+        margins = OxmlElement("w:tcMar")
+        properties.append(margins)
+    for edge, value in (
+        ("top", 70),
+        ("left", 80),
+        ("bottom", 70),
+        ("right", 80),
+    ):
+        margin = margins.find(qn(f"w:{edge}"))
+        if margin is None:
+            margin = OxmlElement(f"w:{edge}")
+            margins.append(margin)
+        margin.set(qn("w:w"), str(value))
+        margin.set(qn("w:type"), "dxa")
+
+
+def _set_docx_row_repeat_header(row: Any) -> None:
+    properties = row._tr.get_or_add_trPr()
+    marker = OxmlElement("w:tblHeader")
+    marker.set(qn("w:val"), "true")
+    properties.append(marker)
+
+
+def _set_docx_row_cant_split(row: Any) -> None:
+    properties = row._tr.get_or_add_trPr()
+    marker = OxmlElement("w:cantSplit")
+    properties.append(marker)
 
 
 def _shade_docx_cell(cell: Any, color: str) -> None:

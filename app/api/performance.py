@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import PerformanceSubmission, PerformanceTask, User
-from app.repositories import get_active_user_by_dingtalk_id
 from app.services.department_performance_service import (
     REQUIRED_DEPARTMENT_MONTHLY_UNITS,
     build_department_monthly_report,
@@ -39,12 +38,6 @@ class CreateBlankPerformanceTaskRequest(BaseModel):
     recipient_dingtalk_user_ids: list[str] = Field(min_length=1)
     created_by: str = ""
     send_messages: bool = False
-
-
-class ManualPerformanceReplyRequest(BaseModel):
-    dingtalk_user_id: str = Field(min_length=1)
-    raw_input: str = Field(min_length=1)
-    source: str = "performance_manual"
 
 
 class DepartmentMonthlyReportRequest(BaseModel):
@@ -199,32 +192,6 @@ async def get_performance_task(task_id: uuid.UUID, session: AsyncSession = Depen
         "status": task.status,
         "metrics": task.metrics_json,
         "submissions": [_submission_payload(item) for item in submissions],
-    }
-
-
-@router.post("/manual")
-async def submit_manual_performance_reply(
-    request: Request,
-    body: ManualPerformanceReplyRequest,
-    session: AsyncSession = Depends(get_session),
-) -> dict[str, Any]:
-    user = await get_active_user_by_dingtalk_id(session, body.dingtalk_user_id)
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-    service: PerformanceTaskService = request.app.state.performance_service
-    result = await service.submit_text(session, user=user, raw_input=body.raw_input, source=body.source)
-    if result is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active performance task for this user.")
-    await session.commit()
-    return {
-        "submission_id": result.submission_id,
-        "task_id": result.task_id,
-        "status": result.status,
-        "message": result.message,
-        "touched_metrics": result.touched_metrics,
-        "missing": result.missing,
-        "responses": result.responses,
-        "confirmed_by_user": result.confirmed_by_user,
     }
 
 

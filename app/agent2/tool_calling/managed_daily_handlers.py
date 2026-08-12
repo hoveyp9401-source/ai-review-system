@@ -26,3 +26,43 @@ def simulate_managed_daily_query(
         },
         execution_mode=ExecutionMode.SHADOW_PROPOSAL,
     )
+
+
+def simulate_daily_briefing_fact_query(
+    request: ShadowHandlerRequest,
+) -> ToolReceipt:
+    """Fail closed when offline Shadow has no outbound briefing ledger."""
+
+    return ToolReceipt(
+        status=ReceiptStatus.BLOCKED,
+        tool_name=request.tool_name,
+        changed=False,
+        target_type="daily_briefing_fact",
+        target_id="",
+        error_code="DAILY_BRIEFING_FACT_SHADOW_READ_UNAVAILABLE",
+        safe_user_facts={
+            "actual_write": False,
+            "shadow_read_available": False,
+        },
+        execution_mode=ExecutionMode.SHADOW_PROPOSAL,
+    )
+
+
+def simulate_report_insight_query(
+    request: ShadowHandlerRequest,
+) -> ToolReceipt:
+    """Fail closed when offline Shadow has no historical tenant projection."""
+
+    return ToolReceipt(
+        status=ReceiptStatus.BLOCKED,
+        tool_name=request.tool_name,
+        changed=False,
+        target_type="daily_report_insight",
+        target_id="",
+        error_code="REPORT_INSIGHT_SHADOW_READ_UNAVAILABLE",
+        safe_user_facts={
+            "actual_write": False,
+            "shadow_read_available": False,
+        },
+        execution_mode=ExecutionMode.SHADOW_PROPOSAL,
+    )

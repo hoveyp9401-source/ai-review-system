@@ -32,6 +32,10 @@ from app.agent2.business.contracts import BusinessCommandError
 TYPED_REPORT_VERSION_KEY = "_agent2_report_version"
 TYPED_COMMAND_KEYS_KEY = "_agent2_typed_command_keys"
 TYPED_AUDIT_KEY = "_agent2_typed_audit"
+EMPTY_ACK_KEYS = {
+    field_name: f"{field_name}_acknowledged_empty"
+    for field_name in REPORT_FIELD_ORDER
+}
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,6 +62,7 @@ class TypedDailyExecutionContext:
     runtime_label: str = "agent2_cognitive_core_v3"
     contract_version: str = "cognitive_core.v3"
     allow_completed_append: bool = False
+    allow_completed_content_mutation: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -180,6 +185,9 @@ async def execute_typed_agent2_daily_commands(
                 actor_user_id=user.id,
                 executed_idempotency_keys=successful_receipt_keys,
                 allow_completed_append=execution_context.allow_completed_append,
+                allow_completed_content_mutation=(
+                    execution_context.allow_completed_content_mutation
+                ),
                 admission_scope=_daily_admission_scope(
                     command=command,
                     user_id=str(user.id),
@@ -350,6 +358,9 @@ async def execute_typed_agent2_daily_commands(
                 actor_user_id=user.id,
                 executed_idempotency_keys=known_keys,
                 allow_completed_append=execution_context.allow_completed_append,
+                allow_completed_content_mutation=(
+                    execution_context.allow_completed_content_mutation
+                ),
                 admission_scope=_daily_admission_scope(
                     command=command,
                     user_id=str(user.id),
@@ -481,6 +492,40 @@ async def execute_typed_agent2_daily_commands(
         field_name: list(working.item_ids.get(field_name, ()))
         for field_name in REPORT_FIELD_ORDER
     }
+    for field_name, status_key in EMPTY_ACK_KEYS.items():
+        if field_name in working.acknowledged_empty_fields:
+            section_status[status_key] = True
+        else:
+            section_status.pop(status_key, None)
+    preserve_existing_submission = (
+        existing is not None
+        and before.status == "completed"
+        and working.status == "completed"
+        and not any(
+            command.command_type in {"reopen_report", "submit_report"}
+            for command in commands
+        )
+    )
+    confirmation_type = (
+        str(getattr(existing, "confirmation_type", "") or "user_confirmed")
+        if preserve_existing_submission
+        else ("user_confirmed" if working.status == "completed" else "none")
+    )
+    confirmed_by_user = (
+        bool(getattr(existing, "confirmed_by_user", True))
+        if preserve_existing_submission
+        else working.status == "completed"
+    )
+    pending_confirmation_at = (
+        getattr(existing, "pending_confirmation_at", None)
+        if preserve_existing_submission
+        else None
+    )
+    auto_submit_at = (
+        getattr(existing, "auto_submit_at", None)
+        if preserve_existing_submission
+        else None
+    )
     report = await upsert_daily_report(
         session,
         user=user,
@@ -503,15 +548,16 @@ async def execute_typed_agent2_daily_commands(
             "typed_audit": [execution.audit.as_dict() for execution in executions],
         },
         received_at=received_at,
-        confirmation_type="user_confirmed" if working.status == "completed" else "none",
-        confirmed_by_user=working.status == "completed",
+        confirmation_type=confirmation_type,
+        confirmed_by_user=confirmed_by_user,
         quality_warning=None,
         last_modified_by_user=True,
         last_modified_at=received_at,
-        pending_confirmation_at=None,
-        auto_submit_at=None,
+        pending_confirmation_at=pending_confirmation_at,
+        auto_submit_at=auto_submit_at,
         replace_sections=True,
         report_id_override=working.report_id if existing is None else None,
+        preserve_existing_submission=preserve_existing_submission,
     )
     await _persist_execution_receipts(
         session,
@@ -616,6 +662,11 @@ def build_typed_daily_snapshot(
         problems=values["problems"],
         tomorrow_plan=values["tomorrow_plan"],
         item_ids=item_ids,
+        acknowledged_empty_fields=frozenset(
+            field_name
+            for field_name, status_key in EMPTY_ACK_KEYS.items()
+            if bool(section_status.get(status_key)) and not values[field_name]
+        ),
     )
 
 
@@ -958,6 +1009,9 @@ def _snapshot_json(snapshot: DailyReportMutationSnapshot) -> dict:
         "today_work": list(snapshot.today_work),
         "problems": list(snapshot.problems),
         "tomorrow_plan": list(snapshot.tomorrow_plan),
+        "acknowledged_empty_fields": sorted(
+            snapshot.acknowledged_empty_fields
+        ),
         "item_ids": {
             field_name: list(item_ids)
             for field_name, item_ids in snapshot.item_ids.items()
@@ -1027,19 +1081,23 @@ def _mutation_report_date(commands: Sequence[TypedDailyCommand], default: date) 
 
 
 def _query_result_message(report_date: date, snapshot: DailyReportMutationSnapshot) -> str:
-    if not any((snapshot.today_work, snapshot.problems, snapshot.tomorrow_plan)):
+    if not any((snapshot.today_work, snapshot.problems, snapshot.tomorrow_plan)) and not snapshot.acknowledged_empty_fields:
         return f"{report_date.isoformat()} 暂无日报内容。"
     status_text = "已提交" if snapshot.status == "completed" else "填写中"
     lines = [f"{report_date.isoformat()} 日报（{status_text}）"]
-    for title, values in (
-        ("今日工作", snapshot.today_work),
-        ("问题与风险", snapshot.problems),
-        ("明日计划", snapshot.tomorrow_plan),
+    for field_name, title, values in (
+        ("today_work", "今日工作", snapshot.today_work),
+        ("problems", "问题与风险", snapshot.problems),
+        ("tomorrow_plan", "明日计划", snapshot.tomorrow_plan),
     ):
         lines.append(f"{title}：")
         lines.extend(f"- {value}" for value in values)
         if not values:
-            lines.append("- 暂无")
+            lines.append(
+                "- 暂无"
+                if field_name in snapshot.acknowledged_empty_fields
+                else "- 未填写"
+            )
     return "\n".join(lines)
 
 
@@ -1066,5 +1124,9 @@ def _make_item_id(field_name: str, index: int, value: str) -> str:
 
 
 def _completeness(snapshot: DailyReportMutationSnapshot) -> float:
-    filled = sum(bool(values) for values in (snapshot.today_work, snapshot.problems, snapshot.tomorrow_plan))
+    filled = sum(
+        bool(getattr(snapshot, field_name))
+        or field_name in snapshot.acknowledged_empty_fields
+        for field_name in REPORT_FIELD_ORDER
+    )
     return round(filled / 3, 4)

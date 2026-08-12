@@ -31,6 +31,16 @@ class ProductionDailyExecutorPort(Protocol):
         request: ProductionHandlerRequest,
     ) -> Any: ...
 
+    async def query_daily_briefing_facts(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> Any: ...
+
+    async def query_report_insights(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> Any: ...
+
     async def add_daily_items(self, request: ProductionHandlerRequest) -> Any: ...
 
     async def edit_daily_items(self, request: ProductionHandlerRequest) -> Any: ...
@@ -40,6 +50,11 @@ class ProductionDailyExecutorPort(Protocol):
     async def move_daily_items(self, request: ProductionHandlerRequest) -> Any: ...
 
     async def copy_previous_to_today(self, request: ProductionHandlerRequest) -> Any: ...
+
+    async def correct_daily_report_date(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> Any: ...
 
     async def complete_previous_plan(self, request: ProductionHandlerRequest) -> Any: ...
 
@@ -90,6 +105,18 @@ async def execute_query_managed_daily_reports(
     )
 
 
+async def execute_query_daily_briefing_facts(
+    request: ProductionHandlerRequest,
+) -> Any:
+    return await request.executor.query_daily_briefing_facts(request)
+
+
+async def execute_query_report_insights(
+    request: ProductionHandlerRequest,
+) -> Any:
+    return await request.executor.query_report_insights(request)
+
+
 async def execute_query_defendant_performance(
     request: ProductionHandlerRequest,
 ) -> Any:
@@ -118,6 +145,12 @@ async def execute_move_daily_items(request: ProductionHandlerRequest) -> Any:
 
 async def execute_copy_previous_to_today(request: ProductionHandlerRequest) -> Any:
     return await request.executor.copy_previous_to_today(request)
+
+
+async def execute_correct_daily_report_date(
+    request: ProductionHandlerRequest,
+) -> Any:
+    return await request.executor.correct_daily_report_date(request)
 
 
 async def execute_complete_previous_plan(request: ProductionHandlerRequest) -> Any:

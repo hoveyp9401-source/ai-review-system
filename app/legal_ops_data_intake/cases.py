@@ -110,6 +110,7 @@ _MASTER_FIELDS = {
     "department_id",
 }
 _ERP_SOURCE_FIELDS = {
+    "cause",
     "plaintiff",
     "defendant",
     "third_party",
@@ -170,6 +171,7 @@ def preview_case_master(
             _text(normalized.get("source_case_id")),
         )
         errors: list[ImportErrorDetail] = []
+        historical_closed = bool(normalized.get("source_case_closed"))
         for key, label in (
             ("source_system", "数据源"),
             ("source_case_id", "ERP案件ID"),
@@ -179,7 +181,23 @@ def preview_case_master(
             ("status", "案件状态"),
         ):
             if not normalized.get(key):
-                errors.append(ImportErrorDetail("required", f"{label}不能为空", key))
+                warning_only = historical_closed and key in {
+                    "case_name",
+                    "owner_user_id",
+                    "team_id",
+                }
+                errors.append(
+                    ImportErrorDetail(
+                        "historical_field_missing" if warning_only else "required",
+                        (
+                            f"已结案历史案件缺少{label}，已保留来源记录并标记待核验"
+                            if warning_only
+                            else f"{label}不能为空"
+                        ),
+                        key,
+                        critical=not warning_only,
+                    )
+                )
         if identity in duplicate_identities:
             errors.append(
                 ImportErrorDetail(
@@ -205,8 +223,9 @@ def preview_case_master(
             _text(normalized.get("source_case_id")),
         )
         after: dict[str, Any] | None = None
-        action = "失败" if errors else "新增"
-        if not errors:
+        has_critical_error = any(error.critical for error in errors)
+        action = "失败" if has_critical_error else "新增"
+        if not has_critical_error:
             present.add(identity)
             after = _merge_case(before, normalized)
             if before is not None:
@@ -265,6 +284,7 @@ def _normalize_master(row: dict[str, Any]) -> dict[str, Any]:
     }
     normalized["source_system"] = _text(row.get("source_system")).upper()
     normalized["source_case_id"] = _text(row.get("source_case_id"))
+    normalized["source_case_closed"] = bool(row.get("source_case_closed"))
     return normalized
 
 

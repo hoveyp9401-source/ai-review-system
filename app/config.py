@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     legal_daily_dashboard_principals_json: str = ""
     legal_daily_dashboard_system_user_id: str = "system:legal-daily-dashboard"
     management_daily_briefing_department_cc_user_ids: str = ""
+    management_daily_briefing_hidden_missing_detail_user_ids: str = (
+        "45a84161-ae1a-4ed5-960b-e33352bec6d2"
+    )
     legal_daily_dashboard_manager_write_enabled: bool = False
     legal_daily_dashboard_analysis_enabled: bool = False
     legal_daily_dashboard_analysis_model: str = ""
@@ -183,7 +186,7 @@ class Settings(BaseSettings):
     reminder_test_user_ids: str = ""
     reminder_cron_hour: int = Field(default=20, ge=0, le=23)
     second_reminder_cron_hour: int = Field(default=22, ge=0, le=23)
-    auto_submit_cron_hour: int = Field(default=23, ge=0, le=23)
+    auto_submit_cron_hour: int = Field(default=8, ge=0, le=23)
     catchup_reminder_enabled: bool = False
     catchup_reminder_cron_hour: int = Field(default=9, ge=0, le=23)
     summary_cron_hour: int = Field(default=9, ge=0, le=23)
@@ -198,7 +201,7 @@ class Settings(BaseSettings):
     agent2_tool_call_canary_max_active_users: int = Field(
         default=1,
         ge=1,
-        le=70,
+        le=74,
     )
     agent2_canary_turn_batch_quiet_seconds: float = Field(
         default=2.0,

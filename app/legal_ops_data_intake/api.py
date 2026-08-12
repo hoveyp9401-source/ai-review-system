@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 from dataclasses import dataclass
@@ -28,6 +29,10 @@ from app.config import Settings, get_settings
 from app.db import get_session
 from app.legal_ops.api import LegalOpsRuntime, get_runtime
 from app.legal_ops.auth import SandboxPrincipal
+from app.legal_ops_data_intake.case_table_releases import (
+    CaseTableReleaseError,
+    CaseTableReleaseService,
+)
 from app.legal_ops_data_intake.permissions import IntakeAccess, resolve_intake_access
 from app.legal_ops_data_intake.service import DataIntakeService
 
@@ -38,6 +43,7 @@ router = APIRouter(prefix="/legal-ops/data-intake", tags=["legal-ops-data-intake
 @dataclass(frozen=True)
 class IntakeContext:
     service: DataIntakeService
+    case_tables: CaseTableReleaseService
     access: IntakeAccess
 
 
@@ -98,7 +104,8 @@ async def _context(
         llm_client=llm_client,
         code_version=os.getenv("APP_COMMIT_SHA", "workspace"),
     )
-    return IntakeContext(service, access)
+    case_tables = CaseTableReleaseService(settings, actor_user_id=access.user_id)
+    return IntakeContext(service, case_tables, access)
 
 
 Context = Annotated[IntakeContext, Depends(_context)]
@@ -228,8 +235,7 @@ async def shell(context: Context) -> dict:
         "identity": context.access.payload(),
         "navigation": [
             {"code": "performance", "label": "绩效数据维护"},
-            {"code": "case-master", "label": "案件主表导入"},
-            {"code": "case-progress", "label": "案件进展导入"},
+            {"code": "case-daily", "label": "案件每日更新"},
             {"code": "batches", "label": "导入批次记录"},
             {"code": "errors", "label": "导入错误处理"},
         ],
@@ -619,6 +625,77 @@ async def publish_case_master(batch_no: str, context: Context) -> dict:
     return await context.service.publish_case_master(batch_no)
 
 
+@router.post("/api/case-daily-snapshot/upload", status_code=201)
+async def upload_case_daily_snapshot(
+    context: Context,
+    file: Annotated[UploadFile, File()],
+    snapshot_date: Annotated[str, Form()],
+    profile_key: Annotated[str, Form()] = "auto",
+) -> dict:
+    context.access.require("case_upload")
+    content = await _read_upload(file, context.service.settings)
+    return await context.service.upload_case_daily_snapshot(
+        content=content,
+        filename=file.filename or "",
+        snapshot_date=snapshot_date,
+        profile_key=profile_key,
+    )
+
+
+@router.post("/api/case-daily-snapshot/{batch_no}/publish")
+async def publish_case_daily_snapshot(batch_no: str, context: Context) -> dict:
+    context.access.require("publish")
+    return await context.service.publish_case_daily_snapshot(batch_no)
+@router.get("/api/case-tables/status")
+async def case_table_status(context: Context) -> dict:
+    context.access.require("view")
+    return await _case_table_call(context.case_tables.status)
+
+
+@router.get("/api/case-tables/history")
+async def case_table_history(
+    context: Context,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> list[dict]:
+    context.access.require("view")
+    return await _case_table_call(context.case_tables.history, limit=limit)
+
+
+@router.get("/api/case-tables/pending")
+async def pending_case_tables(
+    context: Context,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> list[dict]:
+    context.access.require("view")
+    return await _case_table_call(context.case_tables.pending, limit=limit)
+
+
+@router.post("/api/case-tables/upload", status_code=201)
+async def upload_case_table(
+    context: Context,
+    file: Annotated[UploadFile, File()],
+    table_kind: Annotated[Literal["defendant", "plaintiff"], Form()],
+) -> dict:
+    context.access.require("case_upload")
+    content = await _read_upload(file, context.service.settings)
+    return await _case_table_call(
+        context.case_tables.preview,
+        content=content,
+        filename=file.filename or "",
+        table_kind=table_kind,
+    )
+
+
+@router.post("/api/case-tables/{batch_no}/publish")
+async def publish_case_table(batch_no: str, context: Context) -> dict:
+    context.access.require("publish")
+    return await _case_table_call(context.case_tables.publish, batch_no)
+
+
+@router.post("/api/case-tables/versions/{version_id}/restore")
+async def restore_case_table_version(version_id: str, context: Context) -> dict:
+    context.access.require("publish")
+    return await _case_table_call(context.case_tables.restore, version_id)
 @router.post("/api/case-progress/upload", status_code=201)
 async def upload_case_progress(
     context: Context,
@@ -758,6 +835,16 @@ async def download_template(
         "case_progress": "案件进展模板",
     }[template_type]
     return _xlsx_response(content, f"{name}.xlsx")
+
+
+async def _case_table_call(operation, /, *args, **kwargs):
+    try:
+        return await asyncio.to_thread(operation, *args, **kwargs)
+    except CaseTableReleaseError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
 
 
 async def _read_upload(file: UploadFile, settings: Settings) -> bytes:

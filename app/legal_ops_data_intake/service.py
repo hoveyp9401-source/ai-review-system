@@ -35,6 +35,12 @@ from app.legal_ops_data_intake.case_progress_profiles import (
     CaseProgressSourceProfileError,
     parse_case_progress_source_file,
 )
+from app.legal_ops_data_intake.case_snapshot_diff import (
+    CaseSnapshotDiff,
+    SnapshotFieldGroups,
+    SnapshotRecordChange,
+    compare_case_snapshots,
+)
 from app.legal_ops_data_intake.case_source_profiles import (
     CaseSourceProfileError,
     parse_case_master_source_file,
@@ -4755,6 +4761,56 @@ class DataIntakeService:
         import_mode: Literal["full", "incremental"],
         profile_key: str = "auto",
     ) -> dict[str, Any]:
+        return await self._upload_case_master_file(
+            content=content,
+            filename=filename,
+            source_system=source_system,
+            import_mode=import_mode,
+            profile_key=profile_key,
+        )
+
+    async def upload_case_daily_snapshot(
+        self,
+        *,
+        content: bytes,
+        filename: str,
+        snapshot_date: str,
+        profile_key: str = "auto",
+    ) -> dict[str, Any]:
+        normalized_date = str(snapshot_date or "").strip()
+        try:
+            parsed_date = date.fromisoformat(normalized_date)
+        except ValueError as exc:
+            raise DataIntakeError(
+                "快照日期格式不正确，请使用年-月-日",
+                code="invalid_snapshot_date",
+                status_code=422,
+            ) from exc
+        if parsed_date.isoformat() != normalized_date:
+            raise DataIntakeError(
+                "快照日期格式不正确，请使用年-月-日",
+                code="invalid_snapshot_date",
+                status_code=422,
+            )
+        return await self._upload_case_master_file(
+            content=content,
+            filename=filename,
+            source_system="ERP",
+            import_mode="full",
+            profile_key=profile_key,
+            daily_snapshot_date=normalized_date,
+        )
+
+    async def _upload_case_master_file(
+        self,
+        *,
+        content: bytes,
+        filename: str,
+        source_system: str,
+        import_mode: Literal["full", "incremental"],
+        profile_key: str,
+        daily_snapshot_date: str = "",
+    ) -> dict[str, Any]:
         stored = self._store_file(content, filename)
         await self._register_original_file(stored)
         try:
@@ -4781,7 +4837,21 @@ class DataIntakeService:
                 metadata={
                     "source_profile_key": profile_key,
                     "source_profile_label": "尚未识别",
+                    "daily_snapshot": bool(daily_snapshot_date),
+                    "snapshot_date": daily_snapshot_date,
+                    "snapshot_baseline": False,
+                    "change_summary": _empty_snapshot_change_summary(),
+                    "snapshot_role": "每日核对快照",
+                    "publish_boundary": (
+                        "确认发布后才更新本地案件主账；"
+                        "文件未出现的历史案件只提醒、不删除"
+                    ),
                 },
+                idempotency_scope=(
+                    f"daily-case-snapshot|{profile_key}|{daily_snapshot_date}"
+                    if daily_snapshot_date
+                    else ""
+                ),
             )
         await self._canonicalize_person_column(
             parsed,
@@ -4825,7 +4895,44 @@ class DataIntakeService:
             known_people=people,
             known_teams=teams,
         )
+        preview = _block_cross_source_case_id_collisions(
+            preview,
+            existing=case_index,
+            source_system=source_system,
+        )
         preview = _merge_parse_errors(preview, parsed)
+        if daily_snapshot_date:
+            source_snapshots = await self._case_source_snapshots(
+                source_system,
+                source_profile_key=detected.profile.key,
+            )
+            previous_raw, snapshot_baseline = _previous_raw_case_snapshot(
+                source_snapshots,
+                current_rows=parsed.rows,
+            )
+            current_raw = _current_raw_case_snapshot(parsed.rows)
+            field_groups = SnapshotFieldGroups(
+                lifecycle=frozenset(detected.profile.lifecycle_headers),
+                progress=frozenset(detected.profile.progress_headers),
+                plan=frozenset(detected.profile.plan_headers),
+            )
+            snapshot_diff = compare_case_snapshots(
+                previous_raw,
+                current_raw,
+                field_groups=field_groups,
+            )
+            preview = _attach_snapshot_changes(preview, snapshot_diff)
+            source_metadata = {
+                **source_metadata,
+                "daily_snapshot": True,
+                "snapshot_date": daily_snapshot_date,
+                "snapshot_baseline": snapshot_baseline,
+                "change_summary": _snapshot_change_summary(snapshot_diff),
+                "snapshot_role": "每日核对快照",
+                "publish_boundary": (
+                    "确认发布后才更新本地案件主账；文件未出现的历史案件只提醒、不删除"
+                ),
+            }
         await self.session.rollback()
         return await self._save_case_preview(
             business_type="case_master",
@@ -4835,6 +4942,11 @@ class DataIntakeService:
             filename=filename,
             preview=preview,
             metadata=source_metadata,
+            idempotency_scope=(
+                (f"daily-case-snapshot|{detected.profile.key}|{daily_snapshot_date}")
+                if daily_snapshot_date
+                else ""
+            ),
         )
 
     async def upload_case_progress(
@@ -4939,10 +5051,45 @@ class DataIntakeService:
             idempotency_scope=f"{profile_key}|{snapshot_date}|{reporter_id}",
         )
 
-    async def publish_case_master(self, batch_no: str) -> dict[str, Any]:
+    async def publish_case_daily_snapshot(self, batch_no: str) -> dict[str, Any]:
+        return await self.publish_case_master(
+            batch_no,
+            _require_daily_snapshot=True,
+        )
+
+    async def publish_case_master(
+        self,
+        batch_no: str,
+        *,
+        _require_daily_snapshot: bool = False,
+    ) -> dict[str, Any]:
+        timeline_count = 0
+        is_daily_snapshot = False
         async with self.session.begin():
             batch = await self._batch_by_no(batch_no, for_update=True)
             self._require_business(batch, "case_master")
+            metadata = dict(batch["metadata_json"] or {})
+            is_daily_snapshot = bool(metadata.get("daily_snapshot"))
+            if _require_daily_snapshot and not is_daily_snapshot:
+                raise DataIntakeError(
+                    "该批次不是案件每日更新批次",
+                    code="wrong_batch_type",
+                    status_code=409,
+                )
+            if batch["status"] == "published" and is_daily_snapshot:
+                return {
+                    "batch_no": batch_no,
+                    "status": "published",
+                    "status_label": "案件每日更新已发布",
+                    "published_by": self.actor_user_id,
+                    "counts": self._counts_from_batch(batch),
+                    "timeline_count": int(
+                        (metadata.get("change_summary") or {}).get(
+                            "timeline_candidates", 0
+                        )
+                    ),
+                    "already_published": True,
+                }
             self._require_batch_ready(batch)
             source_lock_key = (
                 f"case-master-source|{self.tenant_id}|{batch['data_source']}"
@@ -5041,6 +5188,13 @@ class DataIntakeService:
                     snapshot=after,
                     missing=False,
                 )
+                if is_daily_snapshot:
+                    timeline_count += await self._upsert_daily_snapshot_progress(
+                        batch=batch,
+                        row=row,
+                        case_id=case_id,
+                        snapshot=after,
+                    )
             await self.session.execute(
                 text(
                     """
@@ -5068,9 +5222,19 @@ class DataIntakeService:
         return {
             "batch_no": batch_no,
             "status": "published",
-            "status_label": "案件主表已原子发布",
+            "status_label": (
+                "案件每日更新已发布" if is_daily_snapshot else "案件主表已原子发布"
+            ),
             "published_by": self.actor_user_id,
             "counts": self._counts_from_batch(batch),
+            **(
+                {
+                    "timeline_count": timeline_count,
+                    "already_published": False,
+                }
+                if is_daily_snapshot
+                else {}
+            ),
         }
 
     async def publish_case_progress(self, batch_no: str) -> dict[str, Any]:
@@ -5269,8 +5433,11 @@ class DataIntakeService:
                     "status": row["validation_status"],
                     "status_label": _validation_status_label(row["validation_status"]),
                     "action": row["proposed_action"],
-                    "action_label": ACTION_LABELS.get(
-                        row["proposed_action"], row["proposed_action"]
+                    "action_label": _daily_snapshot_action_label(
+                        row["after_json"] or row["normalized_json"] or {},
+                        ACTION_LABELS.get(
+                            row["proposed_action"], row["proposed_action"]
+                        ),
                     ),
                     "data": _display_row(
                         row["raw_snapshot_json"] or row["normalized_json"]
@@ -5292,6 +5459,11 @@ class DataIntakeService:
                     "after": _display_row(row["after_json"])
                     if row["after_json"]
                     else None,
+                    "change": _daily_snapshot_change_display(
+                        (row["after_json"] or row["normalized_json"] or {}).get(
+                            "__daily_snapshot_change__"
+                        )
+                    ),
                     "published": row["published"],
                 }
                 for row in rows
@@ -5710,7 +5882,7 @@ class DataIntakeService:
         rows = await self._batch_rows(batch["batch_id"])
         workbook = Workbook()
         sheet = workbook.active
-        sheet.title = "错误数据"
+        sheet.title = "问题与提醒"
         raw_headers: list[str] = []
         for row in rows:
             for header in row["raw_snapshot_json"] or {}:
@@ -5720,17 +5892,19 @@ class DataIntakeService:
             [
                 "原始行号",
                 *(safe_excel_cell(header) for header in raw_headers),
-                "错误原因",
+                "级别",
+                "问题或提醒原因",
             ]
         )
         for row in rows:
-            if row["validation_status"] != "error":
+            if row["validation_status"] not in {"error", "warning"}:
                 continue
             raw = row["raw_snapshot_json"] or {}
             sheet.append(
                 [
                     row["source_row_number"],
                     *(safe_excel_cell(raw.get(header, "")) for header in raw_headers),
+                    "错误" if row["validation_status"] == "error" else "提醒",
                     safe_excel_cell(
                         "；".join(
                             str(error.get("message") or "校验失败")
@@ -5930,6 +6104,12 @@ class DataIntakeService:
             "source_profile": (metadata or {}).get("source_profile_label", ""),
             "source_sheet": (metadata or {}).get("detected_sheet", ""),
             "detected_columns": (metadata or {}).get("detected_columns", 0),
+            "daily_snapshot": bool((metadata or {}).get("daily_snapshot")),
+            "snapshot_date": str((metadata or {}).get("snapshot_date") or ""),
+            "source_profile_key": str((metadata or {}).get("source_profile_key") or ""),
+            "change_summary": dict((metadata or {}).get("change_summary") or {}),
+            "snapshot_role": str((metadata or {}).get("snapshot_role") or ""),
+            "publish_boundary": str((metadata or {}).get("publish_boundary") or ""),
         }
 
     async def _register_file(self, stored: StoredFile) -> uuid.UUID:
@@ -6132,11 +6312,20 @@ class DataIntakeService:
         self, batch_id: uuid.UUID, preview: ImportPreview
     ) -> None:
         for row in preview.rows:
+            daily_change = (row.after or row.normalized or {}).get(
+                "__daily_snapshot_change__"
+            )
+            has_daily_change = (
+                isinstance(daily_change, dict)
+                and daily_change.get("action") == "changed"
+            )
             status_value = (
                 "error"
                 if any(error.critical for error in row.errors)
                 else "warning"
                 if row.errors
+                else "valid"
+                if has_daily_change
                 else "skipped"
                 if row.action in {"无变化", "重复跳过"}
                 else "valid"
@@ -7168,6 +7357,21 @@ class DataIntakeService:
                 code="case_changed",
                 status_code=409,
             )
+        collision_source = await self.session.scalar(
+            select(Agent2Case.source_type)
+            .where(
+                Agent2Case.tenant_id == self.tenant_id,
+                Agent2Case.external_case_id == source_case_id,
+                Agent2Case.source_type != source_system,
+            )
+            .with_for_update()
+        )
+        if collision_source is not None:
+            raise DataIntakeError(
+                "本地案件主账已有相同ERP案件ID且来源不同，请重新预览并人工核验",
+                code="cross_source_case_id_collision",
+                status_code=409,
+            )
 
     async def _lock_case_preview(self, before: dict[str, Any]) -> Agent2Case:
         case_id = self._uuid(str(before.get("case_id")), "案件")
@@ -7230,6 +7434,37 @@ class DataIntakeService:
         for case in result.scalars().all():
             cases.append(_case_snapshot(case))
         return CaseMasterIndex(cases)
+
+    async def _case_source_snapshots(
+        self,
+        source_system: str,
+        *,
+        source_profile_key: str = "",
+    ) -> dict[str, dict[str, Any]]:
+        result = await self.session.execute(
+            text(
+                """
+                SELECT source_case_id, source_snapshot_json
+                FROM legal_ops_case_master_sources
+                WHERE tenant_id = :tenant_id
+                  AND UPPER(source_system) = UPPER(:source_system)
+                  AND (
+                    :source_profile_key = ''
+                    OR source_snapshot_json ->> '__source_profile_key__'
+                       = :source_profile_key
+                  )
+                """
+            ),
+            {
+                "tenant_id": self.tenant_id,
+                "source_system": source_system,
+                "source_profile_key": source_profile_key,
+            },
+        )
+        return {
+            str(row["source_case_id"]): dict(row["source_snapshot_json"] or {})
+            for row in result.mappings().all()
+        }
 
     async def _current_case_source_hash(
         self,
@@ -7321,6 +7556,20 @@ class DataIntakeService:
         source_case_id = str(
             snapshot.get("source_case_id") or snapshot.get("external_case_id") or ""
         )
+        stored_snapshot = {
+            key: value
+            for key, value in snapshot.items()
+            if key != "__daily_snapshot_change__"
+        }
+        metadata = dict(batch["metadata_json"] or {})
+        if bool(metadata.get("daily_snapshot")) and not missing:
+            stored_snapshot["__source_raw__"] = dict(row["raw_snapshot_json"] or {})
+            stored_snapshot["__snapshot_date__"] = str(
+                metadata.get("snapshot_date") or ""
+            )
+            stored_snapshot["__source_profile_key__"] = str(
+                metadata.get("source_profile_key") or ""
+            )
         await self.session.execute(
             text(
                 """
@@ -7339,7 +7588,11 @@ class DataIntakeService:
                     source_file_id = EXCLUDED.source_file_id,
                     source_row_number = EXCLUDED.source_row_number,
                     source_version = legal_ops_case_master_sources.source_version + 1,
-                    source_snapshot_json = EXCLUDED.source_snapshot_json,
+                    source_snapshot_json = CASE
+                        WHEN EXCLUDED.missing_from_latest_snapshot
+                        THEN legal_ops_case_master_sources.source_snapshot_json
+                        ELSE EXCLUDED.source_snapshot_json
+                    END,
                     missing_from_latest_snapshot = EXCLUDED.missing_from_latest_snapshot,
                     updated_at = now()
                 """
@@ -7352,10 +7605,180 @@ class DataIntakeService:
                 "batch_id": batch["batch_id"],
                 "file_id": batch["file_id"],
                 "row_number": row["source_row_number"],
-                "snapshot": _json(snapshot),
+                "snapshot": _json(stored_snapshot),
                 "missing": missing,
             },
         )
+
+    async def _upsert_daily_snapshot_progress(
+        self,
+        *,
+        batch: Any,
+        row: Any,
+        case_id: uuid.UUID,
+        snapshot: dict[str, Any],
+    ) -> int:
+        change = snapshot.get("__daily_snapshot_change__")
+        if (
+            not isinstance(change, dict)
+            or change.get("action") != "changed"
+            or not bool(change.get("timeline_candidate"))
+        ):
+            return 0
+        summary, details = _daily_snapshot_progress_text(change)
+        if not summary:
+            return 0
+        metadata = dict(batch["metadata_json"] or {})
+        snapshot_date = str(metadata.get("snapshot_date") or "")
+        profile_key = str(metadata.get("source_profile_key") or "")
+        source_system = str(batch["data_source"])
+        source_case_id = str(
+            snapshot.get("source_case_id") or snapshot.get("external_case_id") or ""
+        )
+        identity_digest = hashlib.sha256(
+            (
+                f"{self.tenant_id}|{source_system}|{profile_key}|"
+                f"{snapshot_date}|{source_case_id}"
+            ).encode()
+        ).hexdigest()
+        idempotency_key = f"daily-case-snapshot:{identity_digest}"
+        external_progress_id = f"daily-snapshot:{identity_digest}"
+        occurred_at = datetime.combine(
+            date.fromisoformat(snapshot_date),
+            time.min,
+            tzinfo=timezone.utc,
+        )
+        progress_snapshot = _daily_progress_source_snapshot(
+            source_system=source_system,
+            external_progress_id=external_progress_id,
+            case_id=case_id,
+            source_case_id=source_case_id,
+            snapshot_date=snapshot_date,
+            profile_key=profile_key,
+            reporter_id=self.actor_user_id,
+            summary=summary,
+            details=details,
+        )
+        progress = await self.session.scalar(
+            select(CaseProgress)
+            .where(
+                CaseProgress.tenant_id == self.tenant_id,
+                CaseProgress.idempotency_key == idempotency_key,
+                CaseProgress.content_origin == "imported_record",
+            )
+            .with_for_update()
+        )
+        source_message_id = f"{batch['batch_no']}:{row['source_row_number']}"
+        if progress is None:
+            progress = CaseProgress(
+                progress_id=_stable_uuid(
+                    "legal-ops-daily-snapshot-progress",
+                    idempotency_key,
+                ),
+                tenant_id=self.tenant_id,
+                case_id=case_id,
+                occurred_at=occurred_at,
+                recorded_at=_utcnow(),
+                reporter_id=self.actor_user_id,
+                progress_type="ERP来源变化",
+                summary=summary,
+                details=details,
+                source_message_id=source_message_id,
+                source_channel="file_import",
+                content_origin="imported_record",
+                related_party_ids=[],
+                related_document_ids=[],
+                related_travel_intent_ids=[],
+                confidence=Decimal(1),
+                confirmation_status="confirmed_by_import_publisher",
+                version=1,
+                idempotency_key=idempotency_key,
+            )
+            self.session.add(progress)
+            await self.session.flush()
+            await self._upsert_progress_source(
+                batch=batch,
+                row=row,
+                progress_id=progress.progress_id,
+                snapshot=progress_snapshot,
+            )
+            return 1
+        if (
+            progress.case_id == case_id
+            and progress.occurred_at == occurred_at
+            and progress.summary == summary
+            and progress.details == details
+        ):
+            if await self._progress_source_row(progress_snapshot) is None:
+                await self._upsert_progress_source(
+                    batch=batch,
+                    row=row,
+                    progress_id=progress.progress_id,
+                    snapshot=progress_snapshot,
+                )
+            return 0
+        source_map = await self._progress_source_row(progress_snapshot)
+        if source_map is None:
+            previous_snapshot = _daily_progress_source_snapshot(
+                source_system=source_system,
+                external_progress_id=external_progress_id,
+                case_id=progress.case_id,
+                source_case_id=source_case_id,
+                snapshot_date=snapshot_date,
+                profile_key=profile_key,
+                reporter_id=progress.reporter_id,
+                summary=progress.summary,
+                details=progress.details,
+            )
+            await self._upsert_progress_source(
+                batch=batch,
+                row=row,
+                progress_id=progress.progress_id,
+                snapshot=previous_snapshot,
+            )
+            source_map = await self._progress_source_row(previous_snapshot)
+        if source_map is not None:
+            await self.session.execute(
+                text(
+                    """
+                    INSERT INTO legal_ops_case_progress_source_history (
+                        tenant_id, source_map_id, source_version,
+                        snapshot_json, changed_by, source_batch_id
+                    ) VALUES (
+                        :tenant_id, :source_map_id, :source_version,
+                        CAST(:snapshot AS jsonb), :actor, :batch_id
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": self.tenant_id,
+                    "source_map_id": source_map["source_map_id"],
+                    "source_version": source_map["source_version"],
+                    "snapshot": _json(source_map["current_snapshot_json"]),
+                    "actor": self.actor_user_id,
+                    "batch_id": batch["batch_id"],
+                },
+            )
+        progress.case_id = case_id
+        progress.occurred_at = occurred_at
+        progress.recorded_at = _utcnow()
+        progress.reporter_id = self.actor_user_id
+        progress.progress_type = "ERP来源变化"
+        progress.summary = summary
+        progress.details = details
+        progress.source_message_id = source_message_id
+        progress.source_channel = "file_import"
+        progress.confirmation_status = "confirmed_by_import_publisher"
+        progress.confidence = Decimal(1)
+        progress.version += 1
+        await self.session.flush()
+        await self._upsert_progress_source(
+            batch=batch,
+            row=row,
+            progress_id=progress.progress_id,
+            snapshot=progress_snapshot,
+        )
+        return 1
 
     async def _progress_source_row(self, before: dict[str, Any]) -> Any | None:
         external_id = str(before.get("external_progress_id") or "")
@@ -7597,7 +8020,14 @@ class DataIntakeService:
             else "",
             "can_publish": row["status"] == "ready",
             "can_abandon": row["status"] not in {"published", "abandoned"},
+            "daily_snapshot": bool(metadata.get("daily_snapshot")),
+            "snapshot_date": str(metadata.get("snapshot_date") or ""),
+            "source_profile_key": str(metadata.get("source_profile_key") or ""),
+            "change_summary": dict(metadata.get("change_summary") or {}),
+            "snapshot_role": str(metadata.get("snapshot_role") or ""),
+            "publish_boundary": str(metadata.get("publish_boundary") or ""),
             "source_profile": {
+                "key": str(metadata.get("source_profile_key") or ""),
                 "label": str(metadata.get("source_profile_label") or ""),
                 "sheet": str(metadata.get("detected_sheet") or ""),
                 "column_count": int(metadata.get("detected_columns") or 0),
@@ -7791,6 +8221,61 @@ class DataIntakeService:
             )
 
 
+def _block_cross_source_case_id_collisions(
+    preview: ImportPreview,
+    *,
+    existing: CaseMasterIndex,
+    source_system: str,
+) -> ImportPreview:
+    output: list[PreviewRow] = []
+    for row in preview.rows:
+        source_case_id = str(
+            (row.after or row.normalized or {}).get("source_case_id") or ""
+        ).strip()
+        if row.action != "新增" or not source_case_id:
+            output.append(row)
+            continue
+        collisions = [
+            case
+            for case in existing.by_external_id.get(source_case_id, [])
+            if str(
+                case.get("source_system")
+                or case.get("source_type")
+                or (case.get("source_json") or {}).get("source_system")
+                or ""
+            ).casefold()
+            != source_system.casefold()
+        ]
+        if not collisions:
+            output.append(row)
+            continue
+        output.append(
+            PreviewRow(
+                row.row_number,
+                "冲突",
+                row.raw,
+                row.normalized,
+                row.before,
+                None,
+                row.errors
+                + (
+                    ImportErrorDetail(
+                        "cross_source_case_id_collision",
+                        ("本地案件主账已有相同ERP案件ID且来源不同，请人工核验后再发布"),
+                        "source_case_id",
+                    ),
+                ),
+            )
+        )
+    counts = dict(preview.counts)
+    for original, changed in zip(preview.rows, output):
+        if original.action == changed.action:
+            continue
+        counts[original.action] = max(0, counts.get(original.action, 0) - 1)
+        counts[changed.action] = counts.get(changed.action, 0) + 1
+    return ImportPreview(tuple(output), counts, preview.deletes)
+
+
 def _merge_parse_errors(preview: ImportPreview, parsed: ParsedTable) -> ImportPreview:
     parse_by_row = {
         row.row_number: tuple(row.errors) for row in parsed.rows if row.errors
@@ -7804,7 +8289,14 @@ def _merge_parse_errors(preview: ImportPreview, parsed: ParsedTable) -> ImportPr
             output.append(row)
             continue
         converted = tuple(_row_error_to_import(error) for error in extra)
-        has_critical = any(error.critical for error in extra)
+        merged_errors = list(row.errors)
+        seen = {(error.code, error.field, error.critical) for error in merged_errors}
+        for error in converted:
+            identity = (error.code, error.field, error.critical)
+            if identity not in seen:
+                seen.add(identity)
+                merged_errors.append(error)
+        has_critical = any(error.critical for error in merged_errors)
         output.append(
             PreviewRow(
                 row.row_number,
@@ -7813,7 +8305,7 @@ def _merge_parse_errors(preview: ImportPreview, parsed: ParsedTable) -> ImportPr
                 row.normalized,
                 row.before,
                 None if has_critical else row.after,
-                row.errors + converted,
+                tuple(merged_errors),
             )
         )
     counts = dict(preview.counts)
@@ -7822,6 +8314,161 @@ def _merge_parse_errors(preview: ImportPreview, parsed: ParsedTable) -> ImportPr
             counts[original.action] = max(0, counts.get(original.action, 0) - 1)
             counts["失败"] = counts.get("失败", 0) + 1
     return ImportPreview(tuple(output), counts, preview.deletes)
+
+
+def _current_raw_case_snapshot(
+    rows: tuple[ParsedRow, ...],
+) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        source_case_id = str(row.normalized.get("source_case_id") or "").strip()
+        if not source_case_id:
+            continue
+        raw = _jsonable(row.raw)
+        raw["source_case_id"] = source_case_id
+        output[source_case_id] = raw
+    return output
+
+
+def _previous_raw_case_snapshot(
+    source_snapshots: dict[str, dict[str, Any]],
+    *,
+    current_rows: tuple[ParsedRow, ...],
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    current = _current_raw_case_snapshot(current_rows)
+    output: dict[str, dict[str, Any]] = {}
+    has_retained_raw_snapshot = False
+    for source_case_id, source_snapshot in source_snapshots.items():
+        raw = source_snapshot.get("__source_raw__")
+        if isinstance(raw, dict):
+            retained = _jsonable(raw)
+            retained["source_case_id"] = source_case_id
+            output[source_case_id] = retained
+            has_retained_raw_snapshot = True
+        elif source_case_id in current:
+            # Legacy source maps did not retain the complete ERP row.  The first
+            # daily file establishes their baseline instead of manufacturing a
+            # change for every historic column.
+            output[source_case_id] = dict(current[source_case_id])
+    return output, not has_retained_raw_snapshot
+
+
+def _snapshot_record_change_payload(
+    change: SnapshotRecordChange,
+    *,
+    timeline_candidate: bool | None = None,
+) -> dict[str, Any]:
+    def items(values: tuple[Any, ...]) -> list[dict[str, Any]]:
+        return [
+            {
+                "field": item.field,
+                "before": _jsonable(item.before),
+                "after": _jsonable(item.after),
+            }
+            for item in values
+        ]
+
+    return {
+        "source_case_id": change.source_case_id,
+        "action": change.action,
+        "master_changes": items(change.master_changes),
+        "progress_changes": items(change.progress_changes),
+        "plan_changes": items(change.plan_changes),
+        "lifecycle_changes": items(change.lifecycle_changes),
+        "timeline_candidate": bool(timeline_candidate),
+    }
+
+
+def _snapshot_change_summary(diff: CaseSnapshotDiff) -> dict[str, int]:
+    summary = {
+        "added": len(diff.added),
+        "missing": len(diff.missing),
+        "unchanged": len(diff.unchanged),
+        "changed": len(diff.changed),
+        "master_changed": sum(bool(item.master_changes) for item in diff.changed),
+        "progress_changed": sum(bool(item.progress_changes) for item in diff.changed),
+        "plan_changed": sum(bool(item.plan_changes) for item in diff.changed),
+        "lifecycle_changed": sum(bool(item.lifecycle_changes) for item in diff.changed),
+        "timeline_candidates": len(diff.timeline_candidates),
+    }
+    return {
+        **summary,
+        "new_cases": summary["added"],
+        "missing_cases": summary["missing"],
+        "unchanged_cases": summary["unchanged"],
+        "master_changes": summary["master_changed"],
+        "progress_changes": summary["progress_changed"],
+        "plan_changes": summary["plan_changed"],
+        "lifecycle_changes": summary["lifecycle_changed"],
+    }
+
+
+def _empty_snapshot_change_summary() -> dict[str, int]:
+    return {
+        "added": 0,
+        "missing": 0,
+        "unchanged": 0,
+        "changed": 0,
+        "master_changed": 0,
+        "progress_changed": 0,
+        "plan_changed": 0,
+        "lifecycle_changed": 0,
+        "timeline_candidates": 0,
+        "new_cases": 0,
+        "missing_cases": 0,
+        "unchanged_cases": 0,
+        "master_changes": 0,
+        "progress_changes": 0,
+        "plan_changes": 0,
+        "lifecycle_changes": 0,
+    }
+
+
+def _attach_snapshot_changes(
+    preview: ImportPreview,
+    diff: CaseSnapshotDiff,
+) -> ImportPreview:
+    candidates = {item.source_case_id for item in diff.timeline_candidates}
+    changes = {
+        item.source_case_id: item
+        for item in (
+            *diff.added,
+            *diff.missing,
+            *diff.unchanged,
+            *diff.changed,
+        )
+    }
+    rows: list[PreviewRow] = []
+    for row in preview.rows:
+        identity = row.after or row.normalized or row.before or {}
+        source_case_id = str(
+            identity.get("source_case_id") or identity.get("external_case_id") or ""
+        ).strip()
+        change = changes.get(source_case_id)
+        if change is None:
+            rows.append(row)
+            continue
+        payload = _snapshot_record_change_payload(
+            change,
+            timeline_candidate=source_case_id in candidates,
+        )
+        normalized = dict(row.normalized)
+        normalized["__daily_snapshot_change__"] = payload
+        after = dict(row.after) if row.after is not None else None
+        if after is not None:
+            after["__daily_snapshot_change__"] = payload
+        rows.append(
+            PreviewRow(
+                row.row_number,
+                row.action,
+                row.raw,
+                normalized,
+                row.before,
+                after,
+                row.errors,
+            )
+        )
+    return ImportPreview(tuple(rows), dict(preview.counts), preview.deletes)
 
 
 def _source_system(value: str) -> str:
@@ -8032,6 +8679,150 @@ def _progress_details(after: dict[str, Any]) -> str:
     if after.get("plan_date"):
         values.append(f"计划日期：{after['plan_date']}")
     return "\n".join(values)
+
+
+def _daily_snapshot_progress_text(
+    change: dict[str, Any],
+) -> tuple[str, str]:
+    items = [
+        item
+        for group in (
+            "lifecycle_changes",
+            "progress_changes",
+            "plan_changes",
+        )
+        for item in (change.get(group) or [])
+        if isinstance(item, dict) and str(item.get("field") or "").strip()
+    ]
+    if not items:
+        return "", ""
+    first_field = str(items[0]["field"]).strip()
+    summary = (
+        f"ERP来源变化：{first_field}更新"
+        if len(items) == 1
+        else f"ERP来源变化：{first_field}等{len(items)}项更新"
+    )
+    details = []
+    for item in items:
+        field = str(item["field"]).strip()
+        before = _snapshot_value_text(item.get("before"))
+        after = _snapshot_value_text(item.get("after"))
+        if before and after:
+            details.append(f"{field}：由“{before}”更新为“{after}”")
+        elif after:
+            details.append(f"{field}：更新为“{after}”")
+    return summary, "\n".join(details)
+
+
+def _daily_progress_source_snapshot(
+    *,
+    source_system: str,
+    external_progress_id: str,
+    case_id: uuid.UUID,
+    source_case_id: str,
+    snapshot_date: str,
+    profile_key: str,
+    reporter_id: str,
+    summary: str,
+    details: str,
+) -> dict[str, Any]:
+    fingerprint = _hash_json(
+        {
+            "case_id": str(case_id),
+            "snapshot_date": snapshot_date,
+            "summary": summary,
+            "details": details,
+        }
+    )
+    return {
+        "source_system": source_system,
+        "external_progress_id": external_progress_id,
+        "fingerprint": fingerprint,
+        "case_id": str(case_id),
+        "source_case_id": source_case_id,
+        "progress_date": snapshot_date,
+        "progress_type": "ERP来源变化",
+        "content": summary,
+        "summary": summary,
+        "details": details,
+        "reporter_id": reporter_id,
+        "source_updated_at": snapshot_date,
+        "source_profile_key": profile_key,
+    }
+
+
+def _snapshot_value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        text_value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text_value = str(value)
+    return re.sub(r"\s+", " ", text_value).strip()[:1000]
+
+
+def _daily_snapshot_change_display(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    group_specs = (
+        ("master", "master_changes", "资料变化"),
+        ("progress", "progress_changes", "进展变化"),
+        ("plan", "plan_changes", "计划变化"),
+        ("lifecycle", "lifecycle_changes", "阶段变化"),
+    )
+    groups: list[dict[str, Any]] = []
+    output: dict[str, Any] = {
+        "类型": {
+            "added": "新增案件",
+            "missing": "本次文件未出现",
+            "unchanged": "无变化",
+            "changed": "内容有变化",
+        }.get(str(value.get("action") or ""), "内容有变化"),
+        "生成案件进展": bool(value.get("timeline_candidate")),
+        "groups": groups,
+    }
+    for key, source_key, label in group_specs:
+        items = []
+        for item in value.get(source_key) or []:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").strip()
+            before = _jsonable(item.get("before"))
+            after = _jsonable(item.get("after"))
+            before_text = _snapshot_value_text(before) or "空"
+            after_text = _snapshot_value_text(after) or "空"
+            items.append(
+                {
+                    "field": field,
+                    "field_label": field,
+                    "before": before,
+                    "after": after,
+                    "before_label": before_text,
+                    "after_label": after_text,
+                    "description": f"{field}：原值“{before_text}”，新值“{after_text}”",
+                }
+            )
+        output[key] = items
+        if items:
+            groups.append({"key": key, "label": label, "items": items})
+    return output
+
+
+def _daily_snapshot_action_label(snapshot: dict[str, Any], fallback: str) -> str:
+    change = snapshot.get("__daily_snapshot_change__")
+    if not isinstance(change, dict) or change.get("action") != "changed":
+        return fallback
+    changed_groups = [
+        label
+        for key, label in (
+            ("master_changes", "资料变化"),
+            ("progress_changes", "进展变化"),
+            ("plan_changes", "计划变化"),
+            ("lifecycle_changes", "阶段变化"),
+        )
+        if change.get(key)
+    ]
+    return changed_groups[0] if len(changed_groups) == 1 else "内容有变化"
 
 
 def _display_row(value: Any) -> Any:

@@ -33,6 +33,11 @@ class SandboxDailyExecutorPort(Protocol):
 
     async def copy_previous_to_today(self, request: SandboxHandlerRequest) -> Any: ...
 
+    async def correct_daily_report_date(
+        self,
+        request: SandboxHandlerRequest,
+    ) -> Any: ...
+
     async def complete_previous_plan(self, request: SandboxHandlerRequest) -> Any: ...
 
     async def confirm_report(self, request: SandboxHandlerRequest) -> Any: ...
@@ -76,6 +81,12 @@ async def execute_move_daily_items(request: SandboxHandlerRequest) -> Any:
 
 async def execute_copy_previous_to_today(request: SandboxHandlerRequest) -> Any:
     return await request.executor.copy_previous_to_today(request)
+
+
+async def execute_correct_daily_report_date(
+    request: SandboxHandlerRequest,
+) -> Any:
+    return await request.executor.correct_daily_report_date(request)
 
 
 async def execute_complete_previous_plan(request: SandboxHandlerRequest) -> Any:

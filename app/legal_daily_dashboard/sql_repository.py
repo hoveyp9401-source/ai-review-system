@@ -85,7 +85,12 @@ class SqlDashboardRepository:
             allowed_team_refs=tuple(team_refs),
         )
 
-    async def list_teams(self, *, tenant_id: str) -> tuple[TeamRecord, ...]:
+    async def list_teams(
+        self,
+        *,
+        tenant_id: str,
+        on_date: date | None = None,
+    ) -> tuple[TeamRecord, ...]:
         result = await self._session.execute(
             text(
                 """
@@ -100,16 +105,36 @@ class SqlDashboardRepository:
                       SELECT memberships.team_id
                       FROM legal_daily_team_memberships memberships
                       WHERE memberships.tenant_id = :tenant_id
+                        AND (
+                            CAST(:on_date AS DATE) IS NULL
+                            OR (
+                                memberships.effective_from <= CAST(:on_date AS DATE)
+                                AND (
+                                    memberships.effective_to IS NULL
+                                    OR memberships.effective_to >= CAST(:on_date AS DATE)
+                                )
+                            )
+                        )
                       UNION
                       SELECT assignments.team_id
                       FROM legal_daily_access_assignments assignments
                       WHERE assignments.tenant_id = :tenant_id
                         AND assignments.team_id IS NOT NULL
                         AND assignments.active IS TRUE
+                        AND (
+                            CAST(:on_date AS DATE) IS NULL
+                            OR (
+                                assignments.effective_from <= CAST(:on_date AS DATE)
+                                AND (
+                                    assignments.effective_to IS NULL
+                                    OR assignments.effective_to >= CAST(:on_date AS DATE)
+                                )
+                            )
+                        )
                   )
                 ORDER BY teams.name
                 """
-            ).bindparams(tenant_id=tenant_id)
+            ).bindparams(tenant_id=tenant_id, on_date=on_date)
         )
         rows = result.mappings().all()
         return tuple(
@@ -129,6 +154,7 @@ class SqlDashboardRepository:
         self,
         *,
         tenant_id: str,
+        on_date: date | None = None,
     ) -> tuple[TeamRecord, ...]:
         result = await self._session.execute(
             text(
@@ -142,9 +168,19 @@ class SqlDashboardRepository:
                 JOIN teams ON teams.id = memberships.team_id
                 WHERE memberships.tenant_id = :tenant_id
                   AND teams.active IS TRUE
+                  AND (
+                      CAST(:on_date AS DATE) IS NULL
+                      OR (
+                          memberships.effective_from <= CAST(:on_date AS DATE)
+                          AND (
+                              memberships.effective_to IS NULL
+                              OR memberships.effective_to >= CAST(:on_date AS DATE)
+                          )
+                      )
+                  )
                 ORDER BY teams.name
                 """
-            ).bindparams(tenant_id=tenant_id)
+            ).bindparams(tenant_id=tenant_id, on_date=on_date)
         )
         rows = result.mappings().all()
         return tuple(
@@ -191,9 +227,13 @@ class SqlDashboardRepository:
             SELECT DISTINCT
                 users.id::text AS member_ref,
                 users.name AS member_name,
-                memberships.team_id::text AS team_ref
+                memberships.team_id::text AS team_ref,
+                teams.name AS team_name,
+                teams.department_name,
+                teams.code AS team_code
             FROM legal_daily_team_memberships memberships
             JOIN users ON users.id = memberships.user_id
+            JOIN teams ON teams.id = memberships.team_id
             WHERE memberships.tenant_id = :tenant_id
               AND memberships.effective_from <= :end_date
               AND (
@@ -343,6 +383,11 @@ class SqlDashboardRepository:
                     ref=str(row["member_ref"]),
                     name=str(row["member_name"]),
                     team_ref=str(row["team_ref"]),
+                    team_name=str(row.get("team_name") or ""),
+                    department_name=str(
+                        row.get("department_name") or ""
+                    ),
+                    team_code=str(row.get("team_code") or ""),
                 )
                 for row in member_rows
             ),
