@@ -310,7 +310,7 @@ def test_summary_commits_auto_submit_before_new_briefing_projection_session() ->
 
 
 def test_default_auto_submit_time_is_next_morning_eight() -> None:
-    assert Settings().auto_submit_cron_hour == 8
+    assert Settings.model_fields["auto_submit_cron_hour"].default == 8
 
 
 def test_incomplete_historical_confirmation_has_honest_guidance() -> None:
