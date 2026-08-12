@@ -4,7 +4,7 @@ set -euo pipefail
 releases=/home/ai_review_tunnel/releases
 backups=/home/ai_review_tunnel/backups
 candidate="$releases/ai-review-system-agent2-v22-completed-edit-8am-20260812-candidate"
-release="$releases/ai-review-system-agent2-v22-completed-edit-8am-20260812-release"
+release="$releases/ai-review-system-agent2-v22-completed-edit-8am-20260812-b88d74c"
 old_release="$releases/ai-review-system-agent2-v22-briefing-detail-20260811-e8a60c5"
 current="$releases/current"
 next_link="$releases/.current-completed-edit-8am-20260812-next"
