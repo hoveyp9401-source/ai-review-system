@@ -822,15 +822,22 @@ def _canary_failure_receipt(receipt: ToolReceipt) -> ToolReceipt:
 def _safe_report_snapshot(
     report: TrustedReportSnapshot,
 ) -> dict[str, object]:
-    fields: dict[str, list[str]] = {
+    fields: dict[str, list[dict[str, str]]] = {
         "today_work": [],
         "problems": [],
         "tomorrow_plan": [],
     }
     for item in report.items:
-        fields[item.field].append(item.content)
+        fields[item.field].append(
+            {
+                "item_id": item.item_id,
+                "content": item.content,
+            }
+        )
     return {
+        "report_id": str(report.report_id),
         "report_date": report.report_date.isoformat(),
+        "version": report.version,
         "status": report.status,
         "fields": fields,
         "acknowledged_empty_fields": sorted(

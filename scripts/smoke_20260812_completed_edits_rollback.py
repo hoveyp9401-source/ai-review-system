@@ -118,7 +118,7 @@ async def _run_case(*, llm_client: LLMClient, case) -> dict[str, object]:
             actual_tools = [row.tool_name for row in tool_receipts]
             expected_tools = (
                 ["query_report_by_date", expected_tool]
-                if case_name in {"edit", "delete", "move"}
+                if case_name in {"append", "edit", "delete", "move"}
                 else [expected_tool]
             )
             if actual_tools != expected_tools:

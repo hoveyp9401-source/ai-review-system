@@ -10,6 +10,7 @@ from app import repositories
 from app.agent2.tool_calling.canary_config import canary_system_prompt
 from app.agent2.tool_calling.context import TrustedReportItem, TrustedReportSnapshot
 from app.agent2.tool_calling.registry import TOOL_REGISTRY
+from app.agent2.tool_calling.production_runtime import _safe_report_snapshot
 from app.agent2.tool_calling.validation import _locked_historical_report_date
 from app.agent2.typed_daily_commands import (
     DailyReportMutationSnapshot,
@@ -280,6 +281,19 @@ def test_agent2_prompt_and_tools_state_completed_owner_edit_contract() -> None:
         description = TOOL_REGISTRY[tool_name].description
         assert "trusted completed report directly" in description
         assert "preserves completed status" in description
+
+
+def test_read_result_exposes_trusted_ids_required_for_followup_edit() -> None:
+    report = _trusted_completed_report()
+    snapshot = _safe_report_snapshot(report)
+
+    assert snapshot["report_id"] == str(report.report_id)
+    assert snapshot["version"] == 3
+    assert snapshot["fields"]["today_work"] == [
+        {"item_id": "tw-1", "content": "review contract"}
+    ]
+    assert "tenant_id" not in snapshot
+    assert "owner_user_id" not in snapshot
 
 
 @pytest.mark.asyncio
