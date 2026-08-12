@@ -190,7 +190,9 @@ def test_legal_head_stays_in_missing_totals_but_name_is_hidden() -> None:
     }
     assert "已交 3/4｜未交 1" in department["text"]
     assert "**中心直属**\n   已交 1/2｜未交 1" in department["text"]
-    assert "**中心直属（1人）**" in department["text"]
+    assert "**中心直属（1人）**" not in department["text"]
+    assert "未交计数已记录，本栏无需要单独通报的人员。" in department["text"]
+    assert "已知应交人员均已提交。" not in department["text"]
     assert "赵卫中" not in department["text"]
 
     zhao_snapshot = next(
@@ -213,7 +215,10 @@ def test_other_missing_names_remain_visible_when_legal_head_is_hidden() -> None:
 
     department = briefings["department_message"]
     assert department["stats"]["missing"] == 2
-    assert "**中心直属（2人）**\n   朱佳佳" in department["text"]
+    assert "已交 2/4｜未交 2" in department["text"]
+    assert "**中心直属**\n   已交 0/2｜未交 2" in department["text"]
+    assert "**中心直属（1人）**\n   朱佳佳" in department["text"]
+    assert "**中心直属（2人）**" not in department["text"]
     assert "赵卫中" not in department["text"]
 
 
@@ -238,8 +243,57 @@ def test_a_different_legal_head_is_not_hidden_by_role() -> None:
     )
 
     text = briefings["department_message"]["text"]
-    assert "**中心直属（2人）**\n   朱佳佳" in text
+    assert "**中心直属（1人）**\n   朱佳佳" in text
     assert "赵卫中" not in text
+
+
+def test_center_direct_missing_detail_stays_visible_when_only_zhu_is_missing() -> None:
+    briefings = build_management_daily_briefings(
+        report_date=REPORT_DATE,
+        now=datetime(2026, 8, 8, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        teams=(TEAM_2, TEAM_4),
+        records=_records(missing_member_refs=frozenset({"zhu"})),
+        recipients=_recipients(),
+        hidden_missing_detail_member_refs=frozenset({"zhao"}),
+    )
+
+    department = briefings["department_message"]
+    assert department["stats"]["missing"] == 1
+    assert "**中心直属（1人）**\n   朱佳佳" in department["text"]
+    assert "未交计数已记录，本栏无需要单独通报的人员。" not in department["text"]
+
+
+def test_other_team_missing_detail_remains_when_zhao_is_the_only_center_missing_member() -> None:
+    briefings = build_management_daily_briefings(
+        report_date=REPORT_DATE,
+        now=datetime(2026, 8, 8, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        teams=(TEAM_2, TEAM_4),
+        records=_records(missing_member_refs=frozenset({"ding", "zhao"})),
+        recipients=_recipients(),
+        hidden_missing_detail_member_refs=frozenset({"zhao"}),
+    )
+
+    department = briefings["department_message"]
+    assert department["stats"]["missing"] == 2
+    assert "**法务二部（1人）**\n   丁益明" in department["text"]
+    assert "**中心直属（" not in department["text"]
+    assert "未交计数已记录，本栏无需要单独通报的人员。" not in department["text"]
+
+
+def test_no_missing_members_keeps_the_all_submitted_empty_text() -> None:
+    briefings = build_management_daily_briefings(
+        report_date=REPORT_DATE,
+        now=datetime(2026, 8, 8, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        teams=(TEAM_2, TEAM_4),
+        records=_records(),
+        recipients=_recipients(),
+        hidden_missing_detail_member_refs=frozenset({"zhao"}),
+    )
+
+    department = briefings["department_message"]
+    assert department["stats"]["missing"] == 0
+    assert "已知应交人员均已提交。" in department["text"]
+    assert "未交计数已记录，本栏无需要单独通报的人员。" not in department["text"]
 
 
 @pytest.mark.asyncio

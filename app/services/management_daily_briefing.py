@@ -421,13 +421,22 @@ def build_department_management_briefing_text(
     ]
     team_entries = [_department_team_entry(view) for view in department_views]
     missing_entries = [
-        _department_missing_entry(
-            view,
-            hidden_member_refs=hidden_missing_detail_member_refs,
-        )
+        entry
         for view in known_views
         if view.missing_members
+        for entry in (
+            _department_missing_entry(
+                view,
+                hidden_member_refs=hidden_missing_detail_member_refs,
+            ),
+        )
+        if entry is not None
     ]
+    empty_missing_detail_text = (
+        "未交计数已记录，本栏无需要单独通报的人员。"
+        if total_missing
+        else "已知应交人员均已提交。"
+    )
     if total_unknown:
         unknown_names = "、".join(
             member.name for view in known_views for member in view.unknown_members
@@ -448,7 +457,7 @@ def build_department_management_briefing_text(
         _numbered_section(
             "二、未交人员",
             missing_entries,
-            "已知应交人员均已提交。",
+            empty_missing_detail_text,
         ),
         _numbered_section(
             "三、需要部门负责人关注",
@@ -614,7 +623,7 @@ def _department_missing_entry(
     view: TeamSubmissionView,
     *,
     hidden_member_refs: frozenset[str],
-) -> tuple[str, str]:
+) -> tuple[str, str] | None:
     """Render missing names without changing the underlying submission totals."""
 
     visible_members = tuple(
@@ -622,9 +631,11 @@ def _department_missing_entry(
         for member in view.missing_members
         if member.ref not in hidden_member_refs
     )
+    if not visible_members:
+        return None
     visible_names = "、".join(member.name for member in visible_members)
     return (
-        f"**{view.team.name}（{len(view.missing_members)}人）**",
+        f"**{view.team.name}（{len(visible_members)}人）**",
         visible_names,
     )
 

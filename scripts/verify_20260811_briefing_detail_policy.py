@@ -66,7 +66,16 @@ async def main() -> int:
     expected_center_summary = (
         f"**中心直属**\n   已交 {center_completed}/2｜未交 {center_missing}"
     )
-    expected_center_missing_heading = f"**中心直属（{center_missing}人）**"
+    visible_center_missing = sum(
+        member.get("classification") == "missing"
+        and str(member.get("member_name") or "") != "赵卫中"
+        for member in center_members
+    )
+    expected_center_missing_heading = (
+        f"**中心直属（{visible_center_missing}人）**"
+        if visible_center_missing
+        else ""
+    )
     other_missing_names = sorted(
         str(member.get("member_name") or "")
         for member in members
@@ -87,7 +96,11 @@ async def main() -> int:
     center_text_ok = (
         len(center_members) == 2
         and expected_center_summary in message
-        and expected_center_missing_heading in missing_section
+        and (
+            expected_center_missing_heading in missing_section
+            if expected_center_missing_heading
+            else "**中心直属（" not in missing_section
+        )
     )
     hidden_ok = zhao_is_missing and not zhao_visible_in_missing_detail
     policy_ok = (
@@ -112,6 +125,7 @@ async def main() -> int:
         "center_snapshot_member_count": len(center_members),
         "center_snapshot_completed": center_completed,
         "center_snapshot_missing": center_missing,
+        "center_visible_missing": visible_center_missing,
         "center_text_ok": center_text_ok,
         "other_missing_names_count": len(other_missing_names),
         "other_missing_names_absent": other_missing_names_absent,
