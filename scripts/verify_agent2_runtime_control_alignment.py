@@ -72,7 +72,7 @@ async def _verify(args: argparse.Namespace) -> dict[str, object]:
                 on_date=today_in_timezone(settings.timezone),
             )
             roster_user_ids = set(roster.user_ids)
-            controls = list(
+            control_rows = list(
                 (
                     await session.scalars(
                         select(ToolCallCanaryControl)
@@ -81,6 +81,20 @@ async def _verify(args: argparse.Namespace) -> dict[str, object]:
                     )
                 ).all()
             )
+            controls = [
+                {
+                    "control_key": row.control_key,
+                    "tenant_id": row.tenant_id,
+                    "user_id": row.user_id,
+                    "enabled": row.enabled,
+                    "messages_enabled": row.messages_enabled,
+                    "runtime": row.runtime,
+                    "registry_digest": row.registry_digest,
+                    "prompt_sha256": row.prompt_sha256,
+                    "model_name": row.model_name,
+                }
+                for row in control_rows
+            ]
             await session.rollback()
     finally:
         await engine.dispose()
@@ -88,27 +102,27 @@ async def _verify(args: argparse.Namespace) -> dict[str, object]:
         raise AssertionError(
             f"control count is {len(controls)}, expected {FORMAL_ROSTER_MEMBER_COUNT}"
         )
-    if len({row.user_id for row in controls}) != FORMAL_ROSTER_MEMBER_COUNT:
+    if len({row["user_id"] for row in controls}) != FORMAL_ROSTER_MEMBER_COUNT:
         raise AssertionError("Agent2 controls contain duplicate users")
-    if {row.user_id for row in controls} != roster_user_ids:
+    if {row["user_id"] for row in controls} != roster_user_ids:
         raise AssertionError("Agent2 controls do not exactly match the formal roster")
-    runtime_tenant_ids = {row.tenant_id for row in controls}
+    runtime_tenant_ids = {row["tenant_id"] for row in controls}
     if len(runtime_tenant_ids) != 1:
         raise AssertionError("Agent2 controls do not share one runtime tenant")
     runtime_tenant_id = next(iter(runtime_tenant_ids))
     if not all(
-        row.enabled
-        and row.messages_enabled
-        and row.runtime == "canary_execute"
+        row["enabled"]
+        and row["messages_enabled"]
+        and row["runtime"] == "canary_execute"
         for row in controls
     ):
         raise AssertionError("not all controls are message-ready Agent2 controls")
     mismatches = [
-        row.control_key
+        str(row["control_key"])
         for row in controls
-        if row.registry_digest != expected["registry_digest"]
-        or row.prompt_sha256 != expected["prompt_sha256"]
-        or row.model_name != expected["model_name"]
+        if row["registry_digest"] != expected["registry_digest"]
+        or row["prompt_sha256"] != expected["prompt_sha256"]
+        or row["model_name"] != expected["model_name"]
     ]
     if mismatches:
         raise AssertionError(
@@ -123,7 +137,7 @@ async def _verify(args: argparse.Namespace) -> dict[str, object]:
         "active_user_limit": settings.agent2_tool_call_canary_max_active_users,
         "contract": expected,
         "thinking_enabled": CANARY_THINKING_ENABLED,
-        "model_distribution": dict(Counter(row.model_name for row in controls)),
+        "model_distribution": dict(Counter(row["model_name"] for row in controls)),
         "dingtalk_send_calls": 0,
     }
 
