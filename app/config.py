@@ -92,9 +92,7 @@ class Settings(BaseSettings):
     legal_daily_dashboard_principals_json: str = ""
     legal_daily_dashboard_system_user_id: str = "system:legal-daily-dashboard"
     management_daily_briefing_department_cc_user_ids: str = ""
-    management_daily_briefing_hidden_missing_detail_user_ids: str = (
-        "45a84161-ae1a-4ed5-960b-e33352bec6d2"
-    )
+    management_daily_briefing_hidden_missing_detail_user_ids: str = ""
     legal_daily_dashboard_manager_write_enabled: bool = False
     legal_daily_dashboard_analysis_enabled: bool = False
     legal_daily_dashboard_analysis_model: str = ""
