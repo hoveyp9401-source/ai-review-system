@@ -205,6 +205,94 @@ def test_typed_executor_persists_structured_command_without_natural_language(mon
     assert "agent2_daily_command_receipts" in receipt_sql
 
 
+def test_completed_content_edit_preserves_auto_submission_metadata(monkeypatch):
+    user = SimpleNamespace(
+        id=uuid5(NAMESPACE_URL, "completed-owner-edit-user"),
+        team_id=uuid5(NAMESPACE_URL, "completed-owner-edit-team"),
+        timezone="Asia/Shanghai",
+    )
+    report_date = date(2026, 8, 11)
+    report_id = uuid5(NAMESPACE_URL, "completed-owner-edit-report")
+    submitted_at = datetime(2026, 8, 11, 15, 0, tzinfo=UTC)
+    existing = SimpleNamespace(
+        id=report_id,
+        user_id=user.id,
+        team_id=user.team_id,
+        report_date=report_date,
+        status="completed",
+        today_work=["review contract"],
+        problems=[],
+        tomorrow_plan=["follow up"],
+        section_status={
+            "_agent2_report_version": 4,
+            "_draft_item_ids": {
+                "today_work": ["tw-1"],
+                "problems": [],
+                "tomorrow_plan": ["tp-1"],
+            },
+        },
+        confirmation_type="auto_submitted_timeout",
+        confirmed_by_user=False,
+        pending_confirmation_at=None,
+        auto_submit_at=None,
+        submitted_at=submitted_at,
+    )
+    command = TypedDailyCommand(
+        command_id=uuid5(NAMESPACE_URL, "completed-owner-edit-command"),
+        decision_id=uuid5(NAMESPACE_URL, "completed-owner-edit-decision"),
+        sub_decision_id=uuid5(NAMESPACE_URL, "completed-owner-edit-subdecision"),
+        command_type="edit_item",
+        report_id=report_id,
+        report_version=4,
+        target_item_ids=("tw-1",),
+        patch={"replacement": "review final contract"},
+        idempotency_key="completed-owner-edit:daily:0",
+    )
+    captured: dict = {}
+    session = _ReceiptSession()
+
+    async def fake_lock(*args, **kwargs):
+        return None
+
+    async def fake_get_report(*args, **kwargs):
+        return existing
+
+    async def fake_upsert(session, **kwargs):
+        captured.update(kwargs)
+        existing.today_work = list(kwargs["today_work"])
+        existing.problems = list(kwargs["problems"])
+        existing.tomorrow_plan = list(kwargs["tomorrow_plan"])
+        return existing
+
+    monkeypatch.setattr("app.repositories.acquire_daily_report_advisory_lock", fake_lock)
+    monkeypatch.setattr("app.repositories.get_report", fake_get_report)
+    monkeypatch.setattr("app.repositories.upsert_daily_report", fake_upsert)
+
+    result = asyncio.run(
+        execute_typed_agent2_daily_commands(
+            session,
+            user=user,
+            commands=(command,),
+            execution_context=TypedDailyExecutionContext(
+                report_date=report_date,
+                source="agent2_v3_test",
+                source_text_hash="f" * 64,
+                tenant_id="tenant-test",
+                allow_completed_content_mutation=True,
+            ),
+            settings=SimpleNamespace(timezone="Asia/Shanghai"),
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.today_work == ["review final contract"]
+    assert captured["preserve_existing_submission"] is True
+    assert captured["confirmation_type"] == "auto_submitted_timeout"
+    assert captured["confirmed_by_user"] is False
+    assert captured["pending_confirmation_at"] is None
+    assert captured["auto_submit_at"] is None
+
+
 def test_typed_executor_rejects_multi_target_single_item_command_before_db_access():
     user = SimpleNamespace(
         id=uuid5(NAMESPACE_URL, "typed-executor-shape-user"),

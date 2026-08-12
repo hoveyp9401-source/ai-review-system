@@ -86,6 +86,19 @@ Daily-report write date rules:
   message. Conversation history cannot supply that assertion.
 """.strip()
 
+
+_COMPLETED_DAILY_CONTENT_POLICY = """
+Completed daily-report content rules:
+- A trusted owned daily report with status=completed remains directly mutable for content changes.
+- When the current user explicitly asks to add, replace, delete, acknowledge an empty section,
+  or move its content, call add_daily_items, edit_daily_items, delete_daily_items, or
+  move_daily_items directly against the trusted snapshot. These content changes preserve
+  completed status.
+- Do not require, suggest, or advertise reopening or revoking submission before a content
+  change. Discuss changing submission state only when the user explicitly asks for that
+  different operation.
+""".strip()
+
 _REPORT_INSIGHT_TOOL_POLICY = """
 Daily-report read-tool boundary:
 - `query_managed_daily_reports` is only for one exact calendar date: one
@@ -246,6 +259,7 @@ def canary_system_prompt() -> str:
         f"{_CONVERSATION_CONTINUITY_POLICY}\n\n"
         f"{_DAILY_BRIEFING_FACT_POLICY}\n\n"
         f"{_DAILY_WRITE_DATE_POLICY}\n\n"
+        f"{_COMPLETED_DAILY_CONTENT_POLICY}\n\n"
         f"{_REPORT_INSIGHT_TOOL_POLICY}\n\n"
         f"{_MANAGED_DAILY_REPLY_POLICY}\n\n"
         f"{_DEFERRED_ACTION_POLICY}\n\n"

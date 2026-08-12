@@ -16,6 +16,18 @@ from app.agent2.admission_hashes import admission_claim_hashes_match
 
 REPORT_FIELDS = ("today_work", "problems", "tomorrow_plan")
 DAILY_DRAFT_MUTABLE_STATUSES = frozenset({"collecting", "pending_confirmation"})
+COMPLETED_CONTENT_MUTATION_COMMANDS = frozenset(
+    {
+        "append_item",
+        "acknowledge_empty_section",
+        "edit_item",
+        "delete_item",
+        "merge_items",
+        "move_item",
+        "move_items",
+        "replace_section",
+    }
+)
 DAILY_ADMISSION_OPERATION_CONTRACTS = MappingProxyType({
     "capture_daily_event": ("append_item", ("section", "items")),
     "submit_daily_report": ("submit_report", ("status",)),
@@ -172,6 +184,7 @@ def execute_typed_daily_command(
     executed_idempotency_keys: Collection[str] = (),
     admission_scope: AdmissionExecutionScope | None = None,
     allow_completed_append: bool = False,
+    allow_completed_content_mutation: bool = False,
 ) -> TypedDailyCommandExecution:
     validation = validate_typed_daily_command(
         command,
@@ -180,6 +193,7 @@ def execute_typed_daily_command(
         executed_idempotency_keys=executed_idempotency_keys,
         admission_scope=admission_scope,
         allow_completed_append=allow_completed_append,
+        allow_completed_content_mutation=allow_completed_content_mutation,
     )
     if validation.status == "duplicate":
         return TypedDailyCommandExecution(
@@ -598,6 +612,7 @@ def validate_typed_daily_command(
     executed_idempotency_keys: Collection[str] = (),
     admission_scope: AdmissionExecutionScope | None = None,
     allow_completed_append: bool = False,
+    allow_completed_content_mutation: bool = False,
 ) -> TypedDailyCommandValidation:
     if (
         not isinstance(command.command_type, str)
@@ -807,9 +822,18 @@ def validate_typed_daily_command(
     if (
         snapshot.status not in DAILY_DRAFT_MUTABLE_STATUSES
         and not (
-            allow_completed_append
-            and snapshot.status == "completed"
-            and command.command_type == "append_item"
+            snapshot.status == "completed"
+            and (
+                (
+                    allow_completed_append
+                    and command.command_type == "append_item"
+                )
+                or (
+                    allow_completed_content_mutation
+                    and command.command_type
+                    in COMPLETED_CONTENT_MUTATION_COMMANDS
+                )
+            )
         )
     ):
         return TypedDailyCommandValidation("blocked", "invalid_report_state")

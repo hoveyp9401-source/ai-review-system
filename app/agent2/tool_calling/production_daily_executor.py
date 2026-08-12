@@ -526,7 +526,7 @@ class ProductionDailyExecutor:
         typed_receipts = await self._execute_typed(
             report_date,
             commands,
-            allow_completed_append=True,
+            allow_completed_content_mutation=True,
         )
         after = await self._snapshot(report_date)
         return self._outcome(
@@ -569,7 +569,11 @@ class ProductionDailyExecutor:
             )
             for index, item_id in enumerate(arguments.target_item_ids)
         )
-        typed_receipts = await self._execute_typed(report.report_date, commands)
+        typed_receipts = await self._execute_typed(
+            report.report_date,
+            commands,
+            allow_completed_content_mutation=True,
+        )
         after = await self._snapshot(report.report_date)
         return self._outcome(
             request,
@@ -600,7 +604,11 @@ class ProductionDailyExecutor:
             )
             for index, item_id in enumerate(arguments.target_item_ids)
         )
-        typed_receipts = await self._execute_typed(report.report_date, commands)
+        typed_receipts = await self._execute_typed(
+            report.report_date,
+            commands,
+            allow_completed_content_mutation=True,
+        )
         after = await self._snapshot(report.report_date)
         return self._outcome(
             request,
@@ -634,6 +642,7 @@ class ProductionDailyExecutor:
         typed_receipts = await self._execute_typed(
             report.report_date,
             (command,),
+            allow_completed_content_mutation=True,
         )
         after = await self._snapshot(report.report_date)
         return self._outcome(
@@ -1141,6 +1150,7 @@ class ProductionDailyExecutor:
         commands: Iterable[TypedDailyCommand],
         *,
         allow_completed_append: bool = False,
+        allow_completed_content_mutation: bool = False,
     ) -> tuple[str, ...]:
         command_tuple = tuple(commands)
         if not command_tuple:
@@ -1161,6 +1171,9 @@ class ProductionDailyExecutor:
                 runtime_label="agent2_tool_call_core",
                 contract_version="tool_call_registry.v1",
                 allow_completed_append=allow_completed_append,
+                allow_completed_content_mutation=(
+                    allow_completed_content_mutation
+                ),
             ),
             settings=self._settings,
             execution_authority="tool_call_core_registry",

@@ -733,10 +733,6 @@ async def process_tool_call_canary_ingress(
         if (
             conversation_report_date is not None
             and conversation_report_date != local_today
-            and _turn_requests_historical_confirmation(
-                user_messages=ordered_user_messages,
-                recent_messages=recent_messages_for_focus,
-            )
         ):
             context_request = replace(
                 context_request,

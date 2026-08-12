@@ -21,7 +21,11 @@ from app.legal_daily_roster import (
     load_formal_legal_daily_roster,
 )
 from app.models import DailyReport, ReportInteractionEvent, User
-from app.repositories import list_missing_users
+from app.repositories import (
+    acquire_daily_report_advisory_lock,
+    get_report,
+    list_missing_users,
+)
 from app.services.dingtalk import DingTalkDeliveryError, DingTalkRobotClient
 from app.services.state_machine import (
     CONFIRMATION_AUTO_SUBMITTED_TIMEOUT,
@@ -963,7 +967,7 @@ def build_report_reminder_text(
     if is_second_reminder:
         return (
             f"{name}，你的{period_text}还有{missing_text}没有填写。"
-            "请方便时补充一下；如果今晚不再补充，后续我会按当前已填写内容自动确认提交。"
+            "请方便时补充一下；如果明早8点前不再补充，我会按当前已填写内容自动确认提交。"
         )
     return (
         f"{name}，你{period_text}我已经记录了一部分，还差{missing_text}。"
@@ -991,29 +995,47 @@ async def auto_submit_due_pending_reports(
     report_date: date | None = None,
 ) -> dict[str, Any]:
     now = now or now_in_timezone(settings.timezone)
-    query = select(DailyReport).where(
+    query = select(
+        DailyReport.user_id,
+        DailyReport.report_date,
+    ).where(
         DailyReport.status.in_(
             [STATUS_PENDING_CONFIRMATION, "collecting"]
         )
     )
     if report_date is not None:
         query = query.where(DailyReport.report_date == report_date)
+    query = query.order_by(DailyReport.report_date, DailyReport.user_id)
     result = await session.execute(query)
-    reports = [
-        report
-        for report in result.scalars().all()
-        if (
-            report_date is None
-            or getattr(report, "report_date", None) == report_date
+    candidate_keys = tuple(
+        dict.fromkeys(
+            (user_id, candidate_date)
+            for user_id, candidate_date in result.all()
         )
-        if _report_has_any_content(report)
-    ]
-    for report in reports:
+    )
+    submitted_reports: list[DailyReport] = []
+    for user_id, candidate_date in candidate_keys:
+        await acquire_daily_report_advisory_lock(
+            session,
+            user_id,
+            candidate_date,
+        )
+        report = await get_report(session, user_id, candidate_date)
+        if report is None or report.status not in {
+            STATUS_PENDING_CONFIRMATION,
+            "collecting",
+        }:
+            continue
+        if report_date is not None and report.report_date != report_date:
+            continue
+        if not _report_has_any_content(report):
+            continue
         mark_report_auto_submitted(report, now)
+        submitted_reports.append(report)
     return {
         "report_date": report_date.isoformat() if report_date else None,
-        "auto_submitted": len(reports),
-        "report_ids": [str(report.id) for report in reports],
+        "auto_submitted": len(submitted_reports),
+        "report_ids": [str(report.id) for report in submitted_reports],
     }
 
 

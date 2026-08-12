@@ -62,6 +62,7 @@ class TypedDailyExecutionContext:
     runtime_label: str = "agent2_cognitive_core_v3"
     contract_version: str = "cognitive_core.v3"
     allow_completed_append: bool = False
+    allow_completed_content_mutation: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -184,6 +185,9 @@ async def execute_typed_agent2_daily_commands(
                 actor_user_id=user.id,
                 executed_idempotency_keys=successful_receipt_keys,
                 allow_completed_append=execution_context.allow_completed_append,
+                allow_completed_content_mutation=(
+                    execution_context.allow_completed_content_mutation
+                ),
                 admission_scope=_daily_admission_scope(
                     command=command,
                     user_id=str(user.id),
@@ -354,6 +358,9 @@ async def execute_typed_agent2_daily_commands(
                 actor_user_id=user.id,
                 executed_idempotency_keys=known_keys,
                 allow_completed_append=execution_context.allow_completed_append,
+                allow_completed_content_mutation=(
+                    execution_context.allow_completed_content_mutation
+                ),
                 admission_scope=_daily_admission_scope(
                     command=command,
                     user_id=str(user.id),
@@ -490,6 +497,35 @@ async def execute_typed_agent2_daily_commands(
             section_status[status_key] = True
         else:
             section_status.pop(status_key, None)
+    preserve_existing_submission = (
+        existing is not None
+        and before.status == "completed"
+        and working.status == "completed"
+        and not any(
+            command.command_type in {"reopen_report", "submit_report"}
+            for command in commands
+        )
+    )
+    confirmation_type = (
+        str(getattr(existing, "confirmation_type", "") or "user_confirmed")
+        if preserve_existing_submission
+        else ("user_confirmed" if working.status == "completed" else "none")
+    )
+    confirmed_by_user = (
+        bool(getattr(existing, "confirmed_by_user", True))
+        if preserve_existing_submission
+        else working.status == "completed"
+    )
+    pending_confirmation_at = (
+        getattr(existing, "pending_confirmation_at", None)
+        if preserve_existing_submission
+        else None
+    )
+    auto_submit_at = (
+        getattr(existing, "auto_submit_at", None)
+        if preserve_existing_submission
+        else None
+    )
     report = await upsert_daily_report(
         session,
         user=user,
@@ -512,15 +548,16 @@ async def execute_typed_agent2_daily_commands(
             "typed_audit": [execution.audit.as_dict() for execution in executions],
         },
         received_at=received_at,
-        confirmation_type="user_confirmed" if working.status == "completed" else "none",
-        confirmed_by_user=working.status == "completed",
+        confirmation_type=confirmation_type,
+        confirmed_by_user=confirmed_by_user,
         quality_warning=None,
         last_modified_by_user=True,
         last_modified_at=received_at,
-        pending_confirmation_at=None,
-        auto_submit_at=None,
+        pending_confirmation_at=pending_confirmation_at,
+        auto_submit_at=auto_submit_at,
         replace_sections=True,
         report_id_override=working.report_id if existing is None else None,
+        preserve_existing_submission=preserve_existing_submission,
     )
     await _persist_execution_receipts(
         session,

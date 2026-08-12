@@ -564,6 +564,17 @@ def _locked_historical_report_date(
                 return None
     if target_date is None:
         return None
+    if (
+        report is not None
+        and report.status == "completed"
+        and getattr(definition, "tool_name", "")
+        in {
+            "edit_daily_items",
+            "delete_daily_items",
+            "move_daily_items",
+        }
+    ):
+        return None
     local_now = context.now.astimezone(
         ZoneInfo(context.principal.timezone)
     )

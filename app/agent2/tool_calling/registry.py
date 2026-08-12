@@ -176,6 +176,11 @@ _CURRENT_TURN_WRITE_AUTHORITY = (
     "otherwise comes only from history, do not call this tool; ask for clarification."
 )
 
+_COMPLETED_OWNER_CONTENT_WRITE = (
+    " Supports the authenticated owner's trusted completed report directly and "
+    "preserves completed status; no reopen or revoke is required for this content change."
+)
+
 
 def _definition(
     name: str,
@@ -501,7 +506,8 @@ TOOL_REGISTRY = MappingProxyType(
             "field must contain the referenced concrete items, not a relational placeholder. "
             "A stated current problem and its related future response are separate matters. "
             "Include a related future response only when it is definite; exclude a contingent "
-            "response. Never replace the current problem with its future response.",
+            "response. Never replace the current problem with its future response."
+            + _COMPLETED_OWNER_CONTENT_WRITE,
             AddDailyItemsArgs, "write", "medium", _OWNER_WRITE, "server_resolved_owner_report",
             "server_expression_authoritative_proposal_untrusted", idempotency=_WRITE_KEY, transaction=_ATOMIC,
             transaction_target="resolved_report",
@@ -522,7 +528,8 @@ TOOL_REGISTRY = MappingProxyType(
             "into content already held by another trusted item. Use delete_daily_items instead "
             "when the requested destination content already exists as another uniquely bound "
             "item in the same field."
-            + _UNIQUE_ITEM_WRITE,
+            + _UNIQUE_ITEM_WRITE
+            + _COMPLETED_OWNER_CONTENT_WRITE,
             EditDailyItemsArgs, "write", "medium", _OWNER_WRITE, "trusted_report_version_and_item_ids",
             "trusted_snapshot_date", idempotency=_WRITE_KEY, transaction=_ATOMIC,
             sandbox_handler=execute_edit_daily_items,
@@ -535,7 +542,8 @@ TOOL_REGISTRY = MappingProxyType(
             "trusted item while retaining desired content that already exists as another "
             "trusted item. When the uniquely bound destination already exists in the same "
             "field, retain it and delete only the source item."
-            + _UNIQUE_ITEM_WRITE,
+            + _UNIQUE_ITEM_WRITE
+            + _COMPLETED_OWNER_CONTENT_WRITE,
             DeleteDailyItemsArgs, "write", "medium", _OWNER_WRITE, "trusted_report_version_and_item_ids",
             "trusted_snapshot_date", idempotency=_WRITE_KEY, transaction=_ATOMIC,
             sandbox_handler=execute_delete_daily_items,
@@ -550,7 +558,8 @@ TOOL_REGISTRY = MappingProxyType(
             "entire source field to an explicit target field, bind all trusted item IDs in that "
             "source field. Do not query again or ask which items when the injected trusted "
             "snapshot already contains the complete source field."
-            + _UNIQUE_ITEM_WRITE,
+            + _UNIQUE_ITEM_WRITE
+            + _COMPLETED_OWNER_CONTENT_WRITE,
             MoveDailyItemsArgs, "write", "medium", _OWNER_WRITE,
             "trusted_report_version_items_and_source_field", "trusted_snapshot_date",
             idempotency=_WRITE_KEY, transaction=_ATOMIC,

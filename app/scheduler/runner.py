@@ -157,19 +157,32 @@ async def run_scheduler() -> None:
 
     async def auto_submit_job() -> None:
         current_date = today_in_timezone(settings.timezone)
-        if _scheduler_paused(settings, current_date):
-            logger.info("auto submit skipped by scheduler pause date=%s", current_date.isoformat())
+        report_date = _auto_submit_report_date(current_date)
+        if report_date is None:
+            logger.info(
+                "auto submit skipped by reporting calendar current_date=%s",
+                current_date.isoformat(),
+            )
+            return
+        if _scheduler_paused(settings, current_date) or _scheduler_paused(
+            settings, report_date
+        ):
+            logger.info(
+                "auto submit skipped by scheduler pause current_date=%s report_date=%s",
+                current_date.isoformat(),
+                report_date.isoformat(),
+            )
             return
         async with AsyncSessionLocal() as session:
             await ensure_daily_submission_obligations(
                 session,
                 settings,
-                current_date,
+                report_date,
             )
             await auto_submit_due_pending_reports(
                 session,
                 settings,
-                report_date=current_date,
+                report_date=report_date,
             )
             await session.commit()
 
@@ -1122,6 +1135,13 @@ def _reporting_required_on(target_date: date) -> bool:
 def _catchup_reminder_report_date(current_date: date) -> date | None:
     if not _reporting_required_on(current_date):
         return None
+    report_date = current_date - timedelta(days=1)
+    if not _reporting_required_on(report_date):
+        return None
+    return report_date
+
+
+def _auto_submit_report_date(current_date: date) -> date | None:
     report_date = current_date - timedelta(days=1)
     if not _reporting_required_on(report_date):
         return None

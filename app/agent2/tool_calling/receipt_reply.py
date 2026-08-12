@@ -122,7 +122,10 @@ def canary_block_message(reason: str) -> str:
     if reason == "tool_call_canary_execution_failed":
         return "刚才没有处理完整，本次没有写入任何内容。请再发一次。"
     if reason == "tool_call_canary_report_already_submitted":
-        return "这份日报已经提交，当前不能继续追加内容。本次没有写入。"
+        return (
+            "这次操作没有执行，日报内容和状态都没有变化。"
+            "请再说一次要增加、修改、删除或移动的具体内容。"
+        )
     if reason == "tool_call_canary_report_incomplete":
         return (
             "这份日报还没填完整，请补充今日工作、问题/风险和明日计划中的缺项；"

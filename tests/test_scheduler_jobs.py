@@ -14,6 +14,7 @@ from app.scheduler.jobs import (
     send_user_message,
 )
 from app.scheduler.runner import _send_daily_briefings
+from app.scheduler.runner import _auto_submit_report_date
 from app.scheduler.runner import _catchup_reminder_report_date
 from app.scheduler.runner import _daily_briefing_report_date
 from app.scheduler.runner import _reporting_required_on
@@ -62,6 +63,12 @@ def test_daily_briefing_calendar_sends_friday_on_saturday_and_skips_sunday_monda
     assert _daily_briefing_report_date(date(2026, 6, 28)) is None
     assert _daily_briefing_report_date(date(2026, 6, 29)) is None
     assert _daily_briefing_report_date(date(2026, 6, 30)) == date(2026, 6, 29)
+
+
+def test_eight_am_auto_submit_targets_previous_reporting_day():
+    assert _auto_submit_report_date(date(2026, 6, 16)) == date(2026, 6, 15)
+    assert _auto_submit_report_date(date(2026, 6, 27)) == date(2026, 6, 26)
+    assert _auto_submit_report_date(date(2026, 6, 29)) is None
 
 
 def test_catchup_reminder_calendar_skips_weekends_and_weekend_report_dates():
@@ -465,7 +472,7 @@ async def test_second_reminder_collecting_report_still_lists_missing_fields(monk
     assert result["target_users"] == 1
     assert result["would_send"] == 1
     text = result["dry_run_messages"][0]["text"]
-    assert "\u5982\u679c\u4eca\u665a\u4e0d\u518d\u8865\u5145" in text
+    assert "\u5982\u679c\u660e\u65e98\u70b9\u524d\u4e0d\u518d\u8865\u5145" in text
     assert "\u95ee\u9898/\u98ce\u9669" in text
     assert "\u660e\u65e5\u8ba1\u5212" in text
 
@@ -674,41 +681,153 @@ async def test_send_user_message_fails_closed_without_provider_reference():
 
 
 @pytest.mark.asyncio
-async def test_auto_submit_submits_collecting_reports_with_content_only():
+async def test_auto_submit_locks_reloads_and_submits_reports_with_content_only(
+    monkeypatch,
+):
+    report_date = date(2026, 6, 15)
     due_pending = _report(
         status="pending_confirmation",
         today_work=["reviewed contracts"],
         auto_submit_at=datetime(2026, 6, 15, 21, 0, tzinfo=timezone.utc),
         id=uuid4(),
+        user_id=uuid4(),
+        report_date=report_date,
     )
-    collecting_with_content = _report(status="collecting", tomorrow_plan=["follow up"], id=uuid4())
-    blank_collecting = _report(status="collecting", id=uuid4())
+    collecting_with_content = _report(
+        status="collecting",
+        tomorrow_plan=["follow up"],
+        id=uuid4(),
+        user_id=uuid4(),
+        report_date=report_date,
+    )
+    blank_collecting = _report(
+        status="collecting",
+        id=uuid4(),
+        user_id=uuid4(),
+        report_date=report_date,
+    )
     future_pending = _report(
         status="pending_confirmation",
         today_work=["reviewed contracts"],
         auto_submit_at=datetime(2026, 6, 16, 21, 0, tzinfo=timezone.utc),
         id=uuid4(),
+        user_id=uuid4(),
+        report_date=report_date,
     )
 
     class Session:
         async def execute(self, query):
             class Result:
-                def scalars(self):
-                    return self
-
                 def all(self):
-                    return [due_pending, collecting_with_content, blank_collecting, future_pending]
+                    return [
+                        (report.user_id, report.report_date)
+                        for report in (
+                            due_pending,
+                            collecting_with_content,
+                            blank_collecting,
+                            future_pending,
+                        )
+                    ]
 
             return Result()
 
+    reports = {
+        (report.user_id, report.report_date): report
+        for report in (
+            due_pending,
+            collecting_with_content,
+            blank_collecting,
+            future_pending,
+        )
+    }
+    locked = []
+
+    async def fake_lock(session, user_id, report_date):
+        del session
+        locked.append((user_id, report_date))
+
+    async def fake_get_report(session, user_id, report_date):
+        del session
+        assert (user_id, report_date) in locked
+        return reports[(user_id, report_date)]
+
+    monkeypatch.setattr(jobs, "acquire_daily_report_advisory_lock", fake_lock)
+    monkeypatch.setattr(jobs, "get_report", fake_get_report)
     now = datetime(2026, 6, 15, 22, 0, tzinfo=timezone.utc)
     result = await auto_submit_due_pending_reports(Session(), SimpleNamespace(timezone="Asia/Shanghai"), now=now)
 
-    assert result["auto_submitted"] == 2
+    assert result["auto_submitted"] == 3
+    assert len(locked) == 4
     assert due_pending.status == STATUS_COMPLETED
     assert collecting_with_content.status == STATUS_COMPLETED
     assert blank_collecting.status == "collecting"
-    assert future_pending.status == "pending_confirmation"
+    assert future_pending.status == STATUS_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_auto_submit_reloads_after_lock_and_never_overwrites_newer_state(
+    monkeypatch,
+):
+    report_date = date(2026, 6, 15)
+    user_id = uuid4()
+    candidate = _report(
+        id=uuid4(),
+        user_id=user_id,
+        report_date=report_date,
+        status="collecting",
+        today_work=["reviewed contracts"],
+    )
+    reloaded = _report(
+        id=candidate.id,
+        user_id=user_id,
+        report_date=report_date,
+        status=STATUS_COMPLETED,
+        today_work=["reviewed final contracts"],
+    )
+
+    class Session:
+        async def execute(self, query):
+            del query
+
+            class Result:
+                def all(self):
+                    return [(user_id, report_date)]
+
+            return Result()
+
+    lock_acquired = False
+
+    async def fake_lock(session, candidate_user_id, candidate_report_date):
+        nonlocal lock_acquired
+        del session
+        assert (candidate_user_id, candidate_report_date) == (
+            user_id,
+            report_date,
+        )
+        lock_acquired = True
+
+    async def fake_get_report(session, candidate_user_id, candidate_report_date):
+        del session
+        assert lock_acquired is True
+        assert (candidate_user_id, candidate_report_date) == (
+            user_id,
+            report_date,
+        )
+        return reloaded
+
+    monkeypatch.setattr(jobs, "acquire_daily_report_advisory_lock", fake_lock)
+    monkeypatch.setattr(jobs, "get_report", fake_get_report)
+
+    result = await auto_submit_due_pending_reports(
+        Session(),
+        SimpleNamespace(timezone="Asia/Shanghai"),
+        now=datetime(2026, 6, 15, 22, 0, tzinfo=timezone.utc),
+        report_date=report_date,
+    )
+
+    assert result["auto_submitted"] == 0
+    assert reloaded.status == STATUS_COMPLETED
+    assert reloaded.today_work == ["reviewed final contracts"]
 
 
 @pytest.mark.asyncio

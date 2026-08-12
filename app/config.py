@@ -186,7 +186,7 @@ class Settings(BaseSettings):
     reminder_test_user_ids: str = ""
     reminder_cron_hour: int = Field(default=20, ge=0, le=23)
     second_reminder_cron_hour: int = Field(default=22, ge=0, le=23)
-    auto_submit_cron_hour: int = Field(default=23, ge=0, le=23)
+    auto_submit_cron_hour: int = Field(default=8, ge=0, le=23)
     catchup_reminder_enabled: bool = False
     catchup_reminder_cron_hour: int = Field(default=9, ge=0, le=23)
     summary_cron_hour: int = Field(default=9, ge=0, le=23)
