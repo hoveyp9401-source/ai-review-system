@@ -42,6 +42,12 @@ from app.agent2.tool_calling.production_memory_executor import (
 from app.agent2.tool_calling.production_performance_executor import (
     ProductionPerformanceExecutor,
 )
+from app.agent2.tool_calling.production_periodic_report_executor import (
+    ProductionPeriodicReportExecutor,
+)
+from app.agent2.tool_calling.production_weekly_plan_executor import (
+    ProductionWeeklyPlanExecutor,
+)
 from app.agent2.tool_calling.production_store import (
     ProductionContextStore,
     ProductionDateResolver,
@@ -131,6 +137,7 @@ class ProductionRuntime:
             capability=capability,
             source_channel=source_channel,
             source_text_hash=source_text_hash,
+            current_turn_source=current_turn_source,
             binder=ShadowCallBinder(
                 context,
                 self._date_resolver,
@@ -155,6 +162,7 @@ class ProductionRuntimeSession:
         capability: ProductionExecutionCapability,
         source_channel: str,
         source_text_hash: str,
+        current_turn_source: CurrentTurnSource,
         binder: ShadowCallBinder,
         date_resolver: ProductionDateResolver,
     ) -> None:
@@ -166,6 +174,7 @@ class ProductionRuntimeSession:
         self._source_channel = source_channel
         self._source_text_hash = source_text_hash
         self._binder = binder
+        self._current_turn_source = current_turn_source
         self._date_resolver = date_resolver
         self._pending_execution: _PendingExecution | None = None
 
@@ -300,6 +309,26 @@ class ProductionRuntimeSession:
                         settings=self._settings,
                     )
                 )
+                weekly_plan_executor = ProductionWeeklyPlanExecutor(
+                    session=self._session,
+                    user=self._user,
+                    context=self._context,
+                    bound_calls={
+                        item.bound.call.tool_call_id: item.bound
+                        for item in prepared
+                    },
+                    current_turn_source=self._current_turn_source,
+                )
+                periodic_report_executor = ProductionPeriodicReportExecutor(
+                    session=self._session,
+                    user=self._user,
+                    context=self._context,
+                    bound_calls={
+                        item.bound.call.tool_call_id: item.bound
+                        for item in prepared
+                    },
+                    source_channel=self._source_channel,
+                )
                 generated: list[ToolReceipt] = []
                 for item in prepared:
                     before = await self._state()
@@ -318,6 +347,10 @@ class ProductionRuntimeSession:
                             performance_executor=(
                                 performance_executor
                             ),
+                            weekly_plan_executor=weekly_plan_executor,
+                            periodic_report_executor=(
+                                periodic_report_executor
+                            ),
                             pending_ttl_seconds=definition.pending_ttl_seconds,
                         )
                     )
@@ -328,22 +361,32 @@ class ProductionRuntimeSession:
                     await self._session.flush()
                     after = await self._state()
                     daily_changed = (
-                        before.payload()["daily_reports"]
-                        != after.payload()["daily_reports"]
+                        before.payload().get("daily_reports", [])
+                        != after.payload().get("daily_reports", [])
+                    )
+                    weekly_changed = (
+                        before.payload().get("weekly_plans", [])
+                        != after.payload().get("weekly_plans", [])
+                    )
+                    periodic_changed = (
+                        before.payload().get("periodic_reports", [])
+                        != after.payload().get("periodic_reports", [])
                     )
                     pending_changed = (
-                        before.payload()["clear_pendings"]
-                        != after.payload()["clear_pendings"]
+                        before.payload().get("clear_pendings", [])
+                        != after.payload().get("clear_pendings", [])
                     )
                     memory_changed = (
-                        before.payload()["personal_memories"]
-                        != after.payload()["personal_memories"]
+                        before.payload().get("personal_memories", [])
+                        != after.payload().get("personal_memories", [])
                     )
                     memory_audit_changed = (
-                        before.payload()["personal_memory_audits"]
-                        != after.payload()["personal_memory_audits"]
+                        before.payload().get("personal_memory_audits", [])
+                        != after.payload().get("personal_memory_audits", [])
                     )
-                    business_write_count += int(daily_changed)
+                    business_write_count += int(
+                        daily_changed or weekly_changed or periodic_changed
+                    )
                     pending_write_count += int(pending_changed)
                     memory_write_count += int(memory_changed)
                     memory_audit_write_count += int(
@@ -356,6 +399,8 @@ class ProductionRuntimeSession:
                         after=after,
                         changed=(
                             daily_changed
+                            or weekly_changed
+                            or periodic_changed
                             or pending_changed
                             or memory_changed
                             or memory_audit_changed
@@ -671,6 +716,10 @@ class ProductionRuntimeSession:
             tenant_id=principal.tenant_id,
             user_id=principal.user_id,
             conversation_id=principal.conversation_id,
+            include_weekly_plan=(self._context.weekly_plan is not None),
+            include_periodic_report=(
+                self._context.current_weekly_report is not None
+            ),
         )
 
 
@@ -783,6 +832,16 @@ def _prepare_call(
                 )
             ),
             "date_facts": bound.date_facts,
+            "periodic_report_id": (
+                str(bound.periodic_report.report_id)
+                if bound.periodic_report is not None
+                else None
+            ),
+            "periodic_report_version": (
+                bound.periodic_report.version
+                if bound.periodic_report is not None
+                else None
+            ),
         },
     }
     return _PreparedCall(

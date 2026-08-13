@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -65,7 +65,7 @@ class ShadowRuntime:
         self._date_resolver = date_resolver or UnavailableDateResolver()
         self._report_read_port = report_read_port
 
-    def open_session(self, context: TrustedContext) -> "ShadowRuntimeSession":
+    def open_session(self, context: TrustedContext) -> ShadowRuntimeSession:
         binder = ShadowCallBinder(context, self._date_resolver, self._report_read_port)
         return ShadowRuntimeSession(context, binder)
 
@@ -257,9 +257,13 @@ def _authoritative_target_version(item: BoundCall) -> int | None:
         item.report.version
         if item.report is not None
         else (
-            item.memory.version
-            if item.memory is not None
-            else None
+            item.periodic_report.version
+            if item.periodic_report is not None
+            else (
+                item.memory.version
+                if item.memory is not None
+                else None
+            )
         )
     )
 
@@ -271,6 +275,14 @@ def _canonical_idempotency_arguments(item: BoundCall) -> dict[str, Any]:
             "date_facts": item.date_facts,
             "target_report": _report_version_binding(item.report),
             "source_report": _report_version_binding(item.source_report),
+            "periodic_report": (
+                {
+                    "report_id": str(item.periodic_report.report_id),
+                    "version": item.periodic_report.version,
+                }
+                if item.periodic_report is not None
+                else None
+            ),
             "personal_memory": _memory_version_binding(item.memory),
         },
     }
@@ -367,6 +379,16 @@ def _call_target(
             f"{context.principal.user_id}"
         )
         return f"{scope}:{key}" if isinstance(key, str) and key else scope
+    if policy == "weekly_plan":
+        if bound is not None and bound.weekly_plan is not None:
+            return bound.weekly_plan.plan_id
+        weekly_plan = context.weekly_plan
+        return weekly_plan.plan_id if weekly_plan is not None else "*"
+    if policy == "periodic_report":
+        if bound is not None and bound.periodic_report is not None:
+            return str(bound.periodic_report.report_id)
+        periodic = context.current_weekly_report
+        return str(periodic.report_id) if periodic is not None else "*"
     if policy == "resolved_report":
         if bound is None:
             return "*"

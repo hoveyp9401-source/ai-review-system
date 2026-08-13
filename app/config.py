@@ -92,9 +92,8 @@ class Settings(BaseSettings):
     legal_daily_dashboard_principals_json: str = ""
     legal_daily_dashboard_system_user_id: str = "system:legal-daily-dashboard"
     management_daily_briefing_department_cc_user_ids: str = ""
-    management_daily_briefing_hidden_missing_detail_user_ids: str = (
-        "45a84161-ae1a-4ed5-960b-e33352bec6d2"
-    )
+    # 生产身份只能由受控环境配置提供，源码和示例配置不得固化真实用户标识。
+    management_daily_briefing_hidden_missing_detail_user_ids: str = ""
     legal_daily_dashboard_manager_write_enabled: bool = False
     legal_daily_dashboard_analysis_enabled: bool = False
     legal_daily_dashboard_analysis_model: str = ""
@@ -122,6 +121,25 @@ class Settings(BaseSettings):
     workflow_intake_mode: str = "observe_only"
     agent2_daily_enabled: bool = False
     agent2_daily_enabled_user_ids: str = ""
+    # 下周工作计划是 Agent2 内的独立受控能力。功能、写入和主动发送
+    # 分别关闭；租户和用户范围留空时一律不放行。
+    agent2_weekly_plan_enabled: bool = False
+    agent2_weekly_plan_write_enabled: bool = False
+    agent2_weekly_plan_send_enabled: bool = False
+    agent2_weekly_plan_tenant_allowlist: str = ""
+    agent2_weekly_plan_user_allowlist: str = ""
+    agent2_weekly_plan_send_user_allowlist: str = ""
+    # 本周周报是独立于日报和下周工作计划的 Agent2 能力。只有开关与
+    # 租户、用户稳定标识白名单同时命中，才向该私聊开放。
+    agent2_current_weekly_report_enabled: bool = False
+    agent2_current_weekly_report_tenant_allowlist: str = ""
+    agent2_current_weekly_report_user_allowlist: str = ""
+    weekly_plan_collection_open_hour: int = Field(default=16, ge=0, le=23)
+    weekly_plan_collection_open_minute: int = Field(default=0, ge=0, le=59)
+    weekly_plan_reminder_hour: int = Field(default=15, ge=0, le=23)
+    weekly_plan_reminder_minute: int = Field(default=0, ge=0, le=59)
+    weekly_plan_snapshot_hour: int = Field(default=9, ge=0, le=23)
+    weekly_plan_snapshot_minute: int = Field(default=0, ge=0, le=59)
     agent2_cognitive_core_v3_enabled: bool = False
     agent2_cognitive_core_v3_model: str = "deepseek-v4-pro"
     agent2_cognitive_core_v3_thinking: bool = True

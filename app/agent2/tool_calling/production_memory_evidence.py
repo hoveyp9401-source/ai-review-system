@@ -129,6 +129,8 @@ def personal_memory_evidence_matches(
         == after_payload["daily_reports"]
         and before_payload["clear_pendings"]
         == after_payload["clear_pendings"]
+        and before_payload.get("weekly_plans", [])
+        == after_payload.get("weekly_plans", [])
     )
     if not memory_call:
         return bool(

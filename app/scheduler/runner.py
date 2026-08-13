@@ -16,26 +16,52 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
 from app.agent2.business.models import Agent2IdentityBinding
-from app.models import Agent2ConversationState, ReportInteractionEvent
 from app.agent2.business.notifications import (
     dispatch_notification_batch,
     reconcile_sent_notification_outcomes,
     recover_stale_notification_claims,
 )
 from app.agent2.business.travel_pipeline import evaluate_travel_collaboration_candidates
+from app.agent2.case_followup_invalidation import expire_due_case_followups
 from app.agent2.case_followup_outbox import (
     enqueue_due_case_followup_reminders,
     enqueue_due_case_followups,
     reconcile_case_followup_provider_acceptances,
 )
-from app.agent2.case_followup_invalidation import expire_due_case_followups
 from app.agent2.case_followup_scheduler import plan_due_case_followups
-from app.agent2.case_followup_service import CaseFollowupTaskCreator, FollowupCreationContext
+from app.agent2.case_followup_service import (
+    CaseFollowupTaskCreator,
+    FollowupCreationContext,
+)
 from app.agent2.case_followup_sql_store import SqlCaseFollowupTaskStore
+from app.agent2.weekly_plan_collection import derive_weekly_plan_collection_schedule
+from app.agent2.weekly_plan_history_pipeline import (
+    HistorySuggestionRefreshRequest,
+    LLMHistoryFollowUpReviewer,
+    WeeklyPlanHistorySuggestionService,
+)
+from app.agent2.weekly_plan_history_sql_adapter import (
+    SqlHistorySuggestionStore,
+    SqlTrustedDailyHistorySource,
+)
+from app.agent2.weekly_plan_models import WeeklyPlanRosterMember
+from app.agent2.weekly_plan_reminder_dispatch import (
+    DingTalkWeeklyPlanReminderTransport,
+    WeeklyPlanReminderDispatcher,
+    WeeklyPlanReminderRecipient,
+)
+from app.agent2.weekly_plan_reminder_outbox import (
+    SqlWeeklyPlanReminderOutboxStore,
+)
+from app.agent2.weekly_plan_sql_collection import (
+    SqlWeeklyPlanCollectionOrchestrator,
+)
+from app.agent2.weekly_plan_store import SqlWeeklyPlanStore
 from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.llm.client import LLMClient
 from app.llm.extractor import TeamSummaryGenerator
+from app.models import Agent2ConversationState, ReportInteractionEvent
 from app.scheduler.jobs import (
     ReminderDispatchEvidence,
     auto_submit_due_pending_reports,
@@ -62,6 +88,414 @@ _DAILY_BRIEFING_EVENT_ACTIONS = frozenset(
 
 class DailyBriefingResumeConflict(RuntimeError):
     """Recorded segments do not match the briefing that would be resumed."""
+
+
+def _strict_weekly_plan_single_id(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    parts = value.split(",")
+    if len(parts) != 1:
+        return None
+    item = parts[0]
+    if (
+        item != item.strip()
+        or not item.isascii()
+        or any(character.isspace() for character in item)
+    ):
+        return None
+    return item
+
+
+def _strict_weekly_plan_canary_scope(settings) -> tuple[str, str] | None:
+    """Return one stable tenant/user pair or fail closed without name matching."""
+
+    tenant_id = _strict_weekly_plan_single_id(
+        getattr(settings, "agent2_weekly_plan_tenant_allowlist", "")
+    )
+    user_id = _strict_weekly_plan_single_id(
+        getattr(settings, "agent2_weekly_plan_user_allowlist", "")
+    )
+    return (tenant_id, user_id) if tenant_id and user_id else None
+
+
+def register_weekly_plan_jobs(
+    scheduler,
+    *,
+    settings,
+    open_job,
+    reminder_job,
+    reminder_reconcile_job,
+    snapshot_job,
+) -> tuple[str, ...]:
+    """Register deterministic collection jobs; none of them sends a message."""
+
+    if (
+        getattr(settings, "agent2_weekly_plan_enabled", False) is not True
+        or getattr(settings, "agent2_weekly_plan_write_enabled", False) is not True
+        or _strict_weekly_plan_canary_scope(settings) is None
+    ):
+        return ()
+
+    registered: list[str] = []
+
+    def add(identifier: str, func, trigger) -> None:
+        scheduler.add_job(
+            func,
+            trigger,
+            id=identifier,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        registered.append(identifier)
+
+    add(
+        "agent2_weekly_plan_collection_open",
+        open_job,
+        CronTrigger(
+            day_of_week="fri",
+            hour=settings.weekly_plan_collection_open_hour,
+            minute=settings.weekly_plan_collection_open_minute,
+            timezone=settings.timezone,
+        ),
+    )
+    send_user_id = (
+        _strict_weekly_plan_single_id(
+            getattr(settings, "agent2_weekly_plan_send_user_allowlist", "")
+        )
+        if getattr(settings, "agent2_weekly_plan_send_enabled", False) is True
+        else None
+    )
+    if send_user_id == _strict_weekly_plan_canary_scope(settings)[1]:
+        add(
+            "agent2_weekly_plan_reminder_enqueue",
+            reminder_job,
+            CronTrigger(
+                day_of_week="sun",
+                hour=settings.weekly_plan_reminder_hour,
+                minute=settings.weekly_plan_reminder_minute,
+                timezone=settings.timezone,
+            ),
+        )
+        if reminder_reconcile_job is not None:
+            add(
+                "agent2_weekly_plan_reminder_reconcile",
+                reminder_reconcile_job,
+                IntervalTrigger(minutes=5),
+            )
+    add(
+        "agent2_weekly_plan_monday_snapshot",
+        snapshot_job,
+        CronTrigger(
+            day_of_week="mon",
+            hour=settings.weekly_plan_snapshot_hour,
+            minute=settings.weekly_plan_snapshot_minute,
+            timezone=settings.timezone,
+        ),
+    )
+    return tuple(registered)
+
+
+def _weekly_plan_schedule_facts(settings, *, now: datetime):
+    """Derive exact collection dates; business meaning never enters this helper."""
+
+    schedule = derive_weekly_plan_collection_schedule(
+        observed_at=now,
+        timezone_name=settings.timezone,
+        collection_open_hour=settings.weekly_plan_collection_open_hour,
+        collection_open_minute=settings.weekly_plan_collection_open_minute,
+        snapshot_hour=settings.weekly_plan_snapshot_hour,
+        snapshot_minute=settings.weekly_plan_snapshot_minute,
+    )
+    return schedule.target_week_start, schedule.window
+
+
+async def _load_weekly_plan_canary_member(
+    session,
+    *,
+    tenant_id: str,
+    user_id: str,
+) -> WeeklyPlanRosterMember:
+    binding = await session.scalar(
+        select(Agent2IdentityBinding).where(
+            Agent2IdentityBinding.tenant_id == tenant_id,
+            Agent2IdentityBinding.user_id == user_id,
+            Agent2IdentityBinding.active.is_(True),
+        )
+    )
+    if binding is None:
+        raise ValueError("weekly_plan_canary_identity_binding_missing")
+    return WeeklyPlanRosterMember(
+        user_id=binding.user_id,
+        display_name=binding.display_name,
+        department_id=binding.department_id,
+        team_id=binding.team_id,
+    )
+
+
+async def run_weekly_plan_collection_open_job(settings, *, now: datetime) -> None:
+    scope = _strict_weekly_plan_canary_scope(settings)
+    if scope is None:
+        return
+    tenant_id, user_id = scope
+    target_week_start, window = _weekly_plan_schedule_facts(settings, now=now)
+    async with AsyncSessionLocal() as session:
+        member = await _load_weekly_plan_canary_member(
+            session, tenant_id=tenant_id, user_id=user_id
+        )
+        orchestrator = SqlWeeklyPlanCollectionOrchestrator(
+            SqlWeeklyPlanStore(session)
+        )
+        await orchestrator.open_collection(
+            tenant_id=tenant_id,
+            target_week_start=target_week_start,
+            source_roster=(member,),
+            canary_user_ids=frozenset({user_id}),
+            window=window,
+        )
+        await session.commit()
+
+
+async def run_weekly_plan_history_suggestion_refresh_job(
+    settings,
+    *,
+    llm_client: LLMClient,
+    now: datetime,
+) -> None:
+    """Refresh optional history suggestions after the canary plan exists."""
+
+    scope = _strict_weekly_plan_canary_scope(settings)
+    if (
+        scope is None
+        or getattr(settings, "agent2_weekly_plan_enabled", False) is not True
+        or getattr(settings, "agent2_weekly_plan_write_enabled", False) is not True
+    ):
+        return
+    tenant_id, user_id = scope
+    target_week_start, _ = _weekly_plan_schedule_facts(settings, now=now)
+    async with AsyncSessionLocal() as session:
+        service = WeeklyPlanHistorySuggestionService(
+            history_source=SqlTrustedDailyHistorySource(session),
+            suggestion_store=SqlHistorySuggestionStore(session),
+            reviewer=LLMHistoryFollowUpReviewer(
+                llm_client,
+                model=getattr(
+                    settings,
+                    "agent2_cognitive_core_v3_model",
+                    None,
+                ),
+                thinking_enabled=False,
+            ),
+        )
+        await service.refresh(
+            HistorySuggestionRefreshRequest(
+                tenant_id=tenant_id,
+                owner_user_id=user_id,
+                target_week_start=target_week_start,
+                as_of=now,
+            )
+        )
+        await session.commit()
+
+
+async def _load_weekly_plan_opening(settings, *, now: datetime, session):
+    scope = _strict_weekly_plan_canary_scope(settings)
+    if scope is None:
+        return None, None
+    tenant_id, user_id = scope
+    target_week_start, window = _weekly_plan_schedule_facts(settings, now=now)
+    member = await _load_weekly_plan_canary_member(
+        session, tenant_id=tenant_id, user_id=user_id
+    )
+    orchestrator = SqlWeeklyPlanCollectionOrchestrator(
+        SqlWeeklyPlanStore(session),
+        outbox_store=SqlWeeklyPlanReminderOutboxStore(session),
+    )
+    opening = await orchestrator.open_collection(
+        tenant_id=tenant_id,
+        target_week_start=target_week_start,
+        source_roster=(member,),
+        canary_user_ids=frozenset({user_id}),
+        window=window,
+    )
+    return opening, orchestrator
+
+
+async def run_weekly_plan_reminder_enqueue_job(settings, *, now: datetime) -> None:
+    scope = _strict_weekly_plan_canary_scope(settings)
+    send_user_id = _strict_weekly_plan_single_id(
+        getattr(settings, "agent2_weekly_plan_send_user_allowlist", "")
+    )
+    if (
+        scope is None
+        or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
+        or send_user_id != scope[1]
+    ):
+        return
+    async with AsyncSessionLocal() as session:
+        opening, orchestrator = await _load_weekly_plan_opening(
+            settings, now=now, session=session
+        )
+        if opening is None or orchestrator is None:
+            return
+        await orchestrator.enqueue_private_reminders(
+            opening=opening,
+            canary_user_ids=frozenset({scope[1]}),
+            reminder_at=now,
+            created_at=now,
+            reminder_slot="sunday-primary",
+        )
+        await session.commit()
+
+
+async def run_weekly_plan_reminder_dispatch_job(
+    settings,
+    *,
+    robot: DingTalkRobotClient,
+    now: datetime,
+) -> None:
+    scope = _strict_weekly_plan_canary_scope(settings)
+    send_user_id = _strict_weekly_plan_single_id(
+        getattr(settings, "agent2_weekly_plan_send_user_allowlist", "")
+    )
+    if (
+        scope is None
+        or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
+        or send_user_id != scope[1]
+    ):
+        return
+    tenant_id, user_id = scope
+    async with AsyncSessionLocal() as session:
+        binding = await session.scalar(
+            select(Agent2IdentityBinding).where(
+                Agent2IdentityBinding.tenant_id == tenant_id,
+                Agent2IdentityBinding.user_id == user_id,
+                Agent2IdentityBinding.active.is_(True),
+            )
+        )
+        if binding is None or not str(binding.dingtalk_user_id).strip():
+            raise ValueError("weekly_plan_reminder_identity_binding_missing")
+        outbox = SqlWeeklyPlanReminderOutboxStore(session)
+        rows = await outbox.load_due_queued(
+            tenant_id=tenant_id,
+            recipient_internal_user_id=user_id,
+            as_of=now,
+            limit=1,
+        )
+        dispatcher = WeeklyPlanReminderDispatcher(
+            outbox=outbox,
+            transport=DingTalkWeeklyPlanReminderTransport(robot),
+            tenant_allowlist=frozenset({tenant_id}),
+            user_allowlist=frozenset({user_id}),
+        )
+        for row in rows:
+            await dispatcher.dispatch(
+                row=row,
+                recipient=WeeklyPlanReminderRecipient(
+                    tenant_id=tenant_id,
+                    internal_user_id=user_id,
+                    dingtalk_user_id=str(binding.dingtalk_user_id),
+                ),
+                changed_at=now,
+                claim_token=f"weekly-plan:{row.outbox_id}:{now.isoformat()}",
+            )
+        await session.commit()
+
+
+async def run_weekly_plan_reminder_reconcile_job(
+    settings,
+    *,
+    robot: DingTalkRobotClient,
+    now: datetime,
+) -> None:
+    scope = _strict_weekly_plan_canary_scope(settings)
+    send_user_id = _strict_weekly_plan_single_id(
+        getattr(settings, "agent2_weekly_plan_send_user_allowlist", "")
+    )
+    if (
+        scope is None
+        or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
+        or send_user_id != scope[1]
+    ):
+        return
+    tenant_id, user_id = scope
+    async with AsyncSessionLocal() as session:
+        binding = await session.scalar(
+            select(Agent2IdentityBinding).where(
+                Agent2IdentityBinding.tenant_id == tenant_id,
+                Agent2IdentityBinding.user_id == user_id,
+                Agent2IdentityBinding.active.is_(True),
+            )
+        )
+        if binding is None or not str(binding.dingtalk_user_id).strip():
+            raise ValueError("weekly_plan_reminder_identity_binding_missing")
+        outbox = SqlWeeklyPlanReminderOutboxStore(session)
+        rows = await outbox.load_delivery_pending(
+            tenant_id=tenant_id,
+            recipient_internal_user_id=user_id,
+            limit=10,
+        )
+        dispatcher = WeeklyPlanReminderDispatcher(
+            outbox=outbox,
+            transport=DingTalkWeeklyPlanReminderTransport(robot),
+            tenant_allowlist=frozenset({tenant_id}),
+            user_allowlist=frozenset({user_id}),
+        )
+        recipient = WeeklyPlanReminderRecipient(
+            tenant_id=tenant_id,
+            internal_user_id=user_id,
+            dingtalk_user_id=str(binding.dingtalk_user_id),
+        )
+        for row in rows:
+            await dispatcher.reconcile_pending(
+                row=row,
+                recipient=recipient,
+                changed_at=now,
+            )
+        await session.commit()
+
+
+async def run_weekly_plan_reminder_maintenance_job(
+    settings,
+    *,
+    robot: DingTalkRobotClient,
+    now: datetime,
+) -> None:
+    """Recover an abandoned durable claim, then verify accepted deliveries."""
+
+    await run_weekly_plan_reminder_dispatch_job(
+        settings,
+        robot=robot,
+        now=now,
+    )
+    await run_weekly_plan_reminder_reconcile_job(
+        settings,
+        robot=robot,
+        now=now,
+    )
+
+
+async def run_weekly_plan_monday_snapshot_job(settings, *, now: datetime) -> None:
+    # On Monday the target being frozen is the week that starts today, not the
+    # following natural week used for new mentions.
+    scope = _strict_weekly_plan_canary_scope(settings)
+    if scope is None:
+        return
+    local_now = now.astimezone(ZoneInfo(settings.timezone))
+    if local_now.weekday() != 0:
+        raise ValueError("weekly_plan_snapshot_requires_monday")
+    friday = local_now - timedelta(days=3)
+    async with AsyncSessionLocal() as session:
+        opening, orchestrator = await _load_weekly_plan_opening(
+            settings, now=friday, session=session
+        )
+        if opening is None or orchestrator is None:
+            return
+        await orchestrator.freeze_monday_snapshot(
+            opening=opening,
+            snapshot_at=now,
+        )
+        await session.commit()
 
 
 @dataclass(frozen=True)
@@ -617,6 +1051,53 @@ async def run_scheduler() -> None:
             max_instances=1,
             coalesce=True,
         )
+
+    # Weekly-plan sending remains inside the exact one-person canary. Provider
+    # acceptance is recorded as pending until exact-recipient delivery proof.
+    async def weekly_plan_open_job() -> None:
+        now = datetime.now(ZoneInfo(settings.timezone))
+        await run_weekly_plan_collection_open_job(
+            settings,
+            now=now,
+        )
+        await run_weekly_plan_history_suggestion_refresh_job(
+            settings,
+            llm_client=llm_client,
+            now=now,
+        )
+
+    async def weekly_plan_reminder_job() -> None:
+        await run_weekly_plan_reminder_enqueue_job(
+            settings,
+            now=datetime.now(ZoneInfo(settings.timezone)),
+        )
+        await run_weekly_plan_reminder_dispatch_job(
+            settings,
+            robot=robot,
+            now=datetime.now(ZoneInfo(settings.timezone)),
+        )
+
+    async def weekly_plan_snapshot_job() -> None:
+        await run_weekly_plan_monday_snapshot_job(
+            settings,
+            now=datetime.now(ZoneInfo(settings.timezone)),
+        )
+
+    async def weekly_plan_reminder_reconcile_job() -> None:
+        await run_weekly_plan_reminder_maintenance_job(
+            settings,
+            robot=robot,
+            now=datetime.now(ZoneInfo(settings.timezone)),
+        )
+
+    register_weekly_plan_jobs(
+        scheduler,
+        settings=settings,
+        open_job=weekly_plan_open_job,
+        reminder_job=weekly_plan_reminder_job,
+        reminder_reconcile_job=weekly_plan_reminder_reconcile_job,
+        snapshot_job=weekly_plan_snapshot_job,
+    )
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

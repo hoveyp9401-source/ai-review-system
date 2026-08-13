@@ -18,6 +18,10 @@ def test_report_insight_uses_the_formatted_agent2_reply_path():
     assert "from app.utils.dingtalk_text import format_dingtalk_plain_text" in source
     assert "is_report_insight_question(job.text)" not in source
     assert "process_tool_call_canary_ingress(" in source
+    assert "normalize_dingtalk_conversation_kind(" in source
+    assert "conversation_kind=normalize_dingtalk_conversation_kind(" in source
+    assert "message_occurred_at=(" in source
+    assert "fragment.received_at" in source
     assert "reply_text = tool_call_canary.message" in source
     assert "formatted_message = format_dingtalk_plain_text(final_content)" in canary_source
 

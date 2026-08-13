@@ -160,6 +160,52 @@ def _blocked_receipt() -> ToolReceipt:
     )
 
 
+def _clarification_receipt() -> ToolReceipt:
+    return ToolReceipt(
+        status=ReceiptStatus.CLARIFICATION_REQUIRED,
+        tool_name="apply_next_weekly_plan",
+        changed=False,
+        safe_user_facts={
+            "actual_write": False,
+            "clarification_option_labels": ["本周", "下周"],
+            "must_ask_user": True,
+        },
+        error_code="WEEKLY_PLAN_TARGET_WEEK_AMBIGUOUS",
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+
+
+def test_clarification_reply_must_ask_every_server_provided_option() -> None:
+    invalid, invalid_errors = validate_write_reply(
+        json.dumps(
+            {
+                "reply": "请问你指哪一周？",
+                "actual_write": False,
+                "operation_outcome": "needs_clarification",
+            },
+            ensure_ascii=False,
+        ),
+        (_clarification_receipt(),),
+    )
+    valid, valid_errors = validate_write_reply(
+        json.dumps(
+            {
+                "reply": "你指本周还是下周？这次还没有写入。",
+                "actual_write": False,
+                "operation_outcome": "needs_clarification",
+            },
+            ensure_ascii=False,
+        ),
+        (_clarification_receipt(),),
+    )
+
+    assert invalid is None
+    assert "本周" in " ".join(invalid_errors)
+    assert "下周" in " ".join(invalid_errors)
+    assert valid_errors == ()
+    assert valid is not None
+
+
 def test_independent_mixed_write_receipts_are_reported_as_partial() -> None:
     receipts = (_changed_receipt(), _blocked_receipt())
     content = json.dumps(

@@ -4,12 +4,15 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field, replace
+from datetime import date
 from time import perf_counter
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import httpx
 
+from app.agent2.report_domain import period_bounds
 from app.agent2.tool_calling.context import TrustedContext
 from app.agent2.tool_calling.contracts import ExecutionMode, ToolReceipt
 from app.agent2.tool_calling.daily_briefing_reply import (
@@ -449,6 +452,9 @@ class DeepSeekToolCallingAdapter:
             raise TypeError(
                 "run_canary_turn requires a Canary context and runtime session"
             )
+        system_prompt_sha256 = hashlib.sha256(
+            system_prompt.encode("utf-8")
+        ).hexdigest()
         briefing_user_question = (
             "\n".join(user_messages) if user_messages else user_text
         )
@@ -484,6 +490,7 @@ class DeepSeekToolCallingAdapter:
         tool_argument_repair_count = 0
         incomplete_confirm_review_count = 0
         daily_submit_section_review_count = 0
+        daily_weekly_write_review_count = 0
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
         async def rollback_pending() -> None:
@@ -537,7 +544,12 @@ class DeepSeekToolCallingAdapter:
                         _model_turn_audit(
                             iterations,
                             completion.message,
-                            response_metadata=completion.metadata,
+                            response_metadata={
+                                **completion.metadata,
+                                "system_prompt_sha256": (
+                                    system_prompt_sha256
+                                ),
+                            },
                         )
                     )
                     parsed = _parse_assistant_turn(completion.message)
@@ -594,6 +606,262 @@ class DeepSeekToolCallingAdapter:
                         audits=audits,
                         model_turns=model_turns,
                     ) from exc
+
+                daily_weekly_review_tool_names = (
+                    _daily_weekly_write_review_tool_names(
+                        parsed.tool_calls,
+                        context=context,
+                    )
+                )
+                if (
+                    daily_weekly_write_review_count == 0
+                    and daily_weekly_review_tool_names
+                    and (parsed.tool_calls or tool_loops == 0)
+                ):
+                    model_turns[-1] = replace(
+                        model_turns[-1],
+                        response_metadata={
+                            **model_turns[-1].response_metadata,
+                            "pre_execution_daily_weekly_write_review": True,
+                            "draft_executed": False,
+                        },
+                    )
+                    try:
+                        review_completion = await self._complete(
+                            _daily_weekly_write_review_messages(
+                                user_text=user_text,
+                                user_messages=user_messages,
+                                calls=parsed.tool_calls,
+                                context=context,
+                                allowed_tool_names=(
+                                    daily_weekly_review_tool_names
+                                ),
+                            ),
+                            tool_schemas=deepseek_tool_schemas(
+                                daily_weekly_review_tool_names
+                            ),
+                            thinking_enabled=True,
+                        )
+                        iterations += 1
+                        model_turns.append(
+                            _model_turn_audit(
+                                iterations,
+                                review_completion.message,
+                                response_metadata={
+                                    **review_completion.metadata,
+                                    "daily_weekly_write_semantic_review": True,
+                                },
+                            )
+                        )
+                        reviewed = _parse_assistant_turn(
+                            review_completion.message
+                        )
+                        _validate_completion_protocol(
+                            review_completion,
+                            reviewed,
+                        )
+                        audits.extend(reviewed.audit)
+                        _validate_daily_weekly_write_review(
+                            reviewed=reviewed,
+                            allowed_tool_names=daily_weekly_review_tool_names,
+                            original_has_domain_writes=any(
+                                _daily_weekly_write_domain(call.tool_name)
+                                is not None
+                                for call in parsed.tool_calls
+                            ),
+                        )
+                    except DeepSeekToolCallingError as exc:
+                        raise _with_canary_turn_state(
+                            exc,
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
+                    except ValueError as exc:
+                        review_content = review_completion.message.get("content")
+                        if (
+                            not reviewed.tool_calls
+                            and isinstance(review_content, str)
+                            and review_content.strip()
+                        ):
+                            try:
+                                repair_completion = await self._complete(
+                                    _daily_weekly_review_envelope_repair_messages(
+                                        raw_content=review_content,
+                                    ),
+                                    tool_schemas=[],
+                                    thinking_enabled=True,
+                                )
+                                iterations += 1
+                                model_turns.append(
+                                    _model_turn_audit(
+                                        iterations,
+                                        repair_completion.message,
+                                        response_metadata={
+                                            **repair_completion.metadata,
+                                            "daily_weekly_write_review_envelope_repair": True,
+                                        },
+                                    )
+                                )
+                                repaired = _parse_assistant_turn(
+                                    repair_completion.message
+                                )
+                                _validate_completion_protocol(
+                                    repair_completion,
+                                    repaired,
+                                )
+                                audits.extend(repaired.audit)
+                                if repaired.tool_calls:
+                                    raise ValueError(
+                                        "clarification envelope repair cannot introduce tool calls"
+                                    )
+                                _validate_daily_weekly_write_review(
+                                    reviewed=repaired,
+                                    allowed_tool_names=daily_weekly_review_tool_names,
+                                    original_has_domain_writes=any(
+                                        _daily_weekly_write_domain(call.tool_name)
+                                        is not None
+                                        for call in parsed.tool_calls
+                                    ),
+                                )
+                                reviewed = repaired
+                            except (DeepSeekToolCallingError, ValueError) as repair_exc:
+                                raise _with_canary_turn_state(
+                                    DeepSeekResponseError(
+                                        "daily and weekly write semantic review returned an invalid replacement"
+                                    ),
+                                    audits=audits,
+                                    model_turns=model_turns,
+                                ) from repair_exc
+                        else:
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "daily and weekly write semantic review returned an invalid replacement"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            ) from exc
+                    original_has_domain_writes = any(
+                        _daily_weekly_write_domain(call.tool_name) is not None
+                        for call in parsed.tool_calls
+                    )
+                    reviewed_has_writes = any(
+                        _daily_weekly_write_domain(call.tool_name) is not None
+                        for call in reviewed.tool_calls
+                    )
+                    if original_has_domain_writes or reviewed_has_writes:
+                        daily_weekly_write_review_count += 1
+                    if (
+                        not original_has_domain_writes
+                        and reviewed.tool_calls
+                        and reviewed_has_writes
+                    ):
+                        try:
+                            confirmation_completion = await self._complete(
+                                _daily_weekly_zero_draft_confirmation_messages(
+                                    user_text=user_text,
+                                    user_messages=user_messages,
+                                    context=context,
+                                    allowed_tool_names=(
+                                        daily_weekly_review_tool_names
+                                    ),
+                                ),
+                                tool_schemas=deepseek_tool_schemas(
+                                    daily_weekly_review_tool_names
+                                ),
+                                thinking_enabled=True,
+                            )
+                            iterations += 1
+                            model_turns.append(
+                                _model_turn_audit(
+                                    iterations,
+                                    confirmation_completion.message,
+                                    response_metadata={
+                                        **confirmation_completion.metadata,
+                                        "daily_weekly_zero_draft_write_confirmation": True,
+                                    },
+                                )
+                            )
+                            confirmed = _parse_assistant_turn(
+                                confirmation_completion.message
+                            )
+                            _validate_completion_protocol(
+                                confirmation_completion,
+                                confirmed,
+                            )
+                            audits.extend(confirmed.audit)
+                            _validate_daily_weekly_zero_draft_agreement(
+                                first=reviewed.tool_calls,
+                                second=confirmed.tool_calls,
+                                allowed_tool_names=daily_weekly_review_tool_names,
+                            )
+                        except DeepSeekToolCallingError as exc:
+                            raise _with_canary_turn_state(
+                                exc,
+                                audits=audits,
+                                model_turns=model_turns,
+                            ) from exc
+                        except ValueError as exc:
+                            clarification_kind = _zero_draft_disagreement_kind(
+                                first=reviewed.tool_calls,
+                                second=confirmed.tool_calls,
+                                context=context,
+                            )
+                            if clarification_kind is None:
+                                raise _with_canary_turn_state(
+                                    DeepSeekResponseError(
+                                        "daily and weekly zero-draft reviewers did not independently agree"
+                                    ),
+                                    audits=audits,
+                                    model_turns=model_turns,
+                                ) from exc
+                            try:
+                                clarification_completion = await self._complete(
+                                    _weekly_target_disagreement_clarification_messages(
+                                        user_text=user_text,
+                                        user_messages=user_messages,
+                                        context=context,
+                                        clarification_kind=clarification_kind,
+                                    ),
+                                    tool_schemas=[],
+                                    thinking_enabled=True,
+                                )
+                                iterations += 1
+                                model_turns.append(
+                                    _model_turn_audit(
+                                        iterations,
+                                        clarification_completion.message,
+                                        response_metadata={
+                                            **clarification_completion.metadata,
+                                            "daily_weekly_zero_draft_disagreement_clarification": True,
+                                        },
+                                    )
+                                )
+                                clarified = _parse_assistant_turn(
+                                    clarification_completion.message
+                                )
+                                _validate_completion_protocol(
+                                    clarification_completion,
+                                    clarified,
+                                )
+                                audits.extend(clarified.audit)
+                                _validate_week_target_disagreement_clarification(
+                                    clarified,
+                                    clarification_kind=clarification_kind,
+                                )
+                                reviewed = clarified
+                            except (DeepSeekToolCallingError, ValueError) as clarify_exc:
+                                raise _with_canary_turn_state(
+                                    DeepSeekResponseError(
+                                        "daily and weekly zero-draft reviewers did not independently agree"
+                                    ),
+                                    audits=audits,
+                                    model_turns=model_turns,
+                                ) from clarify_exc
+                    parsed = _merge_daily_weekly_write_review(
+                        original=parsed,
+                        reviewed=reviewed,
+                        reviewed_tool_names=daily_weekly_review_tool_names,
+                    )
 
                 if not parsed.tool_calls:
                     content = parsed.assistant_message.get("content")
@@ -1500,6 +1768,763 @@ def _pre_execution_tool_argument_repair_message() -> dict[str, str]:
             "不要改用文本描述工具调用，也不要假称已经执行。"
         ),
     }
+
+
+_DAILY_REPORT_TRANSACTION_TARGETS = frozenset(
+    {
+        "bound_report",
+        "resolved_report",
+        "today_report",
+        "pending_report",
+        "source_and_target_reports",
+    }
+)
+
+
+def _daily_weekly_write_review_tool_names(
+    calls: tuple[NativeToolCall, ...],
+    *,
+    context: TrustedContext,
+) -> frozenset[str]:
+    """Select schemas for one independent cross-domain semantic review.
+
+    This gate uses only trusted capabilities and registry metadata. It never
+    interprets words in the user's message; that judgment remains with the
+    reviewer model.
+    """
+
+    available_domains = {
+        domain
+        for name in context.allowed_tool_names
+        if (domain := _daily_weekly_review_domain(name)) is not None
+    }
+    if len(available_domains) < 2:
+        return frozenset()
+    current_reviewed_operations = {
+        call.tool_name
+        for call in calls
+        if _daily_weekly_review_domain(call.tool_name) is not None
+        and call.tool_name in context.allowed_tool_names
+        and context.gate_decisions.get(call.tool_name) is True
+    }
+    if not current_reviewed_operations:
+        if calls or not _in_daily_weekly_zero_tool_review_window(context):
+            return frozenset()
+
+    # Preserve the exact operation vocabulary already selected while exposing
+    # a small canonical set that can restore an omitted record domain.
+    canonical_capture_tools = {
+        name
+        for name in (
+            "add_daily_items",
+            "apply_current_weekly_report",
+            "submit_current_weekly_report",
+            "apply_next_weekly_plan",
+            "submit_next_weekly_plan",
+        )
+        if name in context.allowed_tool_names
+        and context.gate_decisions.get(name) is True
+    }
+    if not current_reviewed_operations:
+        canonical_capture_tools.update(
+            name
+            for name in (
+                "query_current_weekly_report",
+                "query_next_weekly_plan",
+            )
+            if name in context.allowed_tool_names
+            and context.gate_decisions.get(name) is True
+        )
+    review_names = current_reviewed_operations | canonical_capture_tools
+    review_domains = {
+        domain
+        for name in review_names
+        if (domain := _daily_weekly_review_domain(name)) is not None
+    }
+    if len(review_domains) < 2:
+        return frozenset()
+    return frozenset(review_names)
+
+
+def _in_daily_weekly_zero_tool_review_window(context: TrustedContext) -> bool:
+    """Bound zero-draft review to an open report or planning collision window."""
+
+    if context.principal.conversation_kind != "direct":
+        return False
+    open_roles = {"active_collection", "natural_next"}
+    weekly_plan_open = (
+        "apply_next_weekly_plan" in context.allowed_tool_names
+        and context.gate_decisions.get("apply_next_weekly_plan") is True
+        and any(
+            weekly.status in {"draft", "collecting", "pending_confirmation"}
+            and bool(open_roles.intersection(weekly.roles))
+            for weekly in context.all_weekly_plans()
+        )
+    )
+    periodic_report_open = (
+        context.current_weekly_report is not None
+        and context.current_weekly_report.status == "collecting"
+        and context.current_weekly_report.report_type == "weekly"
+        and any(
+            name in context.allowed_tool_names
+            and context.gate_decisions.get(name) is True
+            for name in (
+                "query_current_weekly_report",
+                "apply_current_weekly_report",
+                "submit_current_weekly_report",
+            )
+        )
+    )
+    if periodic_report_open:
+        try:
+            local_date = context.now.astimezone(
+                ZoneInfo(context.principal.timezone)
+            ).date()
+            current_period_key, _, _ = period_bounds("weekly", local_date)
+        except (KeyError, ValueError):
+            periodic_report_open = False
+        else:
+            periodic_report_open = (
+                context.current_weekly_report.period_key == current_period_key
+            )
+    if not weekly_plan_open and not periodic_report_open:
+        return False
+    if periodic_report_open:
+        return True
+    try:
+        local_now = context.now.astimezone(ZoneInfo(context.principal.timezone))
+    except (KeyError, ValueError):
+        return False
+    # Friday through Monday is when report writing most often collides with
+    # planning. Monday also permits late filling of the current-week plan while
+    # a relative "next week" can select another trusted target.
+    return local_now.weekday() in {0, 4, 5, 6}
+
+
+def _daily_weekly_write_domain(tool_name: str) -> str | None:
+    definition = TOOL_REGISTRY.get(tool_name)
+    if definition is None or definition.read_or_write != "write":
+        return None
+    if definition.transaction_target_policy == "weekly_plan":
+        return "weekly"
+    if definition.transaction_target_policy == "periodic_report":
+        return "periodic"
+    if definition.transaction_target_policy in _DAILY_REPORT_TRANSACTION_TARGETS:
+        return "daily"
+    return None
+
+
+def _daily_weekly_review_domain(tool_name: str) -> str | None:
+    """Map a registry tool to one reviewed record without reading user text."""
+
+    write_domain = _daily_weekly_write_domain(tool_name)
+    if write_domain is not None:
+        return write_domain
+    if tool_name == "query_current_weekly_report":
+        definition = TOOL_REGISTRY.get(tool_name)
+        if definition is not None and definition.read_or_write == "read":
+            return "periodic"
+    if tool_name == "query_next_weekly_plan":
+        definition = TOOL_REGISTRY.get(tool_name)
+        if definition is not None and definition.read_or_write == "read":
+            return "weekly"
+    return None
+
+
+def _daily_weekly_review_domains(
+    allowed_tool_names: frozenset[str],
+) -> frozenset[str]:
+    return frozenset(
+        domain
+        for tool_name in allowed_tool_names
+        if (domain := _daily_weekly_review_domain(tool_name)) is not None
+    )
+
+
+def _review_domain_list(domains: frozenset[str]) -> str:
+    labels = tuple(
+        label
+        for domain, label in (
+            ("daily", "the Daily Report"),
+            ("periodic", "the Current Weekly Report"),
+            ("weekly", "the Weekly Work Plan"),
+        )
+        if domain in domains
+    )
+    if not labels:
+        raise ValueError("semantic review requires at least one allowed domain")
+    if len(labels) == 1:
+        return f"{labels[0]} domain"
+    return f"{', '.join(labels[:-1])}, and {labels[-1]} domains"
+
+
+def _daily_weekly_review_domain_policy(domains: frozenset[str]) -> str:
+    policies: list[str] = []
+    if "daily" in domains:
+        policies.append("A Daily Report records one reporting day.")
+    if "periodic" in domains:
+        policies.append(
+            "A Current Weekly Report reviews the current ISO week in "
+            "accomplishments, risks, next_plan, and metrics. Use "
+            "query_current_weekly_report to open or view it, "
+            "apply_current_weekly_report for explicit changes, and "
+            "submit_current_weekly_report only for explicit submission."
+        )
+    if "weekly" in domains:
+        policies.append(
+            "A Monday-to-Saturday Weekly Work Plan records exact dated "
+            "commitments. Trusted weekly_plan_targets may contain a Monday "
+            "active_collection target for the current week and a separate "
+            "natural_next target for the following week; select the exact "
+            "plan_id, version, and dates semantically."
+        )
+    if {"daily", "weekly"}.issubset(domains):
+        policies.append(
+            "A standalone bare expression such as 'Friday: do X' is ambiguous "
+            "between the current Friday's daily report and a future plan, so "
+            "ask a natural clarification instead of guessing. When one sentence "
+            "explicitly contrasts current Friday work with 'next Friday', "
+            "trusted server time plus that contrast may route the two matters "
+            "to daily and weekly records respectively."
+        )
+    if {"periodic", "weekly"}.issubset(domains):
+        policies.append(
+            "The Current Weekly Report's next_plan remains inside that report "
+            "unless a separate dated Weekly Work Plan request is explicit. Never "
+            "route Weekly Report content through weekly-plan tools."
+        )
+    if len(domains) > 1:
+        policies.append(
+            "These are independent records. One turn may authorize more than one; "
+            "retain every matter in its intended allowed domain and do not force "
+            "a domain that is not clear."
+        )
+    return " ".join(policies)
+
+
+def _daily_weekly_write_review_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    calls: tuple[NativeToolCall, ...],
+    context: TrustedContext,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    allowed_domains = _daily_weekly_review_domains(allowed_tool_names)
+    draft_calls = [
+        {"tool_name": call.tool_name, "arguments": call.arguments}
+        for call in calls
+        if _daily_weekly_write_domain(call.tool_name) is not None
+    ]
+    return [
+        {
+            "role": "system",
+            "content": " ".join(
+                (
+                "You are the isolated Agent2 semantic reviewer for one unexecuted "
+                f"operation draft spanning {_review_domain_list(allowed_domains)}. "
+                "Reread every exact current user message independently. Decide meaning "
+                "semantically from the whole utterance and trusted context; never use a "
+                "keyword, phrase list, regular expression, or the mere presence of a "
+                "weekday. "
+                f"{_daily_weekly_review_domain_policy(allowed_domains)} "
+                "Treat the supplied draft as fallible: it may omit one domain, omit a "
+                "matter, or contain the wrong otherwise-valid arguments. The draft has "
+                "not executed and has written nothing. If all intended writes and their "
+                "dates, fields, actors, conditions, evidence, stable IDs, and versions are "
+                "clear, return exactly one complete corrected native tool-call batch using "
+                "only the supplied tools. Preserve exact current-message grounding and do "
+                "not manufacture completion, certainty, or a formal weekday. If any "
+                "material routing or meaning remains ambiguous, return no tool calls and "
+                "exactly one JSON object with keys decision and reply, where decision is "
+                "clarification and reply is a concise natural Chinese question. "
+                "If the original draft had no reviewed operation and the message clearly "
+                "needs none of these records, return no tool calls and exactly "
+                "one JSON object {\"decision\":\"keep_original\"}; do not reproduce, "
+                "rewrite, or evaluate the original conversational answer. "
+                "Never use keep_original when a reviewed operation or clarification is "
+                "semantically required. "
+                "Never say that anything was saved, submitted, or executed. Do not return a partial "
+                "operation batch when clarification is required. Unrelated "
+                "calls are outside this review and must not be reproduced.",
+                )
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(ordered_messages, start=1)
+                    ],
+                    "trusted_context": context.model_payload(),
+                    "unexecuted_daily_periodic_weekly_operation_draft": draft_calls,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _validate_daily_weekly_write_review(
+    *,
+    reviewed: _ParsedAssistantTurn,
+    allowed_tool_names: frozenset[str],
+    original_has_domain_writes: bool,
+) -> None:
+    if reviewed.tool_calls:
+        if any(
+            call.tool_name not in allowed_tool_names
+            or _daily_weekly_review_domain(call.tool_name) is None
+            for call in reviewed.tool_calls
+        ):
+            raise ValueError("review returned an out-of-scope tool")
+        return
+    content = reviewed.assistant_message.get("content")
+    try:
+        payload = json.loads(content) if isinstance(content, str) else None
+    except json.JSONDecodeError as exc:
+        raise ValueError("clarification review must return JSON") from exc
+    if (
+        not original_has_domain_writes
+        and payload == {"decision": "keep_original"}
+    ):
+        return
+    if not isinstance(payload, dict) or set(payload) != {"decision", "reply"}:
+        raise ValueError("clarification review has an invalid envelope")
+    if payload.get("decision") != "clarification":
+        raise ValueError("review without tools must request clarification")
+    reply = payload.get("reply")
+    if not isinstance(reply, str) or not reply.strip() or len(reply) > 8000:
+        raise ValueError("clarification review requires a bounded reply")
+
+
+def _daily_weekly_review_envelope_repair_messages(
+    *,
+    raw_content: str,
+) -> list[dict[str, str]]:
+    """Ask the model to normalize its own clarification without adding meaning."""
+
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are formatting one already-written Agent2 semantic-review "
+                "clarification. Do not reinterpret the user, add facts, choose a "
+                "record, or call a tool. If the supplied text is a clarification "
+                "question, return exactly one JSON object with decision set to "
+                "clarification and reply containing that same question. Otherwise "
+                "return exactly {\"decision\":\"invalid\"}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {"unformatted_clarification": raw_content},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _merge_daily_weekly_write_review(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+    reviewed_tool_names: frozenset[str],
+) -> _ParsedAssistantTurn:
+    if not reviewed.tool_calls:
+        payload = json.loads(reviewed.assistant_message["content"])
+        if payload.get("decision") == "keep_original":
+            return _ParsedAssistantTurn(
+                assistant_message=original.assistant_message,
+                tool_calls=original.tool_calls,
+                audit=(*original.audit, *reviewed.audit),
+            )
+        return _ParsedAssistantTurn(
+            assistant_message={"role": "assistant", "content": payload["reply"]},
+            tool_calls=(),
+            audit=(*original.audit, *reviewed.audit),
+        )
+
+    target_indexes = [
+        index
+        for index, call in enumerate(original.tool_calls)
+        if _daily_weekly_review_domain(call.tool_name) is not None
+    ]
+    insertion_index = target_indexes[0] if target_indexes else len(original.tool_calls)
+    merged: list[NativeToolCall] = []
+    for index, call in enumerate(original.tool_calls):
+        if index == insertion_index:
+            merged.extend(reviewed.tool_calls)
+        if _daily_weekly_review_domain(call.tool_name) is None:
+            merged.append(call)
+    if insertion_index == len(original.tool_calls):
+        merged.extend(reviewed.tool_calls)
+    if any(call.tool_name not in reviewed_tool_names for call in reviewed.tool_calls):
+        raise ValueError("review used a tool outside its supplied schemas")
+
+    merged_calls = tuple(merged)
+    merged_message = {
+        key: value
+        for key, value in original.assistant_message.items()
+        if key in {"role", "content", "reasoning_content"}
+    }
+    merged_message["role"] = "assistant"
+    merged_message["content"] = merged_message.get("content") or ""
+    merged_message["tool_calls"] = [
+        {
+            "id": call.tool_call_id,
+            "type": "function",
+            "function": {
+                "name": call.tool_name,
+                "arguments": json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        for call in merged_calls
+    ]
+    return _ParsedAssistantTurn(
+        assistant_message=merged_message,
+        tool_calls=merged_calls,
+        audit=(*original.audit, *reviewed.audit),
+    )
+
+
+def _daily_weekly_zero_draft_confirmation_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    allowed_domains = _daily_weekly_review_domains(allowed_tool_names)
+    return [
+        {
+            "role": "system",
+            "content": " ".join(
+                (
+                "You are a second isolated Agent2 reviewer. A main model returned "
+                "no tool calls, while another reviewer proposed an operation in "
+                f"{_review_domain_list(allowed_domains)}. You are not shown either "
+                "prior answer. "
+                "Independently reread the exact current user messages and trusted context. "
+                "Only if the user clearly and presently authorizes the operation, return "
+                "one complete native tool-call batch using the supplied tools. Preserve every "
+                "matter, domain, date, actor, qualifier, exact source evidence, stable ID, "
+                "and version. Do not infer from keywords or a weekday alone. "
+                f"{_daily_weekly_review_domain_policy(allowed_domains)} "
+                "If any operation or routing is ambiguous, "
+                "return no tools and a concise clarification JSON. Do not claim execution.",
+                )
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(ordered_messages, start=1)
+                    ],
+                    "trusted_context": context.model_payload(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _validate_daily_weekly_zero_draft_agreement(
+    *,
+    first: tuple[NativeToolCall, ...],
+    second: tuple[NativeToolCall, ...],
+    allowed_tool_names: frozenset[str],
+) -> None:
+    if not first or not second:
+        raise ValueError("both reviewers must return writes")
+    for calls in (first, second):
+        if any(
+            call.tool_name not in allowed_tool_names
+            or _daily_weekly_review_domain(call.tool_name) is None
+            for call in calls
+        ):
+            raise ValueError("review confirmation returned an out-of-scope tool")
+
+    def semantic_payload(calls: tuple[NativeToolCall, ...]) -> list[dict[str, Any]]:
+        return [
+            {
+                "tool_name": call.tool_name,
+                "arguments": _semantic_review_arguments(call),
+            }
+            for call in calls
+        ]
+
+    if semantic_payload(first) != semantic_payload(second):
+        raise ValueError("independent review batches differ")
+
+
+def _zero_draft_disagreement_kind(
+    *,
+    first: tuple[NativeToolCall, ...],
+    second: tuple[NativeToolCall, ...],
+    context: TrustedContext,
+) -> str | None:
+    """Classify the two safe ambiguity shapes that may become a clarification."""
+
+    if context.principal.conversation_kind != "direct" or not first:
+        return None
+    if _zero_draft_disagreement_is_daily_vs_weekly(first=first, second=second):
+        return "daily_vs_weekly"
+    if (
+        len(first) != len(second)
+        or len({plan.target_week_start for plan in context.all_weekly_plans()}) < 2
+    ):
+        return None
+
+    selected_different_week = False
+    for first_call, second_call in zip(first, second, strict=True):
+        if first_call.tool_name != second_call.tool_name:
+            return None
+        if first_call.tool_name not in {
+            "apply_next_weekly_plan",
+            "submit_next_weekly_plan",
+        }:
+            if first_call.arguments != second_call.arguments:
+                return None
+            continue
+
+        first_normalized = _normalize_week_target_arguments(
+            call=first_call,
+            context=context,
+        )
+        second_normalized = _normalize_week_target_arguments(
+            call=second_call,
+            context=context,
+        )
+        if first_normalized is None or second_normalized is None:
+            return None
+        first_payload, first_week_start = first_normalized
+        second_payload, second_week_start = second_normalized
+        if first_payload != second_payload:
+            return None
+        if first_week_start != second_week_start:
+            selected_different_week = True
+
+    return "weekly_target" if selected_different_week else None
+
+
+def _zero_draft_disagreement_is_daily_vs_weekly(
+    *,
+    first: tuple[NativeToolCall, ...],
+    second: tuple[NativeToolCall, ...],
+) -> bool:
+    """Recognize one current-message matter routed to two different records."""
+
+    if len(first) != 1 or len(second) != 1:
+        return False
+    by_name = {first[0].tool_name: first[0], second[0].tool_name: second[0]}
+    if set(by_name) != {"add_daily_items", "apply_next_weekly_plan"}:
+        return False
+
+    daily_items = by_name["add_daily_items"].arguments.get("items")
+    weekly_operations = by_name["apply_next_weekly_plan"].arguments.get("operations")
+    if (
+        not isinstance(daily_items, list)
+        or len(daily_items) != 1
+        or not isinstance(weekly_operations, list)
+        or len(weekly_operations) != 1
+    ):
+        return False
+    daily_item = daily_items[0]
+    weekly_operation = weekly_operations[0]
+    if not isinstance(daily_item, dict) or not isinstance(weekly_operation, dict):
+        return False
+    if daily_item.get("field") != "today_work" or weekly_operation.get(
+        "operation"
+    ) != "add":
+        return False
+    daily_evidence = daily_item.get("source_evidence")
+    weekly_evidence = weekly_operation.get("source_evidence")
+    daily_content = daily_item.get("content")
+    weekly_content = weekly_operation.get("content")
+    weekly_clause = (
+        weekly_evidence.get("exact_clause_quote")
+        if isinstance(weekly_evidence, dict)
+        else None
+    )
+    return (
+        isinstance(daily_evidence, dict)
+        and isinstance(weekly_evidence, dict)
+        and daily_evidence.get("source_message_index")
+        == weekly_evidence.get("source_message_index")
+        and isinstance(daily_content, str)
+        and bool(daily_content.strip())
+        and isinstance(weekly_content, str)
+        and bool(weekly_content.strip())
+        and isinstance(weekly_clause, str)
+        and daily_content.strip() in weekly_clause
+        and weekly_content.strip() in weekly_clause
+    )
+
+
+def _semantic_review_arguments(call: NativeToolCall) -> dict[str, Any]:
+    """Remove reviewer-local labels while preserving every business fact."""
+
+    arguments = json.loads(
+        json.dumps(
+            call.arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    if call.tool_name not in {
+        "apply_current_weekly_report",
+        "apply_next_weekly_plan",
+    }:
+        return arguments
+    operations = arguments.get("operations")
+    if not isinstance(operations, list):
+        return arguments
+    for index, operation in enumerate(operations):
+        if isinstance(operation, dict) and "operation_id" in operation:
+            operation["operation_id"] = f"<review-operation-{index}>"
+    return arguments
+
+
+def _normalize_week_target_arguments(
+    *,
+    call: NativeToolCall,
+    context: TrustedContext,
+) -> tuple[dict[str, Any], Any] | None:
+    plan_id = call.arguments.get("plan_id")
+    if not isinstance(plan_id, str):
+        return None
+    target = context.weekly_plan_by_id(plan_id)
+    if target is None or call.arguments.get("expected_version") != target.version:
+        return None
+
+    normalized = dict(call.arguments)
+    normalized["plan_id"] = "<trusted-weekly-plan>"
+    normalized["expected_version"] = "<trusted-version>"
+    operations = normalized.get("operations")
+    if operations is not None:
+        if not isinstance(operations, list):
+            return None
+        normalized_operations: list[dict[str, Any]] = []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                return None
+            normalized_operation = dict(operation)
+            raw_plan_date = normalized_operation.pop("plan_date", None)
+            if not isinstance(raw_plan_date, str):
+                return None
+            try:
+                plan_date = date.fromisoformat(raw_plan_date)
+            except ValueError:
+                return None
+            day_offset = (plan_date - target.target_week_start).days
+            if day_offset not in range(6):
+                return None
+            normalized_operation["plan_day_offset"] = day_offset
+            normalized_operations.append(normalized_operation)
+        normalized["operations"] = normalized_operations
+    return normalized, target.target_week_start
+
+
+def _weekly_target_disagreement_clarification_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+    clarification_kind: str,
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    if clarification_kind == "weekly_target":
+        conflict = "different trusted Weekly Work Plan target weeks"
+        choices = "本周 and 下周"
+        safety_fact = (
+            "independent reviewers selected different trusted target weeks; "
+            "zero operations executed"
+        )
+    elif clarification_kind == "daily_vs_weekly":
+        conflict = "the Daily Report and the dated Weekly Work Plan"
+        choices = "今日日报 and 下周工作计划"
+        safety_fact = (
+            "independent reviewers selected different record types for the same "
+            "current-message matter; zero operations executed"
+        )
+    else:
+        raise ValueError("unknown zero-draft disagreement clarification kind")
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the final Agent2 clarification writer. Two independent safety "
+                f"reviewers selected {conflict} for the same current-message matter. "
+                "No tool ran and nothing was written. Do not choose a record or call a "
+                f"tool. Ask one concise, natural Chinese question that contrasts {choices}. Return exactly "
+                "one JSON object with decision set to clarification and reply containing "
+                "the question. Do not claim that anything was saved or executed."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(ordered_messages, start=1)
+                    ],
+                    "trusted_weekly_plan_targets": context.model_payload().get(
+                        "weekly_plan_targets",
+                        [],
+                    ),
+                    "server_safety_fact": safety_fact,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _validate_week_target_disagreement_clarification(
+    reviewed: _ParsedAssistantTurn,
+    *,
+    clarification_kind: str,
+) -> None:
+    _validate_daily_weekly_write_review(
+        reviewed=reviewed,
+        allowed_tool_names=frozenset(),
+        original_has_domain_writes=True,
+    )
+    payload = json.loads(reviewed.assistant_message["content"])
+    reply = payload["reply"]
+    required_labels = (
+        ("本周", "下周")
+        if clarification_kind == "weekly_target"
+        else ("今日日报", "下周工作计划")
+    )
+    if any(label not in reply for label in required_labels):
+        raise ValueError(
+            "record clarification must name every trusted choice"
+        )
 
 
 def _needs_daily_submit_section_review(

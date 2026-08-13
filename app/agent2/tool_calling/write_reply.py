@@ -86,6 +86,7 @@ def model_safe_user_facts(receipt: ToolReceipt) -> dict[str, Any]:
 def write_reply_protocol(
     receipts: tuple[ToolReceipt, ...],
 ) -> dict[str, Any]:
+    clarification_options = _required_clarification_options(receipts)
     return {
         "format": "json_object",
         "required_fields": {
@@ -113,8 +114,13 @@ def write_reply_protocol(
             ),
             "Do not claim a write unless expected_actual_write is true.",
             "For partial, state separately what succeeded and what did not.",
+            (
+                "When clarification_option_labels is non-empty, ask the user to "
+                "choose among every label naturally and do not imply a write."
+            ),
             "Do not call another tool in this user turn.",
         ],
+        "clarification_option_labels": list(clarification_options),
     }
 
 
@@ -148,7 +154,33 @@ def validate_write_reply(
     }
     if any(code and code in envelope.reply for code in internal_codes):
         errors.append("reply exposes an internal error code")
+    required_options = _required_clarification_options(receipts)
+    missing_options = tuple(
+        label for label in required_options if label not in envelope.reply
+    )
+    if missing_options:
+        errors.append(
+            "reply omits required clarification options: "
+            + ", ".join(missing_options)
+        )
     return (envelope if not errors else None), tuple(errors)
+
+
+def _required_clarification_options(
+    receipts: tuple[ToolReceipt, ...],
+) -> tuple[str, ...]:
+    options: list[str] = []
+    for receipt in receipts:
+        if receipt.status != ReceiptStatus.CLARIFICATION_REQUIRED:
+            continue
+        raw = receipt.safe_user_facts.get("clarification_option_labels", ())
+        if not isinstance(raw, (list, tuple)):
+            continue
+        for value in raw:
+            label = str(value).strip()
+            if label and label not in options:
+                options.append(label)
+    return tuple(options)
 
 
 def write_reply_retry_instruction(
@@ -159,15 +191,19 @@ def write_reply_retry_instruction(
         "actual_write": any(receipt.changed for receipt in receipts),
         "operation_outcome": expected_write_outcome(receipts),
     }
+    clarification_options = _required_clarification_options(receipts)
     return json.dumps(
         {
             "write_reply_retry": {
                 "validation_errors": list(errors),
                 "required_exact_fields": required_exact_fields,
+                "clarification_option_labels": list(clarification_options),
                 "instruction": (
                     "Return exactly one terminal JSON object. Copy "
                     "required_exact_fields unchanged into it. Compose only the "
-                    "non-empty reply from the existing safe_user_facts. Do not "
+                    "non-empty reply from the existing safe_user_facts. If "
+                    "clarification_option_labels is non-empty, naturally ask the "
+                    "user to choose among every label. Do not "
                     "call tools. Do not return blank text or omit any field."
                 ),
             }

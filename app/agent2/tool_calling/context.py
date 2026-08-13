@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.agent2.memory import TrustedPersonalMemoryContext
+from app.agent2.periodic_report_context import TrustedPeriodicReportContext
+from app.agent2.weekly_plan_context import TrustedWeeklyPlanContext
 
 
 SHADOW_STATE_NAMESPACE = "agent2.tool_calling.shadow.v1"
@@ -49,6 +51,7 @@ class TrustedPrincipal(_FrozenModel):
         min_length=1,
         max_length=128,
     )
+    conversation_kind: Literal["direct", "group", "unknown"] = "unknown"
 
 
 class TrustedReportItem(_FrozenModel):
@@ -228,6 +231,9 @@ class TrustedContext(_FrozenModel):
     recent_messages: tuple[TrustedRecentMessage, ...] = ()
     recent_operations: tuple[TrustedRecentOperation, ...] = ()
     personal_memory: TrustedPersonalMemoryContext | None = None
+    current_weekly_report: TrustedPeriodicReportContext | None = None
+    weekly_plan: TrustedWeeklyPlanContext | None = None
+    weekly_plans: tuple[TrustedWeeklyPlanContext, ...] = ()
     business_glossary: dict[str, str] = Field(default_factory=dict)
     allowed_tool_names: frozenset[str] = frozenset()
     gate_decisions: dict[str, bool] = Field(default_factory=dict)
@@ -304,6 +310,33 @@ class TrustedContext(_FrozenModel):
             raise ValueError(
                 "trusted personal memory must match the authenticated principal"
             )
+        periodic = self.current_weekly_report
+        if periodic is not None and (
+            periodic.tenant_id != self.principal.tenant_id
+            or periodic.owner_user_id != self.principal.user_id
+            or periodic.report_type != "weekly"
+        ):
+            raise ValueError(
+                "trusted current weekly report must match the authenticated principal"
+            )
+        if self.weekly_plan is not None and self.weekly_plans and (
+            self.weekly_plan != self.weekly_plans[0]
+        ):
+            raise ValueError(
+                "trusted weekly-plan compatibility target must match the first target"
+            )
+        all_weekly_contexts = self.all_weekly_plans()
+        weekly_plan_ids = [item.plan_id for item in all_weekly_contexts]
+        if len(weekly_plan_ids) != len(set(weekly_plan_ids)):
+            raise ValueError("trusted weekly-plan target IDs must be unique")
+        if any(
+            weekly_plan.tenant_id != self.principal.tenant_id
+            or weekly_plan.owner_user_id != str(self.principal.user_id)
+            for weekly_plan in all_weekly_contexts
+        ):
+            raise ValueError(
+                "trusted weekly plans must match the authenticated principal"
+            )
         pending = self.active_clear_pending
         if pending is not None and (
             pending.tenant_id != self.principal.tenant_id
@@ -316,6 +349,17 @@ class TrustedContext(_FrozenModel):
     def all_reports(self) -> tuple[TrustedReportSnapshot, ...]:
         current = (self.today_report,) if self.today_report is not None else ()
         return (*current, *self.historical_reports)
+
+    def all_weekly_plans(self) -> tuple[TrustedWeeklyPlanContext, ...]:
+        if self.weekly_plans:
+            return self.weekly_plans
+        return (self.weekly_plan,) if self.weekly_plan is not None else ()
+
+    def weekly_plan_by_id(self, plan_id: str) -> TrustedWeeklyPlanContext | None:
+        return next(
+            (item for item in self.all_weekly_plans() if item.plan_id == plan_id),
+            None,
+        )
 
     def report_by_id(self, report_id: UUID) -> TrustedReportSnapshot | None:
         return next((item for item in self.all_reports() if item.report_id == report_id), None)
@@ -388,6 +432,16 @@ class TrustedContext(_FrozenModel):
             }
         if self.personal_memory is not None and self.personal_memory.entries:
             payload["personal_memory"] = self.personal_memory.model_payload()
+        if self.current_weekly_report is not None:
+            payload["current_weekly_report"] = (
+                self.current_weekly_report.safe_snapshot()
+            )
+        if self.weekly_plan is not None:
+            payload["weekly_plan"] = self.weekly_plan.model_payload()
+        if self.weekly_plans:
+            payload["weekly_plan_targets"] = [
+                item.model_payload() for item in self.weekly_plans
+            ]
         if self.business_glossary:
             payload["business_glossary"] = dict(
                 self.business_glossary

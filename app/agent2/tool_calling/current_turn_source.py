@@ -3,13 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
+    ApplyCurrentWeeklyReportArgs,
+    ApplyNextWeeklyPlanArgs,
     CorrectDailyReportDateArgs,
     CurrentUserMessageEvidence,
     RememberPersonalMemoryArgs,
+    SubmitCurrentWeeklyReportArgs,
+    SubmitNextWeeklyPlanArgs,
 )
 
 
@@ -24,6 +29,7 @@ class CurrentTurnSource:
     """Server-owned current-turn text and exact source-evidence checks."""
 
     messages: tuple[str, ...]
+    occurred_at: tuple[datetime, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.messages or len(self.messages) > 20:
@@ -33,6 +39,28 @@ class CurrentTurnSource:
             for message in self.messages
         ):
             raise ValueError("current user messages must be non-empty strings")
+        if self.occurred_at is not None:
+            if len(self.occurred_at) != len(self.messages):
+                raise ValueError(
+                    "current message times must match current user messages"
+                )
+            if any(
+                not isinstance(value, datetime)
+                or value.tzinfo is None
+                or value.utcoffset() is None
+                for value in self.occurred_at
+            ):
+                raise ValueError(
+                    "current message times must be timezone-aware"
+                )
+
+    def occurred_at_for(self, source_message_index: int) -> datetime | None:
+        if self.occurred_at is None:
+            return None
+        index = source_message_index - 1
+        if index < 0 or index >= len(self.occurred_at):
+            return None
+        return self.occurred_at[index]
 
     @property
     def canonical_text(self) -> str:
@@ -76,6 +104,75 @@ class CurrentTurnSource:
             )
             for item in typed_correction.empty_field_evidence:
                 self._validate_evidence(item.source_evidence)
+            return
+        if tool_name == "apply_next_weekly_plan":
+            typed_weekly_plan = ApplyNextWeeklyPlanArgs.model_validate(
+                arguments
+            )
+            for operation in typed_weekly_plan.operations:
+                source_message = self._validate_evidence(
+                    operation.source_evidence
+                )
+                exact_clause = getattr(
+                    operation.source_evidence,
+                    "exact_clause_quote",
+                    None,
+                )
+                if (
+                    isinstance(exact_clause, str)
+                    and exact_clause not in source_message
+                ):
+                    raise CurrentTurnSourceEvidenceError(
+                        "WEEKLY_PLAN_DATE_EVIDENCE_MISMATCH"
+                    )
+                content = getattr(operation, "content", None)
+                grounded_source = (
+                    exact_clause
+                    if isinstance(exact_clause, str)
+                    else source_message
+                )
+                if isinstance(content, str) and content not in grounded_source:
+                    raise CurrentTurnSourceEvidenceError(
+                        "WEEKLY_PLAN_CONTENT_NOT_GROUNDED"
+                    )
+            return
+        if tool_name == "submit_next_weekly_plan":
+            typed_submission = SubmitNextWeeklyPlanArgs.model_validate(
+                arguments
+            )
+            self._validate_evidence(
+                typed_submission.confirmation_evidence
+            )
+            return
+        if tool_name == "apply_current_weekly_report":
+            typed_periodic = ApplyCurrentWeeklyReportArgs.model_validate(
+                arguments
+            )
+            for operation in typed_periodic.operations:
+                source_message = self._validate_evidence(
+                    operation.source_evidence
+                )
+                value = (
+                    operation.content
+                    if operation.operation == "append"
+                    else (
+                        operation.replacement
+                        if operation.operation == "edit"
+                        else None
+                    )
+                )
+                if isinstance(value, str) and value not in source_message:
+                    raise CurrentTurnSourceEvidenceError(
+                        "PERIODIC_REPORT_CONTENT_NOT_GROUNDED"
+                    )
+            return
+        if tool_name == "submit_current_weekly_report":
+            typed_periodic_submit = (
+                SubmitCurrentWeeklyReportArgs.model_validate(arguments)
+            )
+            self._validate_evidence(
+                typed_periodic_submit.confirmation_evidence
+            )
             return
         if tool_name != "remember_personal_memory":
             return

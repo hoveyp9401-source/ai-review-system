@@ -28,6 +28,15 @@ from app.agent2.case_followup_commands import (
 from app.agent2.case_followup_admin_sql import cancel_unsent_case_followup_task
 from app.agent2.case_followup_metrics import load_case_followup_metrics
 from app.agent2.case_followup_policy_sql import apply_case_followup_policy_command
+from app.agent2.weekly_plan_stats import (
+    WeeklyPlanMondayStats,
+    WeeklyPlanMondayStatsReader,
+)
+from app.agent2.weekly_plan_access import (
+    WeeklyPlanAccessAction,
+    WeeklyPlanAccessPolicy,
+)
+from app.agent2.weekly_plan_store import SqlWeeklyPlanStore
 from app.legal_ops.auth import PrincipalDirectory, SandboxPrincipal
 from app.legal_ops.access import LivePrincipalScope, load_live_principal_scope
 from app.legal_ops.repository import SandboxRepository
@@ -172,6 +181,22 @@ def require_principal(
 
 Runtime = Annotated[LegalOpsRuntime, Depends(get_runtime)]
 Principal = Annotated[SandboxPrincipal, Depends(require_principal)]
+
+
+def get_weekly_plan_monday_stats_reader(
+    session: AsyncSession = Depends(get_session),
+) -> WeeklyPlanMondayStatsReader:
+    return WeeklyPlanMondayStatsReader(SqlWeeklyPlanStore(session))
+
+
+def get_weekly_plan_stats_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+WeeklyPlanStatsReader = Annotated[
+    WeeklyPlanMondayStatsReader,
+    Depends(get_weekly_plan_monday_stats_reader),
+]
 
 router = APIRouter(prefix="/legal-ops", tags=["legal-ops-sandbox"])
 
@@ -515,6 +540,46 @@ async def live_report_center(
         tenant_id=principal.tenant_id,
         principal_user_id=(scope.user_id if scope.allowed_case_ids is not None else ""),
     )
+
+
+@router.get("/api/workspace/weekly-plans/{batch_id}/monday-stats")
+async def live_weekly_plan_monday_stats(
+    batch_id: UUID,
+    runtime: Runtime,
+    principal: Principal,
+    reader: WeeklyPlanStatsReader,
+    settings: Settings = Depends(get_settings),
+    observed_at: datetime = Depends(get_weekly_plan_stats_now),
+) -> dict[str, Any]:
+    """Read one canary's frozen Monday baseline and later changes."""
+
+    _require_weekly_plan_canary_read(runtime, principal, settings)
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise HTTPException(status_code=500, detail="weekly plan stats clock is invalid")
+    try:
+        result = await reader.read(
+            tenant_id=principal.tenant_id,
+            batch_id=str(batch_id),
+            as_of=observed_at,
+        )
+        return _weekly_plan_monday_stats_payload(
+            result,
+            expected_user_id=principal.user_id,
+        )
+    except ValueError as exc:
+        reason = str(exc)
+        status_code = (
+            status.HTTP_404_NOT_FOUND
+            if reason in {
+                "monday_snapshot_not_found",
+                "monday_snapshot_scope_mismatch",
+                "monday_reconciliation_scope_mismatch",
+                "weekly_plan_stats_canary_scope_mismatch",
+            }
+            else status.HTTP_422_UNPROCESSABLE_ENTITY
+        )
+        detail = "Not found" if status_code == status.HTTP_404_NOT_FOUND else reason
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @router.post("/api/workspace/reports/{report_ref}/commands")
@@ -1120,6 +1185,96 @@ def _require_phase2_live_read(
         not settings.agent2_business_phase2_enabled or principal.tenant_id not in allowed_tenants
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+
+def _require_weekly_plan_canary_read(
+    runtime: LegalOpsRuntime,
+    principal: SandboxPrincipal,
+    settings: Settings,
+) -> None:
+    tenants = frozenset(
+        parse_tenant_allowlist(settings.agent2_weekly_plan_tenant_allowlist)
+    )
+    users = frozenset(
+        parse_tenant_allowlist(settings.agent2_weekly_plan_user_allowlist)
+    )
+    decision = WeeklyPlanAccessPolicy(
+        enabled=settings.agent2_weekly_plan_enabled,
+        tenant_allowlist=tenants,
+        user_allowlist=users,
+    ).decide(
+        action=WeeklyPlanAccessAction.READ,
+        tenant_id=principal.tenant_id,
+        user_id=principal.user_id,
+        conversation_kind="direct",
+    )
+    if (
+        runtime.mode != "sandbox_live"
+        or len(tenants) != 1
+        or len(users) != 1
+        or principal.tenant_id != settings.legal_ops_live_tenant_id
+        or decision.allowed is not True
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+
+def _weekly_plan_monday_stats_payload(
+    result: WeeklyPlanMondayStats,
+    *,
+    expected_user_id: str,
+) -> dict[str, Any]:
+    frozen = result.immutable_snapshot
+    current = result.reconciliation
+    if (
+        frozen.roster_count != 1
+        or len(frozen.rows) != 1
+        or frozen.rows[0].user_id != expected_user_id
+        or current.roster_count != 1
+        or len(current.rows) != 1
+        or current.rows[0].user_id != expected_user_id
+    ):
+        raise ValueError("weekly_plan_stats_canary_scope_mismatch")
+    return {
+        "tenant_id": frozen.tenant_id,
+        "batch_id": frozen.batch_id,
+        "target_week_start": frozen.target_week_start,
+        "frozen_snapshot": {
+            "snapshot_id": frozen.snapshot_id,
+            "as_of": frozen.as_of,
+            "deadline_at": frozen.deadline_at,
+            "roster_count": frozen.roster_count,
+            "submitted_count": frozen.submitted_count,
+            "draft_count": frozen.draft_count,
+            "unfilled_count": frozen.unfilled_count,
+            "rows": [
+                {
+                    "user_id": row.user_id,
+                    "display_name": row.display_name,
+                    "plan_status": row.plan_status,
+                    "plan_version": row.plan_version,
+                    "submitted_at": row.submitted_at,
+                }
+                for row in frozen.rows
+            ],
+        },
+        "after_snapshot": {
+            "reconciled_at": current.reconciled_at,
+            "current_submitted_count": current.current_submitted_count,
+            "late_submitted_count": current.late_submitted_count,
+            "closed_window_submitted_count": current.closed_window_submitted_count,
+            "changed_after_snapshot_count": current.changed_after_snapshot_count,
+            "rows": [
+                {
+                    "user_id": row.user_id,
+                    "snapshot_plan_status": row.snapshot_plan_status,
+                    "current_plan_status": row.current_plan_status,
+                    "submission_timing": row.submission_timing,
+                    "changed_after_snapshot": row.changed_after_snapshot,
+                }
+                for row in current.rows
+            ],
+        },
+    }
 
 
 async def _load_phase2_principal_scope(

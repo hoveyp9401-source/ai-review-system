@@ -197,7 +197,7 @@ async def test_successful_canary_turn_exposes_actual_model_call_evidence(
             pass
 
         async def assemble(self, request):
-            return SimpleNamespace()
+            return SimpleNamespace(allowed_tool_names=frozenset())
 
     class FakeRuntime:
         def open_session(self, **kwargs):

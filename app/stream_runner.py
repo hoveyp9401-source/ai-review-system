@@ -28,7 +28,12 @@ from app.repositories import (
     mark_webhook_event_processed,
     maybe_create_report_interaction_event,
 )
-from app.services.dingtalk import DingTalkRobotClient, extract_voice_download_code, extract_voice_text
+from app.services.dingtalk import (
+    DingTalkRobotClient,
+    extract_voice_download_code,
+    extract_voice_text,
+    normalize_dingtalk_conversation_kind,
+)
 from app.services.performance_service import (
     NO_ACTIVE_PERFORMANCE_TASK_MESSAGE,
     PERFORMANCE_PENDING_CONFIRMATION,
@@ -2893,6 +2898,22 @@ async def _handle_job(
                 llm_client=report_service.extractor.client,
                 now=now_in_timezone(
                     user.timezone or settings.timezone
+                ),
+                conversation_kind=normalize_dingtalk_conversation_kind(
+                    getattr(job.message, "conversation_type", None)
+                ),
+                message_occurred_at=(
+                    job.persisted_received_at
+                    if turn_batch is None
+                    else None
+                ),
+                message_occurred_ats=(
+                    tuple(
+                        fragment.received_at
+                        for fragment in turn_batch.fragments
+                    )
+                    if turn_batch is not None
+                    else ()
                 ),
             )
             _apply_canary_observability(timings, tool_call_canary)

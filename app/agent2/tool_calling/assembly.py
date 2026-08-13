@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -35,12 +35,21 @@ class TrustedContextRequest:
     runtime_provider_name: str | None = None
     runtime_model_name: str | None = None
     explicit_history_dates: tuple[date, ...] = ()
+    conversation_kind: Literal["direct", "group", "unknown"] = "unknown"
+    persisted_message_occurred_ats: tuple[datetime, ...] = ()
 
     def __post_init__(self) -> None:
         if not all((self.tenant_id, self.conversation_id, self.source_message_id, self.timezone)):
             raise ValueError("trusted context request requires authenticated scope and timezone")
         if self.server_now.tzinfo is None:
             raise ValueError("server_now must be timezone-aware")
+        if self.conversation_kind not in {"direct", "group", "unknown"}:
+            raise ValueError("trusted conversation kind is invalid")
+        if any(
+            value.tzinfo is None or value.utcoffset() is None
+            for value in self.persisted_message_occurred_ats
+        ):
+            raise ValueError("persisted message times must be timezone-aware")
         if self.display_name is not None:
             normalized_name = self.display_name.strip()
             if not normalized_name or len(normalized_name) > 128:
@@ -85,6 +94,7 @@ class TrustedContextRequest:
             source_message_id=self.source_message_id,
             timezone=self.timezone,
             display_name=self.display_name,
+            conversation_kind=self.conversation_kind,
         )
 
     def runtime_identity(self) -> TrustedRuntimeIdentity | None:
@@ -154,6 +164,8 @@ class TrustedContextAssembler:
         history_report_limit: int = 7,
         namespace: ToolCallStateNamespace = SHADOW_STATE_NAMESPACE,
         personal_memory_module: PersonalMemoryModule | None = None,
+        weekly_plan_loader: Any | None = None,
+        periodic_report_loader: Any | None = None,
     ) -> None:
         if (
             recent_message_limit < 0
@@ -168,6 +180,8 @@ class TrustedContextAssembler:
         self._history_report_limit = history_report_limit
         self._namespace = namespace
         self._personal_memory_module = personal_memory_module
+        self._weekly_plan_loader = weekly_plan_loader
+        self._periodic_report_loader = periodic_report_loader
 
     async def assemble(self, request: TrustedContextRequest) -> TrustedContext:
         today = request.server_now.astimezone(ZoneInfo(request.timezone)).date()
@@ -338,6 +352,45 @@ class TrustedContextAssembler:
             name: await self._policy_port.gate_allowed(request, definition)
             for name, definition in mode_definitions.items()
         }
+        weekly_tool_names = {
+            "query_next_weekly_plan",
+            "apply_next_weekly_plan",
+            "submit_next_weekly_plan",
+        }
+        weekly_plans: tuple[Any, ...] = ()
+        if self._weekly_plan_loader is not None and any(
+            permission_results.get(name) is True
+            for name in weekly_tool_names
+        ):
+            load_targets = getattr(
+                self._weekly_plan_loader,
+                "load_targets",
+                None,
+            )
+            if callable(load_targets):
+                weekly_plans = tuple(await load_targets(request))
+            else:
+                # Keep adapters written for the original single-target seam
+                # usable while production loaders move to the multi-target view.
+                weekly_plans = (await self._weekly_plan_loader.load(request),)
+        weekly_plan = weekly_plans[0] if weekly_plans else None
+        current_weekly_report = None
+        current_weekly_report_tool_names = {
+            "query_current_weekly_report",
+            "apply_current_weekly_report",
+            "submit_current_weekly_report",
+        }
+        if self._periodic_report_loader is not None and any(
+            permission_results.get(name) is True
+            for name in current_weekly_report_tool_names
+        ):
+            current_weekly_report = (
+                await self._periodic_report_loader.load_current_weekly(
+                    tenant_id=request.tenant_id,
+                    owner_user_id=request.user_id,
+                    local_date=today,
+                )
+            )
         return TrustedContext(
             namespace=self._namespace,
             now=request.server_now,
@@ -349,6 +402,9 @@ class TrustedContextAssembler:
             recent_messages=recent_messages,
             recent_operations=recent_operations,
             personal_memory=personal_memory,
+            current_weekly_report=current_weekly_report,
+            weekly_plan=weekly_plan,
+            weekly_plans=weekly_plans,
             allowed_tool_names=frozenset(
                 name for name, allowed in permission_results.items() if allowed
             ),

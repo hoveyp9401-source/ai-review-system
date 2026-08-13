@@ -7,6 +7,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from app.agent2.memory import TrustedPersonalMemory
+from app.agent2.periodic_report_context import TrustedPeriodicReportContext
 from app.agent2.tool_calling.context import TrustedContext, TrustedReportSnapshot
 from app.agent2.tool_calling.contracts import ExecutionMode, ReceiptStatus, ToolReceipt
 from app.agent2.tool_calling.current_turn_source import (
@@ -20,6 +21,11 @@ from app.agent2.tool_calling.registry import (
     validate_tool_arguments,
 )
 from app.agent2.tool_calling.reporting_date import default_daily_write_date
+from app.agent2.weekly_plan_context import TrustedWeeklyPlanContext
+from app.agent2.weekly_plan_date_binding import (
+    WeeklyPlanDateBindingError,
+    validate_weekly_plan_date_binding,
+)
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,8 @@ class BoundCall:
     source_report: TrustedReportSnapshot | None
     date_facts: dict[str, Any]
     memory: TrustedPersonalMemory | None = None
+    weekly_plan: TrustedWeeklyPlanContext | None = None
+    periodic_report: TrustedPeriodicReportContext | None = None
 
 
 class _UntrustedReadSnapshotError(ValueError):
@@ -195,6 +203,22 @@ class ShadowCallBinder:
             and self._context.gate_decisions.get(call.tool_name) is not True
         ):
             return None, failure_receipt(call, ReceiptStatus.BLOCKED, "GATE_BLOCKED")
+
+        weekly_plan, weekly_failure = _validate_weekly_plan_binding(
+            context=self._context,
+            call=call,
+            arguments=arguments,
+            current_turn_source=self._current_turn_source,
+        )
+        if weekly_failure is not None:
+            return None, weekly_failure
+        periodic_report, periodic_failure = _validate_periodic_report_binding(
+            context=self._context,
+            call=call,
+            arguments=arguments,
+        )
+        if periodic_failure is not None:
+            return None, periodic_failure
 
         report: TrustedReportSnapshot | None = None
         source_report: TrustedReportSnapshot | None = None
@@ -438,7 +462,11 @@ class ShadowCallBinder:
             "trusted_previous_report_version_and_plan_item_ids",
             "trusted_previous_report_version_and_today_owner_report",
         }
-        report_id = arguments.get("report_id")
+        report_id = (
+            None
+            if periodic_report is not None
+            else arguments.get("report_id")
+        )
         if report_id is not None:
             parsed_report_id = UUID(str(report_id))
             bound_report = (
@@ -582,9 +610,255 @@ class ShadowCallBinder:
                 source_report,
                 date_facts,
                 bound_memory,
+                weekly_plan,
+                periodic_report,
             ),
             None,
     )
+
+
+def _validate_periodic_report_binding(
+    *,
+    context: TrustedContext,
+    call: NativeToolCall,
+    arguments: dict[str, Any],
+) -> tuple[TrustedPeriodicReportContext | None, ToolReceipt | None]:
+    if call.tool_name not in {
+        "query_current_weekly_report",
+        "apply_current_weekly_report",
+        "submit_current_weekly_report",
+    }:
+        return None, None
+    report = context.current_weekly_report
+    if report is None:
+        return None, failure_receipt(
+            call,
+            ReceiptStatus.BLOCKED,
+            "PERIODIC_REPORT_CONTEXT_REQUIRED",
+        )
+    principal = context.principal
+    local_date = context.now.astimezone(
+        ZoneInfo(principal.timezone)
+    ).date()
+    iso_year, iso_week, _ = local_date.isocalendar()
+    if (
+        report.tenant_id != principal.tenant_id
+        or report.owner_user_id != principal.user_id
+        or report.report_type != "weekly"
+        or report.period_key != f"{iso_year}-W{iso_week:02d}"
+    ):
+        return None, failure_receipt(
+            call,
+            ReceiptStatus.BLOCKED,
+            "UNTRUSTED_PERIODIC_REPORT_CONTEXT",
+        )
+    if call.tool_name == "query_current_weekly_report":
+        return report, None
+    if str(arguments.get("report_id") or "") != str(report.report_id):
+        return None, failure_receipt(
+            call,
+            ReceiptStatus.BLOCKED,
+            "UNTRUSTED_PERIODIC_REPORT_ID",
+        )
+    if arguments.get("expected_version") != report.version:
+        return None, failure_receipt(
+            call,
+            ReceiptStatus.BLOCKED,
+            "STALE_PERIODIC_REPORT_VERSION",
+        )
+    if call.tool_name == "submit_current_weekly_report":
+        return report, None
+    trusted_item_ids = {item.item_id for item in report.items}
+    for operation in arguments.get("operations") or ():
+        if str(operation.get("operation") or "") not in {"edit", "delete"}:
+            continue
+        if str(operation.get("item_id") or "") not in trusted_item_ids:
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "UNTRUSTED_PERIODIC_REPORT_ITEM_ID",
+            )
+    return report, None
+
+
+def _validate_weekly_plan_binding(
+    *,
+    context: TrustedContext,
+    call: NativeToolCall,
+    arguments: dict[str, Any],
+    current_turn_source: CurrentTurnSource | None,
+) -> tuple[TrustedWeeklyPlanContext | None, ToolReceipt | None]:
+    """Bind every model-supplied weekly-plan pointer to server context.
+
+    The language model may choose the user's intended operation, but it cannot
+    invent a plan, version, date, item or suggestion.  This guard deliberately
+    runs before any production executor is reached.
+    """
+
+    if call.tool_name not in {
+        "query_next_weekly_plan",
+        "apply_next_weekly_plan",
+        "submit_next_weekly_plan",
+    }:
+        return None, None
+    plan_id = str(arguments.get("plan_id") or "")
+    if call.tool_name == "query_next_weekly_plan" and not plan_id:
+        plans = context.all_weekly_plans()
+        if len(plans) > 1:
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "WEEKLY_PLAN_QUERY_PLAN_ID_REQUIRED",
+            )
+        plan = plans[0] if plans else None
+    else:
+        plan = context.weekly_plan_by_id(plan_id)
+    if plan is None:
+        error_code = (
+            "WEEKLY_PLAN_CONTEXT_REQUIRED"
+            if not context.all_weekly_plans()
+            else "UNTRUSTED_WEEKLY_PLAN_ID"
+        )
+        return None, failure_receipt(
+            call, ReceiptStatus.BLOCKED, error_code
+        )
+    if call.tool_name == "query_next_weekly_plan":
+        return plan, None
+
+    if str(arguments.get("plan_id") or "") != plan.plan_id:
+        return None, failure_receipt(
+            call,
+            ReceiptStatus.BLOCKED,
+            "UNTRUSTED_WEEKLY_PLAN_ID",
+        )
+    if arguments.get("expected_version") != plan.version:
+        return None, failure_receipt(
+            call,
+            ReceiptStatus.BLOCKED,
+            "STALE_WEEKLY_PLAN_VERSION",
+        )
+    if call.tool_name == "submit_next_weekly_plan":
+        return plan, None
+
+    trusted_dates = {day.plan_date.isoformat() for day in plan.days}
+    trusted_item_ids = {
+        item.item_id for day in plan.days for item in day.items
+    }
+    trusted_suggestion_ids = {
+        suggestion.suggestion_id for suggestion in plan.suggestions
+    }
+    for operation in arguments.get("operations") or ():
+        operation_type = str(operation.get("operation") or "")
+        plan_date = (
+            operation.get("target_plan_date")
+            if operation_type == "move"
+            else operation.get("plan_date")
+        )
+        if plan_date is not None and str(plan_date) not in trusted_dates:
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "UNTRUSTED_WEEKLY_PLAN_DATE",
+            )
+        if operation_type in {
+            "add",
+            "move",
+            "set_day_empty",
+            "accept_suggestion",
+        }:
+            if current_turn_source is None:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "CURRENT_TURN_SOURCE_REQUIRED",
+                )
+            evidence = operation.get("source_evidence") or {}
+            try:
+                source_message_index = int(
+                    evidence.get("source_message_index")
+                )
+                source_index = source_message_index - 1
+                source_message = current_turn_source.messages[source_index]
+                source_occurred_at = current_turn_source.occurred_at_for(
+                    source_message_index
+                )
+                if source_occurred_at is None:
+                    return None, failure_receipt(
+                        call,
+                        ReceiptStatus.BLOCKED,
+                        "WEEKLY_PLAN_SOURCE_TIME_REQUIRED",
+                    )
+                proposed = date.fromisoformat(str(plan_date))
+                validate_weekly_plan_date_binding(
+                    source_message=source_message,
+                    exact_clause_quote=str(
+                        evidence.get("exact_clause_quote") or ""
+                    ),
+                    source_occurred_at=source_occurred_at,
+                    business_timezone=context.principal.timezone,
+                    target_week_start=plan.target_week_start,
+                    proposed_date=proposed,
+                    date_role=(
+                        "move_target"
+                        if operation_type == "move"
+                        else "single_day"
+                    ),
+                    # On Monday both a late-fill current-week plan and the
+                    # natural next-week plan may be writable.  The model still
+                    # decides the user's intended operation; this deterministic
+                    # guard only refuses to let a bare weekday silently choose
+                    # between two trusted calendar weeks.
+                    require_explicit_week_scope=len(
+                        {
+                            candidate.target_week_start
+                            for candidate in context.all_weekly_plans()
+                        }
+                    ) > 1,
+                )
+            except WeeklyPlanDateBindingError as exc:
+                clarification_facts = (
+                    {
+                        "clarification_reason": "weekly_plan_target_week_ambiguous",
+                        "possible_week_scopes": ["current_week", "next_week"],
+                        "clarification_option_labels": ["本周", "下周"],
+                        "must_ask_user": True,
+                    }
+                    if exc.code == "WEEKLY_PLAN_TARGET_WEEK_AMBIGUOUS"
+                    else None
+                )
+                return None, failure_receipt(
+                    call,
+                    (
+                        ReceiptStatus.CLARIFICATION_REQUIRED
+                        if exc.code == "WEEKLY_PLAN_TARGET_WEEK_AMBIGUOUS"
+                        else ReceiptStatus.BLOCKED
+                    ),
+                    exc.code,
+                    safe_user_facts=clarification_facts,
+                )
+            except (IndexError, TypeError, ValueError):
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "WEEKLY_PLAN_DATE_EVIDENCE_MISMATCH",
+                )
+        if operation_type in {"edit", "move", "delete"} and str(
+            operation.get("item_id") or ""
+        ) not in trusted_item_ids:
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "UNTRUSTED_WEEKLY_PLAN_ITEM_ID",
+            )
+        if operation_type in {"accept_suggestion", "reject_suggestion"} and str(
+            operation.get("suggestion_id") or ""
+        ) not in trusted_suggestion_ids:
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "UNTRUSTED_WEEKLY_PLAN_SUGGESTION_ID",
+            )
+    return plan, None
 
 
 def _locked_historical_report_date(

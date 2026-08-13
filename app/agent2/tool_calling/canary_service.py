@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,9 @@ from sqlalchemy.engine import make_url
 from app.agent2.business.models import Agent2IdentityBinding
 from app.agent2.memory import PersonalMemoryModule
 from app.agent2.memory.postgres import PostgresPersonalMemoryReadStore
+from app.agent2.periodic_report_context_loader import (
+    ProductionPeriodicReportContextLoader,
+)
 from app.agent2.tool_calling.assembly import (
     TrustedContextAssembler,
     TrustedContextRequest,
@@ -58,16 +62,20 @@ from app.agent2.tool_calling.production_runtime import ProductionRuntime
 from app.agent2.tool_calling.production_store import ProductionContextStore
 from app.agent2.tool_calling.receipt_reply import (
     canary_block_message,
-    finalize_canary_content,
 )
 from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     runtime_registry_contract_digest,
+    runtime_registry_tool_names,
 )
 from app.agent2.tool_calling.salutation_onboarding import (
     PersonalMemoryOnboarding,
     PostgresPersonalMemoryOnboardingStore,
 )
+from app.agent2.weekly_plan_context_loader import (
+    ProductionWeeklyPlanContextLoader,
+)
+from app.agent2.weekly_plan_store import SqlWeeklyPlanStore
 from app.utils.dingtalk_text import format_dingtalk_plain_text
 
 _model_audit_logger = logging.getLogger(
@@ -219,6 +227,7 @@ def _record_canary_execution_failure(
     tenant_id: str = "",
     user_id: str = "",
     conversation_id: str = "",
+    system_prompt_sha256: str | None = None,
 ) -> CanaryIngressExecutionError:
     model_turns = tuple(getattr(error, "model_turns", ()) or ())
     model_call_count = max(
@@ -252,6 +261,7 @@ def _record_canary_execution_failure(
             "tenant_id": tenant_id,
             "user_id": user_id,
             "conversation_id": conversation_id,
+            "system_prompt_sha256": system_prompt_sha256,
             "model_call_count": model_call_count,
             "model_request_attempt_count": model_request_attempt_count,
             "model_transport_retry_count": model_transport_retry_count,
@@ -627,12 +637,23 @@ async def process_tool_call_canary_ingress(
     settings: object,
     llm_client: Any,
     now,
+    conversation_kind: str = "unknown",
+    message_occurred_at: Any | None = None,
+    message_occurred_ats: tuple[Any, ...] = (),
 ) -> CanaryIngressOutcome:
     ordered_user_messages = _ordered_user_messages(
         user_text=user_text,
         user_messages=user_messages,
     )
-    current_turn_source = CurrentTurnSource(ordered_user_messages)
+    ordered_message_times = _ordered_message_times(
+        message_count=len(ordered_user_messages),
+        message_occurred_at=message_occurred_at,
+        message_occurred_ats=message_occurred_ats,
+    )
+    current_turn_source = CurrentTurnSource(
+        ordered_user_messages,
+        occurred_at=ordered_message_times,
+    )
     canonical_conversation_id = (
         conversation_id.strip()
         or f"dingtalk:{source_channel}:{dingtalk_user_id}"
@@ -692,6 +713,7 @@ async def process_tool_call_canary_ingress(
         )
 
     turn_transaction = await session.begin_nested()
+    rendered_prompt_sha256: str | None = None
     try:
         context_store = ProductionContextStore(
             session,
@@ -715,6 +737,8 @@ async def process_tool_call_canary_ingress(
             ),
             runtime_provider_name=CANARY_MODEL_PROVIDER,
             runtime_model_name=CANARY_MODEL_NAME,
+            conversation_kind=conversation_kind,
+            persisted_message_occurred_ats=ordered_message_times or (),
         )
         context = await TrustedContextAssembler(
             read_port=context_store,
@@ -725,11 +749,30 @@ async def process_tool_call_canary_ingress(
             personal_memory_module=PersonalMemoryModule(
                 read_port=PostgresPersonalMemoryReadStore(session)
             ),
+            weekly_plan_loader=ProductionWeeklyPlanContextLoader(
+                SqlWeeklyPlanStore(session)
+            ),
+            periodic_report_loader=(
+                ProductionPeriodicReportContextLoader(session)
+            ),
         ).assemble(context_request)
         context = _attach_performance_glossary(
             context,
             settings=settings,
         )
+        allowed_tool_names = frozenset(
+            getattr(
+                context,
+                "allowed_tool_names",
+                runtime_registry_tool_names(settings),
+            )
+        )
+        system_prompt = canary_system_prompt(
+            allowed_tool_names=allowed_tool_names
+        )
+        rendered_prompt_sha256 = hashlib.sha256(
+            system_prompt.encode("utf-8")
+        ).hexdigest()
         runtime_session = ProductionRuntime().open_session(
             session=session,
             user=user,
@@ -753,7 +796,7 @@ async def process_tool_call_canary_ingress(
             ),
         )
         result = await adapter.run_canary_turn(
-            system_prompt=canary_system_prompt(),
+            system_prompt=system_prompt,
             user_text=(
                 ordered_user_messages[0]
                 if len(ordered_user_messages) == 1
@@ -869,6 +912,7 @@ async def process_tool_call_canary_ingress(
             tenant_id=resolution.binding.tenant_id,
             user_id=str(getattr(user, "id", "") or ""),
             conversation_id=canonical_conversation_id,
+            system_prompt_sha256=rendered_prompt_sha256,
         )
         if failure.messages_enabled:
             return failure.outcome()
@@ -3546,12 +3590,46 @@ def _ordered_user_messages(
     return normalized
 
 
+def _ordered_message_times(
+    *,
+    message_count: int,
+    message_occurred_at: Any | None,
+    message_occurred_ats: tuple[Any, ...],
+) -> tuple[Any, ...] | None:
+    """Keep provider-ingress times aligned with the exact message fragments.
+
+    A missing timestamp is tolerated for existing non-weekly capabilities.  A
+    weekly operation with a relative date will later fail closed instead of
+    silently using its possibly delayed processing time.
+    """
+
+    values = tuple(message_occurred_ats)
+    if values:
+        if message_occurred_at is not None or len(values) != message_count:
+            raise ValueError(
+                "message occurrence times must match current user messages"
+            )
+        return values
+    if message_occurred_at is None:
+        return None
+    if message_count != 1:
+        raise ValueError(
+            "one message occurrence time cannot bind multiple user messages"
+        )
+    return (message_occurred_at,)
+
+
 def _runtime_attestation(settings: object) -> CanaryRuntimeAttestation:
+    allowed_tool_names = frozenset(
+        runtime_registry_tool_names(settings)
+    )
     return CanaryRuntimeAttestation(
         runtime_ready=True,
         runtime_mode="canary_execute",
         registry_digest=runtime_registry_contract_digest(settings),
-        prompt_sha256=canary_prompt_sha256(),
+        prompt_sha256=canary_prompt_sha256(
+            allowed_tool_names=allowed_tool_names
+        ),
         model_name=CANARY_MODEL_NAME,
         production_database_verified=_production_database_declared(settings),
         sandbox_configuration_present=any(

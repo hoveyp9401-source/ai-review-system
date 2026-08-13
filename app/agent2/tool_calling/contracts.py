@@ -38,7 +38,14 @@ class StrictContract(BaseModel):
 NonEmptyText = Annotated[str, Field(min_length=1, max_length=4000)]
 DateExpression = Annotated[str, Field(min_length=1, max_length=128)]
 ItemId = Annotated[str, Field(min_length=1, max_length=256)]
+WeeklyPlanOperationId = Annotated[str, Field(min_length=1, max_length=128)]
 ReportField = Literal["today_work", "problems", "tomorrow_plan"]
+PeriodicReportField = Literal[
+    "accomplishments",
+    "risks",
+    "next_plan",
+    "metrics",
+]
 PersonalMemoryKey = Literal[
     "assistant.preferred_name",
     "response.verbosity",
@@ -77,6 +84,23 @@ class DailyReportDateEvidence(CurrentUserMessageEvidence):
     ]
 
 
+class WeeklyPlanExplicitDateEvidence(CurrentUserMessageEvidence):
+    """One complete current-message clause that binds a formal plan date."""
+
+    exact_clause_quote: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=2000,
+            description=(
+                "Exact complete current-message clause containing both the "
+                "weekly day expression and the asserted plan matter. Do not "
+                "quote only a weekday or cut text out of an ambiguous clause."
+            ),
+        ),
+    ]
+
+
 class PersonalMemorySourceEvidence(CurrentUserMessageEvidence):
     intent: Literal[
         "explicit_preference",
@@ -90,6 +114,177 @@ class PersonalMemorySourceEvidence(CurrentUserMessageEvidence):
 
 class QueryTodayReportArgs(StrictContract):
     pass
+
+
+class QueryCurrentWeeklyReportArgs(StrictContract):
+    """The authenticated owner and current ISO week come only from the server."""
+
+
+class _PeriodicWeeklyOperation(StrictContract):
+    operation_id: Annotated[str, Field(min_length=1, max_length=128)]
+    source_evidence: CurrentUserMessageEvidence
+
+
+class PeriodicWeeklyAppendOperation(_PeriodicWeeklyOperation):
+    operation: Literal["append"]
+    field: PeriodicReportField
+    content: NonEmptyText
+
+
+class PeriodicWeeklyEditOperation(_PeriodicWeeklyOperation):
+    operation: Literal["edit"]
+    item_id: ItemId
+    replacement: NonEmptyText
+
+
+class PeriodicWeeklyDeleteOperation(_PeriodicWeeklyOperation):
+    operation: Literal["delete"]
+    item_id: ItemId
+
+
+PeriodicWeeklyOperation = Annotated[
+    PeriodicWeeklyAppendOperation
+    | PeriodicWeeklyEditOperation
+    | PeriodicWeeklyDeleteOperation,
+    Field(discriminator="operation"),
+]
+
+
+class ApplyCurrentWeeklyReportArgs(StrictContract):
+    report_id: UUID
+    expected_version: int = Field(ge=0)
+    operations: tuple[PeriodicWeeklyOperation, ...] = Field(
+        min_length=1,
+        max_length=50,
+    )
+
+    @field_validator("operations")
+    @classmethod
+    def operation_ids_must_be_unique(
+        cls,
+        value: tuple[PeriodicWeeklyOperation, ...],
+    ) -> tuple[PeriodicWeeklyOperation, ...]:
+        operation_ids = tuple(item.operation_id for item in value)
+        if len(operation_ids) != len(set(operation_ids)):
+            raise ValueError("periodic weekly operation IDs must be unique")
+        return value
+
+
+class SubmitCurrentWeeklyReportArgs(StrictContract):
+    report_id: UUID
+    expected_version: int = Field(ge=0)
+    confirmation_evidence: CurrentUserMessageEvidence
+
+
+class QueryNextWeeklyPlanArgs(StrictContract):
+    """Select one exact weekly-plan target; omit only for one-target compatibility."""
+
+    plan_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Stable plan_id copied from weekly_plan_targets. It may be omitted only "
+            "when trusted context exposes exactly one weekly-plan target; with multiple "
+            "targets the model must select and provide the intended trusted plan_id."
+        ),
+    )
+
+
+class _WeeklyPlanOperation(StrictContract):
+    operation_id: WeeklyPlanOperationId
+    source_evidence: CurrentUserMessageEvidence
+
+
+class WeeklyPlanAddOperation(_WeeklyPlanOperation):
+    source_evidence: WeeklyPlanExplicitDateEvidence
+    operation: Literal["add"]
+    plan_date: date
+    content: NonEmptyText
+
+
+class WeeklyPlanEditOperation(_WeeklyPlanOperation):
+    operation: Literal["edit"]
+    item_id: ItemId
+    content: NonEmptyText
+
+
+class WeeklyPlanMoveOperation(_WeeklyPlanOperation):
+    source_evidence: WeeklyPlanExplicitDateEvidence
+    operation: Literal["move"]
+    item_id: ItemId
+    target_plan_date: date
+
+
+class WeeklyPlanDeleteOperation(_WeeklyPlanOperation):
+    operation: Literal["delete"]
+    item_id: ItemId
+
+
+class WeeklyPlanSetDayEmptyOperation(_WeeklyPlanOperation):
+    source_evidence: WeeklyPlanExplicitDateEvidence
+    operation: Literal["set_day_empty"]
+    plan_date: date
+
+
+class WeeklyPlanAcceptSuggestionOperation(_WeeklyPlanOperation):
+    source_evidence: WeeklyPlanExplicitDateEvidence
+    operation: Literal["accept_suggestion"]
+    suggestion_id: ItemId
+    plan_date: date
+
+
+class WeeklyPlanRejectSuggestionOperation(_WeeklyPlanOperation):
+    operation: Literal["reject_suggestion"]
+    suggestion_id: ItemId
+
+
+class WeeklyPlanCaptureSuggestionOperation(_WeeklyPlanOperation):
+    """Capture an explicitly next-week matter whose day is still undecided."""
+
+    operation: Literal["capture_suggestion"]
+    content: NonEmptyText
+
+
+WeeklyPlanOperation = Annotated[
+    WeeklyPlanAddOperation
+    | WeeklyPlanEditOperation
+    | WeeklyPlanMoveOperation
+    | WeeklyPlanDeleteOperation
+    | WeeklyPlanSetDayEmptyOperation
+    | WeeklyPlanAcceptSuggestionOperation
+    | WeeklyPlanRejectSuggestionOperation
+    | WeeklyPlanCaptureSuggestionOperation,
+    Field(discriminator="operation"),
+]
+
+
+class ApplyNextWeeklyPlanArgs(StrictContract):
+    """Write the selected exact weekly-plan target from trusted context."""
+
+    plan_id: UUID
+    expected_version: int = Field(ge=0)
+    operations: tuple[WeeklyPlanOperation, ...] = Field(
+        min_length=1,
+        max_length=50,
+    )
+
+    @field_validator("operations")
+    @classmethod
+    def operation_ids_must_be_unique(
+        cls,
+        value: tuple[WeeklyPlanOperation, ...],
+    ) -> tuple[WeeklyPlanOperation, ...]:
+        operation_ids = tuple(item.operation_id for item in value)
+        if len(operation_ids) != len(set(operation_ids)):
+            raise ValueError("weekly plan operation IDs must be unique")
+        return value
+
+
+class SubmitNextWeeklyPlanArgs(StrictContract):
+    """Submit the selected exact weekly-plan target from trusted context."""
+
+    plan_id: UUID
+    expected_version: int = Field(ge=0)
+    confirmation_evidence: CurrentUserMessageEvidence
 
 
 class QueryReportByDateArgs(StrictContract):

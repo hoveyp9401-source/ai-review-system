@@ -486,6 +486,8 @@ async def dingtalk_webhook(
             settings=settings,
             llm_client=ingress_llm_client,
             now=now_in_timezone(user.timezone or settings.timezone),
+            conversation_kind=incoming.conversation_kind,
+            message_occurred_at=event.received_at,
         )
         if tool_call_canary.handled:
             agent2_result = Agent2DailyExecutionResult(

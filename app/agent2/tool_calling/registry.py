@@ -2,34 +2,41 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Literal, Mapping
+from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
 
 from app.agent2.tool_calling import production_handlers
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
+    ApplyCurrentWeeklyReportArgs,
+    ApplyNextWeeklyPlanArgs,
     CompletePreviousPlanArgs,
     ConfirmClearReportArgs,
     ConfirmReportArgs,
-    CorrectDailyReportDateArgs,
     CopyPreviousToTodayArgs,
+    CorrectDailyReportDateArgs,
     DeleteDailyItemsArgs,
     EditDailyItemsArgs,
     ExecutionMode,
     ForgetPersonalMemoryArgs,
     MoveDailyItemsArgs,
+    QueryCurrentWeeklyReportArgs,
     QueryDailyBriefingFactsArgs,
     QueryDefendantPerformanceArgs,
     QueryManagedDailyReportsArgs,
+    QueryNextWeeklyPlanArgs,
     QueryPersonalMemoryArgs,
     QueryReportByDateArgs,
     QueryReportInsightsArgs,
     QueryTodayReportArgs,
     RememberPersonalMemoryArgs,
     RequestClearReportArgs,
+    SubmitCurrentWeeklyReportArgs,
+    SubmitNextWeeklyPlanArgs,
     ToolReceipt,
 )
 from app.agent2.tool_calling.handlers import (
@@ -88,6 +95,8 @@ TransactionTargetPolicy = Literal[
     "pending_report",
     "personal_memory",
     "source_and_target_reports",
+    "weekly_plan",
+    "periodic_report",
 ]
 
 
@@ -277,6 +286,151 @@ TOOL_REGISTRY = MappingProxyType(
             sandbox_handler=execute_query_today_report,
             production_handler=production_handlers.execute_query_today_report,
             shadow_handler=simulate_query,
+        ),
+        "query_current_weekly_report": _definition(
+            "query_current_weekly_report",
+            "Return the authenticated owner's retrospective Weekly Report for the "
+            "server-derived current ISO week, with stable item IDs and exact version. "
+            "Use for viewing, opening, or continuing 本周周报. This is the report of "
+            "work already done, risks, metrics, and follow-up plan; it is never the "
+            "Monday-to-Saturday 下周工作计划. The model supplies no owner, week, or date.",
+            QueryCurrentWeeklyReportArgs,
+            "read",
+            "low",
+            "authenticated_owner_current_weekly_report",
+            "server_current_week_owner_periodic_report",
+            "server_current_iso_week_in_user_timezone",
+            transaction_target="read_only",
+            production_handler=(
+                production_handlers.execute_query_current_weekly_report
+            ),
+            enabled_modes=frozenset({ExecutionMode.CANARY_EXECUTE}),
+        ),
+        "apply_current_weekly_report": _definition(
+            "apply_current_weekly_report",
+            "Apply one ordered atomic batch of append, edit, or delete operations to "
+            "the authenticated owner's retrospective Weekly Report for the exact "
+            "server-derived current week. Copy the trusted report_id/version and stable "
+            "item IDs. New or replacement text must be copied from the current user "
+            "message. Never use for a daily report or the Monday-to-Saturday 下周工作计划.",
+            ApplyCurrentWeeklyReportArgs,
+            "write",
+            "medium",
+            "authenticated_owner_current_weekly_report",
+            "trusted_current_week_periodic_report_version_and_items",
+            "server_current_iso_week_in_user_timezone",
+            idempotency=_WRITE_KEY,
+            transaction="same_periodic_report_atomic",
+            transaction_target="periodic_report",
+            production_handler=(
+                production_handlers.execute_apply_current_weekly_report
+            ),
+            conflict="broad_target",
+            enabled_modes=frozenset({ExecutionMode.CANARY_EXECUTE}),
+        ),
+        "submit_current_weekly_report": _definition(
+            "submit_current_weekly_report",
+            "Submit the authenticated owner's retrospective Weekly Report for the "
+            "exact server-derived current week only when the current user message "
+            "explicitly confirms submission. Copy trusted report_id/version. This does "
+            "not submit a daily report or a 下周工作计划.",
+            SubmitCurrentWeeklyReportArgs,
+            "write",
+            "medium",
+            "authenticated_owner_current_weekly_report",
+            "trusted_current_week_periodic_report_version",
+            "server_current_iso_week_in_user_timezone",
+            confirmation="formal_current_turn_confirmation_call",
+            idempotency=_WRITE_KEY,
+            transaction="same_periodic_report_atomic",
+            transaction_target="periodic_report",
+            production_handler=(
+                production_handlers.execute_submit_current_weekly_report
+            ),
+            conflict="broad_target",
+            enabled_modes=frozenset({ExecutionMode.CANARY_EXECUTE}),
+        ),
+        "query_next_weekly_plan": _definition(
+            "query_next_weekly_plan",
+            "Return the authenticated owner's selected server-bound Monday-to-Saturday "
+            "Weekly Work Plan, including stable plan, day, item and suggestion identifiers "
+            "and the exact current version. Trusted context can expose multiple exact "
+            "targets: active_collection may be the current week open for Monday late fill, "
+            "while natural_next may be the following week. This legacy tool name does not "
+            "make every target 'next week'. It never queries a retrospective Weekly Report. "
+            "When multiple exact targets exist, the model must copy the selected trusted "
+            "plan_id; omission is allowed only for one-target compatibility. The model never "
+            "supplies an owner ID or guesses the target week.",
+            QueryNextWeeklyPlanArgs,
+            "read",
+            "low",
+            "authenticated_owner_weekly_plan_read",
+            "server_bound_owner_next_weekly_plan",
+            "server_next_week_monday_in_user_timezone",
+            transaction_target="read_only",
+            production_handler=(
+                production_handlers.execute_query_next_weekly_plan
+            ),
+            enabled_modes=frozenset({ExecutionMode.CANARY_EXECUTE}),
+        ),
+        "apply_next_weekly_plan": _definition(
+            "apply_next_weekly_plan",
+            "Apply one ordered, atomic batch of additions, edits, moves, deletions, explicit "
+            "empty-day decisions, undated target-week suggestion captures, suggestion "
+            "acceptances, or suggestion rejections to the "
+            "authenticated owner's selected exact weekly-plan target. Trusted context may "
+            "contain multiple exact active_collection and natural_next targets, including "
+            "current-week Monday late fill and a following-week plan. This is a legacy tool "
+            "name: choose semantically, then copy that target's plan_id and exact version. "
+            "Never use this tool for a retrospective Weekly Report. Every operation uses "
+            "stable identifiers, and every operation carries current-message evidence. New "
+            "or replacement content must come from that current user message; conversation "
+            "history may bind existing targets but cannot supply new content. Execute all "
+            "operations or none, and never infer a missing target or day. Every operation "
+            "that assigns a formal day must cite one complete exact current-message clause "
+            "containing that day and matter so the server can independently verify the date. "
+            "For capture_suggestion, content must be one exact contiguous excerpt from the "
+            "current user message, including any alternative days or uncertainty qualifiers; "
+            "never summarize or normalize it.",
+            ApplyNextWeeklyPlanArgs,
+            "write",
+            "medium",
+            "authenticated_owner_weekly_plan_write",
+            "trusted_weekly_plan_version_and_operations",
+            "trusted_exact_plan_dates_within_next_week",
+            idempotency=_WRITE_KEY,
+            transaction="same_weekly_plan_atomic",
+            transaction_target="weekly_plan",
+            production_handler=(
+                production_handlers.execute_apply_next_weekly_plan
+            ),
+            conflict="broad_target",
+            enabled_modes=frozenset({ExecutionMode.CANARY_EXECUTE}),
+        ),
+        "submit_next_weekly_plan": _definition(
+            "submit_next_weekly_plan",
+            "Submit the authenticated owner's selected exact weekly-plan target only when "
+            "the current user message explicitly confirms that target's complete preview. "
+            "Trusted context may expose multiple exact active_collection and natural_next "
+            "targets. This legacy tool name does not force the following week: copy the "
+            "selected target's stable plan_id and exact version. Never submit or alter a "
+            "retrospective Weekly Report with this tool, and do not reconstruct, add, or alter "
+            "plan content while submitting.",
+            SubmitNextWeeklyPlanArgs,
+            "write",
+            "medium",
+            "authenticated_owner_weekly_plan_write",
+            "trusted_weekly_plan_version_and_operations",
+            "trusted_next_week_snapshot",
+            confirmation="formal_current_turn_confirmation_call",
+            idempotency=_WRITE_KEY,
+            transaction="same_weekly_plan_atomic",
+            transaction_target="weekly_plan",
+            production_handler=(
+                production_handlers.execute_submit_next_weekly_plan
+            ),
+            conflict="broad_target",
+            enabled_modes=frozenset({ExecutionMode.CANARY_EXECUTE}),
         ),
         "query_report_by_date": _definition(
             "query_report_by_date",
@@ -798,7 +952,7 @@ def deepseek_tool_schemas(
     selected = set(TOOL_REGISTRY) if allowed_names is None else set(allowed_names)
     unknown = selected - set(TOOL_REGISTRY)
     if unknown:
-        raise UnknownToolError(sorted(unknown)[0])
+        raise UnknownToolError(min(unknown))
     return [
         {"type": "function", "function": {
             "name": item.tool_name, "description": item.description, "parameters": _thaw_json(item.input_schema),
@@ -855,7 +1009,7 @@ def registry_contract_digest(
     )
     unknown = selected_names - set(TOOL_REGISTRY)
     if unknown:
-        raise UnknownToolError(sorted(unknown)[0])
+        raise UnknownToolError(min(unknown))
     payload = {
         name: {
             "description": definition.description,
@@ -949,6 +1103,26 @@ def runtime_registry_tool_names(
             ).strip()
         )
     )
+    weekly_plan_read_enabled = bool(
+        getattr(settings, "agent2_weekly_plan_enabled", False)
+    )
+    weekly_plan_write_enabled = (
+        weekly_plan_read_enabled
+        and bool(
+            getattr(
+                settings,
+                "agent2_weekly_plan_write_enabled",
+                False,
+            )
+        )
+    )
+    current_weekly_report_enabled = bool(
+        getattr(
+            settings,
+            "agent2_current_weekly_report_enabled",
+            False,
+        )
+    )
     return tuple(
         name
         for name, definition in TOOL_REGISTRY.items()
@@ -962,6 +1136,21 @@ def runtime_registry_tool_names(
                 definition.permission_policy
                 != "authenticated_tenant_performance_read"
                 or performance_read_enabled
+            )
+            and (
+                definition.permission_policy
+                != "authenticated_owner_weekly_plan_read"
+                or weekly_plan_read_enabled
+            )
+            and (
+                definition.permission_policy
+                != "authenticated_owner_weekly_plan_write"
+                or weekly_plan_write_enabled
+            )
+            and (
+                definition.permission_policy
+                != "authenticated_owner_current_weekly_report"
+                or current_weekly_report_enabled
             )
         )
     )

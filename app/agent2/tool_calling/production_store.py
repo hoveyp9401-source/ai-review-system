@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-import hashlib
-import json
 from typing import Any
-import uuid
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
@@ -22,18 +22,31 @@ from sqlalchemy import (
     or_,
     select,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from app.agent2.business.models import PeriodicReportCommandReceipt
+from app.agent2.memory import (
+    PreferredSalutationValue,
+    validate_personal_memory_value,
+)
+from app.agent2.memory.postgres import (
+    PersonalMemoryAuditRecord,
+    PersonalMemoryRecord,
+)
+from app.agent2.personal_memory_reply import (
+    strip_server_rendered_salutations,
+)
 from app.agent2.tool_calling.assembly import TrustedContextRequest
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedClearPending,
     TrustedRecentMessage,
     TrustedRecentOperation,
-    TrustedReportReference,
     TrustedReportItem,
+    TrustedReportReference,
     TrustedReportSnapshot,
 )
 from app.agent2.tool_calling.outbound_context import (
@@ -46,18 +59,11 @@ from app.agent2.tool_calling.turn_batching import (
     is_recoverable_ingress_payload,
 )
 from app.agent2.tool_calling.validation import DateResolution
-from app.agent2.memory import (
-    PreferredSalutationValue,
-    validate_personal_memory_value,
-)
-from app.agent2.memory.postgres import (
-    PersonalMemoryAuditRecord,
-    PersonalMemoryRecord,
-)
-from app.agent2.personal_memory_reply import (
-    strip_server_rendered_salutations,
-)
 from app.agent2.typed_daily_executor import build_typed_daily_snapshot
+from app.agent2.weekly_plan_access import (
+    WeeklyPlanAccessAction,
+    WeeklyPlanAccessPolicy,
+)
 from app.db import Base
 from app.models import (
     Agent2DailyCommandReceipt,
@@ -68,14 +74,32 @@ from app.models import (
 )
 from app.services.dingtalk import extract_voice_text
 
-
 _RECENT_MESSAGE_MAX_AGE = timedelta(hours=2)
 _SCHEDULED_OUTBOUND_MAX_AGE = timedelta(hours=16)
 _RECENT_OPERATION_MAX_AGE = timedelta(hours=2)
 
 
+def _strict_ascii_allowlist(raw: object) -> frozenset[str]:
+    """Parse configuration without normalizing an unsafe identity value."""
+
+    if not isinstance(raw, str) or not raw:
+        return frozenset()
+    values = raw.split(",")
+    if any(
+        not value
+        or value != value.strip()
+        or not value.isascii()
+        or any(character.isspace() for character in value)
+        for value in values
+    ):
+        # One malformed entry invalidates the whole list.  Partially applying an
+        # identity allowlist would make the production scope hard to reason about.
+        return frozenset({"__invalid_weekly_plan_allowlist__"})
+    return frozenset(values)
+
+
 def _trusted_report_reference_from_receipt(
-    row: "ToolCallCanaryReceipt",
+    row: ToolCallCanaryReceipt,
 ) -> TrustedReportReference | None:
     if (
         row.status not in {"success", "no_op"}
@@ -586,6 +610,16 @@ class ProductionContextStore:
             == "authenticated_tenant_performance_read"
         ):
             return self._performance_read_allowed(request)
+        if definition.permission_policy in {
+            "authenticated_owner_weekly_plan_read",
+            "authenticated_owner_weekly_plan_write",
+        }:
+            return self._weekly_plan_allowed(request, definition)
+        if (
+            definition.permission_policy
+            == "authenticated_owner_current_weekly_report"
+        ):
+            return self._current_weekly_report_allowed(request)
         return (
             request.tenant_id == self._tenant_id
             and request.user_id == self._user.id
@@ -607,6 +641,16 @@ class ProductionContextStore:
             == "authenticated_tenant_performance_read"
         ):
             return self._performance_read_allowed(request)
+        if definition.permission_policy in {
+            "authenticated_owner_weekly_plan_read",
+            "authenticated_owner_weekly_plan_write",
+        }:
+            return self._weekly_plan_allowed(request, definition)
+        if (
+            definition.permission_policy
+            == "authenticated_owner_current_weekly_report"
+        ):
+            return self._current_weekly_report_allowed(request)
         return (
             request.tenant_id == self._tenant_id
             and request.user_id == self._user.id
@@ -675,6 +719,108 @@ class ProductionContextStore:
                 or ""
             ).strip()
             == request.tenant_id
+        )
+
+    def _weekly_plan_allowed(
+        self,
+        request: TrustedContextRequest,
+        definition: ToolDefinition,
+    ) -> bool:
+        if (
+            request.tenant_id != self._tenant_id
+            or request.user_id != self._user.id
+            or not bool(self._user.active)
+            or self._settings is None
+        ):
+            return False
+        policy = WeeklyPlanAccessPolicy(
+            enabled=getattr(
+                self._settings,
+                "agent2_weekly_plan_enabled",
+                False,
+            ),
+            write_enabled=getattr(
+                self._settings,
+                "agent2_weekly_plan_write_enabled",
+                False,
+            ),
+            send_enabled=getattr(
+                self._settings,
+                "agent2_weekly_plan_send_enabled",
+                False,
+            ),
+            tenant_allowlist=_strict_ascii_allowlist(
+                getattr(
+                    self._settings,
+                    "agent2_weekly_plan_tenant_allowlist",
+                    "",
+                )
+            ),
+            user_allowlist=_strict_ascii_allowlist(
+                getattr(
+                    self._settings,
+                    "agent2_weekly_plan_user_allowlist",
+                    "",
+                )
+            ),
+            send_user_allowlist=_strict_ascii_allowlist(
+                getattr(
+                    self._settings,
+                    "agent2_weekly_plan_send_user_allowlist",
+                    "",
+                )
+            ),
+        )
+        action = (
+            WeeklyPlanAccessAction.WRITE
+            if definition.permission_policy
+            == "authenticated_owner_weekly_plan_write"
+            else WeeklyPlanAccessAction.READ
+        )
+        return policy.decide(
+            action=action,
+            tenant_id=request.tenant_id,
+            user_id=str(request.user_id),
+            conversation_kind=request.conversation_kind,
+        ).allowed
+
+    def _current_weekly_report_allowed(
+        self,
+        request: TrustedContextRequest,
+    ) -> bool:
+        if (
+            request.tenant_id != self._tenant_id
+            or request.user_id != self._user.id
+            or not bool(self._user.active)
+            or request.conversation_kind != "direct"
+            or self._settings is None
+            or getattr(
+                self._settings,
+                "agent2_current_weekly_report_enabled",
+                False,
+            )
+            is not True
+        ):
+            return False
+        tenant_allowlist = _strict_ascii_allowlist(
+            getattr(
+                self._settings,
+                "agent2_current_weekly_report_tenant_allowlist",
+                "",
+            )
+        )
+        user_allowlist = _strict_ascii_allowlist(
+            getattr(
+                self._settings,
+                "agent2_current_weekly_report_user_allowlist",
+                "",
+            )
+        )
+        if len(tenant_allowlist) != 1 or len(user_allowlist) != 1:
+            return False
+        return bool(
+            request.tenant_id in tenant_allowlist
+            and str(request.user_id) in user_allowlist
         )
 
     async def _load_snapshot(
@@ -851,6 +997,8 @@ async def capture_production_state(
     tenant_id: str,
     user_id: uuid.UUID,
     conversation_id: str,
+    include_weekly_plan: bool = False,
+    include_periodic_report: bool = False,
 ) -> ProductionStateSnapshot:
     reports = list(
         (
@@ -907,10 +1055,58 @@ async def capture_production_state(
             )
         ).all()
     )
+    weekly_plans: list[dict[str, Any]] = []
+    if include_weekly_plan:
+        from app.agent2.weekly_plan_store import weekly_plan_state_payload
+
+        weekly_plans = await weekly_plan_state_payload(
+            session,
+            tenant_id=tenant_id,
+            owner_user_id=str(user_id),
+        )
+    periodic_reports: list[dict[str, Any]] = []
+    if include_periodic_report:
+        from app.agent2.business.models import PeriodicReport
+
+        rows = list(
+            (
+                await session.scalars(
+                    select(PeriodicReport)
+                    .where(
+                        PeriodicReport.tenant_id == tenant_id,
+                        PeriodicReport.owner_user_id == str(user_id),
+                        PeriodicReport.report_type == "weekly",
+                    )
+                    .order_by(
+                        PeriodicReport.period_key,
+                        PeriodicReport.report_id,
+                    )
+                )
+            ).all()
+        )
+        periodic_reports = [
+            {
+                "report_id": str(row.report_id),
+                "report_type": str(row.report_type),
+                "period_key": str(row.period_key),
+                "sections": row.sections_json or {},
+                "item_ids": row.item_ids_json or {},
+                "status": str(row.status),
+                "version": int(row.version),
+                "submitted_at": (
+                    row.submitted_at.astimezone(UTC).isoformat()
+                    if row.submitted_at is not None
+                    else None
+                ),
+            }
+            for row in rows
+        ]
     payload = {
         "tenant_id": tenant_id,
         "user_id": str(user_id),
         "conversation_id": conversation_id,
+        "weekly_plans": weekly_plans,
+        "periodic_reports": periodic_reports,
         "daily_reports": [
             {
                 "report_id": str(report.id),
@@ -1036,11 +1232,11 @@ async def load_typed_receipts(
     *,
     tenant_id: str,
     receipt_ids: tuple[str, ...],
-) -> tuple[Agent2DailyCommandReceipt, ...]:
+) -> tuple[Any, ...]:
     if not receipt_ids:
         return ()
     parsed_ids = tuple(uuid.UUID(value) for value in receipt_ids)
-    rows = list(
+    daily_rows = list(
         (
             await session.scalars(
                 select(Agent2DailyCommandReceipt).where(
@@ -1050,7 +1246,26 @@ async def load_typed_receipts(
             )
         ).all()
     )
-    return tuple(rows)
+    found_ids = {row.receipt_id for row in daily_rows}
+    missing_ids = tuple(value for value in parsed_ids if value not in found_ids)
+    periodic_rows = (
+        list(
+            (
+                await session.scalars(
+                    select(PeriodicReportCommandReceipt).where(
+                        PeriodicReportCommandReceipt.tenant_id == tenant_id,
+                        PeriodicReportCommandReceipt.receipt_id.in_(missing_ids),
+                    )
+                )
+            ).all()
+        )
+        if missing_ids
+        else []
+    )
+    by_id = {
+        row.receipt_id: row for row in (*daily_rows, *periodic_rows)
+    }
+    return tuple(by_id[value] for value in parsed_ids if value in by_id)
 
 
 def trusted_snapshot_from_report(

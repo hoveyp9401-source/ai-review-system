@@ -8,7 +8,7 @@ import json
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -24,6 +24,8 @@ class DingTalkIncomingMessage:
     conversation_id: str | None
     source: str
     session_webhook: str | None = None
+    conversation_kind: Literal["direct", "group", "unknown"] = "unknown"
+    bot_was_mentioned: bool | None = None
 
 
 class DingTalkPayloadError(ValueError):
@@ -213,6 +215,17 @@ def parse_incoming_message(payload: dict[str, Any]) -> DingTalkIncomingMessage:
     if not text and msg_type not in ("audio", "voice"):
         raise DingTalkPayloadError("Message text is empty.")
 
+    conversation_kind = normalize_dingtalk_conversation_kind(
+        payload.get("conversationType")
+        or payload.get("conversation_type")
+    )
+    mention_value = payload.get("isInAtList")
+    bot_was_mentioned = (
+        mention_value
+        if isinstance(mention_value, bool)
+        else None
+    )
+
     return DingTalkIncomingMessage(
         dingtalk_user_id=str(sender_id),
         text=text,
@@ -220,7 +233,29 @@ def parse_incoming_message(payload: dict[str, Any]) -> DingTalkIncomingMessage:
         conversation_id=payload.get("conversationId") or payload.get("conversation_id") or payload.get("openConversationId"),
         source=f"dingtalk_{event_type or msg_type}",
         session_webhook=payload.get("sessionWebhook"),
+        conversation_kind=conversation_kind,
+        bot_was_mentioned=bot_was_mentioned,
     )
+
+
+def normalize_dingtalk_conversation_kind(
+    provider_value: Any,
+) -> Literal["direct", "group", "unknown"]:
+    """Keep DingTalk's scene as a trusted transport fact.
+
+    DingTalk uses 1 for a one-to-one conversation and 2 for a group.  Missing
+    metadata stays unknown so a private-only feature can fail closed instead
+    of guessing from a conversation ID or reply webhook.
+    """
+
+    if provider_value is None or str(provider_value).strip() == "":
+        return "unknown"
+    normalized = str(provider_value).strip().lower()
+    if normalized in {"1", "single", "direct", "private"}:
+        return "direct"
+    if normalized in {"2", "group"}:
+        return "group"
+    raise DingTalkPayloadError("Unsupported DingTalk conversation type.")
 
 
 def build_idempotency_key(payload: dict[str, Any], message: DingTalkIncomingMessage) -> str:
