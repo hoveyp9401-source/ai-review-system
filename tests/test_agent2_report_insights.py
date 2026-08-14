@@ -5,12 +5,13 @@ from uuid import UUID
 
 import pytest
 
-from app.agent2.knowledge_resolver import KnowledgeQuery
 from app.agent2.assistant_responder import AssistantReply
 from app.agent2.assistant_tools import build_tool_assisted_reply
-from app.agent2.context_pack import KnowledgeEvidenceFrame, build_agent2_context_pack
 from app.agent2.cognitive_reply_v3 import build_cognitive_side_reply_v3
+from app.agent2.context_pack import KnowledgeEvidenceFrame, build_agent2_context_pack
+from app.agent2.knowledge_resolver import KnowledgeQuery
 from app.agent2.report_insight_intent import is_report_insight_question
+from app.agent2.report_insight_query import StructuredReportInsightQuery
 from app.agent2.report_insights import (
     InMemoryReportInsightRepository,
     ReportInsightAnswer,
@@ -223,6 +224,227 @@ async def test_department_head_can_summarize_named_team_current_week_work():
     assert "陈晨：组织办公区域安全检查" in answer.text
     assert "上周工作不应出现" not in answer.text
     assert "其他部门工作不应出现" not in answer.text
+
+
+@pytest.mark.asyncio
+async def test_team_week_summary_keeps_the_same_work_recorded_on_different_days():
+    repository = InMemoryReportInsightRepository(
+        teams=[
+            {
+                "id": "team-admin",
+                "name": "综合管理部",
+                "department_name": "法务中心",
+            }
+        ],
+        users=[
+            {
+                "id": "u-manager",
+                "name": "负责人",
+                "team_id": "team-admin",
+                "role": "department_head",
+            },
+            {
+                "id": "u-pang",
+                "name": "庞浩",
+                "team_id": "team-admin",
+                "role": "member",
+            },
+        ],
+        reports=[
+            {
+                "id": "monday",
+                "user_id": "u-pang",
+                "date": "2026-08-10",
+                "status": "completed",
+                "today_work": ["日常用印审核"],
+            },
+            {
+                "id": "tuesday",
+                "user_id": "u-pang",
+                "date": "2026-08-11",
+                "status": "completed",
+                "today_work": ["日常用印审核"],
+            },
+        ],
+    )
+    module = ReportInsightModule(repository)
+    requester = SimpleNamespace(
+        id="u-manager",
+        name="负责人",
+        dingtalk_user_id="dt-manager",
+        team_id="team-admin",
+        role="department_head",
+    )
+
+    answer = await module.answer_query(
+        StructuredReportInsightQuery(
+            query="综合部本周都做了什么？",
+            query_kind="period_work",
+            scope_type="organization",
+            scope_name="综合管理部",
+            period_type="current_week",
+        ),
+        requester=requester,
+        current_date=date(2026, 8, 14),
+    )
+
+    assert answer is not None
+    assert [item["date"] for item in answer.evidence.facts["work_items"]] == [
+        "2026-08-11",
+        "2026-08-10",
+    ]
+    assert "2026-08-11（共 1 项）：" in answer.text
+    assert "2026-08-10（共 1 项）：" in answer.text
+    assert answer.text.count("庞浩：日常用印审核") == 2
+
+
+@pytest.mark.asyncio
+async def test_team_week_summary_covers_every_day_when_work_exceeds_the_old_preview_limit():
+    report_dates = (
+        "2026-08-10",
+        "2026-08-11",
+        "2026-08-12",
+        "2026-08-13",
+        "2026-08-14",
+    )
+    repository = InMemoryReportInsightRepository(
+        teams=[
+            {
+                "id": "team-admin",
+                "name": "综合管理部",
+                "department_name": "法务中心",
+            }
+        ],
+        users=[
+            {
+                "id": "u-manager",
+                "name": "负责人",
+                "team_id": "team-admin",
+                "role": "department_head",
+            },
+            {
+                "id": "u-pang",
+                "name": "庞浩",
+                "team_id": "team-admin",
+                "role": "member",
+            },
+        ],
+        reports=[
+            {
+                "id": f"report-{report_date}",
+                "user_id": "u-pang",
+                "date": report_date,
+                "status": "completed",
+                "today_work": [
+                    f"{report_date}工作事项{index}" for index in range(1, 5)
+                ],
+            }
+            for report_date in report_dates
+        ],
+    )
+    module = ReportInsightModule(repository)
+    requester = SimpleNamespace(
+        id="u-manager",
+        name="负责人",
+        dingtalk_user_id="dt-manager",
+        team_id="team-admin",
+        role="department_head",
+    )
+
+    answer = await module.answer_query(
+        StructuredReportInsightQuery(
+            query="综合部本周都做了什么？",
+            query_kind="period_work",
+            scope_type="organization",
+            scope_name="综合管理部",
+            period_type="current_week",
+        ),
+        requester=requester,
+        current_date=date(2026, 8, 14),
+    )
+
+    assert answer is not None
+    assert len(answer.evidence.facts["work_items"]) == 20
+    for report_date in report_dates:
+        assert report_date in answer.text
+        assert f"{report_date}工作事项1" in answer.text
+    assert "共 20 项" in answer.text
+    assert "本次展示 16 项，另有 4 项未展开" in answer.text
+
+
+@pytest.mark.asyncio
+async def test_person_week_summary_keeps_repeated_work_and_covers_every_recorded_day():
+    repository = InMemoryReportInsightRepository(
+        teams=[
+            {
+                "id": "team-admin",
+                "name": "综合管理部",
+                "department_name": "法务中心",
+            }
+        ],
+        users=[
+            {
+                "id": "u-pang",
+                "name": "庞浩",
+                "team_id": "team-admin",
+                "role": "member",
+            }
+        ],
+        reports=[
+            {
+                "id": "wednesday",
+                "user_id": "u-pang",
+                "date": "2026-08-12",
+                "status": "completed",
+                "today_work": [
+                    "日常用印审核",
+                    *[f"周三工作事项{index}" for index in range(1, 10)],
+                ],
+            },
+            {
+                "id": "tuesday",
+                "user_id": "u-pang",
+                "date": "2026-08-11",
+                "status": "completed",
+                "today_work": ["日常用印审核"],
+            },
+            {
+                "id": "monday",
+                "user_id": "u-pang",
+                "date": "2026-08-10",
+                "status": "completed",
+                "today_work": ["日常用印审核"],
+            },
+        ],
+    )
+    module = ReportInsightModule(repository)
+    requester = SimpleNamespace(
+        id="u-pang",
+        name="庞浩",
+        dingtalk_user_id="dt-pang",
+        team_id="team-admin",
+        role="member",
+    )
+
+    answer = await module.answer_query(
+        StructuredReportInsightQuery(
+            query="我本周都做了什么？",
+            query_kind="recent_work",
+            scope_type="person",
+            scope_name="庞浩",
+            period_type="current_week",
+        ),
+        requester=requester,
+        current_date=date(2026, 8, 14),
+    )
+
+    assert answer is not None
+    assert len(answer.evidence.facts["work_items"]) == 12
+    assert "2026-08-11（共 1 项）：" in answer.text
+    assert "2026-08-10（共 1 项）：" in answer.text
+    assert answer.text.count("日常用印审核") == 3
+    assert "共 12 项" in answer.text
+    assert "本次展示 10 项，另有 2 项未展开" in answer.text
 
 
 @pytest.mark.asyncio

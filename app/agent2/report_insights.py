@@ -1316,6 +1316,16 @@ class ReportInsightModule:
         plan_items = _scoped_report_items(
             reports, "tomorrow_plan", user_names=user_names
         )
+        work_preview, work_date_counts = _balanced_scoped_work_preview(
+            work_items,
+            limit=16,
+        )
+        work_preview_lines = _work_preview_lines(
+            work_preview,
+            work_date_counts=work_date_counts,
+            include_user_name=True,
+        )
+        work_unshown_count = len(work_items) - len(work_preview)
         reporter_count = len(
             {str(_value(report, "user_id") or "") for report in reports}
         )
@@ -1324,8 +1334,13 @@ class ReportInsightModule:
                 f"根据 {start_date.isoformat()} 至 {end_date.isoformat()} 的日报，"
                 f"{scope_label}{period_label}共有 {reporter_count} 人、{len(reports)} 份记录。"
             ),
-            "主要工作：",
-            *(_scoped_numbered_lines(work_items, limit=16) or ["- 暂无已记录工作"]),
+            (
+                f"主要工作（共 {len(work_items)} 项，本次展示 {len(work_preview)} 项，"
+                f"另有 {work_unshown_count} 项未展开）："
+                if work_unshown_count
+                else f"主要工作（共 {len(work_items)} 项）："
+            ),
+            *(work_preview_lines or ["- 暂无已记录工作"]),
         ]
         if problem_items:
             lines.extend(
@@ -1351,6 +1366,11 @@ class ReportInsightModule:
                 "report_count": len(reports),
                 "reporter_count": reporter_count,
                 "work_items": work_items,
+                "work_item_count": len(work_items),
+                "work_preview_count": len(work_preview),
+                "work_unshown_count": work_unshown_count,
+                "work_preview_truncated": bool(work_unshown_count),
+                "work_date_counts": work_date_counts,
                 "problem_items": problem_items,
                 "plan_items": plan_items,
                 "permission_allowed": True,
@@ -1385,14 +1405,29 @@ class ReportInsightModule:
         work_items = _report_items(reports, "today_work")
         problem_items = _report_items(reports, "problems")
         plan_items = _report_items(reports, "tomorrow_plan")
+        work_preview, work_date_counts = _balanced_scoped_work_preview(
+            work_items,
+            limit=10,
+        )
+        work_preview_lines = _work_preview_lines(
+            work_preview,
+            work_date_counts=work_date_counts,
+            include_user_name=False,
+        )
+        work_unshown_count = len(work_items) - len(work_preview)
         lines = [
             (
                 f"根据 {start_date.isoformat()} 至 {end_date.isoformat()} 的"
                 f"{'日报' if permission_team_ids is None else '可查看范围内日报'}，"
                 f"{target_name}共有 {len(reports)} 份记录。"
             ),
-            "主要工作：",
-            *(_numbered_lines(work_items, limit=10) or ["- 暂无已记录工作"]),
+            (
+                f"主要工作（共 {len(work_items)} 项，本次展示 {len(work_preview)} 项，"
+                f"另有 {work_unshown_count} 项未展开）："
+                if work_unshown_count
+                else f"主要工作（共 {len(work_items)} 项）："
+            ),
+            *(work_preview_lines or ["- 暂无已记录工作"]),
         ]
         if problem_items:
             lines.extend(["问题/风险：", *_numbered_lines(problem_items, limit=6)])
@@ -1415,6 +1450,11 @@ class ReportInsightModule:
                 "report_count": len(reports),
                 "permission_scope_team_ids": sorted(permission_team_ids or ()),
                 "work_items": work_items,
+                "work_item_count": len(work_items),
+                "work_preview_count": len(work_preview),
+                "work_unshown_count": work_unshown_count,
+                "work_preview_truncated": bool(work_unshown_count),
+                "work_date_counts": work_date_counts,
                 "problem_items": problem_items,
                 "plan_items": plan_items,
                 "permission_allowed": True,
@@ -1639,7 +1679,7 @@ def _query_scope_matches_target(
 
 def _report_items(reports: Sequence[Any], field: str) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for report in reports:
         report_date = _as_date(_value(report, "report_date") or _value(report, "date"))
         values = _value(report, field) or ()
@@ -1647,12 +1687,14 @@ def _report_items(reports: Sequence[Any], field: str) -> list[dict[str, str]]:
             values = (values,)
         for value in values:
             item_text = str(value or "").strip()
-            if not item_text or item_text in seen:
+            report_date_text = report_date.isoformat() if report_date else ""
+            key = (report_date_text, item_text)
+            if not item_text or key in seen:
                 continue
-            seen.add(item_text)
+            seen.add(key)
             items.append(
                 {
-                    "date": report_date.isoformat() if report_date else "",
+                    "date": report_date_text,
                     "text": item_text,
                 }
             )
@@ -1675,7 +1717,7 @@ def _scoped_report_items(
     user_names: dict[str, str],
 ) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for report in reports:
         user_id = str(_value(report, "user_id") or "")
         report_date = _as_date(_value(report, "report_date") or _value(report, "date"))
@@ -1684,7 +1726,8 @@ def _scoped_report_items(
             values = (values,)
         for value in values:
             item_text = str(value or "").strip()
-            key = (user_id, item_text)
+            report_date_text = report_date.isoformat() if report_date else ""
+            key = (user_id, report_date_text, item_text)
             if not item_text or key in seen:
                 continue
             seen.add(key)
@@ -1692,7 +1735,7 @@ def _scoped_report_items(
                 {
                     "user_id": user_id,
                     "user_name": user_names.get(user_id, "未命名人员"),
-                    "date": report_date.isoformat() if report_date else "",
+                    "date": report_date_text,
                     "text": item_text,
                 }
             )
@@ -1708,6 +1751,88 @@ def _scoped_numbered_lines(items: Sequence[dict[str, str]], *, limit: int) -> li
         )
         for index, item in enumerate(items[:limit], start=1)
     ]
+
+
+def _balanced_scoped_work_preview(
+    items: Sequence[dict[str, str]],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, str]]] = {}
+    date_order: list[str] = []
+    for item in items:
+        report_date = str(item.get("date") or "")
+        if report_date not in groups:
+            groups[report_date] = []
+            date_order.append(report_date)
+        groups[report_date].append(item)
+
+    shown_by_date = {report_date: 0 for report_date in date_order}
+    remaining_slots = min(max(limit, 0), len(items))
+    while remaining_slots:
+        added = False
+        for report_date in date_order:
+            shown_count = shown_by_date[report_date]
+            if shown_count >= len(groups[report_date]):
+                continue
+            shown_by_date[report_date] = shown_count + 1
+            remaining_slots -= 1
+            added = True
+            if not remaining_slots:
+                break
+        if not added:
+            break
+
+    preview: list[dict[str, str]] = []
+    date_counts: list[dict[str, Any]] = []
+    for report_date in date_order:
+        date_items = groups[report_date]
+        shown_count = shown_by_date[report_date]
+        preview.extend(date_items[:shown_count])
+        date_counts.append(
+            {
+                "date": report_date,
+                "count": len(date_items),
+                "shown_count": shown_count,
+                "unshown_count": len(date_items) - shown_count,
+            }
+        )
+    return preview, date_counts
+
+
+def _work_preview_lines(
+    items: Sequence[dict[str, str]],
+    *,
+    work_date_counts: Sequence[dict[str, Any]],
+    include_user_name: bool,
+) -> list[str]:
+    lines: list[str] = []
+    item_number = 1
+    for date_count in work_date_counts:
+        report_date = str(date_count.get("date") or "")
+        total_count = int(date_count.get("count") or 0)
+        shown_count = int(date_count.get("shown_count") or 0)
+        unshown_count = int(date_count.get("unshown_count") or 0)
+        date_label = report_date or "日期未记录"
+        if unshown_count:
+            lines.append(
+                f"{date_label}（共 {total_count} 项，展示 {shown_count} 项）："
+            )
+        else:
+            lines.append(f"{date_label}（共 {total_count} 项）：")
+        for item in items:
+            if str(item.get("date") or "") != report_date:
+                continue
+            item_prefix = (
+                f"{item.get('user_name') or '未命名人员'}："
+                if include_user_name
+                else ""
+            )
+            lines.append(f"{item_number}. {item_prefix}{item['text']}")
+            item_number += 1
+        if unshown_count:
+            lines.append(f"- 该日另有 {unshown_count} 项未展开")
+    return lines
 
 
 @dataclass(frozen=True)

@@ -27,6 +27,12 @@ from app.agent2.admission_store_sql import (
     SqlAdmissionTicketStore,
 )
 from app.agent2.business.contracts import BusinessCommandError
+from app.services.state_machine import (
+    STATUS_COLLECTING,
+    STATUS_COMPLETED,
+    STATUS_PENDING_CONFIRMATION,
+    assess_daily_report_completeness,
+)
 
 
 TYPED_REPORT_VERSION_KEY = "_agent2_report_version"
@@ -387,6 +393,7 @@ async def execute_typed_agent2_daily_commands(
                     working,
                     exc.code,
                 )
+        execution = _with_projected_draft_status(execution)
         executions.append(execution)
         if execution.validation.status == "blocked":
             await _persist_execution_receipts(
@@ -477,8 +484,20 @@ async def execute_typed_agent2_daily_commands(
             ],
         )
 
-    received_at = datetime.now(
-        ZoneInfo(getattr(user, "timezone", None) or getattr(settings, "timezone", "Asia/Shanghai"))
+    local_timezone = ZoneInfo(
+        getattr(user, "timezone", None)
+        or getattr(settings, "timezone", "Asia/Shanghai")
+    )
+    received_at = (
+        execution_context.occurred_at.astimezone(local_timezone)
+        if execution_context.occurred_at is not None
+        else datetime.now(local_timezone)
+    )
+    completeness = assess_daily_report_completeness(
+        today_work=working.today_work,
+        problems=working.problems,
+        tomorrow_plan=working.tomorrow_plan,
+        acknowledged_empty_fields=working.acknowledged_empty_fields,
     )
     section_status = dict(getattr(existing, "section_status", None) or {})
     section_status[TYPED_REPORT_VERSION_KEY] = working.version
@@ -499,8 +518,8 @@ async def execute_typed_agent2_daily_commands(
             section_status.pop(status_key, None)
     preserve_existing_submission = (
         existing is not None
-        and before.status == "completed"
-        and working.status == "completed"
+        and before.status == STATUS_COMPLETED
+        and working.status == STATUS_COMPLETED
         and not any(
             command.command_type in {"reopen_report", "submit_report"}
             for command in commands
@@ -509,18 +528,25 @@ async def execute_typed_agent2_daily_commands(
     confirmation_type = (
         str(getattr(existing, "confirmation_type", "") or "user_confirmed")
         if preserve_existing_submission
-        else ("user_confirmed" if working.status == "completed" else "none")
+        else ("user_confirmed" if working.status == STATUS_COMPLETED else "none")
     )
     confirmed_by_user = (
         bool(getattr(existing, "confirmed_by_user", True))
         if preserve_existing_submission
-        else working.status == "completed"
+        else working.status == STATUS_COMPLETED
     )
-    pending_confirmation_at = (
-        getattr(existing, "pending_confirmation_at", None)
-        if preserve_existing_submission
-        else None
-    )
+    if preserve_existing_submission:
+        pending_confirmation_at = getattr(
+            existing,
+            "pending_confirmation_at",
+            None,
+        )
+    elif working.status == STATUS_PENDING_CONFIRMATION:
+        pending_confirmation_at = (
+            getattr(existing, "pending_confirmation_at", None) or received_at
+        )
+    else:
+        pending_confirmation_at = None
     auto_submit_at = (
         getattr(existing, "auto_submit_at", None)
         if preserve_existing_submission
@@ -536,7 +562,7 @@ async def execute_typed_agent2_daily_commands(
         problems=list(working.problems),
         tomorrow_plan=list(working.tomorrow_plan),
         emotion="",
-        completeness_score=_completeness(working),
+        completeness_score=completeness.completeness_score,
         status=working.status,
         section_status=section_status,
         llm_model=execution_context.runtime_label,
@@ -610,7 +636,12 @@ async def execute_typed_agent2_daily_commands(
         report_id=str(report.id),
         report_date=report_date,
         status=working.status,
-        message=("日报已提交。" if working.status == "completed" else "日报已更新。")
+        message=_mutation_result_lead(
+            status=working.status,
+            report_date=report_date,
+            occurred_at=received_at,
+            settings=settings,
+        )
         + "\n\n"
         + _query_result_message(report_date, working),
         report_saved=working != before,
@@ -705,6 +736,35 @@ def _execution_result(execution: TypedDailyCommandExecution, *, tenant_id: str) 
         "actual_write": execution.should_write_db,
         "audit": execution.audit.as_dict(),
     }
+
+
+def _with_projected_draft_status(
+    execution: TypedDailyCommandExecution,
+) -> TypedDailyCommandExecution:
+    """Keep content-command receipts and the persisted report in one state."""
+
+    if (
+        not execution.changed
+        or not execution.should_write_db
+        or execution.validation.status == "blocked"
+        or execution.command.command_type
+        in {"query_report", "reopen_report", "submit_report"}
+        or execution.after.status
+        not in {STATUS_COLLECTING, STATUS_PENDING_CONFIRMATION}
+    ):
+        return execution
+    assessment = assess_daily_report_completeness(
+        today_work=execution.after.today_work,
+        problems=execution.after.problems,
+        tomorrow_plan=execution.after.tomorrow_plan,
+        acknowledged_empty_fields=execution.after.acknowledged_empty_fields,
+    )
+    if execution.after.status == assessment.draft_status:
+        return execution
+    return replace(
+        execution,
+        after=replace(execution.after, status=assessment.draft_status),
+    )
 
 
 async def _persist_execution_receipts(
@@ -1083,7 +1143,10 @@ def _mutation_report_date(commands: Sequence[TypedDailyCommand], default: date) 
 def _query_result_message(report_date: date, snapshot: DailyReportMutationSnapshot) -> str:
     if not any((snapshot.today_work, snapshot.problems, snapshot.tomorrow_plan)) and not snapshot.acknowledged_empty_fields:
         return f"{report_date.isoformat()} 暂无日报内容。"
-    status_text = "已提交" if snapshot.status == "completed" else "填写中"
+    status_text = {
+        STATUS_COMPLETED: "已提交",
+        STATUS_PENDING_CONFIRMATION: "待确认",
+    }.get(snapshot.status, "填写中")
     lines = [f"{report_date.isoformat()} 日报（{status_text}）"]
     for field_name, title, values in (
         ("today_work", "今日工作", snapshot.today_work),
@@ -1123,10 +1186,49 @@ def _make_item_id(field_name: str, index: int, value: str) -> str:
     return f"di_{digest}"
 
 
-def _completeness(snapshot: DailyReportMutationSnapshot) -> float:
-    filled = sum(
-        bool(getattr(snapshot, field_name))
-        or field_name in snapshot.acknowledged_empty_fields
-        for field_name in REPORT_FIELD_ORDER
+def _mutation_result_lead(
+    *,
+    status: str,
+    report_date: date,
+    occurred_at: datetime,
+    settings: object,
+) -> str:
+    if status == STATUS_COMPLETED:
+        return "日报已提交。"
+    if status != STATUS_PENDING_CONFIRMATION:
+        return "日报已更新。"
+    return pending_confirmation_next_step(
+        report_date=report_date,
+        occurred_at=occurred_at,
+        settings=settings,
     )
-    return round(filled / 3, 4)
+
+
+def pending_confirmation_next_step(
+    *,
+    report_date: date,
+    occurred_at: datetime,
+    settings: object,
+) -> str:
+    if report_date == occurred_at.date():
+        return (
+            "日报已填写完整，当前为待确认状态。"
+            "如不再修改，系统会按现有规则于次日上午自动提交。"
+        )
+    summary_time = time(
+        int(getattr(settings, "summary_cron_hour", 9)),
+        int(getattr(settings, "summary_cron_minute", 0)),
+    )
+    if (
+        report_date == occurred_at.date() - timedelta(days=1)
+        and occurred_at.time().replace(tzinfo=None) < summary_time
+    ):
+        return (
+            "历史日报已补充完整，当前为待确认状态。"
+            "如不再修改，系统会按现有规则在今天晨报前自动提交；"
+            "本次没有代你确认或提交。"
+        )
+    return (
+        "历史日报已补充完整，当前为待确认状态。"
+        "请确认无误后再提交；本次没有代你确认或提交。"
+    )

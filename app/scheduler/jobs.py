@@ -31,6 +31,7 @@ from app.services.state_machine import (
     CONFIRMATION_AUTO_SUBMITTED_TIMEOUT,
     STATUS_COMPLETED,
     STATUS_PENDING_CONFIRMATION,
+    assess_daily_report_completeness,
 )
 from app.utils.time import now_in_timezone
 
@@ -90,6 +91,16 @@ async def remind_missing_reports(
             formal_roster,
             test_user_ids,
         )
+    reports_by_user = await _load_reports_by_user(
+        session,
+        report_date,
+        [user.id for user in missing_users],
+    )
+    missing_users = _filter_reminder_users(
+        missing_users,
+        reports_by_user,
+        report_date,
+    )
     target_users, skipped_real_users = _partition_reminder_users(missing_users, test_user_ids)
     requested_dry_run = bool(dry_run or getattr(settings, "reminder_dry_run", True))
     send_enabled = bool(getattr(settings, "reminder_send_enabled", False))
@@ -115,8 +126,6 @@ async def remind_missing_reports(
     dry_run_messages: list[dict[str, Any]] = []
     sent_user_ids = []
     sent_evidence_by_user: dict[Any, ReminderDispatchEvidence] = {}
-    reports_by_user = await _load_reports_by_user(session, report_date, [user.id for user in target_users])
-    target_users = _filter_reminder_users(target_users, reports_by_user, report_date)
     now = now_in_timezone(settings.timezone)
     preferred_salutations = await _load_preferred_salutations(
         session,
@@ -773,8 +782,12 @@ def _filter_reminder_users(users: list[User], reports_by_user: dict, report_date
     filtered = []
     for user in users:
         report = reports_by_user.get(user.id)
-        status = getattr(report, "status", None)
-        if status in {STATUS_COMPLETED, STATUS_PENDING_CONFIRMATION}:
+        if report is None:
+            filtered.append(user)
+            continue
+        if getattr(report, "status", None) == STATUS_COMPLETED:
+            continue
+        if _report_completeness(report).ready_for_confirmation:
             continue
         filtered.append(user)
     return filtered
@@ -957,13 +970,18 @@ def build_report_reminder_text(
             "可以和我说说今天主要做了什么、碰到了什么问题或风险、明天有什么工作计划。"
             "不用写得很正式，你按自己的话说，我来帮你整理。"
         )
-    if report.status == STATUS_PENDING_CONFIRMATION:
+    missing = _missing_report_fields(report)
+    if not missing:
+        if is_catchup:
+            return (
+                f"{name}，{period_text}已经补充完整，当前为待确认状态。"
+                "请确认无误后再提交；我不会代你确认或提交。"
+            )
         return (
             f"{name}，我已经帮你整理好{period_text}。"
             "系统会按时自动提交，无需再确认；需要调整的话，直接告诉我要改哪一段。"
         )
-    missing = _missing_report_fields(report)
-    missing_text = "、".join(SECTION_LABELS[field] for field in missing) if missing else "未完成部分"
+    missing_text = "、".join(SECTION_LABELS[field] for field in missing)
     if is_second_reminder:
         return (
             f"{name}，你的{period_text}还有{missing_text}没有填写。"
@@ -976,15 +994,16 @@ def build_report_reminder_text(
 
 
 def _missing_report_fields(report: DailyReport) -> list[str]:
-    missing: list[str] = []
-    if not report.today_work:
-        missing.append("today_work")
-    problems_done = bool(report.problems) or bool((report.section_status or {}).get("problems_acknowledged_empty"))
-    if not problems_done:
-        missing.append("problems")
-    if not report.tomorrow_plan:
-        missing.append("tomorrow_plan")
-    return missing
+    return list(_report_completeness(report).missing_sections)
+
+
+def _report_completeness(report: DailyReport):
+    return assess_daily_report_completeness(
+        today_work=getattr(report, "today_work", None),
+        problems=getattr(report, "problems", None),
+        tomorrow_plan=getattr(report, "tomorrow_plan", None),
+        section_status=getattr(report, "section_status", None),
+    )
 
 
 async def auto_submit_due_pending_reports(

@@ -62,6 +62,7 @@ from app.agent2.typed_daily_executor import (
     TypedDailyExecutionContext,
     build_typed_daily_snapshot,
     execute_typed_agent2_daily_commands,
+    pending_confirmation_next_step,
 )
 from app.agent2.weekly_plan_models import WeeklyPlan
 from app.agent2.weekly_plan_store import SqlWeeklyPlanStore
@@ -420,7 +421,12 @@ class ProductionDailyExecutor:
                     "最近7天、最近30天还是全部历史；不要提日报份数或其他分类数量，"
                     "不得猜测或列出已暂缓返回的明细。若 unclosed_preview_truncated=true，"
                     "必须说清总数、当前仅展示前多少项、另有多少项未展开；不得把展示数"
-                    "说成全部数量。"
+                    "说成全部数量。若 facts.query_kind 是 team_work_summary 或"
+                    " recent_work，必须说明 work_item_count，并覆盖 work_date_counts 中"
+                    "每个有工作记录的日期及"
+                    "对应数量；若 work_preview_truncated=true，还必须说明"
+                    "work_preview_count、work_unshown_count 和未展开口径，不得把预览"
+                    "说成全部工作。"
                 ),
             },
         )
@@ -1495,6 +1501,14 @@ class ProductionDailyExecutor:
             "report_status": report.status if report is not None else None,
             "affected_item_ids": list(affected),
         }
+        if report is not None and report.status == "pending_confirmation":
+            facts["next_step"] = pending_confirmation_next_step(
+                report_date=report.report_date,
+                occurred_at=self._context.now.astimezone(
+                    ZoneInfo(self._context.principal.timezone)
+                ),
+                settings=self._settings,
+            )
         return ProductionHandlerOutcome(
             target_type="daily_report",
             target_id=str(report.report_id) if report is not None else "",

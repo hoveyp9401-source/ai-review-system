@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from app.agent2.report_insights import InMemoryReportInsightRepository
-from app.agent2.tool_calling.contracts import QueryReportInsightsArgs
 from app.agent2.tool_calling.canary_config import canary_system_prompt
+from app.agent2.tool_calling.contracts import QueryReportInsightsArgs
 from app.agent2.tool_calling.production_daily_executor import ProductionDailyExecutor
 from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
 from app.agent2.tool_calling.registry import TOOL_REGISTRY, validate_tool_arguments
@@ -200,3 +200,111 @@ async def test_typed_report_insight_execution_is_read_only_and_uses_live_facts(
     assert facts["scope_label"] == "刘聪"
     assert facts["unclosed_count"] == 1
     assert facts["unclosed_items"][0]["plan_text"] == "完成预算审批"
+
+
+@pytest.mark.asyncio
+async def test_week_period_tool_tells_the_reply_model_about_every_date_and_omitted_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team_id = str(uuid4())
+    requester_id = uuid4()
+    report_dates = (
+        "2026-08-10",
+        "2026-08-11",
+        "2026-08-12",
+        "2026-08-13",
+        "2026-08-14",
+    )
+    repository = InMemoryReportInsightRepository(
+        teams=[
+            {
+                "id": team_id,
+                "name": "综合管理部",
+                "department_name": "法务合约中心",
+            }
+        ],
+        users=[
+            {
+                "id": str(requester_id),
+                "name": "庞浩",
+                "team_id": team_id,
+                "role": "department_head",
+            }
+        ],
+        reports=[
+            {
+                "id": f"report-{report_date}",
+                "user_id": str(requester_id),
+                "team_id": team_id,
+                "date": report_date,
+                "status": "completed",
+                "today_work": [
+                    f"{report_date}工作事项{index}" for index in range(1, 5)
+                ],
+            }
+            for report_date in report_dates
+        ],
+    )
+    monkeypatch.setattr(
+        "app.agent2.tool_calling.production_daily_executor.SqlReportInsightRepository",
+        lambda *_args, **_kwargs: repository,
+    )
+    principal = SimpleNamespace(
+        tenant_id="tenant-legal",
+        user_id=requester_id,
+        timezone="Asia/Shanghai",
+    )
+    context = SimpleNamespace(
+        principal=principal,
+        now=datetime(2026, 8, 14, 7, 0, tzinfo=timezone.utc),
+        business_glossary={},
+    )
+    user = SimpleNamespace(
+        id=requester_id,
+        name="庞浩",
+        dingtalk_user_id="dt-pang",
+        team_id=team_id,
+        role="department_head",
+    )
+    executor = ProductionDailyExecutor(
+        session=object(),
+        user=user,
+        context=context,
+        settings=SimpleNamespace(
+            legal_daily_dashboard_tenant_id="tenant-legal"
+        ),
+        bound_calls={},
+        source_channel="test",
+        source_text_hash="0" * 64,
+        date_resolver=object(),
+    )
+    request = ProductionHandlerRequest(
+        tool_call_id="call-week",
+        tool_name="query_report_insights",
+        arguments=QueryReportInsightsArgs(
+            query_kind="period_work",
+            scope_type="organization",
+            scope_name="综合管理部",
+            period_type="current_week",
+        ),
+        executor=executor,
+        memory_executor=object(),
+    )
+
+    outcome = await executor.query_report_insights(request)
+
+    assert outcome.status_if_unchanged.value == "success"
+    assert outcome.safe_user_facts is not None
+    report_insight = outcome.safe_user_facts["report_insight"]
+    facts = report_insight["facts"]
+    assert facts["work_item_count"] == 20
+    assert facts["work_preview_count"] == 16
+    assert facts["work_unshown_count"] == 4
+    assert facts["work_preview_truncated"] is True
+    assert [row["date"] for row in facts["work_date_counts"]] == list(
+        reversed(report_dates)
+    )
+    reply_requirement = outcome.safe_user_facts["回复要求"]
+    assert "每个有工作记录的日期" in reply_requirement
+    assert "recent_work" in reply_requirement
+    assert "未展开" in reply_requirement

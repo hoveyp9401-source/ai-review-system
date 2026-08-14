@@ -39,6 +39,73 @@ class ReportState:
     ready_for_confirmation: bool
 
 
+@dataclass(frozen=True)
+class DailyReportCompleteness:
+    section_status: dict[str, bool]
+    completeness_score: float
+    missing_sections: tuple[str, ...]
+    ready_for_confirmation: bool
+    draft_status: str
+
+
+def assess_daily_report_completeness(
+    *,
+    today_work: object,
+    problems: object,
+    tomorrow_plan: object,
+    section_status: dict | None = None,
+    acknowledged_empty_fields: set[str] | frozenset[str] = frozenset(),
+) -> DailyReportCompleteness:
+    """Apply one deterministic completeness rule across writers and reminders."""
+
+    prior = section_status or {}
+    acknowledged_empty = {
+        field_name: bool(
+            prior.get(f"{field_name}_acknowledged_empty")
+            or field_name in acknowledged_empty_fields
+        )
+        for field_name in SECTION_LABELS
+    }
+    filled = {
+        "today_work": bool(today_work) or acknowledged_empty["today_work"],
+        "problems": bool(problems) or acknowledged_empty["problems"],
+        "tomorrow_plan": bool(tomorrow_plan)
+        or acknowledged_empty["tomorrow_plan"],
+    }
+    missing_sections = tuple(
+        field_name for field_name in SECTION_LABELS if not filled[field_name]
+    )
+    completeness_score = round(
+        (0.34 if filled["today_work"] else 0)
+        + (0.33 if filled["problems"] else 0)
+        + (0.33 if filled["tomorrow_plan"] else 0),
+        4,
+    )
+    ready_for_confirmation = not missing_sections
+    normalized_section_status = {
+        **filled,
+        "problems_acknowledged_empty": acknowledged_empty["problems"],
+    }
+    normalized_section_status.update(
+        {
+            f"{field_name}_acknowledged_empty": True
+            for field_name in ("today_work", "tomorrow_plan")
+            if acknowledged_empty[field_name]
+        }
+    )
+    return DailyReportCompleteness(
+        section_status=normalized_section_status,
+        completeness_score=completeness_score,
+        missing_sections=missing_sections,
+        ready_for_confirmation=ready_for_confirmation,
+        draft_status=(
+            STATUS_PENDING_CONFIRMATION
+            if ready_for_confirmation
+            else STATUS_COLLECTING
+        ),
+    )
+
+
 def infer_report_state(
     *,
     existing_section_status: dict | None,
@@ -50,38 +117,32 @@ def infer_report_state(
 ) -> ReportState:
     previous = existing_section_status or {}
     problem_ack = bool(previous.get("problems_acknowledged_empty")) or _mentions_no_problem(raw_input)
-
-    section_status = {
-        "today_work": bool(merged_today_work),
-        "problems": bool(merged_problems) or problem_ack,
-        "tomorrow_plan": bool(merged_tomorrow_plan),
-        "problems_acknowledged_empty": problem_ack,
-    }
-
-    if structured.completeness >= 1 and merged_today_work and merged_tomorrow_plan:
-        section_status["today_work"] = True
-        section_status["problems"] = True
-        section_status["tomorrow_plan"] = True
-
-    completeness_score = round(
-        (0.34 if section_status["today_work"] else 0)
-        + (0.33 if section_status["problems"] else 0)
-        + (0.33 if section_status["tomorrow_plan"] else 0),
-        4,
+    if (
+        structured.completeness >= 1
+        and merged_today_work
+        and merged_tomorrow_plan
+        and not merged_problems
+    ):
+        problem_ack = True
+    completeness_status = dict(previous)
+    completeness_status["problems_acknowledged_empty"] = problem_ack
+    assessment = assess_daily_report_completeness(
+        today_work=merged_today_work,
+        problems=merged_problems,
+        tomorrow_plan=merged_tomorrow_plan,
+        section_status=completeness_status,
     )
-    missing_sections = [key for key in SECTION_LABELS if not section_status[key]]
-    ready_for_confirmation = not missing_sections
-    status = STATUS_PENDING_CONFIRMATION if ready_for_confirmation else STATUS_COLLECTING
+    missing_sections = list(assessment.missing_sections)
     current_slot = missing_sections[0] if missing_sections else None
 
     return ReportState(
-        section_status=section_status,
-        completeness_score=completeness_score,
-        status=status,
+        section_status=assessment.section_status,
+        completeness_score=assessment.completeness_score,
+        status=assessment.draft_status,
         missing_sections=missing_sections,
         current_slot=current_slot,
         should_ask_followup=bool(missing_sections),
-        ready_for_confirmation=ready_for_confirmation,
+        ready_for_confirmation=assessment.ready_for_confirmation,
     )
 
 
