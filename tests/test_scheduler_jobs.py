@@ -99,7 +99,7 @@ def test_reminder_text_for_collecting_report_lists_missing_fields():
     assert "\u4eca\u65e5\u5de5\u4f5c" not in text
 
 
-def test_reminder_text_for_pending_confirmation_asks_to_confirm():
+def test_reminder_text_for_pending_confirmation_does_not_claim_a_missing_section():
     text = build_report_reminder_text(
         date(2026, 6, 15),
         _user(),
@@ -111,8 +111,9 @@ def test_reminder_text_for_pending_confirmation_asks_to_confirm():
         ),
     )
 
-    assert "\u8fd8\u5dee\u6700\u540e\u786e\u8ba4" in text
-    assert "\u56de\u590d\u201c\u786e\u8ba4\u201d" in text
+    assert "\u7cfb\u7edf\u4f1a\u6309\u65f6\u81ea\u52a8\u63d0\u4ea4" in text
+    assert "\u65e0\u9700\u518d\u786e\u8ba4" in text
+    assert "\u8fd8\u5dee\u6700\u540e\u786e\u8ba4" not in text
 
 
 def test_catchup_reminder_text_for_yesterday_missing_report():
@@ -148,8 +149,11 @@ def test_catchup_reminder_text_for_pending_confirmation_uses_yesterday_wording()
         reminder_kind="catchup",
     )
 
-    assert "\u6574\u7406\u597d\u6628\u5929\u7684\u590d\u76d8" in text
-    assert "\u6574\u7406\u597d\u4eca\u5929\u7684\u590d\u76d8" not in text
+    assert "\u6628\u5929\u7684\u590d\u76d8\u5df2\u7ecf\u8865\u5145\u5b8c\u6574" in text
+    assert "\u5f85\u786e\u8ba4\u72b6\u6001" in text
+    assert "\u8bf7\u786e\u8ba4\u65e0\u8bef\u540e\u518d\u63d0\u4ea4" in text
+    assert "\u6211\u4e0d\u4f1a\u4ee3\u4f60\u786e\u8ba4\u6216\u63d0\u4ea4" in text
+    assert "\u4eca\u5929\u7684\u590d\u76d8" not in text
 
 
 def test_mark_report_auto_submitted_updates_confirmation_fields():
@@ -364,7 +368,7 @@ async def test_first_reminder_skips_completed_report(monkeypatch):
         ),
     )
 
-    assert result["missing_count"] == 1
+    assert result["missing_count"] == 0
     assert result["target_users"] == 0
     assert result["would_send"] == 0
     assert result["real_sent"] == 0
@@ -383,11 +387,10 @@ async def test_first_reminder_pending_confirmation_does_not_send_start_prompt(mo
         ),
     )
 
-    assert result["target_users"] == 1
-    assert result["would_send"] == 1
-    text = result["dry_run_messages"][0]["text"]
-    assert "\u8fd8\u5dee\u6700\u540e\u786e\u8ba4" in text
-    assert "\u8fd8\u6ca1\u6709\u6536\u5230" not in text
+    assert result["missing_count"] == 0
+    assert result["target_users"] == 0
+    assert result["would_send"] == 0
+    assert result["dry_run_messages"] == []
 
 
 @pytest.mark.asyncio
@@ -414,7 +417,7 @@ async def test_confirmation_reminder_sent_once_per_day_skips_second_reminder(mon
 
 
 @pytest.mark.asyncio
-async def test_second_reminder_sends_confirmation_if_not_sent_today(monkeypatch):
+async def test_second_reminder_skips_complete_pending_confirmation(monkeypatch):
     result = await _run_first_reminder_dry_run(
         monkeypatch,
         _report(
@@ -426,11 +429,10 @@ async def test_second_reminder_sends_confirmation_if_not_sent_today(monkeypatch)
         reminder_kind="second",
     )
 
-    assert result["target_users"] == 1
-    assert result["would_send"] == 1
-    text = result["dry_run_messages"][0]["text"]
-    assert "\u8fd8\u5dee\u6700\u540e\u786e\u8ba4" in text
-    assert "\u8fd8\u6ca1\u6709\u6536\u5230" not in text
+    assert result["missing_count"] == 0
+    assert result["target_users"] == 0
+    assert result["would_send"] == 0
+    assert result["dry_run_messages"] == []
 
 
 @pytest.mark.asyncio
@@ -629,7 +631,7 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
     assert result["skipped_real_users"] == 1
     assert len(session.added) == 1
     reminder_event = session.added[0]
-    assert reminder_event.backend_action == "daily_report_reminder_sent"
+    assert reminder_event.backend_action == "daily_report_reminder_delivery_pending"
     assert reminder_event.user_id == test_user.id
     assert reminder_event.report_date == date(2026, 6, 15)
     assert reminder_event.report_id is None
@@ -639,6 +641,7 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
     assert reminder_event.llm_decision_json["provider_reference_available"] is True
     assert reminder_event.llm_decision_json["provider_message_id_available"] is False
     assert reminder_event.llm_decision_json["transport"] == "direct_robot"
+    assert reminder_event.llm_decision_json["delivery_verified"] is False
 
 
 @pytest.mark.asyncio
