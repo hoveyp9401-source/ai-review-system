@@ -356,6 +356,7 @@ class TrustedContextAssembler:
             "query_next_weekly_plan",
             "apply_next_weekly_plan",
             "submit_next_weekly_plan",
+            "record_weekly_plan_items_as_today_work",
         }
         weekly_plans: tuple[Any, ...] = ()
         if self._weekly_plan_loader is not None and any(

@@ -378,6 +378,24 @@ Weekly Work Plan boundary:
   edits, moves, deletions, empty-day decisions, or an accepted suggestion. Do
   not interview the user one day at a time. Ask only about missing or genuinely
   ambiguous parts, and then show one complete preview with exact server dates.
+- A bounded repeated schedule is still a dated formal plan. For wording such as
+  "every day" or "Monday through Friday every day", emit one add operation for
+  every selected exact date inside the same atomic call, keep the user's matter
+  unchanged, and copy the entire current user message as the same
+  `exact_clause_quote` for every expanded add.
+  Also copy the complete contiguous date scope into
+  `source_evidence.recurrence_scope_quote` for every expanded add. It must
+  include every attached bound, exception, or qualifier; never shorten a phrase
+  such as "every day, only on working days" to just "every day". If that full
+  scope cannot be mapped safely to exact Monday-through-Saturday dates, ask one
+  concise question instead of expanding it.
+  Do not turn a repeated dated matter into an undated suggestion merely because
+  the user described the dates as one range instead of listing them one by one.
+- When one leading day precedes several clearly parallel matters in the same
+  clause, that leading day applies to every clearly parallel matter until the
+  user supplies another date or changes record scope. Preserve each matter as a
+  separate add on that day and cite the same complete clause evidence. Do not
+  ask the date of the later parallel matter when the shared date is already clear.
 - A future-plan statement may appear while the person is filling a daily
   report. Preserve both intents in the same Agent2 turn. If the user explicitly
   assigns a matter to one exact day of the selected target week, add it directly to that
@@ -388,6 +406,19 @@ Weekly Work Plan boundary:
   date is not permission to guess a formal day; capture it as a suggestion or
   ask naturally. Daily-report content and weekly-plan content remain separate
   records even when both tools succeed in one database transaction.
+- When the current user message semantically says that one exact committed
+  Weekly Work Plan item was also done today without restating its text, use
+  `record_weekly_plan_items_as_today_work` with the selected trusted plan ID,
+  exact current version and stable item ID(s). Never manufacture a Daily Report
+  `content` value for this reference: the server copies each selected
+  `original_text` verbatim into today's `today_work` and leaves the Weekly Work
+  Plan unchanged. Identical text selected from several physical plan items is
+  recorded only once. If the reference could mean more than one distinct
+  matter, ask which matter before calling any write tool. This tool's `today`
+  is the authenticated user's current local calendar date. Use it only after
+  semantically confirming that exact date. During deep overnight hours, when
+  "today" could still mean the reporting day that just ended under the Daily
+  Report date policy, ask which date instead of calling this fixed-today tool.
 - On Monday, phrases about filling or supplementing "this week's plan" select
   the current-week `active_collection` target; an explicit "next week" selects
   the following-week `natural_next` target for that message. If both are clear,
@@ -436,6 +467,7 @@ _WEEKLY_PLAN_TOOL_NAMES = frozenset(
         "query_next_weekly_plan",
         "apply_next_weekly_plan",
         "submit_next_weekly_plan",
+        "record_weekly_plan_items_as_today_work",
     }
 )
 

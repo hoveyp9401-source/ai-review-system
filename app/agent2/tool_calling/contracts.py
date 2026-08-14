@@ -95,10 +95,26 @@ class WeeklyPlanExplicitDateEvidence(CurrentUserMessageEvidence):
             description=(
                 "Exact complete current-message clause containing both the "
                 "weekly day expression and the asserted plan matter. Do not "
-                "quote only a weekday or cut text out of an ambiguous clause."
+                "quote only a weekday or cut text out of an ambiguous clause. "
+                "For one matter expanded to several dates, copy the entire "
+                "current user message so a later qualifier cannot be hidden."
             ),
         ),
     ]
+    recurrence_scope_quote: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=500,
+            description=(
+                "For one matter expanded to multiple exact plan dates, copy the "
+                "complete contiguous date-scope text, such as 下周每天 or "
+                "周一到周五每天. Include every qualifier or exclusion attached "
+                "to that scope; never truncate a restricted phrase to just 每天. "
+                "Omit it for a single-date operation."
+            ),
+        ),
+    ] | None = None
 
 
 class PersonalMemorySourceEvidence(CurrentUserMessageEvidence):
@@ -285,6 +301,25 @@ class SubmitNextWeeklyPlanArgs(StrictContract):
     plan_id: UUID
     expected_version: int = Field(ge=0)
     confirmation_evidence: CurrentUserMessageEvidence
+
+
+class RecordWeeklyPlanItemsAsTodayWorkArgs(StrictContract):
+    """Copy exact trusted weekly-plan text into today's Daily Report."""
+
+    plan_id: UUID
+    expected_version: int = Field(ge=0)
+    target_item_ids: tuple[ItemId, ...] = Field(min_length=1, max_length=30)
+    source_evidence: CurrentUserMessageEvidence
+
+    @field_validator("target_item_ids")
+    @classmethod
+    def item_ids_must_be_unique(
+        cls,
+        value: tuple[ItemId, ...],
+    ) -> tuple[ItemId, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("weekly plan item IDs must be unique")
+        return value
 
 
 class QueryReportByDateArgs(StrictContract):

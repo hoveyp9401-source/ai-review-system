@@ -98,6 +98,7 @@ class ProductionWeeklyPlanExecutor:
         bound_calls: dict[str, BoundCall],
         current_turn_source: CurrentTurnSource | None,
         store: WeeklyPlanStorePort | None = None,
+        settings: object | None = None,
         authoritative_roster_member: WeeklyPlanRosterMember | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
@@ -107,6 +108,7 @@ class ProductionWeeklyPlanExecutor:
         self._bound_calls = bound_calls
         self._current_turn_source = current_turn_source
         self._store = store or SqlWeeklyPlanStore(session)
+        self._settings = settings
         self._authoritative_roster_member = authoritative_roster_member
         self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
 
@@ -344,11 +346,11 @@ class ProductionWeeklyPlanExecutor:
         self,
         weekly: TrustedWeeklyPlanContext,
     ) -> tuple[WeeklyPlanBatch, WeeklyPlan]:
-        member = await self._load_authoritative_roster_member()
+        roster = await self._load_authoritative_roster()
         requested_batch = create_weekly_plan_batch(
             tenant_id=self._context.principal.tenant_id,
             target_week_start=weekly.target_week_start,
-            roster=(member,),
+            roster=roster,
             created_at=self._context.now,
         )
         try:
@@ -367,45 +369,72 @@ class ProductionWeeklyPlanExecutor:
             created_at=self._context.now,
         )
 
-    async def _load_authoritative_roster_member(self) -> WeeklyPlanRosterMember:
+    async def _load_authoritative_roster(
+        self,
+    ) -> tuple[WeeklyPlanRosterMember, ...]:
         principal = self._context.principal
-        injected = self._authoritative_roster_member
-        if injected is not None:
-            member = injected
+        injected_member = self._authoritative_roster_member
+        if injected_member is not None:
+            members = (injected_member,)
         else:
-            if self._session is None:
+            user_ids = _configured_canary_roster_user_ids(
+                self._settings,
+                tenant_id=principal.tenant_id,
+            )
+            if (
+                self._session is None
+                or user_ids is None
+                or str(principal.user_id) not in user_ids
+            ):
                 raise ProductionExecutionError(
                     "WEEKLY_PLAN_IDENTITY_BINDING_REQUIRED"
                 )
-            binding = await self._session.scalar(
-                select(Agent2IdentityBinding).where(
-                    Agent2IdentityBinding.tenant_id == principal.tenant_id,
-                    Agent2IdentityBinding.user_id == str(principal.user_id),
-                    Agent2IdentityBinding.active.is_(True),
-                )
+            bindings = tuple(
+                (
+                    await self._session.scalars(
+                        select(Agent2IdentityBinding).where(
+                            Agent2IdentityBinding.tenant_id
+                            == principal.tenant_id,
+                            Agent2IdentityBinding.user_id.in_(user_ids),
+                            Agent2IdentityBinding.active.is_(True),
+                        )
+                    )
+                ).all()
             )
-            if binding is None:
+            by_user_id = {str(binding.user_id): binding for binding in bindings}
+            if set(by_user_id) != set(user_ids):
                 raise ProductionExecutionError(
                     "WEEKLY_PLAN_IDENTITY_BINDING_REQUIRED"
                 )
-            member = WeeklyPlanRosterMember(
-                user_id=str(binding.user_id),
-                display_name=str(binding.display_name),
-                department_id=str(binding.department_id),
-                department_name="",
-                team_id=str(binding.team_id),
-                team_name="",
+            members = tuple(
+                WeeklyPlanRosterMember(
+                    user_id=user_id,
+                    display_name=str(by_user_id[user_id].display_name),
+                    department_id=str(by_user_id[user_id].department_id),
+                    department_name="",
+                    team_id=str(by_user_id[user_id].team_id),
+                    team_name="",
+                )
+                for user_id in user_ids
             )
+        canonical = tuple(sorted(members, key=lambda item: item.user_id))
         if (
-            member.user_id != str(principal.user_id)
-            or not member.display_name.strip()
-            or not member.department_id.strip()
-            or not member.team_id.strip()
+            not canonical
+            or len(canonical) > 2
+            or len({member.user_id for member in canonical}) != len(canonical)
+            or str(principal.user_id)
+            not in {member.user_id for member in canonical}
+            or any(
+                not member.display_name.strip()
+                or not member.department_id.strip()
+                or not member.team_id.strip()
+                for member in canonical
+            )
         ):
             raise ProductionExecutionError(
                 "WEEKLY_PLAN_IDENTITY_BINDING_INVALID"
             )
-        return member
+        return canonical
 
     async def _load_live(
         self,
@@ -833,6 +862,41 @@ class ProductionWeeklyPlanExecutor:
             after_version=plan.version,
             error_code=error_code,
         )
+
+
+def _configured_canary_roster_user_ids(
+    settings: object | None,
+    *,
+    tenant_id: str,
+) -> tuple[str, ...] | None:
+    if settings is None:
+        return None
+    tenant_raw = getattr(
+        settings,
+        "agent2_weekly_plan_tenant_allowlist",
+        "",
+    )
+    user_raw = getattr(
+        settings,
+        "agent2_weekly_plan_user_allowlist",
+        "",
+    )
+    if not isinstance(tenant_raw, str) or tenant_raw != tenant_id:
+        return None
+    if not isinstance(user_raw, str) or not user_raw:
+        return None
+    parts = user_raw.split(",")
+    if not 1 <= len(parts) <= 2 or len(parts) != len(set(parts)):
+        return None
+    if any(
+        item != item.strip()
+        or not item
+        or not item.isascii()
+        or any(character.isspace() for character in item)
+        for item in parts
+    ):
+        return None
+    return tuple(sorted(parts))
 
 
 def _formal_plan_preview(

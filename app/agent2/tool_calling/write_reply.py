@@ -76,6 +76,7 @@ def model_safe_user_facts(receipt: ToolReceipt) -> dict[str, Any]:
             "error_code",
             "proposal_status",
             "execution_mode",
+            "pre_execution_block_observation",
         }
     }
     facts["actual_write"] = bool(receipt.changed)

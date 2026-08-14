@@ -106,16 +106,35 @@ def _strict_weekly_plan_single_id(value: object) -> str | None:
     return item
 
 
-def _strict_weekly_plan_canary_scope(settings) -> tuple[str, str] | None:
-    """Return one stable tenant/user pair or fail closed without name matching."""
+def _strict_weekly_plan_user_ids(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    parts = value.split(",")
+    if not 1 <= len(parts) <= 2 or len(parts) != len(set(parts)):
+        return None
+    if any(
+        item != item.strip()
+        or not item
+        or not item.isascii()
+        or any(character.isspace() for character in item)
+        for item in parts
+    ):
+        return None
+    return tuple(sorted(parts))
+
+
+def _strict_weekly_plan_canary_scope(
+    settings,
+) -> tuple[str, tuple[str, ...]] | None:
+    """Return one tenant and at most two stable users, with no name matching."""
 
     tenant_id = _strict_weekly_plan_single_id(
         getattr(settings, "agent2_weekly_plan_tenant_allowlist", "")
     )
-    user_id = _strict_weekly_plan_single_id(
+    user_ids = _strict_weekly_plan_user_ids(
         getattr(settings, "agent2_weekly_plan_user_allowlist", "")
     )
-    return (tenant_id, user_id) if tenant_id and user_id else None
+    return (tenant_id, user_ids) if tenant_id and user_ids else None
 
 
 def register_weekly_plan_jobs(
@@ -166,7 +185,8 @@ def register_weekly_plan_jobs(
         if getattr(settings, "agent2_weekly_plan_send_enabled", False) is True
         else None
     )
-    if send_user_id == _strict_weekly_plan_canary_scope(settings)[1]:
+    scope = _strict_weekly_plan_canary_scope(settings)
+    if scope is not None and send_user_id in scope[1]:
         add(
             "agent2_weekly_plan_reminder_enqueue",
             reminder_job,
@@ -237,11 +257,18 @@ async def run_weekly_plan_collection_open_job(settings, *, now: datetime) -> Non
     scope = _strict_weekly_plan_canary_scope(settings)
     if scope is None:
         return
-    tenant_id, user_id = scope
+    tenant_id, user_ids = scope
     target_week_start, window = _weekly_plan_schedule_facts(settings, now=now)
     async with AsyncSessionLocal() as session:
-        member = await _load_weekly_plan_canary_member(
-            session, tenant_id=tenant_id, user_id=user_id
+        members = tuple(
+            [
+                await _load_weekly_plan_canary_member(
+                    session,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+                for user_id in user_ids
+            ]
         )
         orchestrator = SqlWeeklyPlanCollectionOrchestrator(
             SqlWeeklyPlanStore(session)
@@ -249,8 +276,8 @@ async def run_weekly_plan_collection_open_job(settings, *, now: datetime) -> Non
         await orchestrator.open_collection(
             tenant_id=tenant_id,
             target_week_start=target_week_start,
-            source_roster=(member,),
-            canary_user_ids=frozenset({user_id}),
+            source_roster=members,
+            canary_user_ids=frozenset(user_ids),
             window=window,
         )
         await session.commit()
@@ -271,7 +298,7 @@ async def run_weekly_plan_history_suggestion_refresh_job(
         or getattr(settings, "agent2_weekly_plan_write_enabled", False) is not True
     ):
         return
-    tenant_id, user_id = scope
+    tenant_id, user_ids = scope
     target_week_start, _ = _weekly_plan_schedule_facts(settings, now=now)
     async with AsyncSessionLocal() as session:
         service = WeeklyPlanHistorySuggestionService(
@@ -287,14 +314,15 @@ async def run_weekly_plan_history_suggestion_refresh_job(
                 thinking_enabled=False,
             ),
         )
-        await service.refresh(
-            HistorySuggestionRefreshRequest(
-                tenant_id=tenant_id,
-                owner_user_id=user_id,
-                target_week_start=target_week_start,
-                as_of=now,
+        for user_id in user_ids:
+            await service.refresh(
+                HistorySuggestionRefreshRequest(
+                    tenant_id=tenant_id,
+                    owner_user_id=user_id,
+                    target_week_start=target_week_start,
+                    as_of=now,
+                )
             )
-        )
         await session.commit()
 
 
@@ -302,10 +330,17 @@ async def _load_weekly_plan_opening(settings, *, now: datetime, session):
     scope = _strict_weekly_plan_canary_scope(settings)
     if scope is None:
         return None, None
-    tenant_id, user_id = scope
+    tenant_id, user_ids = scope
     target_week_start, window = _weekly_plan_schedule_facts(settings, now=now)
-    member = await _load_weekly_plan_canary_member(
-        session, tenant_id=tenant_id, user_id=user_id
+    members = tuple(
+        [
+            await _load_weekly_plan_canary_member(
+                session,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            for user_id in user_ids
+        ]
     )
     orchestrator = SqlWeeklyPlanCollectionOrchestrator(
         SqlWeeklyPlanStore(session),
@@ -314,8 +349,8 @@ async def _load_weekly_plan_opening(settings, *, now: datetime, session):
     opening = await orchestrator.open_collection(
         tenant_id=tenant_id,
         target_week_start=target_week_start,
-        source_roster=(member,),
-        canary_user_ids=frozenset({user_id}),
+        source_roster=members,
+        canary_user_ids=frozenset(user_ids),
         window=window,
     )
     return opening, orchestrator
@@ -329,7 +364,7 @@ async def run_weekly_plan_reminder_enqueue_job(settings, *, now: datetime) -> No
     if (
         scope is None
         or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
-        or send_user_id != scope[1]
+        or send_user_id not in scope[1]
     ):
         return
     async with AsyncSessionLocal() as session:
@@ -340,7 +375,7 @@ async def run_weekly_plan_reminder_enqueue_job(settings, *, now: datetime) -> No
             return
         await orchestrator.enqueue_private_reminders(
             opening=opening,
-            canary_user_ids=frozenset({scope[1]}),
+            canary_user_ids=frozenset({send_user_id}),
             reminder_at=now,
             created_at=now,
             reminder_slot="sunday-primary",
@@ -361,10 +396,11 @@ async def run_weekly_plan_reminder_dispatch_job(
     if (
         scope is None
         or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
-        or send_user_id != scope[1]
+        or send_user_id not in scope[1]
     ):
         return
-    tenant_id, user_id = scope
+    tenant_id, _user_ids = scope
+    user_id = send_user_id
     async with AsyncSessionLocal() as session:
         binding = await session.scalar(
             select(Agent2IdentityBinding).where(
@@ -415,10 +451,11 @@ async def run_weekly_plan_reminder_reconcile_job(
     if (
         scope is None
         or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
-        or send_user_id != scope[1]
+        or send_user_id not in scope[1]
     ):
         return
-    tenant_id, user_id = scope
+    tenant_id, _user_ids = scope
+    user_id = send_user_id
     async with AsyncSessionLocal() as session:
         binding = await session.scalar(
             select(Agent2IdentityBinding).where(

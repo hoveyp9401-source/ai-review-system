@@ -5,7 +5,6 @@ from app.agent2.weekly_plan_access import (
     WeeklyPlanAccessPolicy,
 )
 
-
 TENANT_ID = "tenant-internal-001"
 USER_ID = "user-internal-042"
 
@@ -77,7 +76,7 @@ def test_tenant_and_user_ids_are_exact_and_names_never_grant_access() -> None:
     assert padded_user_id.reason == "weekly_plan_user_not_allowlisted"
 
 
-def test_single_user_canary_rejects_more_than_one_tenant_or_user() -> None:
+def test_two_user_canary_keeps_one_tenant_and_rejects_a_third_user() -> None:
     multi_tenant = WeeklyPlanAccessPolicy(
         enabled=True,
         tenant_allowlist=frozenset({TENANT_ID, "tenant-internal-002"}),
@@ -88,10 +87,59 @@ def test_single_user_canary_rejects_more_than_one_tenant_or_user() -> None:
         user_id=USER_ID,
         conversation_kind="direct",
     )
-    multi_user = WeeklyPlanAccessPolicy(
+    two_users = WeeklyPlanAccessPolicy(
         enabled=True,
+        write_enabled=True,
         tenant_allowlist=frozenset({TENANT_ID}),
         user_allowlist=frozenset({USER_ID, "user-internal-043"}),
+    ).decide(
+        action=WeeklyPlanAccessAction.WRITE,
+        tenant_id=TENANT_ID,
+        user_id="user-internal-043",
+        conversation_kind="direct",
+    )
+    third_user = WeeklyPlanAccessPolicy(
+        enabled=True,
+        write_enabled=True,
+        tenant_allowlist=frozenset({TENANT_ID}),
+        user_allowlist=frozenset({USER_ID, "user-internal-043"}),
+    ).decide(
+        action=WeeklyPlanAccessAction.WRITE,
+        tenant_id=TENANT_ID,
+        user_id="user-internal-044",
+        conversation_kind="direct",
+    )
+
+    assert multi_tenant.reason == "weekly_plan_single_canary_scope_required"
+    assert two_users.allowed is True
+    assert third_user.reason == "weekly_plan_user_not_allowlisted"
+
+
+def test_two_user_canary_still_rejects_group_and_unknown_conversations() -> None:
+    policy = WeeklyPlanAccessPolicy(
+        enabled=True,
+        write_enabled=True,
+        tenant_allowlist=frozenset({TENANT_ID}),
+        user_allowlist=frozenset({USER_ID, "user-internal-043"}),
+    )
+
+    for conversation_kind in ("group", "unknown"):
+        decision = policy.decide(
+            action=WeeklyPlanAccessAction.WRITE,
+            tenant_id=TENANT_ID,
+            user_id="user-internal-043",
+            conversation_kind=conversation_kind,
+        )
+        assert decision.reason == "weekly_plan_direct_conversation_required"
+
+
+def test_weekly_plan_canary_never_expands_beyond_two_users() -> None:
+    decision = WeeklyPlanAccessPolicy(
+        enabled=True,
+        tenant_allowlist=frozenset({TENANT_ID}),
+        user_allowlist=frozenset(
+            {USER_ID, "user-internal-043", "user-internal-044"}
+        ),
     ).decide(
         action=WeeklyPlanAccessAction.READ,
         tenant_id=TENANT_ID,
@@ -99,8 +147,7 @@ def test_single_user_canary_rejects_more_than_one_tenant_or_user() -> None:
         conversation_kind="direct",
     )
 
-    assert multi_tenant.reason == "weekly_plan_single_canary_scope_required"
-    assert multi_user.reason == "weekly_plan_single_canary_scope_required"
+    assert decision.reason == "weekly_plan_two_user_canary_scope_required"
 
 
 def test_only_an_explicit_direct_conversation_is_permitted() -> None:

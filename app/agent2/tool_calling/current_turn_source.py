@@ -12,6 +12,7 @@ from app.agent2.tool_calling.contracts import (
     ApplyNextWeeklyPlanArgs,
     CorrectDailyReportDateArgs,
     CurrentUserMessageEvidence,
+    RecordWeeklyPlanItemsAsTodayWorkArgs,
     RememberPersonalMemoryArgs,
     SubmitCurrentWeeklyReportArgs,
     SubmitNextWeeklyPlanArgs,
@@ -22,6 +23,19 @@ class CurrentTurnSourceEvidenceError(ValueError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+def _is_ordered_text_grounded(content: str, source: str) -> bool:
+    """Allow punctuation/filler omission, but never model-added characters."""
+
+    expected = tuple(character.casefold() for character in content if character.isalnum())
+    available = iter(
+        character.casefold() for character in source if character.isalnum()
+    )
+    return bool(expected) and all(
+        any(candidate == character for candidate in available)
+        for character in expected
+    )
 
 
 @dataclass(frozen=True)
@@ -88,7 +102,16 @@ class CurrentTurnSource:
         if tool_name == "add_daily_items":
             typed = AddDailyItemsArgs.model_validate(arguments)
             for item in typed.items:
-                self._validate_evidence(item.source_evidence)
+                source_message = self._validate_evidence(
+                    item.source_evidence
+                )
+                if not _is_ordered_text_grounded(
+                    item.content,
+                    source_message,
+                ):
+                    raise CurrentTurnSourceEvidenceError(
+                        "DAILY_ITEM_CONTENT_NOT_GROUNDED"
+                    )
             for item in typed.empty_field_evidence:
                 self._validate_evidence(item.source_evidence)
             if typed.date_evidence is not None:
@@ -104,6 +127,12 @@ class CurrentTurnSource:
             )
             for item in typed_correction.empty_field_evidence:
                 self._validate_evidence(item.source_evidence)
+            return
+        if tool_name == "record_weekly_plan_items_as_today_work":
+            typed_weekly_daily = (
+                RecordWeeklyPlanItemsAsTodayWorkArgs.model_validate(arguments)
+            )
+            self._validate_evidence(typed_weekly_daily.source_evidence)
             return
         if tool_name == "apply_next_weekly_plan":
             typed_weekly_plan = ApplyNextWeeklyPlanArgs.model_validate(
@@ -124,6 +153,22 @@ class CurrentTurnSource:
                 ):
                     raise CurrentTurnSourceEvidenceError(
                         "WEEKLY_PLAN_DATE_EVIDENCE_MISMATCH"
+                    )
+                recurrence_scope = getattr(
+                    operation.source_evidence,
+                    "recurrence_scope_quote",
+                    None,
+                )
+                if (
+                    isinstance(recurrence_scope, str)
+                    and (
+                        recurrence_scope not in source_message
+                        or not isinstance(exact_clause, str)
+                        or recurrence_scope not in exact_clause
+                    )
+                ):
+                    raise CurrentTurnSourceEvidenceError(
+                        "WEEKLY_PLAN_RECURRENCE_SCOPE_EVIDENCE_MISMATCH"
                     )
                 content = getattr(operation, "content", None)
                 grounded_source = (

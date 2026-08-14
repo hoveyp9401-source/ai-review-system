@@ -64,6 +64,11 @@ class ProductionDailyExecutorPort(Protocol):
 
     async def complete_previous_plan(self, request: ProductionHandlerRequest) -> Any: ...
 
+    async def record_weekly_plan_items_as_today_work(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> Any: ...
+
     async def confirm_report(self, request: ProductionHandlerRequest) -> Any: ...
 
     async def request_clear_report(self, request: ProductionHandlerRequest) -> Any: ...
@@ -261,6 +266,14 @@ async def execute_correct_daily_report_date(
 
 async def execute_complete_previous_plan(request: ProductionHandlerRequest) -> Any:
     return await request.executor.complete_previous_plan(request)
+
+
+async def execute_record_weekly_plan_items_as_today_work(
+    request: ProductionHandlerRequest,
+) -> Any:
+    return await request.executor.record_weekly_plan_items_as_today_work(
+        request
+    )
 
 
 async def execute_confirm_report(request: ProductionHandlerRequest) -> Any:

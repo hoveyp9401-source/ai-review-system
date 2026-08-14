@@ -8,8 +8,8 @@ import pytest
 from app.agent2.weekly_plan_date_binding import (
     WeeklyPlanDateBindingError,
     validate_weekly_plan_date_binding,
+    validate_weekly_plan_date_set_binding,
 )
-
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -197,3 +197,22 @@ def test_an_undated_next_week_statement_is_not_eligible_for_formal_date_binding(
             "下周继续完善合同评审规则",
             date(2026, 8, 19),
         )
+
+
+def test_explicit_monday_to_friday_daily_scope_binds_exactly_five_plan_days():
+    result = validate_weekly_plan_date_set_binding(
+        source_message="我周一到周五每天做日常用印审核",
+        exact_clause_quote="我周一到周五每天做日常用印审核",
+        recurrence_scope_quote="周一到周五每天",
+        matter_text="日常用印审核",
+        source_occurred_at=datetime(2026, 8, 14, 17, 30, tzinfo=SHANGHAI),
+        business_timezone="Asia/Shanghai",
+        target_week_start=date(2026, 8, 17),
+        proposed_dates=tuple(
+            date(2026, 8, 17) + timedelta(days=offset) for offset in range(5)
+        ),
+    )
+
+    assert result.resolved_dates == tuple(
+        date(2026, 8, 17) + timedelta(days=offset) for offset in range(5)
+    )

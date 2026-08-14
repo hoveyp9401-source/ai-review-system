@@ -7,7 +7,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from time import perf_counter
 from typing import Any
@@ -157,6 +157,7 @@ class CanaryIngressOutcome:
     tool_clarification_count: int = 0
     tool_blocked_count: int = 0
     tool_failure_count: int = 0
+    pre_execution_block_observations: tuple[dict[str, Any], ...] = ()
     user_visible_result: str = "unknown"
     reply_formed: bool = False
 
@@ -435,6 +436,10 @@ def _canary_turn_observation(
         ),
         "tool_blocked_count": max(0, outcome.tool_blocked_count),
         "tool_failure_count": max(0, outcome.tool_failure_count),
+        "pre_execution_blocks": [
+            dict(item)
+            for item in outcome.pre_execution_block_observations
+        ],
     }
 
 
@@ -895,6 +900,9 @@ async def process_tool_call_canary_ingress(
             ],
             tool_blocked_count=receipt_counts["blocked"],
             tool_failure_count=receipt_counts["failed"],
+            pre_execution_block_observations=(
+                _pre_execution_block_observations(result.receipts)
+            ),
             user_visible_result=_user_visible_result(receipt_counts),
             reply_formed=bool(formatted_message),
         )
@@ -935,6 +943,135 @@ def _receipt_status_counts(receipts: tuple[Any, ...]) -> dict[str, int]:
         if value in counts:
             counts[value] += 1
     return counts
+
+
+_PRE_EXECUTION_BLOCK_SCHEMA_VERSION = (
+    "agent2.pre_execution_block.observation.v1"
+)
+_PRE_EXECUTION_BLOCK_TOOL_NAMES = frozenset(
+    {
+        "apply_next_weekly_plan",
+        "submit_next_weekly_plan",
+    }
+)
+_SAFE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_SAFE_ERROR_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
+_SAFE_WEEKLY_OPERATION_TYPES = frozenset(
+    {
+        "add",
+        "edit",
+        "move",
+        "delete",
+        "set_day_empty",
+        "accept_suggestion",
+        "reject_suggestion",
+        "capture_suggestion",
+    }
+)
+
+
+def _pre_execution_block_observations(
+    receipts: tuple[Any, ...],
+) -> tuple[dict[str, Any], ...]:
+    """Project transient binder failures into the existing safe turn record."""
+
+    observations: list[dict[str, Any]] = []
+    for receipt in receipts:
+        if len(observations) >= 50:
+            break
+        status = getattr(receipt, "status", "")
+        status_value = str(getattr(status, "value", status) or "")
+        if status_value not in {
+            "blocked",
+            "clarification_required",
+            "failed",
+        }:
+            continue
+        safe_facts = getattr(receipt, "safe_user_facts", None)
+        if not isinstance(safe_facts, Mapping):
+            continue
+        candidate = safe_facts.get(
+            "pre_execution_block_observation"
+        )
+        if not isinstance(candidate, Mapping):
+            continue
+        projected = _validated_pre_execution_block_observation(
+            candidate,
+            receipt=receipt,
+        )
+        if projected is not None:
+            observations.append(projected)
+    return tuple(observations)
+
+
+def _validated_pre_execution_block_observation(
+    candidate: Mapping[str, Any],
+    *,
+    receipt: Any,
+) -> dict[str, Any] | None:
+    tool_name = str(getattr(receipt, "tool_name", "") or "")
+    error_code = str(getattr(receipt, "error_code", "") or "")
+    arguments_sha256 = str(candidate.get("arguments_sha256") or "")
+    target_plan_ref_sha256 = str(
+        candidate.get("target_plan_ref_sha256") or ""
+    )
+    target_week_start = str(candidate.get("target_week_start") or "")
+    target_version = candidate.get("target_version")
+    operation_count = candidate.get("operation_count")
+    raw_type_counts = candidate.get("operation_type_counts")
+    if (
+        candidate.get("schema_version")
+        != _PRE_EXECUTION_BLOCK_SCHEMA_VERSION
+        or candidate.get("tool_name") != tool_name
+        or tool_name not in _PRE_EXECUTION_BLOCK_TOOL_NAMES
+        or candidate.get("target_type") != "weekly_plan"
+        or candidate.get("error_code") != error_code
+        or _SAFE_ERROR_CODE_RE.fullmatch(error_code) is None
+        or candidate.get("actual_write") is not False
+        or _SAFE_SHA256_RE.fullmatch(arguments_sha256) is None
+        or _SAFE_SHA256_RE.fullmatch(target_plan_ref_sha256) is None
+        or not isinstance(target_version, int)
+        or isinstance(target_version, bool)
+        or target_version < 0
+        or not isinstance(operation_count, int)
+        or isinstance(operation_count, bool)
+        or not 0 <= operation_count <= 50
+        or not isinstance(raw_type_counts, Mapping)
+    ):
+        return None
+    if target_week_start:
+        try:
+            target_week = date.fromisoformat(target_week_start)
+        except ValueError:
+            return None
+        if target_week.weekday() != 0:
+            return None
+    operation_type_counts: dict[str, int] = {}
+    for key, value in raw_type_counts.items():
+        operation_type = str(key or "")
+        if (
+            operation_type not in _SAFE_WEEKLY_OPERATION_TYPES
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= 50
+        ):
+            return None
+        operation_type_counts[operation_type] = value
+    if sum(operation_type_counts.values()) != operation_count:
+        return None
+    return {
+        "schema_version": _PRE_EXECUTION_BLOCK_SCHEMA_VERSION,
+        "tool_name": tool_name,
+        "arguments_sha256": arguments_sha256,
+        "target_type": "weekly_plan",
+        "target_plan_ref_sha256": target_plan_ref_sha256,
+        "target_week_start": target_week_start,
+        "target_version": target_version,
+        "operation_type_counts": operation_type_counts,
+        "operation_count": operation_count,
+        "error_code": error_code,
+        "actual_write": False,
+    }
 
 
 def _model_elapsed_seconds(model_turns: tuple[Any, ...]) -> float:

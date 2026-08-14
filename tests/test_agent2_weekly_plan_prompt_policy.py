@@ -110,6 +110,19 @@ def test_weekly_plan_prompt_requires_one_preview_and_explicit_submission():
     assert "remain separate records" in prompt
 
 
+def test_weekly_plan_prompt_preserves_repeated_ranges_and_shared_date_scope():
+    prompt = " ".join(canary_system_prompt().split()).lower()
+
+    assert "one add operation for every selected exact date" in prompt
+    assert "monday through friday every day" in prompt
+    assert "leading day applies to every clearly parallel matter" in prompt
+    assert "entire current user message" in prompt
+    assert "recurrence_scope_quote" in prompt
+    assert "include every attached bound, exception, or qualifier" in prompt
+    assert "never shorten a phrase" in prompt
+    assert "do not turn a repeated dated matter into an undated suggestion" in prompt
+
+
 def test_weekly_plan_prompt_explains_monday_dual_targets_and_report_boundary():
     prompt = " ".join(canary_system_prompt().split()).lower()
 

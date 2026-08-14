@@ -6,8 +6,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.agent2.tool_calling.assembly import TrustedContextRequest
-from app.agent2.tool_calling.registry import TOOL_REGISTRY
 from app.agent2.tool_calling.production_store import ProductionContextStore
+from app.agent2.tool_calling.registry import TOOL_REGISTRY
 from app.config import Settings
 
 
@@ -121,8 +121,9 @@ async def test_weekly_tools_fail_closed_for_empty_or_wrong_ids_and_write_switch(
 
 
 @pytest.mark.asyncio
-async def test_weekly_chat_tools_fail_closed_for_multi_user_configuration():
+async def test_weekly_chat_tools_allow_exactly_two_users_and_deny_a_third():
     user_id = uuid4()
+    second_user_id = uuid4()
     store = ProductionContextStore(
         _Session(),
         user=SimpleNamespace(id=user_id, active=True),
@@ -131,15 +132,19 @@ async def test_weekly_chat_tools_fail_closed_for_multi_user_configuration():
             agent2_weekly_plan_enabled=True,
             agent2_weekly_plan_write_enabled=True,
             agent2_weekly_plan_tenant_allowlist="tenant-a",
-            agent2_weekly_plan_user_allowlist=f"{user_id},{uuid4()}",
+            agent2_weekly_plan_user_allowlist=f"{user_id},{second_user_id}",
         ),
     )
 
-    assert not await store.permission_allowed(
+    assert await store.permission_allowed(
         _request(user_id=user_id),
         TOOL_REGISTRY["query_next_weekly_plan"],
     )
-    assert not await store.gate_allowed(
+    assert await store.gate_allowed(
         _request(user_id=user_id),
         TOOL_REGISTRY["apply_next_weekly_plan"],
+    )
+    assert not await store.permission_allowed(
+        _request(user_id=uuid4()),
+        TOOL_REGISTRY["query_next_weekly_plan"],
     )

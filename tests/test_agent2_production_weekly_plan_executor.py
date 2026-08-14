@@ -46,6 +46,12 @@ AUTHORITY_MEMBER = WeeklyPlanRosterMember(
     department_id="department-authoritative",
     team_id="team-authoritative",
 )
+SECOND_AUTHORITY_MEMBER = WeeklyPlanRosterMember(
+    user_id="33333333-3333-4333-8333-333333333333",
+    display_name="测试用户乙",
+    department_id="department-authoritative",
+    team_id="team-authoritative",
+)
 
 
 class _FakeWeeklyPlanStore:
@@ -204,6 +210,8 @@ def _executor(
     bound_calls,
     source,
     authoritative_member=AUTHORITY_MEMBER,
+    session=None,
+    settings=None,
     now_provider=None,
 ):
     from app.agent2.tool_calling.production_weekly_plan_executor import (
@@ -219,12 +227,13 @@ def _executor(
         for call_id, bound in bound_calls.items()
     }
     return ProductionWeeklyPlanExecutor(
-        session=None,
+        session=session,
         user=_user(),
         context=context,
         bound_calls=trusted_bound_calls,
         current_turn_source=source,
         store=store,
+        settings=settings,
         authoritative_roster_member=authoritative_member,
         now_provider=now_provider or (lambda: context.now),
     )
@@ -583,6 +592,85 @@ async def test_first_write_freezes_authoritative_identity_roster_for_friday_repl
         tenant_id=TENANT_ID,
         target_week_start=WEEK_START,
         roster=(AUTHORITY_MEMBER,),
+        created_at=NOW,
+    )
+    assert await store.open_or_load_batch(replay) == store.batch
+
+
+@pytest.mark.asyncio
+async def test_production_first_write_loads_both_configured_identity_bindings():
+    context = _context()
+    store = _FakeWeeklyPlanStore()
+    message = "next Monday prepare materials"
+    arguments = ApplyNextWeeklyPlanArgs.model_validate(
+        {
+            "plan_id": context.weekly_plan.plan_id,
+            "expected_version": 0,
+            "operations": [
+                {
+                    "operation_id": "configured-two-user-roster",
+                    "operation": "add",
+                    "plan_date": "2026-08-17",
+                    "content": "prepare materials",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_clause_quote": message,
+                    },
+                }
+            ],
+        }
+    )
+    request, bound_calls = _request("apply_next_weekly_plan", arguments)
+
+    class _Bindings:
+        def all(self):
+            return (
+                SimpleNamespace(
+                    user_id=SECOND_AUTHORITY_MEMBER.user_id,
+                    display_name=SECOND_AUTHORITY_MEMBER.display_name,
+                    department_id=SECOND_AUTHORITY_MEMBER.department_id,
+                    team_id=SECOND_AUTHORITY_MEMBER.team_id,
+                ),
+                SimpleNamespace(
+                    user_id=AUTHORITY_MEMBER.user_id,
+                    display_name=AUTHORITY_MEMBER.display_name,
+                    department_id=AUTHORITY_MEMBER.department_id,
+                    team_id=AUTHORITY_MEMBER.team_id,
+                ),
+            )
+
+    class _Session:
+        async def scalars(self, _statement):
+            return _Bindings()
+
+    settings = SimpleNamespace(
+        agent2_weekly_plan_tenant_allowlist=TENANT_ID,
+        agent2_weekly_plan_user_allowlist=(
+            f"{SECOND_AUTHORITY_MEMBER.user_id},{AUTHORITY_MEMBER.user_id}"
+        ),
+    )
+    executor = _executor(
+        store=store,
+        context=context,
+        bound_calls=bound_calls,
+        source=CurrentTurnSource((message,)),
+        authoritative_member=None,
+        session=_Session(),
+        settings=settings,
+    )
+
+    await executor.apply_next_weekly_plan(request)
+
+    assert store.batch.roster == tuple(
+        sorted(
+            (AUTHORITY_MEMBER, SECOND_AUTHORITY_MEMBER),
+            key=lambda member: member.user_id,
+        )
+    )
+    replay = create_weekly_plan_batch(
+        tenant_id=TENANT_ID,
+        target_week_start=WEEK_START,
+        roster=store.batch.roster,
         created_at=NOW,
     )
     assert await store.open_or_load_batch(replay) == store.batch

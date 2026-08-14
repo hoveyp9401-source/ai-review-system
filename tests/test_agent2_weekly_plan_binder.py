@@ -211,6 +211,59 @@ async def test_weekly_plan_query_rejects_untrusted_plan_id():
 
 
 @pytest.mark.asyncio
+async def test_one_leading_weekday_binds_all_parallel_items_in_the_same_clause():
+    message = "周一日常用印审核 优化日报机器人"
+    call = NativeToolCall(
+        "call-parallel-monday-items",
+        "apply_next_weekly_plan",
+        {
+            "plan_id": str(PLAN_ID),
+            "expected_version": 4,
+            "operations": [
+                {
+                    "operation_id": "add-imprint-review",
+                    "operation": "add",
+                    "plan_date": "2026-08-17",
+                    "content": "日常用印审核",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_clause_quote": "周一日常用印审核",
+                    },
+                },
+                {
+                    "operation_id": "add-daily-bot",
+                    "operation": "add",
+                    "plan_date": "2026-08-17",
+                    "content": "优化日报机器人",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_clause_quote": message,
+                    },
+                },
+            ],
+        },
+    )
+
+    bound, failure = await ShadowCallBinder(
+        _context(),
+        _DateResolver(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource(
+            (message,),
+            occurred_at=(
+                datetime(2026, 8, 14, 11, 17, tzinfo=ZoneInfo("Asia/Shanghai")),
+            ),
+        ),
+    ).bind(call)
+
+    assert failure is None
+    assert bound is not None
+    assert bound.weekly_plan is not None
+    assert bound.weekly_plan.plan_id == str(PLAN_ID)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("target_index", "plan_date"),
     ((0, "2026-08-19"), (1, "2026-08-26")),

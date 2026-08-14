@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -217,7 +218,13 @@ class ProductionRuntimeSession:
                 return _blocked("UNKNOWN_OR_DISABLED_TOOL")
             bound, failure = await self._binder.bind(call)
             if failure is not None:
-                staged.append(_canary_failure_receipt(failure))
+                staged.append(
+                    _canary_failure_receipt(
+                        failure,
+                        context=self._context,
+                        call=call,
+                    )
+                )
                 continue
             assert bound is not None
             prepared_call = _prepare_call(self._context, bound)
@@ -313,6 +320,7 @@ class ProductionRuntimeSession:
                     session=self._session,
                     user=self._user,
                     context=self._context,
+                    settings=self._settings,
                     bound_calls={
                         item.bound.call.tool_call_id: item.bound
                         for item in prepared
@@ -842,6 +850,16 @@ def _prepare_call(
                 if bound.periodic_report is not None
                 else None
             ),
+            "weekly_plan_id": (
+                bound.weekly_plan.plan_id
+                if bound.weekly_plan is not None
+                else None
+            ),
+            "weekly_plan_version": (
+                bound.weekly_plan.version
+                if bound.weekly_plan is not None
+                else None
+            ),
         },
     }
     return _PreparedCall(
@@ -865,17 +883,99 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _canary_failure_receipt(receipt: ToolReceipt) -> ToolReceipt:
+def _canary_failure_receipt(
+    receipt: ToolReceipt,
+    *,
+    context: TrustedContext,
+    call: NativeToolCall,
+) -> ToolReceipt:
+    safe_user_facts = {
+        **receipt.safe_user_facts,
+        "execution_mode": ExecutionMode.CANARY_EXECUTE.value,
+        "actual_write": False,
+    }
+    if call.tool_name in {
+        "apply_next_weekly_plan",
+        "submit_next_weekly_plan",
+    }:
+        safe_user_facts["pre_execution_block_observation"] = (
+            _pre_execution_block_observation(
+                context=context,
+                call=call,
+                error_code=str(receipt.error_code or ""),
+            )
+        )
     return receipt.model_copy(
         update={
-            "safe_user_facts": {
-                **receipt.safe_user_facts,
-                "execution_mode": ExecutionMode.CANARY_EXECUTE.value,
-                "actual_write": False,
-            },
+            "safe_user_facts": safe_user_facts,
             "execution_mode": ExecutionMode.CANARY_EXECUTE,
         }
     )
+
+
+def _pre_execution_block_observation(
+    *,
+    context: TrustedContext,
+    call: NativeToolCall,
+    error_code: str,
+) -> dict[str, Any]:
+    operations = call.arguments.get("operations")
+    operation_rows = (
+        tuple(operations)
+        if isinstance(operations, (list, tuple))
+        else ()
+    )
+    operation_type_counts: dict[str, int] = {}
+    for operation in operation_rows:
+        if not isinstance(operation, Mapping):
+            continue
+        operation_type = str(operation.get("operation") or "").strip()
+        if not operation_type:
+            continue
+        operation_type_counts[operation_type] = (
+            operation_type_counts.get(operation_type, 0) + 1
+        )
+
+    plan_ref = str(call.arguments.get("plan_id") or "").strip()
+    trusted_plan = (
+        context.weekly_plan_by_id(plan_ref) if plan_ref else None
+    )
+    expected_version = call.arguments.get("expected_version")
+    target_version = (
+        expected_version
+        if isinstance(expected_version, int)
+        and not isinstance(expected_version, bool)
+        else None
+    )
+    return {
+        "schema_version": "agent2.pre_execution_block.observation.v1",
+        "tool_name": call.tool_name,
+        "arguments_sha256": _sha256(call.arguments),
+        "target_type": (
+            "weekly_plan"
+            if call.tool_name
+            in {
+                "apply_next_weekly_plan",
+                "submit_next_weekly_plan",
+            }
+            else ""
+        ),
+        "target_plan_ref_sha256": (
+            hashlib.sha256(plan_ref.encode("utf-8")).hexdigest()
+            if plan_ref
+            else ""
+        ),
+        "target_week_start": (
+            trusted_plan.target_week_start.isoformat()
+            if trusted_plan is not None
+            else ""
+        ),
+        "target_version": target_version,
+        "operation_type_counts": operation_type_counts,
+        "operation_count": len(operation_rows),
+        "error_code": error_code,
+        "actual_write": False,
+    }
 
 
 def _safe_report_snapshot(

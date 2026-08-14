@@ -128,6 +128,36 @@ def test_current_turn_source_rejects_a_non_current_message_index() -> None:
     assert caught.value.code == "CURRENT_MESSAGE_EVIDENCE_MISMATCH"
 
 
+@pytest.mark.parametrize(
+    "content",
+    ("日常用印审核", "完成日常用印审核"),
+)
+def test_daily_item_text_must_be_grounded_in_current_message(
+    content: str,
+) -> None:
+    source = CurrentTurnSource(("今天也做了这个",))
+    arguments = AddDailyItemsArgs.model_validate(
+        {
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": content,
+                    "source_evidence": {"source_message_index": 1},
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(CurrentTurnSourceEvidenceError) as caught:
+        source.validate_tool_arguments(
+            "add_daily_items",
+            arguments.model_dump(mode="json"),
+        )
+
+    assert caught.value.code == "DAILY_ITEM_CONTENT_NOT_GROUNDED"
+
+
 def test_quote_bearing_daily_item_can_bind_the_whole_current_message() -> None:
     source = CurrentTurnSource(
         ("老板原话是“要么降薪，要么裁员”",)

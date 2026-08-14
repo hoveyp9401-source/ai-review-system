@@ -49,8 +49,10 @@ class WeeklyPlanAccessPolicy:
             )
         ):
             return _deny("weekly_plan_allowlist_invalid")
-        if len(self.tenant_allowlist) > 1 or len(self.user_allowlist) > 1:
+        if len(self.tenant_allowlist) > 1:
             return _deny("weekly_plan_single_canary_scope_required")
+        if len(self.user_allowlist) > 2:
+            return _deny("weekly_plan_two_user_canary_scope_required")
         if len(self.send_user_allowlist) > 1:
             return _deny("weekly_plan_single_canary_scope_required")
         if not isinstance(tenant_id, str) or not tenant_id:

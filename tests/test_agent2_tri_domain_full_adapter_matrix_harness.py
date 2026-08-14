@@ -72,3 +72,38 @@ def test_strict_scorer_accepts_no_tool_monday_week_clarification() -> None:
 
     assert passed is True
     assert errors == ()
+
+
+def test_strict_scorer_requires_both_parallel_items_to_keep_monday_scope() -> None:
+    case = next(
+        item for item in CASES
+        if item.case_id == "plan_parallel_items_share_monday_scope"
+    )
+    one_item_only = {
+        "name": "apply_next_weekly_plan",
+        "arguments": {
+            "plan_id": str(_FRIDAY_PLAN_ID),
+            "expected_version": _FRIDAY_PLAN_VERSION,
+            "operations": [
+                {
+                    "operation_id": "only-first-item",
+                    "operation": "add",
+                    "plan_date": "2026-08-17",
+                    "content": "日常用印审核",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_clause_quote": "周一日常用印审核 优化日报机器人",
+                    },
+                }
+            ],
+        },
+    }
+
+    passed, errors = _score(
+        case,
+        calls=[one_item_only],
+        assistant_content="要确认一下第二个事项的日期。",
+    )
+
+    assert passed is False
+    assert any("weekly-plan additions differ" in error for error in errors)

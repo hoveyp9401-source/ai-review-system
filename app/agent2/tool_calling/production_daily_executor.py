@@ -1,36 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, timedelta
 import hashlib
 import json
-from typing import Any, Iterable
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
-from app.agent2.tool_calling.context import (
-    CANARY_STATE_NAMESPACE,
-    TrustedContext,
-    TrustedReportSnapshot,
-)
-from app.agent2.tool_calling.contracts import (
-    AddDailyItemsArgs,
-    CompletePreviousPlanArgs,
-    ConfirmReportArgs,
-    CorrectDailyReportDateArgs,
-    CopyPreviousToTodayArgs,
-    DeleteDailyItemsArgs,
-    EditDailyItemsArgs,
-    MoveDailyItemsArgs,
-    QueryDailyBriefingFactsArgs,
-    QueryManagedDailyReportsArgs,
-    QueryReportInsightsArgs,
-    QueryReportByDateArgs,
-    ReceiptStatus,
-    RequestClearReportArgs,
-)
 from app.agent2.daily_briefing_fact_query import (
     DailyBriefingFactAmbiguous,
     DailyBriefingFactNotFound,
@@ -43,10 +23,32 @@ from app.agent2.report_insights import (
     ReportInsightModule,
     SqlReportInsightRepository,
 )
-from app.agent2.tool_calling.idempotency import build_write_idempotency_key
+from app.agent2.tool_calling.context import (
+    CANARY_STATE_NAMESPACE,
+    TrustedContext,
+    TrustedReportSnapshot,
+)
+from app.agent2.tool_calling.contracts import (
+    AddDailyItemsArgs,
+    CompletePreviousPlanArgs,
+    ConfirmReportArgs,
+    CopyPreviousToTodayArgs,
+    CorrectDailyReportDateArgs,
+    DeleteDailyItemsArgs,
+    EditDailyItemsArgs,
+    MoveDailyItemsArgs,
+    QueryDailyBriefingFactsArgs,
+    QueryManagedDailyReportsArgs,
+    QueryReportByDateArgs,
+    QueryReportInsightsArgs,
+    ReceiptStatus,
+    RecordWeeklyPlanItemsAsTodayWorkArgs,
+    RequestClearReportArgs,
+)
 from app.agent2.tool_calling.daily_report_date_correction import (
     SqlDailyReportDateCorrection,
 )
+from app.agent2.tool_calling.idempotency import build_write_idempotency_key
 from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
 from app.agent2.tool_calling.production_store import (
     ProductionContextStore,
@@ -61,7 +63,8 @@ from app.agent2.typed_daily_executor import (
     build_typed_daily_snapshot,
     execute_typed_agent2_daily_commands,
 )
-from app.models import DailyReport, User
+from app.agent2.weekly_plan_models import WeeklyPlan
+from app.agent2.weekly_plan_store import SqlWeeklyPlanStore
 from app.legal_daily_dashboard.chat_query import (
     ManagedDailyQuery,
     ManagedDailyQueryAmbiguous,
@@ -72,12 +75,24 @@ from app.legal_daily_dashboard.service import DashboardNotFound
 from app.legal_daily_dashboard.sql_repository import (
     SqlDashboardRepository,
 )
+from app.models import DailyReport, User
 
 
 class ProductionExecutionError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class WeeklyPlanReadPort(Protocol):
+    async def load_plan(
+        self,
+        *,
+        tenant_id: str,
+        plan_id: str,
+        owner_user_id: str,
+        for_update: bool = False,
+    ) -> WeeklyPlan | None: ...
 
 
 @dataclass(frozen=True)
@@ -112,6 +127,7 @@ class ProductionDailyExecutor:
         date_resolver: ProductionDateResolver,
         managed_daily_query: ManagedDailyQuery | None = None,
         daily_briefing_fact_query: DailyBriefingFactQuery | None = None,
+        weekly_plan_store: WeeklyPlanReadPort | None = None,
     ) -> None:
         self._session = session
         self._user = user
@@ -137,6 +153,9 @@ class ProductionDailyExecutor:
             settings=settings,
         )
         self._date_correction = SqlDailyReportDateCorrection(session)
+        self._weekly_plan_store = weekly_plan_store or SqlWeeklyPlanStore(
+            session
+        )
 
     async def query_today_report(
         self,
@@ -776,6 +795,116 @@ class ProductionDailyExecutor:
             else ()
         )
         typed_receipts = await self._execute_typed(target_date, commands)
+        after = await self._snapshot(target_date)
+        return self._outcome(
+            request,
+            before=before,
+            after=after,
+            typed_receipt_ids=typed_receipts,
+        )
+
+    async def record_weekly_plan_items_as_today_work(
+        self,
+        request: ProductionHandlerRequest,
+    ) -> ProductionHandlerOutcome:
+        arguments = self._arguments(
+            request,
+            RecordWeeklyPlanItemsAsTodayWorkArgs,
+        )
+        bound = self._bound(request)
+        plan = bound.weekly_plan
+        if plan is None:
+            raise ProductionExecutionError("WEEKLY_PLAN_CONTEXT_REQUIRED")
+        principal = self._context.principal
+        if (
+            principal.conversation_kind != "direct"
+            or str(getattr(self._user, "id", ""))
+            != str(principal.user_id)
+            or plan.tenant_id != principal.tenant_id
+            or plan.owner_user_id != str(principal.user_id)
+            or str(arguments.plan_id) != plan.plan_id
+        ):
+            raise ProductionExecutionError("WEEKLY_PLAN_SCOPE_MISMATCH")
+        try:
+            live_plan = await self._weekly_plan_store.load_plan(
+                tenant_id=principal.tenant_id,
+                plan_id=plan.plan_id,
+                owner_user_id=str(principal.user_id),
+                for_update=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProductionExecutionError(
+                "WEEKLY_PLAN_LIVE_READ_FAILED"
+            ) from exc
+        if live_plan is None:
+            raise ProductionExecutionError("WEEKLY_PLAN_NOT_FOUND")
+        if (
+            live_plan.plan_id != plan.plan_id
+            or live_plan.tenant_id != principal.tenant_id
+            or live_plan.owner_user_id != str(principal.user_id)
+            or live_plan.target_week_start != plan.target_week_start
+        ):
+            raise ProductionExecutionError("WEEKLY_PLAN_SCOPE_MISMATCH")
+        if (
+            live_plan.version != arguments.expected_version
+            or live_plan.version != plan.version
+        ):
+            raise ProductionExecutionError("STALE_WEEKLY_PLAN_VERSION")
+
+        trusted_items = {
+            item.item_id: item
+            for day in plan.days
+            for item in day.items
+        }
+        live_items = {
+            item.item_id: item
+            for day in live_plan.days
+            for item in day.items
+        }
+        if any(
+            item_id not in trusted_items or item_id not in live_items
+            for item_id in arguments.target_item_ids
+        ):
+            raise ProductionExecutionError(
+                "UNTRUSTED_WEEKLY_PLAN_ITEM_ID"
+            )
+        if any(
+            live_items[item_id].original_text
+            != trusted_items[item_id].original_text
+            for item_id in arguments.target_item_ids
+        ):
+            raise ProductionExecutionError("WEEKLY_PLAN_CONTEXT_MISMATCH")
+
+        target_date = self._today()
+        before = await self._snapshot(target_date)
+        target = await self._typed_snapshot(target_date)
+        seen = set(target.today_work)
+        values: list[str] = []
+        for item_id in arguments.target_item_ids:
+            original_text = live_items[item_id].original_text
+            if original_text in seen:
+                continue
+            seen.add(original_text)
+            values.append(original_text)
+        commands = (
+            (
+                self._command(
+                    request,
+                    ordinal=0,
+                    command_type="append_item",
+                    report_id=target.report_id,
+                    report_version=target.version,
+                    patch={"field": "today_work", "items": values},
+                ),
+            )
+            if values
+            else ()
+        )
+        typed_receipts = await self._execute_typed(
+            target_date,
+            commands,
+            allow_completed_content_mutation=True,
+        )
         after = await self._snapshot(target_date)
         return self._outcome(
             request,

@@ -13,7 +13,6 @@ from app.agent2.tool_calling.production_handlers import (
     execute_query_next_weekly_plan,
     execute_submit_next_weekly_plan,
 )
-
 from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     ToolArgumentsValidationError,
@@ -53,12 +52,14 @@ def test_weekly_plan_tools_are_absent_until_their_independent_flags_open():
         "query_next_weekly_plan",
         "apply_next_weekly_plan",
         "submit_next_weekly_plan",
+        "record_weekly_plan_items_as_today_work",
     }
     assert weekly_names.isdisjoint(closed)
     assert "query_next_weekly_plan" in read_only
     assert {
         "apply_next_weekly_plan",
         "submit_next_weekly_plan",
+        "record_weekly_plan_items_as_today_work",
     }.isdisjoint(read_only)
     assert weekly_names <= set(writable)
 

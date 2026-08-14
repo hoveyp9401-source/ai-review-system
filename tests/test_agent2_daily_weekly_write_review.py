@@ -29,7 +29,6 @@ from app.agent2.weekly_plan_context import (
     TrustedWeeklyPlanDay,
 )
 
-
 _USER_ID = UUID("10000000-0000-4000-8000-000000000001")
 _PLAN_ID = "20000000-0000-4000-8000-000000000001"
 
@@ -157,6 +156,42 @@ def _weekly_call(*, call_id: str = "weekly") -> dict:
                                 "exact_clause_quote": "下周三整理案件材料",
                             },
                         }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
+def _weekly_recurrence_call(
+    *,
+    call_id: str,
+    days: tuple[int, ...] = (17, 18, 19, 20, 21, 22),
+    message: str = "下周每天做日常用印审核",
+) -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "apply_next_weekly_plan",
+            "arguments": json.dumps(
+                {
+                    "plan_id": _PLAN_ID,
+                    "expected_version": 0,
+                    "operations": [
+                        {
+                            "operation_id": f"recurrence-{day}",
+                            "operation": "add",
+                            "plan_date": f"2026-08-{day:02d}",
+                            "content": "日常用印审核",
+                            "source_evidence": {
+                                "source_message_index": 1,
+                                "exact_clause_quote": message,
+                                "recurrence_scope_quote": "下周每天",
+                            },
+                        }
+                        for day in days
                     ],
                 },
                 ensure_ascii=False,
@@ -347,9 +382,142 @@ async def test_independent_review_restores_a_weekly_write_omitted_from_daily_dra
     assert result.model_turns[1].response_metadata[
         "daily_weekly_write_semantic_review"
     ] is True
+
+
+@pytest.mark.asyncio
+async def test_recurrence_write_uses_existing_independent_semantic_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _tool_completion(_weekly_recurrence_call(call_id="draft")),
+            _tool_completion(_weekly_recurrence_call(call_id="review")),
+            _terminal_completion("已把该事项安排到下周周一至周六。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="下周每天做日常用印审核",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == "已把该事项安排到下周周一至周六。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert len(runtime.calls[0].arguments["operations"]) == 6
+    assert result.model_turns[1].response_metadata[
+        "daily_weekly_write_semantic_review"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_recurrence_semantic_review_can_ask_naturally_and_write_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    clarification = "你是要安排周一至周五，还是周一至周六每天都做？"
+    completions = iter(
+        (
+            _tool_completion(_weekly_recurrence_call(call_id="draft")),
+            _clarification_completion(clarification),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="下周每天做日常用印审核",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == clarification
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_and_recurrence_are_confirmed_and_written_in_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    message = "今天完成合同审核；下周每天做日常用印审核"
+
+    def batch(label: str) -> _CompletionResponse:
+        return _tool_completion(
+            _daily_call(call_id=f"{label}-daily"),
+            _weekly_recurrence_call(
+                call_id=f"{label}-weekly",
+                message=message,
+            ),
+        )
+
+    completions = iter(
+        (
+            batch("draft"),
+            batch("review"),
+            _terminal_completion(),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text=message,
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "add_daily_items",
+        "apply_next_weekly_plan",
+    ]
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
     assert result.model_turns[0].response_metadata[
         "system_prompt_sha256"
-    ] == hashlib.sha256("Agent2 test".encode("utf-8")).hexdigest()
+    ] == hashlib.sha256(b"Agent2 test").hexdigest()
 
 
 @pytest.mark.asyncio

@@ -121,10 +121,17 @@ class MatrixCase:
     expected_plan_bindings: tuple[
         tuple[str, int, frozenset[str], frozenset[str]], ...
     ] = ()
+    expected_plan_additions: tuple[tuple[str, str], ...] = ()
     expected_daily_submit: bool = False
     expected_periodic_submit: bool = False
     expected_plan_submit: tuple[str, int] | None = None
-    response_kind: Literal["any", "daily_open", "clarification", "no_submit"] = "any"
+    response_kind: Literal[
+        "any",
+        "daily_open",
+        "clarification",
+        "no_submit",
+        "no_clarification",
+    ] = "any"
     recent_messages: tuple[tuple[Literal["user", "assistant"], str], ...] = ()
     note: str = ""
 
@@ -227,6 +234,86 @@ CASES = (
                 tuple(f"2026-08-{day:02d}" for day in range(17, 23)),
                 ("add", "set_day_empty"),
             ),
+        ),
+    ),
+    MatrixCase(
+        "plan_parallel_items_share_monday_scope",
+        "plan_lifecycle",
+        "周一日常用印审核 优化日报机器人",
+        frozenset({"apply_next_weekly_plan"}),
+        expected_plan_bindings=(
+            _binding(
+                _FRIDAY_PLAN_ID,
+                _FRIDAY_PLAN_VERSION,
+                ("2026-08-17",),
+                ("add",),
+            ),
+        ),
+        expected_plan_additions=(
+            ("2026-08-17", "日常用印审核"),
+            ("2026-08-17", "优化日报机器人"),
+        ),
+        response_kind="no_clarification",
+        note=(
+            "A space naturally separates two parallel plan items; the leading Monday "
+            "scope applies to both, so neither item may become an undated suggestion."
+        ),
+    ),
+    MatrixCase(
+        "plan_every_day_scope",
+        "plan_lifecycle",
+        "每天都做的工作是日常用印审核",
+        frozenset({"apply_next_weekly_plan"}),
+        expected_plan_bindings=(
+            _binding(
+                _FRIDAY_PLAN_ID,
+                _FRIDAY_PLAN_VERSION,
+                tuple(
+                    f"2026-08-{day:02d}" for day in range(17, 23)
+                ),
+                ("add",),
+            ),
+        ),
+        expected_plan_additions=tuple(
+            (f"2026-08-{day:02d}", "日常用印审核")
+            for day in range(17, 23)
+        ),
+        response_kind="no_clarification",
+        note=(
+            "In one open weekly-plan target, every day means all six exact plan "
+            "dates and must not be downgraded to an undated suggestion."
+        ),
+        recent_messages=(
+            ("user", "帮我填下周计划"),
+            (
+                "assistant",
+                "下周计划（8月17日至22日，周一至周六）已就绪，请告诉我具体安排。",
+            ),
+        ),
+    ),
+    MatrixCase(
+        "plan_monday_to_friday_daily_scope",
+        "plan_lifecycle",
+        "我周一到周五每天做日常用印审核",
+        frozenset({"apply_next_weekly_plan"}),
+        expected_plan_bindings=(
+            _binding(
+                _FRIDAY_PLAN_ID,
+                _FRIDAY_PLAN_VERSION,
+                tuple(
+                    f"2026-08-{day:02d}" for day in range(17, 22)
+                ),
+                ("add",),
+            ),
+        ),
+        expected_plan_additions=tuple(
+            (f"2026-08-{day:02d}", "日常用印审核")
+            for day in range(17, 22)
+        ),
+        response_kind="no_clarification",
+        note=(
+            "An explicit Monday-to-Friday recurrence expands to exactly five "
+            "trusted dates in one atomic weekly-plan call."
         ),
     ),
     MatrixCase(
@@ -412,20 +499,27 @@ class _ZeroWriteRuntime:
 
     def _receipt(self, call: NativeToolCall) -> ToolReceipt:
         name = call.tool_name
-        is_write = TOOL_REGISTRY[name].read_or_write == "write"
+        definition = TOOL_REGISTRY[name]
+        is_write = definition.read_or_write == "write"
         safe_facts: dict[str, Any] = {
             "actual_write": False,
             "evaluation_only": True,
             "production_handler_called": False,
         }
-        if "weekly_plan" in name:
+        if (
+            definition.transaction_target_policy == "weekly_plan"
+            or name == "query_next_weekly_plan"
+        ):
             requested = call.arguments.get("plan_id")
             plan = self.context.weekly_plan_by_id(str(requested)) if requested else self.context.weekly_plan
             assert plan is not None
             if name == "query_next_weekly_plan":
                 safe_facts["weekly_plan"] = plan.model_payload()
             target_type, target_id, version = "weekly_plan", plan.plan_id, plan.version
-        elif "current_weekly_report" in name:
+        elif (
+            definition.transaction_target_policy == "periodic_report"
+            or name == "query_current_weekly_report"
+        ):
             report = self.context.current_weekly_report
             assert report is not None
             if name == "query_current_weekly_report":
@@ -763,6 +857,18 @@ def _response_check(case: MatrixCase, content: str | None) -> tuple[bool, str]:
         return True, "matched"
     if case.response_kind == "no_submit":
         return True, "matched"
+    if case.response_kind == "no_clarification":
+        redundant_scope_questions = (
+            "仅周一",
+            "还是每天",
+            "哪一天",
+            "具体日期",
+            "未指定日期",
+            "请确认是否",
+        )
+        if any(marker in reply for marker in redundant_scope_questions):
+            return False, "parallel Monday items triggered a redundant date clarification"
+        return True, "matched"
     if not (
         any(token in reply for token in ("今天", "日报", "本周"))
         and any(token in reply for token in ("下周", "工作计划", "哪一周"))
@@ -845,6 +951,7 @@ def _score(
             errors.append("current Weekly Report submit selected the wrong record or version")
 
     actual_plan_bindings: list[tuple[str, int, frozenset[str], frozenset[str]]] = []
+    actual_plan_additions: list[tuple[str, str]] = []
     for arguments in by_name.get("apply_next_weekly_plan", []):
         operations = arguments.get("operations", ())
         dates = frozenset(
@@ -861,10 +968,26 @@ def _score(
                 operation_names,
             )
         )
+        actual_plan_additions.extend(
+            (
+                str(operation.get("plan_date") or ""),
+                str(operation.get("content") or ""),
+            )
+            for operation in operations
+            if operation.get("operation") == "add"
+        )
     if sorted(actual_plan_bindings) != sorted(case.expected_plan_bindings):
         errors.append(
             "weekly-plan bindings differ: expected "
             f"{sorted(case.expected_plan_bindings)}, got {sorted(actual_plan_bindings)}"
+        )
+    if (
+        case.expected_plan_additions
+        and tuple(actual_plan_additions) != case.expected_plan_additions
+    ):
+        errors.append(
+            "weekly-plan additions differ: expected "
+            f"{case.expected_plan_additions}, got {tuple(actual_plan_additions)}"
         )
 
     plan_submits = by_name.get("submit_next_weekly_plan", [])
@@ -905,7 +1028,12 @@ async def _evaluate_one(
     context = _context(case, round_number)
     runtime = (
         _BinderZeroWriteRuntime(context, case.user_text)
-        if case.case_id == "monday_bare_weekday_ambiguous"
+        if case.case_id in {
+            "monday_bare_weekday_ambiguous",
+            "plan_parallel_items_share_monday_scope",
+            "plan_every_day_scope",
+            "plan_monday_to_friday_daily_scope",
+        }
         else _ZeroWriteRuntime(context)
     )
     started = perf_counter()
@@ -1038,6 +1166,10 @@ def _case_manifest() -> list[dict[str, Any]]:
                     "operations": sorted(operations),
                 }
                 for plan_id, version, dates, operations in case.expected_plan_bindings
+            ],
+            "expected_plan_additions": [
+                {"plan_date": plan_date, "content": content}
+                for plan_date, content in case.expected_plan_additions
             ],
             "expected_daily_submit": case.expected_daily_submit,
             "expected_periodic_submit": case.expected_periodic_submit,

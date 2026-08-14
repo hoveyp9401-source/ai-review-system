@@ -81,6 +81,7 @@ class _IngressSession:
         self.committed = deepcopy(self.working)
         self.outer_commit_count = 0
         self.outer_rollback_count = 0
+        self.bound_failure_codes: list[str | None] = []
 
     async def scalar(self, _statement):
         return None
@@ -171,6 +172,7 @@ class _PendingLedgerRuntime:
             else:
                 bound.append(item)
         if failures:
+            self._ledger.bound_failure_codes = [item.error_code for item in failures]
             receipts = tuple(
                 failures
                 + [
@@ -359,6 +361,75 @@ def _weekly_call(
                             },
                         }
                     ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
+def _weekly_every_day_call(*, call_id: str) -> dict:
+    """Captured model meaning for “每天都做的工作是日常用印审核”."""
+
+    operations = []
+    for offset in range(6):
+        plan_date = TARGET_WEEK + timedelta(days=offset)
+        operations.append(
+            {
+                "operation_id": f"add-imprint-review-{offset}",
+                "operation": "add",
+                "plan_date": plan_date.isoformat(),
+                "content": "日常用印审核",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_clause_quote": "每天都做的工作是日常用印审核",
+                    "recurrence_scope_quote": "每天",
+                },
+            }
+        )
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "apply_next_weekly_plan",
+            "arguments": json.dumps(
+                {
+                    "plan_id": _plan_id(),
+                    "expected_version": 0,
+                    "operations": operations,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
+def _weekly_monday_to_friday_call(*, call_id: str) -> dict:
+    message = "我周一到周五每天做日常用印审核"
+    operations = [
+        {
+            "operation_id": f"add-weekday-imprint-review-{offset}",
+            "operation": "add",
+            "plan_date": (TARGET_WEEK + timedelta(days=offset)).isoformat(),
+            "content": "日常用印审核",
+            "source_evidence": {
+                "source_message_index": 1,
+                "exact_clause_quote": message,
+                "recurrence_scope_quote": "周一到周五每天",
+            },
+        }
+        for offset in range(5)
+    ]
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "apply_next_weekly_plan",
+            "arguments": json.dumps(
+                {
+                    "plan_id": _plan_id(),
+                    "expected_version": 0,
+                    "operations": operations,
                 },
                 ensure_ascii=False,
             ),
@@ -564,6 +635,62 @@ async def test_private_weekly_enters_weekly_without_writing_daily(monkeypatch) -
 
     assert outcome.actual_write is True
     assert session.committed == {"daily": [], "weekly": ["整理案件材料"]}
+
+
+@pytest.mark.asyncio
+async def test_repro_every_day_scope_writes_six_days_and_survives_followup(
+    monkeypatch,
+) -> None:
+    """Red loop for the 2026-08-14 Pang-only weekly-plan screenshot."""
+
+    draft = _weekly_every_day_call(call_id="draft-every-day")
+    reviewed = _weekly_every_day_call(call_id="reviewed-every-day")
+    outcome, session, _http = await _run_ingress(
+        monkeypatch,
+        first_calls=(draft,),
+        reviewed_calls=(reviewed,),
+        user_text="每天都做的工作是日常用印审核",
+    )
+
+    expected_plan = ["日常用印审核"] * 6
+    evidence = {
+        "captured_symptom": (
+            "模型理解为周一至周六同项，但写入未成功、计划未变"
+        ),
+        "model_understanding": "six_day_same_item",
+        "model_operation_count": 6,
+        "actual_write": outcome.actual_write,
+        "tool_blocked_count": outcome.tool_blocked_count,
+        "tool_failure_count": outcome.tool_failure_count,
+        "bound_failure_codes": session.bound_failure_codes,
+        "outer_commit_count": session.outer_commit_count,
+        "outer_rollback_count": session.outer_rollback_count,
+        "plan_after": session.committed["weekly"],
+        "followup": "周一日常用印审核 优化日报机器人",
+        "followup_must_not_reask": "日常用印审核是仅周一还是每天",
+    }
+    assert (
+        outcome.actual_write is True
+        and session.committed["weekly"] == expected_plan
+    ), json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_monday_to_friday_daily_scope_writes_five_exact_plan_days(
+    monkeypatch,
+) -> None:
+    draft = _weekly_monday_to_friday_call(call_id="draft-weekday-range")
+    reviewed = _weekly_monday_to_friday_call(call_id="reviewed-weekday-range")
+
+    outcome, session, _http = await _run_ingress(
+        monkeypatch,
+        first_calls=(draft,),
+        reviewed_calls=(reviewed,),
+        user_text="我周一到周五每天做日常用印审核",
+    )
+
+    assert outcome.actual_write is True
+    assert session.committed["weekly"] == ["日常用印审核"] * 5
 
 
 @pytest.mark.asyncio

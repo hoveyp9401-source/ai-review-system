@@ -25,6 +25,7 @@ from app.agent2.weekly_plan_context import TrustedWeeklyPlanContext
 from app.agent2.weekly_plan_date_binding import (
     WeeklyPlanDateBindingError,
     validate_weekly_plan_date_binding,
+    validate_weekly_plan_date_set_binding,
 )
 
 
@@ -431,7 +432,10 @@ class ShadowCallBinder:
                         ),
                     },
                 )
-        if definition.object_binding_policy == "server_today_owner_report":
+        if definition.object_binding_policy in {
+            "server_today_owner_report",
+            "trusted_weekly_plan_version_and_item_ids_to_server_today_report",
+        }:
             report = self._context.today_report
         if (
             definition.object_binding_policy
@@ -502,7 +506,12 @@ class ShadowCallBinder:
                 report = self._context.today_report
             else:
                 report = bound_report
-        expected_version = arguments.get("expected_version")
+        expected_version = (
+            None
+            if definition.object_binding_policy
+            == "trusted_weekly_plan_version_and_item_ids_to_server_today_report"
+            else arguments.get("expected_version")
+        )
         version_report = source_report if previous_binding else report
         if (
             version_report is not None
@@ -518,7 +527,12 @@ class ShadowCallBinder:
 
         target_item_ids = tuple(arguments.get("target_item_ids") or ())
         item_report = source_report if previous_binding else report
-        if item_report is not None and target_item_ids:
+        if (
+            item_report is not None
+            and target_item_ids
+            and definition.object_binding_policy
+            != "trusted_weekly_plan_version_and_item_ids_to_server_today_report"
+        ):
             items = tuple(item_report.item(item_id) for item_id in target_item_ids)
             if any(item is None for item in items):
                 return None, failure_receipt(
@@ -699,6 +713,7 @@ def _validate_weekly_plan_binding(
         "query_next_weekly_plan",
         "apply_next_weekly_plan",
         "submit_next_weekly_plan",
+        "record_weekly_plan_items_as_today_work",
     }:
         return None, None
     plan_id = str(arguments.get("plan_id") or "")
@@ -740,6 +755,20 @@ def _validate_weekly_plan_binding(
     if call.tool_name == "submit_next_weekly_plan":
         return plan, None
 
+    if call.tool_name == "record_weekly_plan_items_as_today_work":
+        trusted_item_ids = {
+            item.item_id for day in plan.days for item in day.items
+        }
+        target_item_ids = tuple(arguments.get("target_item_ids") or ())
+        if any(item_id not in trusted_item_ids for item_id in target_item_ids):
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "UNTRUSTED_WEEKLY_PLAN_ITEM_ID",
+            )
+        return plan, None
+
+    operations = tuple(arguments.get("operations") or ())
     trusted_dates = {day.plan_date.isoformat() for day in plan.days}
     trusted_item_ids = {
         item.item_id for day in plan.days for item in day.items
@@ -747,7 +776,181 @@ def _validate_weekly_plan_binding(
     trusted_suggestion_ids = {
         suggestion.suggestion_id for suggestion in plan.suggestions
     }
-    for operation in arguments.get("operations") or ():
+    # A recurrence is represented by several ordinary add operations in one
+    # atomic apply call.  Validate the shared current-message clause once as a
+    # date set; validating each expanded add as if the user had named one day
+    # is what previously rejected “每天做 X”.
+    recurrent_add_groups: dict[
+        tuple[int, str, str, str], list[tuple[int, dict[str, Any]]]
+    ] = {}
+    for operation_index, operation in enumerate(operations):
+        if str(operation.get("operation") or "") != "add":
+            continue
+        evidence = operation.get("source_evidence") or {}
+        try:
+            group_key = (
+                int(evidence.get("source_message_index")),
+                str(evidence.get("exact_clause_quote") or ""),
+                str(evidence.get("recurrence_scope_quote") or ""),
+                str(operation.get("content") or ""),
+            )
+        except (TypeError, ValueError):
+            continue
+        recurrent_add_groups.setdefault(group_key, []).append(
+            (operation_index, operation)
+        )
+
+    date_set_validated_indexes: set[int] = set()
+    for (
+        source_message_index,
+        exact_clause,
+        recurrence_scope,
+        content,
+    ), grouped in (
+        recurrent_add_groups.items()
+    ):
+        proposed_values = tuple(
+            str(operation.get("plan_date") or "")
+            for _index, operation in grouped
+        )
+        if len(grouped) < 2 or len(set(proposed_values)) < 2:
+            continue
+        if current_turn_source is None:
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "CURRENT_TURN_SOURCE_REQUIRED",
+            )
+        try:
+            source_message = current_turn_source.messages[source_message_index - 1]
+            source_occurred_at = current_turn_source.occurred_at_for(
+                source_message_index
+            )
+            if source_occurred_at is None:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "WEEKLY_PLAN_SOURCE_TIME_REQUIRED",
+                )
+            proposed_dates = tuple(date.fromisoformat(value) for value in proposed_values)
+            validate_weekly_plan_date_set_binding(
+                source_message=source_message,
+                exact_clause_quote=exact_clause,
+                recurrence_scope_quote=recurrence_scope,
+                matter_text=content,
+                source_occurred_at=source_occurred_at,
+                business_timezone=context.principal.timezone,
+                target_week_start=plan.target_week_start,
+                proposed_dates=proposed_dates,
+                require_explicit_week_scope=len(
+                    {
+                        candidate.target_week_start
+                        for candidate in context.all_weekly_plans()
+                    }
+                )
+                > 1,
+            )
+        except WeeklyPlanDateBindingError as exc:
+            clarification_facts = (
+                {
+                    "clarification_reason": "weekly_plan_target_week_ambiguous",
+                    "possible_week_scopes": ["current_week", "next_week"],
+                    "clarification_option_labels": ["本周", "下周"],
+                    "must_ask_user": True,
+                }
+                if exc.code == "WEEKLY_PLAN_TARGET_WEEK_AMBIGUOUS"
+                else None
+            )
+            return None, failure_receipt(
+                call,
+                (
+                    ReceiptStatus.CLARIFICATION_REQUIRED
+                    if exc.code == "WEEKLY_PLAN_TARGET_WEEK_AMBIGUOUS"
+                    else ReceiptStatus.BLOCKED
+                ),
+                exc.code,
+                safe_user_facts=clarification_facts,
+            )
+        except (IndexError, TypeError, ValueError):
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "WEEKLY_PLAN_DATE_EVIDENCE_MISMATCH",
+            )
+        date_set_validated_indexes.update(index for index, _operation in grouped)
+
+    # A leading weekday can govern several parallel matters in one clause.  A
+    # reviewer may quote the short first fragment for one item and the complete
+    # clause for another.  Reuse only a larger, current-message quote that
+    # contains the short quote and matter and that independently resolves to the
+    # same proposed date.  This keeps incomplete standalone fragments blocked
+    # while accepting the safely evidenced shared scope.
+    shared_scope_validated_indexes: set[int] = set()
+    add_operations = tuple(
+        (index, operation)
+        for index, operation in enumerate(operations)
+        if str(operation.get("operation") or "") == "add"
+    )
+    if current_turn_source is not None:
+        for operation_index, operation in add_operations:
+            evidence = operation.get("source_evidence") or {}
+            try:
+                source_message_index = int(evidence.get("source_message_index"))
+                source_message = current_turn_source.messages[
+                    source_message_index - 1
+                ]
+                source_occurred_at = current_turn_source.occurred_at_for(
+                    source_message_index
+                )
+                proposed = date.fromisoformat(str(operation.get("plan_date") or ""))
+                short_quote = str(evidence.get("exact_clause_quote") or "")
+                content = str(operation.get("content") or "")
+            except (IndexError, TypeError, ValueError):
+                continue
+            if source_occurred_at is None:
+                continue
+            for _candidate_index, candidate in add_operations:
+                candidate_evidence = candidate.get("source_evidence") or {}
+                try:
+                    candidate_source_index = int(
+                        candidate_evidence.get("source_message_index")
+                    )
+                except (TypeError, ValueError):
+                    continue
+                candidate_quote = str(
+                    candidate_evidence.get("exact_clause_quote") or ""
+                )
+                if (
+                    candidate_source_index != source_message_index
+                    or str(candidate.get("plan_date") or "")
+                    != proposed.isoformat()
+                    or not short_quote
+                    or short_quote not in candidate_quote
+                    or content not in candidate_quote
+                ):
+                    continue
+                try:
+                    validate_weekly_plan_date_binding(
+                        source_message=source_message,
+                        exact_clause_quote=candidate_quote,
+                        source_occurred_at=source_occurred_at,
+                        business_timezone=context.principal.timezone,
+                        target_week_start=plan.target_week_start,
+                        proposed_date=proposed,
+                        require_explicit_week_scope=len(
+                            {
+                                candidate_plan.target_week_start
+                                for candidate_plan in context.all_weekly_plans()
+                            }
+                        )
+                        > 1,
+                    )
+                except WeeklyPlanDateBindingError:
+                    continue
+                shared_scope_validated_indexes.add(operation_index)
+                break
+
+    for operation_index, operation in enumerate(operations):
         operation_type = str(operation.get("operation") or "")
         plan_date = (
             operation.get("target_plan_date")
@@ -765,7 +968,9 @@ def _validate_weekly_plan_binding(
             "move",
             "set_day_empty",
             "accept_suggestion",
-        }:
+        } and operation_index not in (
+            date_set_validated_indexes | shared_scope_validated_indexes
+        ):
             if current_turn_source is None:
                 return None, failure_receipt(
                     call,

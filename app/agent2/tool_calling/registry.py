@@ -33,6 +33,7 @@ from app.agent2.tool_calling.contracts import (
     QueryReportByDateArgs,
     QueryReportInsightsArgs,
     QueryTodayReportArgs,
+    RecordWeeklyPlanItemsAsTodayWorkArgs,
     RememberPersonalMemoryArgs,
     RequestClearReportArgs,
     SubmitCurrentWeeklyReportArgs,
@@ -389,6 +390,13 @@ TOOL_REGISTRY = MappingProxyType(
             "operations or none, and never infer a missing target or day. Every operation "
             "that assigns a formal day must cite one complete exact current-message clause "
             "containing that day and matter so the server can independently verify the date. "
+            "For one bounded every-day or weekday-range recurrence, emit one add per exact "
+            "selected date and copy the entire current user message as exact_clause_quote "
+            "plus the same complete "
+            "recurrence_scope_quote. Include every attached bound, exception, or qualifier in "
+            "that scope quote; never shorten a restricted phrase to only 'every day'. If one leading date "
+            "governs several clearly parallel matters, keep every matter as a separate add "
+            "on that shared date and reuse the complete governing clause. "
             "For capture_suggestion, content must be one exact contiguous excerpt from the "
             "current user message, including any alternative days or uncertainty qualifiers; "
             "never summarize or normalize it.",
@@ -430,6 +438,36 @@ TOOL_REGISTRY = MappingProxyType(
                 production_handlers.execute_submit_next_weekly_plan
             ),
             conflict="broad_target",
+            enabled_modes=frozenset({ExecutionMode.CANARY_EXECUTE}),
+        ),
+        "record_weekly_plan_items_as_today_work": _definition(
+            "record_weekly_plan_items_as_today_work",
+            "Record one or more exact committed Weekly Work Plan items as work also done "
+            "today. Use this only when the current user message semantically adopts exact "
+            "stable items from one trusted weekly_plan_target; copy its plan_id, exact "
+            "current version, and stable item IDs. Do not provide, summarize, prefix, or "
+            "rewrite Daily Report content: the server copies each selected original_text "
+            "verbatim into today's today_work and deduplicates identical text. This does "
+            "not alter the Weekly Work Plan or prove that any unselected item was done. "
+            "Here today is the authenticated user's current local calendar date. Call this "
+            "tool only when the model has semantically confirmed that exact date. During "
+            "deep overnight hours, if 今天 could still mean the reporting day that just "
+            "ended, ask which date instead of calling this fixed-today tool. "
+            "If more than one distinct trusted matter could be meant, ask which one and "
+            "call no write tool.",
+            RecordWeeklyPlanItemsAsTodayWorkArgs,
+            "write",
+            "medium",
+            "authenticated_owner_weekly_plan_write",
+            "trusted_weekly_plan_version_and_item_ids_to_server_today_report",
+            "server_today_in_user_timezone",
+            idempotency=_WRITE_KEY,
+            transaction=_ATOMIC,
+            transaction_target="today_report",
+            production_handler=(
+                production_handlers.execute_record_weekly_plan_items_as_today_work
+            ),
+            conflict="item_content",
             enabled_modes=frozenset({ExecutionMode.CANARY_EXECUTE}),
         ),
         "query_report_by_date": _definition(

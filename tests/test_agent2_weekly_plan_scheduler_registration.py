@@ -6,9 +6,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from app.agent2.weekly_plan_models import WeeklyPlanRosterMember
 from app.scheduler import runner
 from app.scheduler.runner import (
     register_weekly_plan_jobs,
+    run_weekly_plan_collection_open_job,
     run_weekly_plan_history_suggestion_refresh_job,
     run_weekly_plan_reminder_maintenance_job,
 )
@@ -156,6 +158,115 @@ def test_reminder_enqueue_is_not_registered_when_send_scope_is_closed() -> None:
         "agent2_weekly_plan_monday_snapshot",
     )
     assert [job["id"] for job in scheduler.jobs] == list(registered)
+
+
+def test_two_user_canary_registers_open_and_snapshot_but_no_send_jobs() -> None:
+    scheduler = _Scheduler()
+
+    registered = register_weekly_plan_jobs(
+        scheduler,
+        settings=_settings(
+            agent2_weekly_plan_enabled=True,
+            agent2_weekly_plan_write_enabled=True,
+            agent2_weekly_plan_send_enabled=False,
+            agent2_weekly_plan_tenant_allowlist="tenant-a",
+            agent2_weekly_plan_user_allowlist="user-b,user-a",
+            agent2_weekly_plan_send_user_allowlist="",
+        ),
+        open_job=_noop,
+        reminder_job=_noop,
+        reminder_reconcile_job=_noop,
+        snapshot_job=_noop,
+    )
+
+    assert registered == (
+        "agent2_weekly_plan_collection_open",
+        "agent2_weekly_plan_monday_snapshot",
+    )
+    assert [job["id"] for job in scheduler.jobs] == list(registered)
+
+
+def test_weekly_plan_scheduler_rejects_three_user_canary_scope() -> None:
+    scheduler = _Scheduler()
+
+    registered = register_weekly_plan_jobs(
+        scheduler,
+        settings=_settings(
+            agent2_weekly_plan_enabled=True,
+            agent2_weekly_plan_write_enabled=True,
+            agent2_weekly_plan_tenant_allowlist="tenant-a",
+            agent2_weekly_plan_user_allowlist="user-a,user-b,user-c",
+        ),
+        open_job=_noop,
+        reminder_job=_noop,
+        reminder_reconcile_job=_noop,
+        snapshot_job=_noop,
+    )
+
+    assert registered == ()
+    assert scheduler.jobs == []
+
+
+@pytest.mark.asyncio
+async def test_two_user_open_job_freezes_both_configured_members_in_stable_order(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _Session:
+        async def commit(self) -> None:
+            captured["committed"] = True
+
+    class _Sessions:
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def __call__(self):
+            return self
+
+    async def _member(_session, *, tenant_id, user_id):
+        return WeeklyPlanRosterMember(
+            user_id=user_id,
+            display_name=user_id,
+            department_id="department-a",
+            team_id="team-a",
+        )
+
+    class _Orchestrator:
+        def __init__(self, _store) -> None:
+            pass
+
+        async def open_collection(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
+    monkeypatch.setattr(runner, "_load_weekly_plan_canary_member", _member)
+    monkeypatch.setattr(runner, "SqlWeeklyPlanStore", lambda _session: object())
+    monkeypatch.setattr(
+        runner,
+        "SqlWeeklyPlanCollectionOrchestrator",
+        _Orchestrator,
+    )
+
+    await run_weekly_plan_collection_open_job(
+        _settings(
+            agent2_weekly_plan_enabled=True,
+            agent2_weekly_plan_write_enabled=True,
+            agent2_weekly_plan_tenant_allowlist="tenant-a",
+            agent2_weekly_plan_user_allowlist="user-b,user-a",
+        ),
+        now=datetime(2026, 8, 14, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert [member.user_id for member in captured["source_roster"]] == [
+        "user-a",
+        "user-b",
+    ]
+    assert captured["canary_user_ids"] == frozenset({"user-a", "user-b"})
+    assert captured["committed"] is True
 
 
 @pytest.mark.asyncio

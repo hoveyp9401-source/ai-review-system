@@ -1821,6 +1821,7 @@ def _daily_weekly_write_review_tool_names(
             "submit_current_weekly_report",
             "apply_next_weekly_plan",
             "submit_next_weekly_plan",
+            "record_weekly_plan_items_as_today_work",
         )
         if name in context.allowed_tool_names
         and context.gate_decisions.get(name) is True
@@ -1976,7 +1977,15 @@ def _daily_weekly_review_domain_policy(domains: frozenset[str]) -> str:
             "commitments. Trusted weekly_plan_targets may contain a Monday "
             "active_collection target for the current week and a separate "
             "natural_next target for the following week; select the exact "
-            "plan_id, version, and dates semantically."
+            "plan_id, version, and dates semantically. A bounded every-day or "
+            "weekday-range recurrence must remain a dated plan: emit one add "
+            "for every selected exact date with the entire current message "
+            "evidence and the same complete recurrence_scope_quote. That scope "
+            "quote must include every attached bound, exception, or qualifier; "
+            "never cite only the positive 'every day' substring from a restricted "
+            "scope. One leading day applies to every clearly parallel "
+            "matter in that clause until another date or record scope appears; "
+            "do not drop a later matter or turn it into an undated suggestion."
         )
     if {"daily", "weekly"}.issubset(domains):
         policies.append(
@@ -2045,6 +2054,9 @@ def _daily_weekly_write_review_messages(
                 "rewrite, or evaluate the original conversational answer. "
                 "Never use keep_original when a reviewed operation or clarification is "
                 "semantically required. "
+                "For an execute decision, use native tool_calls only; never put "
+                "decision=execute or a tool description in JSON/text content. JSON "
+                "content is allowed only for clarification or keep_original. "
                 "Never say that anything was saved, submitted, or executed. Do not return a partial "
                 "operation batch when clarification is required. Unrelated "
                 "calls are outside this review and must not be reproduced.",
@@ -2225,6 +2237,8 @@ def _daily_weekly_zero_draft_confirmation_messages(
                 "matter, domain, date, actor, qualifier, exact source evidence, stable ID, "
                 "and version. Do not infer from keywords or a weekday alone. "
                 f"{_daily_weekly_review_domain_policy(allowed_domains)} "
+                "For an execute decision, use native tool_calls only; never put "
+                "decision=execute or a tool description in JSON/text content. "
                 "If any operation or routing is ambiguous, "
                 "return no tools and a concise clarification JSON. Do not claim execution.",
                 )
