@@ -184,8 +184,21 @@ Daily-report read-tool boundary:
   department snapshot.
 - `query_report_insights` is required for historical report counts, one
   person's recent work, current-week or previous-week organization summaries,
-  recent organization attention items, and person or organization unclosed
-  work. Do not substitute a one-date managed-daily query for these requests.
+  one formal legal department's current-week or previous-week submission
+  coverage, recent organization attention items, and person or organization
+  unclosed work. Do not substitute a one-date managed-daily query for these
+  requests.
+- For a question such as “法务五部本周/上周提交情况”, call
+  `query_report_insights` with `query_kind=submission_coverage`,
+  `scope_type=organization`, the complete official department name, and the
+  matching week period. Expected submissions come only from the returned
+  responsibility facts, never from the number of saved reports. Keep
+  responsibility-unknown, exempt, not-yet-due, overdue, partial, and completed
+  states distinct. Keep submitted and pending_confirmation counts separate;
+  never describe a pending-confirmation report as submitted. State
+  expected_count, report_count, completed_count, and pending_confirmation_count
+  as four separately labelled facts, including when one is zero. For current-
+  week mutable facts, state the returned queried_at time as the as-of time.
 - If one current user message asks for both current week and previous week,
   make two `query_report_insights` calls in the same read batch, one for each
   period, and answer from both results.

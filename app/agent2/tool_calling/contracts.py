@@ -469,6 +469,7 @@ class QueryReportInsightsArgs(StrictContract):
         "report_count",
         "recent_work",
         "period_work",
+        "submission_coverage",
         "recent_attention",
         "unclosed_work",
     ]
@@ -512,6 +513,15 @@ class QueryReportInsightsArgs(StrictContract):
             }:
                 raise ValueError(
                     "period_work requires organization scope and a week period"
+                )
+            return self
+        if self.query_kind == "submission_coverage":
+            if self.scope_type != "organization" or self.period_type not in {
+                "current_week",
+                "previous_week",
+            }:
+                raise ValueError(
+                    "submission_coverage requires organization scope and a week period"
                 )
             return self
         if self.query_kind == "recent_attention":

@@ -230,7 +230,31 @@ class SqlDashboardRepository:
                 memberships.team_id::text AS team_ref,
                 teams.name AS team_name,
                 teams.department_name,
-                teams.code AS team_code
+                teams.code AS team_code,
+                memberships.effective_from,
+                memberships.effective_to,
+                NOT EXISTS (
+                    SELECT 1
+                    FROM legal_daily_team_memberships competing
+                    WHERE competing.tenant_id = memberships.tenant_id
+                      AND competing.user_id = memberships.user_id
+                      AND competing.membership_id <> memberships.membership_id
+                      AND GREATEST(
+                          competing.effective_from,
+                          memberships.effective_from,
+                          CAST(:start_date AS DATE)
+                      ) <= LEAST(
+                          COALESCE(
+                              competing.effective_to,
+                              CAST(:end_date AS DATE)
+                          ),
+                          COALESCE(
+                              memberships.effective_to,
+                              CAST(:end_date AS DATE)
+                          ),
+                          CAST(:end_date AS DATE)
+                      )
+                ) AS membership_unambiguous
             FROM legal_daily_team_memberships memberships
             JOIN users ON users.id = memberships.user_id
             JOIN teams ON teams.id = memberships.team_id
@@ -388,6 +412,21 @@ class SqlDashboardRepository:
                         row.get("department_name") or ""
                     ),
                     team_code=str(row.get("team_code") or ""),
+                    effective_from=(
+                        _as_date(row["effective_from"])
+                        if row.get("effective_from") is not None
+                        else None
+                    ),
+                    effective_to=(
+                        _as_date(row["effective_to"])
+                        if row.get("effective_to") is not None
+                        else None
+                    ),
+                    membership_unambiguous=(
+                        bool(row["membership_unambiguous"])
+                        if row.get("membership_unambiguous") is not None
+                        else True
+                    ),
                 )
                 for row in member_rows
             ),

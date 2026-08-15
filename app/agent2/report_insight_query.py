@@ -10,6 +10,7 @@ REPORT_INSIGHT_QUERY_KINDS = frozenset(
         "report_count",
         "recent_work",
         "period_work",
+        "submission_coverage",
         "recent_attention",
         "unclosed_work",
     }
@@ -69,6 +70,17 @@ class StructuredReportInsightQuery:
             "previous_week",
         }:
             raise ValueError("period work requires current_week or previous_week")
+        if self.query_kind == "submission_coverage" and (
+            self.scope_type != "organization"
+            or self.period_type
+            not in {
+                "current_week",
+                "previous_week",
+            }
+        ):
+            raise ValueError(
+                "submission coverage requires organization scope and a week period"
+            )
         if self.query_kind == "recent_attention" and self.period_type != "recent_7_days":
             raise ValueError("recent attention requires recent_7_days")
 

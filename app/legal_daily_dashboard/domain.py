@@ -44,6 +44,9 @@ class MemberRecord:
     team_name: str = ""
     department_name: str = ""
     team_code: str = ""
+    effective_from: date | None = None
+    effective_to: date | None = None
+    membership_unambiguous: bool = True
 
 
 @dataclass(frozen=True)

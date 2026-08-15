@@ -380,17 +380,95 @@ class ProductionDailyExecutor:
             period_type=arguments.period_type,
             status_filter=arguments.status_filter,
         )
-        answer = await ReportInsightModule(
-            SqlReportInsightRepository(
-                self._session,
-                roster_date=current_date,
-                roster_tenant_id=roster_tenant_id,
+        if query.query_kind == "submission_coverage":
+            from app.agent2.context_pack import KnowledgeEvidenceFrame
+            from app.agent2.report_insights import ReportInsightAnswer
+            from app.agent2.submission_coverage_query import (
+                SubmissionCoverageAmbiguous,
+                SubmissionCoverageDataError,
+                SubmissionCoverageNotFound,
+                SubmissionCoverageQuery,
+                SubmissionCoverageRequest,
             )
-        ).answer_query(
-            query,
-            requester=self._user,
-            current_date=current_date,
-        )
+
+            try:
+                coverage = await SubmissionCoverageQuery(
+                    SqlDashboardRepository(self._session)
+                ).execute(
+                    SubmissionCoverageRequest(
+                        tenant_id=roster_tenant_id,
+                        scope_name=query.scope_name,
+                        period_type=query.period_type,
+                        current_date=current_date,
+                        now=self._context.now,
+                    )
+                )
+            except SubmissionCoverageAmbiguous:
+                return self._report_insight_read_outcome(
+                    request=request,
+                    current_date=current_date,
+                    status=ReceiptStatus.CLARIFICATION_REQUIRED,
+                    error_code="SUBMISSION_COVERAGE_SCOPE_AMBIGUOUS",
+                    facts={
+                        "model_composition_allowed": False,
+                        "response_text": "提交情况查询的部门范围不唯一，请明确具体部门。",
+                    },
+                )
+            except SubmissionCoverageNotFound:
+                return self._report_insight_read_outcome(
+                    request=request,
+                    current_date=current_date,
+                    status=ReceiptStatus.BLOCKED,
+                    error_code="SUBMISSION_COVERAGE_SCOPE_NOT_FOUND",
+                    facts={
+                        "model_composition_allowed": False,
+                        "response_text": "没有找到对应的正式法务部门。",
+                    },
+                )
+            except SubmissionCoverageDataError:
+                return self._report_insight_read_outcome(
+                    request=request,
+                    current_date=current_date,
+                    status=ReceiptStatus.BLOCKED,
+                    error_code="SUBMISSION_COVERAGE_DATA_INVALID",
+                    facts={
+                        "model_composition_allowed": False,
+                        "response_text": "提交责任数据存在冲突，暂时无法可靠统计。",
+                    },
+                )
+            answer = ReportInsightAnswer(
+                text="",
+                evidence=KnowledgeEvidenceFrame(
+                    source_type="daily_report_insight",
+                    source_id=(
+                        "daily_submission_coverage:"
+                        f"{coverage.facts['scope_label']}:"
+                        f"{coverage.facts['period_start']}:"
+                        f"{coverage.facts['period_end']}"
+                    ),
+                    title=coverage.title,
+                    summary=(
+                        f"{coverage.facts['scope_label']} "
+                        f"{coverage.facts['period_start']} 至 "
+                        f"{coverage.facts['period_end']} 提交覆盖事实"
+                    ),
+                    facts=coverage.facts,
+                    confidence=1.0,
+                    freshness=coverage.freshness,
+                ),
+            )
+        else:
+            answer = await ReportInsightModule(
+                SqlReportInsightRepository(
+                    self._session,
+                    roster_date=current_date,
+                    roster_tenant_id=roster_tenant_id,
+                )
+            ).answer_query(
+                query,
+                requester=self._user,
+                current_date=current_date,
+            )
         if answer is None:
             return self._report_insight_read_outcome(
                 request=request,
@@ -429,7 +507,16 @@ class ProductionDailyExecutor:
                     "每个有工作记录的日期及"
                     "对应数量；若 work_preview_truncated=true，还必须说明"
                     "work_preview_count、work_unshown_count 和未展开口径，不得把预览"
-                    "说成全部工作。"
+                    "说成全部工作。若 facts.query_kind=submission_coverage，所有分类"
+                    "计数单位都是人次（一个人一天算一次），必须说明起止日期和"
+                    "responsibility_data_complete；本周结果还必须说明 queried_at"
+                    "所给的查询时点。责任待核不能说成未交，"
+                    "not_yet_due 不能说成逾期，pending_confirmation 不能说成"
+                    "已提交；expected_count、report_count、completed_count 和"
+                    "pending_confirmation_count 必须分别说明，即使其中一项为 0；"
+                    "report_count 为 0 也不能把 expected_count 说成 0。"
+                    "并按 daily_breakdown 和"
+                    "member_breakdown 保留逐日、逐人事实。"
                 ),
             },
         )
