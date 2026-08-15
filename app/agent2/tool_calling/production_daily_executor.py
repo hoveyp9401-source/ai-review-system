@@ -77,6 +77,7 @@ from app.legal_daily_dashboard.sql_repository import (
     SqlDashboardRepository,
 )
 from app.models import DailyReport, User
+from app.services.state_machine import assess_daily_report_completeness
 
 
 class ProductionExecutionError(RuntimeError):
@@ -929,6 +930,30 @@ class ProductionDailyExecutor:
         before = await self._snapshot(report.report_date)
         live = await self._typed_snapshot(report.report_date)
         self._require_same_report(report, live.report_id)
+        completion_facts = _daily_completion_facts(
+            today_work=live.today_work,
+            problems=live.problems,
+            tomorrow_plan=live.tomorrow_plan,
+            acknowledged_empty_fields=live.acknowledged_empty_fields,
+            report_status=live.status,
+            persisted_report_available=before is not None,
+        )
+        if completion_facts["missing_sections"]:
+            return ProductionHandlerOutcome(
+                target_type="daily_report",
+                target_id=str(report.report_id),
+                before_report=before,
+                after_report=before,
+                idempotency_key=self._tool_idempotency_key(request),
+                safe_user_facts={
+                    "actual_write": False,
+                    "report_date": report.report_date.isoformat(),
+                    "report_status": live.status,
+                    **completion_facts,
+                },
+                status_if_unchanged=ReceiptStatus.CLARIFICATION_REQUIRED,
+                error_code="REPORT_INCOMPLETE",
+            )
         command = self._command(
             request,
             ordinal=0,
@@ -1501,6 +1526,27 @@ class ProductionDailyExecutor:
             "report_status": report.status if report is not None else None,
             "affected_item_ids": list(affected),
         }
+        if report is not None:
+            fields = {
+                field_name: tuple(
+                    item.content
+                    for item in report.items
+                    if item.field == field_name
+                )
+                for field_name in ("today_work", "problems", "tomorrow_plan")
+            }
+            facts.update(
+                _daily_completion_facts(
+                    today_work=fields["today_work"],
+                    problems=fields["problems"],
+                    tomorrow_plan=fields["tomorrow_plan"],
+                    acknowledged_empty_fields=(
+                        report.acknowledged_empty_fields
+                    ),
+                    report_status=report.status,
+                    persisted_report_available=True,
+                )
+            )
         if report is not None and report.status == "pending_confirmation":
             facts["next_step"] = pending_confirmation_next_step(
                 report_date=report.report_date,
@@ -1549,3 +1595,34 @@ def _affected_item_ids(
 
 def source_text_hash(user_text: str) -> str:
     return hashlib.sha256(user_text.encode("utf-8")).hexdigest()
+
+
+def _daily_completion_facts(
+    *,
+    today_work: object,
+    problems: object,
+    tomorrow_plan: object,
+    acknowledged_empty_fields: set[str] | frozenset[str],
+    report_status: str,
+    persisted_report_available: bool,
+) -> dict[str, object]:
+    assessment = assess_daily_report_completeness(
+        today_work=today_work,
+        problems=problems,
+        tomorrow_plan=tomorrow_plan,
+        acknowledged_empty_fields=acknowledged_empty_fields,
+    )
+    facts = assessment.safe_facts()
+    draft_available = (
+        persisted_report_available
+        and report_status in {"collecting", "pending_confirmation"}
+    )
+    facts.update(
+        {
+            "confirmation_available": (
+                draft_available and assessment.ready_for_confirmation
+            ),
+            "persisted_draft_available": draft_available,
+        }
+    )
+    return facts

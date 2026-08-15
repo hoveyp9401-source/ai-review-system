@@ -1,23 +1,21 @@
 import asyncio
-from datetime import UTC, date, datetime, timedelta
 import inspect
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
-import pytest
-
-from app.config import Settings
 from app.agent2.tool_calling.canary_config import canary_system_prompt
-from app.agent2.tool_calling.canary_service import process_tool_call_canary_ingress
+from app.agent2.tool_calling.canary_service import (
+    _canary_execution_failure_reason,
+    process_tool_call_canary_ingress,
+)
 from app.agent2.tool_calling.context import TrustedRecentMessage
 from app.agent2.tool_calling.production_store import (
     _select_recent_messages_with_scheduled_outbound,
 )
-from app.agent2.tool_calling.canary_service import (
-    _canary_execution_failure_reason,
-)
 from app.agent2.tool_calling.receipt_reply import canary_block_message
 from app.agent2.tool_calling.registry import TOOL_REGISTRY
+from app.config import Settings
 from app.scheduler.jobs import (
     _load_preferred_salutations,
     build_report_reminder_text,
@@ -231,5 +229,6 @@ def test_incomplete_historical_confirmation_has_honest_guidance() -> None:
     message = canary_block_message(reason)
     assert "还没填完整" in message
     assert "直接自然说明即可" in message
+    assert "今日工作、问题/风险和明日计划" not in message
     assert "照着固定句式" not in message
     assert "已经提交" not in message

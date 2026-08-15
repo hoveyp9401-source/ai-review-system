@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date, datetime
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, uuid5
@@ -8,8 +9,23 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.agent2.tool_calling.context import TrustedReportSnapshot
+from app.agent2.tool_calling.context import (
+    TrustedReportItem,
+    TrustedReportSnapshot,
+)
+from app.agent2.tool_calling.contracts import (
+    ConfirmReportArgs,
+    ExecutionMode,
+    ReceiptStatus,
+    ToolReceipt,
+)
 from app.agent2.tool_calling.production_daily_executor import ProductionDailyExecutor
+from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
+from app.agent2.tool_calling.receipt_reply import finalize_canary_content
+from app.agent2.tool_calling.write_reply import (
+    write_reply_protocol,
+    write_reply_retry_instruction,
+)
 from app.agent2.typed_daily_commands import TypedDailyCommand
 from app.agent2.typed_daily_executor import (
     TypedDailyExecutionContext,
@@ -259,6 +275,602 @@ def test_tool_receipt_exposes_the_safe_next_step_for_completed_catchup() -> None
     assert outcome.safe_user_facts is not None
     assert "请确认无误后再提交" in outcome.safe_user_facts["next_step"]
     assert "没有代你确认或提交" in outcome.safe_user_facts["next_step"]
+
+
+def test_completed_report_receipt_does_not_offer_confirmation_or_a_draft() -> None:
+    executor = ProductionDailyExecutor.__new__(ProductionDailyExecutor)
+    executor._context = SimpleNamespace(
+        now=datetime(2026, 8, 14, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        principal=SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+    executor._settings = SimpleNamespace()
+    executor._tool_idempotency_key = lambda _request: "daily:completed"
+    report_id = uuid5(NAMESPACE_URL, "completed-state-report")
+    owner_id = uuid5(NAMESPACE_URL, "completed-state-owner")
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="tenant-test",
+        owner_user_id=owner_id,
+        report_date=date(2026, 8, 14),
+        version=4,
+        status="completed",
+        items=(
+            TrustedReportItem(
+                item_id="completed-work",
+                field="today_work",
+                content="完成合同审核",
+                report_id=report_id,
+                report_version=4,
+            ),
+            TrustedReportItem(
+                item_id="completed-plan",
+                field="tomorrow_plan",
+                content="继续跟进项目",
+                report_id=report_id,
+                report_version=4,
+            ),
+        ),
+        acknowledged_empty_fields=frozenset({"problems"}),
+    )
+
+    outcome = executor._outcome(
+        SimpleNamespace(),
+        before=report,
+        after=report,
+        typed_receipt_ids=(),
+    )
+
+    assert outcome.safe_user_facts is not None
+    assert outcome.safe_user_facts["content_complete"] is True
+    assert outcome.safe_user_facts["confirmation_available"] is False
+    assert outcome.safe_user_facts["persisted_draft_available"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("missing_field", "expected_missing"),
+    (
+        ("today_work", ("today_work",)),
+        ("problems", ("problems",)),
+        ("tomorrow_plan", ("tomorrow_plan",)),
+    ),
+)
+async def test_incomplete_confirmation_returns_only_the_actual_missing_section(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_field: str,
+    expected_missing: tuple[str, ...],
+) -> None:
+    report_id = uuid5(NAMESPACE_URL, f"missing-section-{missing_field}")
+    user_id = uuid5(NAMESPACE_URL, f"missing-section-user-{missing_field}")
+    items = tuple(
+        TrustedReportItem(
+            item_id=f"item-{field_name}",
+            field=field_name,
+            content=f"{field_name}内容",
+            report_id=report_id,
+            report_version=2,
+        )
+        for field_name in ("today_work", "tomorrow_plan")
+        if field_name != missing_field
+    )
+    acknowledged_empty_fields = (
+        frozenset({"problems"})
+        if missing_field != "problems"
+        else frozenset()
+    )
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="tenant-test",
+        owner_user_id=user_id,
+        report_date=date(2026, 8, 14),
+        version=2,
+        status="collecting",
+        items=items,
+        acknowledged_empty_fields=acknowledged_empty_fields,
+    )
+    executor = ProductionDailyExecutor.__new__(ProductionDailyExecutor)
+    executor._context = SimpleNamespace(
+        principal=SimpleNamespace(
+            tenant_id="tenant-test",
+            user_id=user_id,
+            conversation_id="conversation-test",
+            source_message_id="message-test",
+            timezone="Asia/Shanghai",
+        ),
+        now=datetime(2026, 8, 14, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    executor._settings = SimpleNamespace()
+    executor._source_text_hash = "a" * 64
+    executor._arguments = lambda request, _expected_type: request.arguments
+    executor._bound = lambda _request: SimpleNamespace(report=report)
+    executor._required_bound_report = lambda _bound: report
+    executor._require_same_report = lambda _trusted, _live_id: None
+    executor._tool_idempotency_key = lambda _request: "daily:confirm-incomplete"
+
+    async def snapshot(_report_date):
+        return report
+
+    async def typed_snapshot(_report_date):
+        return SimpleNamespace(
+            report_id=report_id,
+            version=2,
+            status="collecting",
+            today_work=tuple(
+                item.content for item in items if item.field == "today_work"
+            ),
+            problems=(),
+            tomorrow_plan=tuple(
+                item.content for item in items if item.field == "tomorrow_plan"
+            ),
+            acknowledged_empty_fields=acknowledged_empty_fields,
+        )
+
+    async def must_not_execute(*_args, **_kwargs):
+        raise AssertionError("an incomplete confirmation must not reach the writer")
+
+    monkeypatch.setattr(executor, "_snapshot", snapshot)
+    monkeypatch.setattr(executor, "_typed_snapshot", typed_snapshot)
+    monkeypatch.setattr(executor, "_execute_typed", must_not_execute)
+    request = ProductionHandlerRequest(
+        tool_call_id="confirm-incomplete",
+        tool_name="confirm_report",
+        arguments=ConfirmReportArgs(
+            report_id=report_id,
+            expected_version=2,
+        ),
+        executor=executor,
+        memory_executor=executor,
+    )
+
+    outcome = await executor.confirm_report(request)
+
+    assert outcome.status_if_unchanged == ReceiptStatus.CLARIFICATION_REQUIRED
+    assert outcome.error_code == "REPORT_INCOMPLETE"
+    assert outcome.before_report == report
+    assert outcome.after_report == report
+    assert outcome.safe_user_facts is not None
+    assert tuple(outcome.safe_user_facts["missing_sections"]) == expected_missing
+    assert len(outcome.safe_user_facts["missing_section_labels"]) == 1
+    assert outcome.safe_user_facts["section_states"][missing_field] == "missing"
+    assert outcome.safe_user_facts["confirmation_available"] is False
+    assert outcome.safe_user_facts["persisted_draft_available"] is True
+    assert outcome.safe_user_facts["actual_write"] is False
+
+
+def test_incomplete_confirmation_reply_cannot_expand_one_missing_section_to_three() -> None:
+    receipt = ToolReceipt(
+        status=ReceiptStatus.CLARIFICATION_REQUIRED,
+        tool_name="confirm_report",
+        changed=False,
+        target_type="daily_report",
+        target_id="report-test",
+        error_code="REPORT_INCOMPLETE",
+        safe_user_facts={
+            "actual_write": False,
+            "section_states": {
+                "today_work": "filled",
+                "problems": "missing",
+                "tomorrow_plan": "filled",
+            },
+            "section_labels": {
+                "today_work": "今日工作",
+                "problems": "问题/风险",
+                "tomorrow_plan": "明日计划",
+            },
+            "missing_sections": ["problems"],
+            "missing_section_labels": ["问题/风险"],
+            "confirmation_available": False,
+            "persisted_draft_available": True,
+        },
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+    unsafe_model_reply = json.dumps(
+        {
+            "reply": "请补充今日工作、问题/风险和明日计划中的缺项。",
+            "actual_write": False,
+            "operation_outcome": "needs_clarification",
+            "daily_report_state": {
+                "section_states": {
+                    "today_work": "filled",
+                    "problems": "missing",
+                    "tomorrow_plan": "filled",
+                },
+                "missing_sections": ["problems"],
+                "confirmation_available": False,
+                "persisted_draft_available": True,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    with pytest.raises(ValueError, match="write reply failed receipt validation"):
+        finalize_canary_content(
+            unsafe_model_reply,
+            (receipt,),
+            write_batch_seen=True,
+        )
+
+    safe_model_reply = json.dumps(
+        {
+            "reply": (
+                "这份日报尚未提交，目前只缺"
+                "{{daily_missing_section_labels}}；如果确实没有，直接说明即可。"
+            ),
+            "actual_write": False,
+            "operation_outcome": "needs_clarification",
+            "daily_report_state": {
+                "section_states": {
+                    "today_work": "filled",
+                    "problems": "missing",
+                    "tomorrow_plan": "filled",
+                },
+                "missing_sections": ["problems"],
+                "confirmation_available": False,
+                "persisted_draft_available": True,
+            },
+        },
+        ensure_ascii=False,
+    )
+    final_reply, _model_hash = finalize_canary_content(
+        safe_model_reply,
+        (receipt,),
+        write_batch_seen=True,
+    )
+
+    assert final_reply.startswith("这份日报尚未提交")
+    assert "只缺问题/风险" in final_reply
+    assert "{{daily_missing_section_labels}}" not in final_reply
+
+
+def test_incomplete_daily_reply_preserves_another_domain_success() -> None:
+    daily_receipt = ToolReceipt(
+        status=ReceiptStatus.CLARIFICATION_REQUIRED,
+        tool_name="confirm_report",
+        changed=False,
+        target_type="daily_report",
+        target_id="report-test",
+        error_code="REPORT_INCOMPLETE",
+        safe_user_facts={
+            "actual_write": False,
+            "section_states": {
+                "today_work": "filled",
+                "problems": "missing",
+                "tomorrow_plan": "filled",
+            },
+            "section_labels": {
+                "today_work": "今日工作",
+                "problems": "问题/风险",
+                "tomorrow_plan": "明日计划",
+            },
+            "missing_sections": ["problems"],
+            "missing_section_labels": ["问题/风险"],
+            "confirmation_available": False,
+            "persisted_draft_available": True,
+        },
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+    weekly_receipt = ToolReceipt(
+        status=ReceiptStatus.SUCCESS,
+        tool_name="apply_next_weekly_plan",
+        changed=True,
+        target_type="weekly_plan",
+        target_id="weekly-test",
+        safe_user_facts={"actual_write": True},
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+    model_reply = json.dumps(
+        {
+            "reply": (
+                "下周计划已经更新；日报尚未提交，目前只缺"
+                "{{daily_missing_section_labels}}。"
+            ),
+            "actual_write": True,
+            "operation_outcome": "partial",
+            "daily_report_state": {
+                "section_states": {
+                    "today_work": "filled",
+                    "problems": "missing",
+                    "tomorrow_plan": "filled",
+                },
+                "missing_sections": ["problems"],
+                "confirmation_available": False,
+                "persisted_draft_available": True,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    final_reply, _model_hash = finalize_canary_content(
+        model_reply,
+        (weekly_receipt, daily_receipt),
+        write_batch_seen=True,
+    )
+
+    assert "下周计划已经更新" in final_reply
+    assert "日报尚未提交" in final_reply
+    assert "只缺问题/风险" in final_reply
+
+
+def test_two_incomplete_daily_reports_keep_each_date_and_missing_section_separate() -> None:
+    receipts = (
+        ToolReceipt(
+            status=ReceiptStatus.CLARIFICATION_REQUIRED,
+            tool_name="confirm_report",
+            changed=False,
+            target_type="daily_report",
+            target_id="report-2026-08-13",
+            error_code="REPORT_INCOMPLETE",
+            safe_user_facts={
+                "actual_write": False,
+                "report_date": "2026-08-13",
+                "section_states": {
+                    "today_work": "filled",
+                    "problems": "missing",
+                    "tomorrow_plan": "filled",
+                },
+                "section_labels": {
+                    "today_work": "今日工作",
+                    "problems": "问题/风险",
+                    "tomorrow_plan": "明日计划",
+                },
+                "missing_sections": ["problems"],
+                "missing_section_labels": ["问题/风险"],
+                "confirmation_available": False,
+                "persisted_draft_available": True,
+            },
+            execution_mode=ExecutionMode.CANARY_EXECUTE,
+        ),
+        ToolReceipt(
+            status=ReceiptStatus.CLARIFICATION_REQUIRED,
+            tool_name="confirm_report",
+            changed=False,
+            target_type="daily_report",
+            target_id="report-2026-08-14",
+            error_code="REPORT_INCOMPLETE",
+            safe_user_facts={
+                "actual_write": False,
+                "report_date": "2026-08-14",
+                "section_states": {
+                    "today_work": "filled",
+                    "problems": "filled",
+                    "tomorrow_plan": "missing",
+                },
+                "section_labels": {
+                    "today_work": "今日工作",
+                    "problems": "问题/风险",
+                    "tomorrow_plan": "明日计划",
+                },
+                "missing_sections": ["tomorrow_plan"],
+                "missing_section_labels": ["明日计划"],
+                "confirmation_available": False,
+                "persisted_draft_available": True,
+            },
+            execution_mode=ExecutionMode.CANARY_EXECUTE,
+        ),
+    )
+    swapped_model_reply = json.dumps(
+        {
+            "reply": (
+                "8月13日只缺{{daily_missing_section_labels_2}}；"
+                "8月14日只缺{{daily_missing_section_labels_1}}。"
+            ),
+            "actual_write": False,
+            "operation_outcome": "needs_clarification",
+            "daily_report_states": [
+                {
+                    "report_date": "2026-08-13",
+                    "section_states": {
+                        "today_work": "filled",
+                        "problems": "missing",
+                        "tomorrow_plan": "filled",
+                    },
+                    "missing_sections": ["problems"],
+                    "missing_section_labels": ["问题/风险"],
+                    "confirmation_available": False,
+                    "persisted_draft_available": True,
+                },
+                {
+                    "report_date": "2026-08-14",
+                    "section_states": {
+                        "today_work": "filled",
+                        "problems": "filled",
+                        "tomorrow_plan": "missing",
+                    },
+                    "missing_sections": ["tomorrow_plan"],
+                    "missing_section_labels": ["明日计划"],
+                    "confirmation_available": False,
+                    "persisted_draft_available": True,
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+    with pytest.raises(ValueError, match="write reply failed receipt validation"):
+        finalize_canary_content(
+            swapped_model_reply,
+            receipts,
+            write_batch_seen=True,
+        )
+
+    model_reply = json.dumps(
+        {
+            "reply": (
+                "这两份日报尚未提交，分别缺"
+                "{{daily_missing_report_summary}}。"
+            ),
+            "actual_write": False,
+            "operation_outcome": "needs_clarification",
+            "daily_report_states": [
+                {
+                    "report_date": "2026-08-13",
+                    "section_states": {
+                        "today_work": "filled",
+                        "problems": "missing",
+                        "tomorrow_plan": "filled",
+                    },
+                    "missing_sections": ["problems"],
+                    "missing_section_labels": ["问题/风险"],
+                    "confirmation_available": False,
+                    "persisted_draft_available": True,
+                },
+                {
+                    "report_date": "2026-08-14",
+                    "section_states": {
+                        "today_work": "filled",
+                        "problems": "filled",
+                        "tomorrow_plan": "missing",
+                    },
+                    "missing_sections": ["tomorrow_plan"],
+                    "missing_section_labels": ["明日计划"],
+                    "confirmation_available": False,
+                    "persisted_draft_available": True,
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    final_reply, _model_hash = finalize_canary_content(
+        model_reply,
+        receipts,
+        write_batch_seen=True,
+    )
+
+    assert final_reply == (
+        "这两份日报尚未提交，分别缺"
+        "2026-08-13：问题/风险；2026-08-14：明日计划。"
+    )
+
+
+def test_two_complete_daily_reports_do_not_request_a_missing_section_token() -> None:
+    receipts = tuple(
+        ToolReceipt(
+            status=ReceiptStatus.SUCCESS,
+            tool_name="confirm_report",
+            changed=True,
+            target_type="daily_report",
+            target_id=f"report-{report_date}",
+            safe_user_facts={
+                "actual_write": True,
+                "report_date": report_date,
+                "section_states": {
+                    "today_work": "filled",
+                    "problems": "acknowledged_empty",
+                    "tomorrow_plan": "filled",
+                },
+                "section_labels": {
+                    "today_work": "今日工作",
+                    "problems": "问题/风险",
+                    "tomorrow_plan": "明日计划",
+                },
+                "missing_sections": [],
+                "missing_section_labels": [],
+                "confirmation_available": False,
+                "persisted_draft_available": False,
+            },
+            execution_mode=ExecutionMode.CANARY_EXECUTE,
+        )
+        for report_date in ("2026-08-13", "2026-08-14")
+    )
+
+    protocol = write_reply_protocol(receipts)
+
+    assert protocol["required_daily_reply_mode"] == (
+        "completion_acknowledgement_only"
+    )
+    assert "daily_missing_report_summary" not in protocol
+    assert all(
+        "daily_missing_report_summary" not in rule
+        for rule in protocol["rules"]
+    )
+    retry = json.loads(
+        write_reply_retry_instruction(("actual_write mismatch",), receipts)
+    )
+    assert retry["write_reply_retry"]["required_daily_reply_mode"] == (
+        "completion_acknowledgement_only"
+    )
+    assert (
+        retry["write_reply_retry"]["daily_missing_label_requirements"]
+        == []
+    )
+
+
+def test_completed_daily_mode_does_not_suppress_another_domain_clarification() -> None:
+    daily_receipt = ToolReceipt(
+        status=ReceiptStatus.SUCCESS,
+        tool_name="confirm_report",
+        changed=True,
+        target_type="daily_report",
+        target_id="daily-completed",
+        safe_user_facts={
+            "actual_write": True,
+            "report_date": "2026-08-14",
+            "section_states": {
+                "today_work": "filled",
+                "problems": "acknowledged_empty",
+                "tomorrow_plan": "filled",
+            },
+            "section_labels": {
+                "today_work": "今日工作",
+                "problems": "问题/风险",
+                "tomorrow_plan": "明日计划",
+            },
+            "missing_sections": [],
+            "missing_section_labels": [],
+            "confirmation_available": False,
+            "persisted_draft_available": False,
+        },
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+    weekly_receipt = ToolReceipt(
+        status=ReceiptStatus.CLARIFICATION_REQUIRED,
+        tool_name="apply_next_weekly_plan",
+        changed=False,
+        target_type="weekly_plan",
+        target_id="weekly-needs-date",
+        safe_user_facts={
+            "actual_write": False,
+            "clarification_option_labels": ["周一", "周二"],
+        },
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+
+    protocol = write_reply_protocol((daily_receipt, weekly_receipt))
+
+    assert protocol["required_daily_reply_mode"] == (
+        "mixed_status_with_clarification"
+    )
+
+    weekly_success = ToolReceipt(
+        status=ReceiptStatus.SUCCESS,
+        tool_name="apply_next_weekly_plan",
+        changed=True,
+        target_type="weekly_plan",
+        target_id="weekly-updated",
+        safe_user_facts={"actual_write": True},
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+    success_protocol = write_reply_protocol((daily_receipt, weekly_success))
+    assert success_protocol["required_daily_reply_mode"] == "mixed_status_update"
+
+    date_correction_receipt = ToolReceipt(
+        status=ReceiptStatus.CLARIFICATION_REQUIRED,
+        tool_name="correct_daily_report_date",
+        changed=False,
+        target_type="daily_report",
+        target_id="daily-date-correction",
+        safe_user_facts={
+            "actual_write": False,
+            "clarification_option_labels": ["8月13日", "8月14日"],
+        },
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+    correction_protocol = write_reply_protocol(
+        (daily_receipt, date_correction_receipt)
+    )
+    assert correction_protocol["required_daily_reply_mode"] == (
+        "mixed_status_with_clarification"
+    )
 
 
 @pytest.mark.asyncio

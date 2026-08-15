@@ -42,10 +42,27 @@ class ReportState:
 @dataclass(frozen=True)
 class DailyReportCompleteness:
     section_status: dict[str, bool]
+    section_states: dict[str, str]
     completeness_score: float
     missing_sections: tuple[str, ...]
     ready_for_confirmation: bool
     draft_status: str
+
+    def safe_facts(self) -> dict[str, object]:
+        return {
+            "section_states": dict(self.section_states),
+            "section_labels": {
+                field_name: FOLLOWUP_SECTION_LABELS[field_name]
+                for field_name in SECTION_LABELS
+            },
+            "missing_sections": list(self.missing_sections),
+            "missing_section_labels": [
+                FOLLOWUP_SECTION_LABELS[field_name]
+                for field_name in self.missing_sections
+            ],
+            "content_complete": self.ready_for_confirmation,
+            "completeness_score": self.completeness_score,
+        }
 
 
 def assess_daily_report_completeness(
@@ -65,6 +82,11 @@ def assess_daily_report_completeness(
             or field_name in acknowledged_empty_fields
         )
         for field_name in SECTION_LABELS
+    }
+    section_values = {
+        "today_work": today_work,
+        "problems": problems,
+        "tomorrow_plan": tomorrow_plan,
     }
     filled = {
         "today_work": bool(today_work) or acknowledged_empty["today_work"],
@@ -93,8 +115,21 @@ def assess_daily_report_completeness(
             if acknowledged_empty[field_name]
         }
     )
+    section_states = {
+        field_name: (
+            "filled"
+            if bool(section_values[field_name])
+            else (
+                "acknowledged_empty"
+                if acknowledged_empty[field_name]
+                else "missing"
+            )
+        )
+        for field_name in SECTION_LABELS
+    }
     return DailyReportCompleteness(
         section_status=normalized_section_status,
+        section_states=section_states,
         completeness_score=completeness_score,
         missing_sections=missing_sections,
         ready_for_confirmation=ready_for_confirmation,
@@ -237,7 +272,7 @@ def _display_section(values: list[str], *, empty_fallback: str = "未填写") ->
 
 def _numbered_item(index: int, value: str) -> str:
     stripped = value.strip()
-    if stripped.startswith(f"{index}. ") or stripped.startswith(f"{index}、"):
+    if stripped.startswith((f"{index}. ", f"{index}、")):
         return stripped
     return f"{index}. {stripped}"
 

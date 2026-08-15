@@ -6,7 +6,10 @@ import json
 from app.agent2.memory import TrustedPersonalMemoryContext
 from app.agent2.tool_calling.contracts import ToolReceipt
 from app.agent2.tool_calling.runtime import TurnExecutionPlan
-from app.agent2.tool_calling.write_reply import validate_write_reply
+from app.agent2.tool_calling.write_reply import (
+    render_write_reply,
+    validate_write_reply,
+)
 
 
 def finalize_shadow_content(
@@ -49,7 +52,7 @@ def finalize_canary_content(
             "write reply failed receipt validation: " + "; ".join(errors)
         )
     del personal_memory
-    return envelope.reply, model_hash
+    return render_write_reply(envelope, receipts), model_hash
 
 
 def _render_report_snapshot(
@@ -128,7 +131,7 @@ def canary_block_message(reason: str) -> str:
         )
     if reason == "tool_call_canary_report_incomplete":
         return (
-            "这份日报还没填完整，请补充今日工作、问题/风险和明日计划中的缺项；"
+            "这份日报还没填完整，请补充当前实际缺少的栏目；"
             "如果某一栏确实没有内容，直接自然说明即可。本次没有提交。"
         )
     return "这条消息暂时没有处理成功，本次没有写入任何内容。"

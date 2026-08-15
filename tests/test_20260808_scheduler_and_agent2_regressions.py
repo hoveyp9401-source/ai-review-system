@@ -173,6 +173,23 @@ def test_empty_acknowledgement_renders_as_no_problem_not_unfilled() -> None:
     assert "问题风险\n（未填写）" not in rendered
 
 
+def test_unacknowledged_empty_problem_renders_as_unfilled_not_no_problem() -> None:
+    rendered = _render_report_snapshot(
+        {
+            "report_date": "2026-08-08",
+            "fields": {
+                "today_work": ["完成合同审核"],
+                "problems": [],
+                "tomorrow_plan": ["继续跟进案件"],
+            },
+            "acknowledged_empty_fields": [],
+        }
+    )
+
+    assert "问题风险\n（未填写）" in rendered
+    assert "问题风险\n暂无明显问题" not in rendered
+
+
 def test_voice_recent_context_contains_only_recognition_text() -> None:
     payload = {
         "msgtype": "audio",

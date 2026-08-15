@@ -821,8 +821,16 @@ async def test_trusted_report_existing_sections_allow_empty_problem_submit_witho
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_text",
+    (
+        "问题与风险没有，前面的内容就按这个提交。",
+        "其他没什么问题，提交吧。",
+    ),
+)
 async def test_incomplete_trusted_report_confirm_draft_gets_agent2_review_before_write(
     monkeypatch: pytest.MonkeyPatch,
+    user_text: str,
 ) -> None:
     report = _trusted_historical_report(include_tomorrow_plan=True)
     runtime = _DeferredRuntimeSession()
@@ -871,7 +879,7 @@ async def test_incomplete_trusted_report_confirm_draft_gets_agent2_review_before
 
     result = await adapter.run_canary_turn(
         system_prompt="Agent2 test",
-        user_text="问题与风险没有，前面的内容就按这个提交。",
+        user_text=user_text,
         context=_context(
             allowed_tool_names=frozenset({"add_daily_items", "confirm_report"}),
             historical_reports=(report,),
