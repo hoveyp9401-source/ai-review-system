@@ -225,6 +225,18 @@ class ShadowCallBinder:
             and self._context.gate_decisions.get(call.tool_name) is not True
         ):
             return None, failure_receipt(call, ReceiptStatus.BLOCKED, "GATE_BLOCKED")
+        if (
+            definition.read_or_write == "write"
+            and definition.transaction_target_policy == "personal_memory"
+            and arguments.get("memory_key")
+            == "report.daily_reminders_enabled"
+            and self._context.principal.conversation_kind != "direct"
+        ):
+            return None, failure_receipt(
+                call,
+                ReceiptStatus.BLOCKED,
+                "PERSONAL_MEMORY_DIRECT_CONVERSATION_REQUIRED",
+            )
 
         weekly_plan, weekly_failure = _validate_weekly_plan_binding(
             context=self._context,

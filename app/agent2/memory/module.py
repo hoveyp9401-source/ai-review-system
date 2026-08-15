@@ -325,6 +325,7 @@ def _memory_value_model(
     if memory_key == "response.verbosity":
         value_model = VerbosityPreferenceValue
     elif memory_key in {
+        "report.daily_reminders_enabled",
         "report.show_updated_snapshot",
         "report.show_item_numbers",
     }:

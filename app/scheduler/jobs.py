@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent2.memory.module import (
     PreferredSalutationValue,
+    TogglePreferenceValue,
     validate_personal_memory_value,
 )
 from app.agent2.memory.postgres import PersonalMemoryRecord
@@ -42,6 +43,7 @@ SECTION_LABELS = {
 }
 CONFIRMATION_REMINDED_ON_KEY = "_confirmation_reminded_on"
 CONFIRMATION_REMINDED_AT_KEY = "_confirmation_reminded_at"
+DAILY_REMINDERS_ENABLED_KEY = "report.daily_reminders_enabled"
 logger = logging.getLogger(__name__)
 
 
@@ -101,6 +103,23 @@ async def remind_missing_reports(
         reports_by_user,
         report_date,
     )
+    missing_count = len(missing_users)
+    now = now_in_timezone(settings.timezone)
+    reminder_preferences = await _load_daily_reminder_preferences(
+        session,
+        [user.id for user in missing_users],
+        tenant_id=roster_tenant_id,
+        now=now,
+    )
+    skipped_by_preference = sum(
+        reminder_preferences.get(user.id, True) is False
+        for user in missing_users
+    )
+    missing_users = [
+        user
+        for user in missing_users
+        if reminder_preferences.get(user.id, True) is not False
+    ]
     target_users, skipped_real_users = _partition_reminder_users(missing_users, test_user_ids)
     requested_dry_run = bool(dry_run or getattr(settings, "reminder_dry_run", True))
     send_enabled = bool(getattr(settings, "reminder_send_enabled", False))
@@ -126,7 +145,6 @@ async def remind_missing_reports(
     dry_run_messages: list[dict[str, Any]] = []
     sent_user_ids = []
     sent_evidence_by_user: dict[Any, ReminderDispatchEvidence] = {}
-    now = now_in_timezone(settings.timezone)
     preferred_salutations = await _load_preferred_salutations(
         session,
         [user.id for user in target_users],
@@ -335,9 +353,10 @@ async def remind_missing_reports(
         "requested_dry_run": requested_dry_run,
         "send_enabled": send_enabled,
         "send_block_reasons": send_block_reasons,
-        "missing_count": len(missing_users),
+        "missing_count": missing_count,
         "test_user_ids_configured": len(test_user_ids),
         "target_users": len(target_users),
+        "skipped_by_preference": skipped_by_preference,
         "would_send": would_send,
         "real_sent": sent,
         "skipped_real_users": len(skipped_real_users),
@@ -864,6 +883,66 @@ async def _load_preferred_salutations(
         for user_id, values in values_by_user.items()
         if len(values) == 1
     }
+
+
+async def _load_daily_reminder_preferences(
+    session: AsyncSession,
+    user_ids: list,
+    *,
+    tenant_id: str,
+    now: datetime,
+) -> dict[Any, bool]:
+    """Load explicit reminder choices; a missing choice keeps reminders on."""
+
+    if not user_ids:
+        return {}
+    if not tenant_id:
+        raise RuntimeError(
+            "daily reminder preference read requires a trusted tenant scope"
+        )
+    if not hasattr(session, "execute"):
+        raise RuntimeError(
+            "daily reminder preference read requires a database session"
+        )
+    statement = select(
+        PersonalMemoryRecord.user_id,
+        PersonalMemoryRecord.value_json,
+    ).where(
+        PersonalMemoryRecord.user_id.in_(user_ids),
+        PersonalMemoryRecord.memory_type == "response_preference",
+        PersonalMemoryRecord.memory_key == DAILY_REMINDERS_ENABLED_KEY,
+        PersonalMemoryRecord.status == "active",
+        or_(
+            PersonalMemoryRecord.expires_at.is_(None),
+            PersonalMemoryRecord.expires_at > now,
+        ),
+    )
+    statement = statement.where(
+        PersonalMemoryRecord.tenant_id == tenant_id
+    )
+    result = await session.execute(statement)
+    preferences: dict[Any, bool] = {}
+    for user_id, raw_value in result.all():
+        if user_id in preferences:
+            raise RuntimeError(
+                "daily reminder preference read returned duplicate active rows"
+            )
+        try:
+            validated = validate_personal_memory_value(
+                "response_preference",
+                DAILY_REMINDERS_ENABLED_KEY,
+                raw_value,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "daily reminder preference read returned an invalid value"
+            ) from exc
+        if not isinstance(validated, TogglePreferenceValue):
+            raise TypeError(
+                "daily reminder preference read returned an invalid type"
+            )
+        preferences[user_id] = validated.enabled
+    return preferences
 
 
 def _group_users_by_reminder_text(

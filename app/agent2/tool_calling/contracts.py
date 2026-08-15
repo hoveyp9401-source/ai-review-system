@@ -51,6 +51,15 @@ PersonalMemoryKey = Literal[
     "response.verbosity",
     "response.output_format",
     "response.preferred_salutation",
+    "report.daily_reminders_enabled",
+    "report.show_updated_snapshot",
+    "report.show_item_numbers",
+]
+ForgettablePersonalMemoryKey = Literal[
+    "assistant.preferred_name",
+    "response.verbosity",
+    "response.output_format",
+    "response.preferred_salutation",
     "report.show_updated_snapshot",
     "report.show_item_numbers",
 ]
@@ -880,7 +889,7 @@ class RememberPersonalMemoryArgs(StrictContract):
 
 
 class ForgetPersonalMemoryArgs(StrictContract):
-    memory_key: PersonalMemoryKey
+    memory_key: ForgettablePersonalMemoryKey
 
 
 class ToolReceipt(StrictContract):

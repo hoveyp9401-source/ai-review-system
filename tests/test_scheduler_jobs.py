@@ -23,6 +23,10 @@ from app.scheduler.runner import _scheduler_pause_dates
 from app.services.state_machine import CONFIRMATION_AUTO_SUBMITTED_TIMEOUT, STATUS_COMPLETED
 
 
+async def _no_daily_reminder_preferences(*_args, **_kwargs):
+    return {}
+
+
 def _user(name="Pang Hao"):
     return SimpleNamespace(id=uuid4(), name=name, dingtalk_user_id="user-1")
 
@@ -204,6 +208,11 @@ async def test_reminder_dry_run_does_not_send(monkeypatch):
     robot = Robot()
     monkeypatch.setattr(jobs, "list_missing_users", fake_list_missing_users)
     monkeypatch.setattr(jobs, "_load_reports_by_user", fake_load_reports_by_user)
+    monkeypatch.setattr(
+        jobs,
+        "_load_daily_reminder_preferences",
+        _no_daily_reminder_preferences,
+    )
 
     result = await remind_missing_reports(
         SimpleNamespace(),
@@ -280,6 +289,11 @@ async def test_reminder_scope_excludes_active_accounts_outside_formal_roster(mon
         raising=False,
     )
     monkeypatch.setattr(jobs, "_load_reports_by_user", fake_load_reports_by_user)
+    monkeypatch.setattr(
+        jobs,
+        "_load_daily_reminder_preferences",
+        _no_daily_reminder_preferences,
+    )
 
     result = await remind_missing_reports(
         SimpleNamespace(),
@@ -336,6 +350,11 @@ async def _run_first_reminder_dry_run(monkeypatch, report, *, reminder_kind="dai
     robot = Robot()
     monkeypatch.setattr(jobs, "list_missing_users", fake_list_missing_users)
     monkeypatch.setattr(jobs, "_load_reports_by_user", fake_load_reports_by_user)
+    monkeypatch.setattr(
+        jobs,
+        "_load_daily_reminder_preferences",
+        _no_daily_reminder_preferences,
+    )
 
     result = await remind_missing_reports(
         SimpleNamespace(),
@@ -524,6 +543,11 @@ async def test_reminder_without_test_user_ids_blocks_real_send(monkeypatch):
     robot = Robot()
     monkeypatch.setattr(jobs, "list_missing_users", fake_list_missing_users)
     monkeypatch.setattr(jobs, "_load_reports_by_user", fake_load_reports_by_user)
+    monkeypatch.setattr(
+        jobs,
+        "_load_daily_reminder_preferences",
+        _no_daily_reminder_preferences,
+    )
 
     result = await remind_missing_reports(
         SimpleNamespace(),
@@ -606,6 +630,11 @@ async def test_reminder_real_send_is_limited_to_test_user_ids(monkeypatch):
     robot = Robot()
     monkeypatch.setattr(jobs, "list_missing_users", fake_list_missing_users)
     monkeypatch.setattr(jobs, "_load_reports_by_user", fake_load_reports_by_user)
+    monkeypatch.setattr(
+        jobs,
+        "_load_daily_reminder_preferences",
+        _no_daily_reminder_preferences,
+    )
 
     session = Session()
     result = await remind_missing_reports(
