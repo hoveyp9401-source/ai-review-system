@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -30,6 +31,9 @@ from app.repositories import (
 )
 from app.services.dingtalk import (
     DingTalkRobotClient,
+    UNSUPPORTED_FILE_REPLY_TEXT,
+    VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT,
+    VOICE_TRANSCRIPTION_UNAVAILABLE_REPLY_TEXT,
     extract_voice_download_code,
     extract_voice_text,
     normalize_dingtalk_conversation_kind,
@@ -626,9 +630,21 @@ async def _record_immediate_stream_failure(
     reply_text: str,
     error_message: str,
     settings: Settings,
-) -> None:
+    voice_transcribe_seconds: float = 0.0,
+) -> bool:
     idempotency_key = _stream_idempotency_key(incoming, "")
     response_payload = {"msgtype": "text", "text": {"content": reply_text}}
+    recoverable_payload = prepare_recoverable_ingress_payload(
+        payload,
+        text="",
+        message_type=(
+            "voice"
+            if incoming.message_type in {"audio", "voice"}
+            else str(incoming.message_type or "text")
+        ),
+        voice_download_seconds=0.0,
+        voice_transcribe_seconds=voice_transcribe_seconds,
+    )
     try:
         async with AsyncSessionLocal() as session:
             event, inserted = await create_webhook_event_once(
@@ -636,7 +652,7 @@ async def _record_immediate_stream_failure(
                 idempotency_key=idempotency_key,
                 external_message_id=incoming.message_id,
                 dingtalk_user_id=user_id,
-                payload=payload,
+                payload=recoverable_payload,
             )
             if inserted or event.status == "processing":
                 await mark_webhook_event_failed(
@@ -647,8 +663,10 @@ async def _record_immediate_stream_failure(
                     now=now_in_timezone(settings.timezone),
                 )
                 await session.commit()
+        return True
     except Exception:
         logger.exception("failed to persist immediate stream failure")
+        return False
 
 
 def _stream_idempotency_key(message: dingtalk_stream.ChatbotMessage, text: str) -> str:
@@ -897,24 +915,42 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
                         "received voice message without downloadCode user=%s",
                         user_id,
                     )
-                    await _record_immediate_stream_failure(
+                    persisted = await _record_immediate_stream_failure(
                         incoming=incoming,
                         user_id=user_id,
                         payload=payload,
-                        reply_text=TEXT_TEXT_ONLY,
+                        reply_text=VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT,
                         error_message="voice_without_download_code",
                         settings=self.settings,
                     )
-                    self._reply_soon(incoming, TEXT_TEXT_ONLY)
+                    self._reply_soon(
+                        incoming,
+                        (
+                            VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT
+                            if persisted
+                            else TEXT_PROCESS_FAILED
+                        ),
+                    )
                     _log_immediate_stream_timing(
                         incoming=incoming,
                         user_id=user_id,
                         message_type=message_type,
                         text_len=0,
                         received_at_monotonic=received_at_monotonic,
-                        status="voice_without_download_code",
+                        status=(
+                            "voice_without_download_code"
+                            if persisted
+                            else "ingress_persistence_failed"
+                        ),
                     )
-                    return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+                    return (
+                        dingtalk_stream.AckMessage.STATUS_OK,
+                        (
+                            "voice unavailable"
+                            if persisted
+                            else "persistence failed"
+                        ),
+                    )
 
                 transcribe_start = time.perf_counter()
                 try:
@@ -925,33 +961,93 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
                 except Exception as exc:
                     voice_transcribe_seconds = _elapsed_seconds(transcribe_start)
                     logger.exception(
-                        "ASR recognition failed user=%s download_code=%s",
+                        "ASR recognition failed user=%s download_code_sha256=%s",
                         user_id,
-                        str(download_code)[:16],
+                        hashlib.sha256(
+                            str(download_code).encode("utf-8")
+                        ).hexdigest(),
                     )
-                    await _record_immediate_stream_failure(
+                    persisted = await _record_immediate_stream_failure(
                         incoming=incoming,
                         user_id=user_id,
                         payload=payload,
-                        reply_text=TEXT_TEXT_ONLY,
+                        reply_text=VOICE_TRANSCRIPTION_UNAVAILABLE_REPLY_TEXT,
                         error_message=f"voice_transcribe_failed: {exc.__class__.__name__}: {exc}",
                         settings=self.settings,
+                        voice_transcribe_seconds=voice_transcribe_seconds,
                     )
-                    self._reply_soon(incoming, TEXT_TEXT_ONLY)
+                    self._reply_soon(
+                        incoming,
+                        (
+                            VOICE_TRANSCRIPTION_UNAVAILABLE_REPLY_TEXT
+                            if persisted
+                            else TEXT_PROCESS_FAILED
+                        ),
+                    )
                     _log_immediate_stream_timing(
                         incoming=incoming,
                         user_id=user_id,
                         message_type=message_type,
                         text_len=0,
                         received_at_monotonic=received_at_monotonic,
-                        status="voice_transcribe_failed",
+                        status=(
+                            "voice_transcribe_failed"
+                            if persisted
+                            else "ingress_persistence_failed"
+                        ),
                         voice_transcribe_seconds=voice_transcribe_seconds,
                         error="asr_failed",
                     )
-                    return dingtalk_stream.AckMessage.STATUS_OK, "asr failed"
+                    return (
+                        dingtalk_stream.AckMessage.STATUS_OK,
+                        (
+                            "asr failed"
+                            if persisted
+                            else "persistence failed"
+                        ),
+                    )
 
                 voice_transcribe_seconds = _elapsed_seconds(transcribe_start)
                 text = recognized.strip()
+                if not text:
+                    persisted = await _record_immediate_stream_failure(
+                        incoming=incoming,
+                        user_id=user_id,
+                        payload=payload,
+                        reply_text=VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT,
+                        error_message="voice_transcribe_empty",
+                        settings=self.settings,
+                        voice_transcribe_seconds=voice_transcribe_seconds,
+                    )
+                    self._reply_soon(
+                        incoming,
+                        (
+                            VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT
+                            if persisted
+                            else TEXT_PROCESS_FAILED
+                        ),
+                    )
+                    _log_immediate_stream_timing(
+                        incoming=incoming,
+                        user_id=user_id,
+                        message_type=message_type,
+                        text_len=0,
+                        received_at_monotonic=received_at_monotonic,
+                        status=(
+                            "voice_transcribe_empty"
+                            if persisted
+                            else "ingress_persistence_failed"
+                        ),
+                        voice_transcribe_seconds=voice_transcribe_seconds,
+                    )
+                    return (
+                        dingtalk_stream.AckMessage.STATUS_OK,
+                        (
+                            "voice unavailable"
+                            if persisted
+                            else "persistence failed"
+                        ),
+                    )
                 logger.info(
                     "received stream voice message id=%s user=%s asr len=%s",
                     incoming.message_id,
@@ -968,6 +1064,41 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
                 incoming.message_type,
                 incoming.conversation_id,
                 len(text),
+            )
+
+        if incoming.message_type == "file":
+            payload = incoming.to_dict()
+            persisted = await _record_immediate_stream_failure(
+                incoming=incoming,
+                user_id=user_id,
+                payload=payload,
+                reply_text=UNSUPPORTED_FILE_REPLY_TEXT,
+                error_message="unsupported_file_message",
+                settings=self.settings,
+            )
+            self._reply_soon(
+                incoming,
+                (
+                    UNSUPPORTED_FILE_REPLY_TEXT
+                    if persisted
+                    else TEXT_PROCESS_FAILED
+                ),
+            )
+            _log_immediate_stream_timing(
+                incoming=incoming,
+                user_id=user_id,
+                message_type="file",
+                text_len=0,
+                received_at_monotonic=received_at_monotonic,
+                status=(
+                    "unsupported_file_message"
+                    if persisted
+                    else "ingress_persistence_failed"
+                ),
+            )
+            return (
+                dingtalk_stream.AckMessage.STATUS_OK,
+                "ok" if persisted else "persistence failed",
             )
 
         if not text:

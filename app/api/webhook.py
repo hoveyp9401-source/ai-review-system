@@ -22,6 +22,9 @@ from app.repositories import (
 )
 from app.services.dingtalk import (
     DingTalkPayloadError,
+    UNSUPPORTED_FILE_REPLY_TEXT,
+    VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT,
+    VOICE_TRANSCRIPTION_UNAVAILABLE_REPLY_TEXT,
     build_idempotency_key,
     dingtalk_text_response,
     extract_voice_download_code,
@@ -307,6 +310,8 @@ async def dingtalk_webhook(
     message_type = str(
         payload.get("msgtype") or payload.get("msgType") or "text"
     )
+    voice_transcribe_error = ""
+    voice_content_error = ""
 
     # If audio/voice message without auto-recognition text, try ASR
     if not incoming.text:
@@ -319,11 +324,19 @@ async def dingtalk_webhook(
                     from dataclasses import replace
                     incoming = replace(incoming, text=str(recognized).strip())
                 except Exception as exc:
+                    voice_transcribe_error = (
+                        f"voice_transcribe_failed: {exc.__class__.__name__}: {exc}"
+                    )
                     logger.warning(
                         "dingtalk_asr_failed download_code_sha256=%s error_type=%s",
                         hashlib.sha256(str(download_code).encode("utf-8")).hexdigest(),
                         type(exc).__name__,
                     )
+                else:
+                    if not incoming.text:
+                        voice_content_error = "voice_transcribe_empty"
+            else:
+                voice_content_error = "voice_without_download_code"
 
     persisted_payload = prepare_recoverable_ingress_payload(
         payload,
@@ -341,6 +354,38 @@ async def dingtalk_webhook(
         payload=persisted_payload,
     )
     await session.commit()
+
+    immediate_failure_reply = ""
+    immediate_failure_error = ""
+    if message_type == "file":
+        immediate_failure_reply = UNSUPPORTED_FILE_REPLY_TEXT
+        immediate_failure_error = "unsupported_file_message"
+    elif voice_transcribe_error:
+        immediate_failure_reply = VOICE_TRANSCRIPTION_UNAVAILABLE_REPLY_TEXT
+        immediate_failure_error = voice_transcribe_error
+    elif voice_content_error:
+        immediate_failure_reply = VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT
+        immediate_failure_error = voice_content_error
+
+    if immediate_failure_reply:
+        response_payload = dingtalk_text_response(immediate_failure_reply)
+        if inserted or event.status == "processing":
+            await mark_webhook_event_failed(
+                session,
+                event,
+                error_message=immediate_failure_error,
+                response_payload=response_payload,
+                now=now_in_timezone(settings.timezone),
+            )
+            await session.commit()
+        else:
+            response_payload = (
+                canary_provider_response_payload(event.response_payload)
+                or response_payload
+            )
+        if is_encrypted and crypto:
+            return _encrypt_response(crypto, response_payload)
+        return response_payload
 
     if not inserted:
         resp = canary_provider_response_payload(

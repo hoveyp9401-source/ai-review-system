@@ -16,6 +16,20 @@ from app.config import Settings
 from app.message_identity import canonical_dingtalk_idempotency_key
 
 
+UNSUPPORTED_FILE_REPLY_TEXT = (
+    "已收到文件（包括 Word 文档），但当前暂不支持解析文件内容。"
+    "请将需要处理的内容直接发送为文字；文件内容不会进入日报处理。"
+)
+VOICE_TRANSCRIPTION_UNAVAILABLE_REPLY_TEXT = (
+    "语音转写服务暂时不可用，因此这条语音没有进入日报处理。"
+    "请稍后重试，或直接发送文字。"
+)
+VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT = (
+    "这条语音没有可用的音频或转写文字，因此未进入日报处理。"
+    "请重新发送语音，或直接发送文字。"
+)
+
+
 @dataclass(frozen=True)
 class DingTalkIncomingMessage:
     dingtalk_user_id: str
@@ -193,6 +207,11 @@ def parse_incoming_message(payload: dict[str, Any]) -> DingTalkIncomingMessage:
         text = text_obj.get("content") if isinstance(text_obj, dict) else str(text_obj)
     elif msg_type in {"audio", "voice"}:
         text = extract_voice_text(payload)
+    elif msg_type == "file":
+        # File metadata is evidence about the inbound message, not user-authored
+        # report text. The ingress layer persists it before returning its
+        # unsupported outcome.
+        text = ""
     else:
         text = payload.get("content") or payload.get("text", {}).get("content", "")
 
@@ -212,7 +231,7 @@ def parse_incoming_message(payload: dict[str, Any]) -> DingTalkIncomingMessage:
                     text = content_obj
 
     text = str(text).strip()
-    if not text and msg_type not in ("audio", "voice"):
+    if not text and msg_type not in ("audio", "voice", "file"):
         raise DingTalkPayloadError("Message text is empty.")
 
     conversation_kind = normalize_dingtalk_conversation_kind(
