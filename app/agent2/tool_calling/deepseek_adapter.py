@@ -2043,7 +2043,11 @@ def _daily_weekly_write_review_messages(
         "one exactly once. Coordinating wording does not merge different actions "
         "or different objects into one matter. The exact_quote source spans for "
         "different items must not overlap, and each quote must contain only the "
-        "one matter persisted by that item. "
+        "one matter persisted by that item. A second action with a different "
+        "object is a separate item even when a comma or coordinating word joins "
+        "it to the first action. By contrast, one action about a relationship "
+        "between two objects remains one item. Do not preserve the draft's item "
+        "grouping without independently recounting the source matters. "
         if allowed_domains == {"daily"}
         else ""
     )

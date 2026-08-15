@@ -521,6 +521,8 @@ async def test_daily_partial_quote_review_splits_independent_items_before_write(
     assert "action-object pair" in review_system_prompts[0]
     assert "Count the independently editable matters" in review_system_prompts[0]
     assert "source spans for different items must not overlap" in review_system_prompts[0]
+    assert "A second action with a different object is a separate item" in review_system_prompts[0]
+    assert "one action about a relationship between two objects remains one item" in review_system_prompts[0]
 
 
 @pytest.mark.asyncio

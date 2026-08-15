@@ -270,7 +270,10 @@ Current-turn daily-report source fidelity:
   to their governing item instead of splitting a single risk chain. One quote
   must not cross into another matter merely to make the wording smoother. The
   source spans for separate items must not overlap; each span authorizes only
-  its own persisted item.
+  its own persisted item. A second action with a different object is a separate
+  item even when a comma or coordinating word joins it to the first action. By
+  contrast, one action about a relationship between two objects remains one
+  item.
   Preserve the user's actors and qualifiers. A harmless
   source-language lead-in may remain when it is genuinely part of the matter;
   completeness and faithful separation take priority over cosmetic trimming.

@@ -15,6 +15,8 @@ def test_daily_source_policy_preserves_complete_risk_and_separate_matters() -> N
     assert "one independently editable action or object per item" in prompt
     assert "compound sentence must not hide two actions in one item" in prompt
     assert "source spans for separate items must not overlap" in prompt
+    assert "A second action with a different object is a separate item" in prompt
+    assert "one action about a relationship between two objects remains one item" in prompt
     assert "Keep conditions and consequences attached" in prompt
     assert "to their governing item" in prompt
     assert "Never shorten exact_quote into a summary" in prompt
