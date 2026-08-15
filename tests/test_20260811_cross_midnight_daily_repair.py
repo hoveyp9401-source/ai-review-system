@@ -25,10 +25,12 @@ from app.agent2.tool_calling.current_turn_source import (
 from app.agent2.tool_calling.production_runtime import _prepare_call
 from app.agent2.tool_calling.production_daily_executor import (
     ProductionDailyExecutor,
+    ProductionExecutionError,
 )
 from app.agent2.tool_calling.production_handlers import (
     ProductionHandlerRequest,
 )
+from app.agent2.tool_calling.production_store import report_state_hash
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
     CorrectDailyReportDateArgs,
@@ -1020,3 +1022,85 @@ async def test_empty_acknowledgement_and_submit_are_one_atomic_add_call() -> Non
         "submit_report",
     ]
     assert [command.report_version for command in captured] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_trusted_retry_locks_before_rechecking_an_absent_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = UUID("22222222-2222-2222-2222-222222222222")
+    target_date = date(2026, 8, 11)
+    source_text = "reviewed the contract payment terms"
+    call = NativeToolCall(
+        tool_call_id="trusted-retry-absent",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "trusted_failed_write",
+            "retry_candidate_id": "a" * 64,
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": source_text,
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": source_text,
+                    },
+                }
+            ],
+        },
+    )
+    arguments = AddDailyItemsArgs.model_validate(call.arguments)
+    bound = BoundCall(
+        call=call,
+        arguments=arguments.model_dump(mode="json"),
+        report=None,
+        target_item_ids=(),
+        source_report=None,
+        date_facts={
+            "resolved_date": target_date.isoformat(),
+            "retry_target_state_sha256": report_state_hash(None),
+        },
+    )
+    executor = ProductionDailyExecutor.__new__(ProductionDailyExecutor)
+    executor._bound_calls = {call.tool_call_id: bound}
+    executor._session = SimpleNamespace()
+    executor._user = SimpleNamespace(id=user_id)
+    lock_acquired = False
+
+    async def acquire_lock(_session, locked_user_id, locked_date):
+        nonlocal lock_acquired
+        assert locked_user_id == user_id
+        assert locked_date == target_date
+        lock_acquired = True
+
+    async def snapshot_after_lock(report_date, *, for_update=False):
+        assert lock_acquired is True
+        assert report_date == target_date
+        assert for_update is True
+        return TrustedReportSnapshot(
+            report_id=UUID("11111111-1111-1111-1111-111111111111"),
+            tenant_id="tenant",
+            owner_user_id=user_id,
+            report_date=target_date,
+            version=0,
+            status="collecting",
+        )
+
+    monkeypatch.setattr(
+        "app.agent2.tool_calling.production_daily_executor."
+        "acquire_daily_report_advisory_lock",
+        acquire_lock,
+    )
+    executor._snapshot = snapshot_after_lock
+    request = ProductionHandlerRequest(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        arguments=arguments,
+        executor=executor,
+        memory_executor=None,
+    )
+
+    with pytest.raises(ProductionExecutionError) as caught:
+        await executor.add_daily_items(request)
+
+    assert caught.value.code == "DAILY_RETRY_TARGET_STALE"

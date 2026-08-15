@@ -55,6 +55,7 @@ from app.agent2.tool_calling.production_store import (
     ProductionDateResolver,
     ToolCallCanaryClearPending,
     report_state_hash,
+    trusted_snapshot_from_report,
 )
 from app.agent2.tool_calling.validation import BoundCall
 from app.agent2.typed_daily_commands import TypedDailyCommand
@@ -77,6 +78,7 @@ from app.legal_daily_dashboard.sql_repository import (
     SqlDashboardRepository,
 )
 from app.models import DailyReport, User
+from app.repositories import acquire_daily_report_advisory_lock
 from app.services.state_machine import assess_daily_report_completeness
 
 
@@ -452,7 +454,27 @@ class ProductionDailyExecutor:
         arguments = self._arguments(request, AddDailyItemsArgs)
         bound = self._bound(request)
         report_date = self._resolved_date(bound, "resolved_date")
-        before = await self._snapshot(report_date)
+        is_trusted_retry = (
+            arguments.date_selection == "trusted_failed_write"
+        )
+        if is_trusted_retry:
+            # Use the same report-level lock as every normal Daily writer.
+            # This also serializes the important "report did not exist"
+            # state, for which a row lock alone cannot protect anything.
+            await acquire_daily_report_advisory_lock(
+                self._session,
+                self._user.id,
+                report_date,
+            )
+        before = (
+            await self._snapshot(report_date, for_update=True)
+            if is_trusted_retry
+            else await self._snapshot(report_date)
+        )
+        if is_trusted_retry and report_state_hash(before) != str(
+            bound.date_facts.get("retry_target_state_sha256") or ""
+        ):
+            raise ProductionExecutionError("DAILY_RETRY_TARGET_STALE")
         typed_before = await self._typed_snapshot(report_date)
         existing = {
             field: set(getattr(typed_before, field))
@@ -1351,7 +1373,27 @@ class ProductionDailyExecutor:
     async def _snapshot(
         self,
         report_date,
+        *,
+        for_update: bool = False,
     ) -> TrustedReportSnapshot | None:
+        if for_update:
+            report = await self._session.scalar(
+                select(DailyReport)
+                .where(
+                    DailyReport.user_id == self._user.id,
+                    DailyReport.report_date == report_date,
+                )
+                .with_for_update()
+            )
+            if report is None:
+                return None
+            return trusted_snapshot_from_report(
+                user=self._user,
+                tenant_id=self._context.principal.tenant_id,
+                report_date=report_date,
+                report=report,
+                provenance="trusted_context",
+            )
         return await self._context_store.load_report(
             self._context_request(),
             report_date,

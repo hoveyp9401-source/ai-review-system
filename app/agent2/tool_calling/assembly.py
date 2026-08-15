@@ -13,6 +13,7 @@ from app.agent2.tool_calling.context import (
     ToolCallStateNamespace,
     TrustedClearPending,
     TrustedContext,
+    TrustedDailyWriteRetryCandidate,
     TrustedPrincipal,
     TrustedRecentMessage,
     TrustedRecentOperation,
@@ -139,6 +140,13 @@ class TrustedContextReadPort(Protocol):
         limit: int,
     ) -> tuple[TrustedRecentOperation, ...]: ...
 
+    async def load_retryable_daily_write(
+        self,
+        request: TrustedContextRequest,
+        *,
+        namespace: str,
+    ) -> TrustedDailyWriteRetryCandidate | None: ...
+
 class TrustedPolicyPort(Protocol):
     async def permission_allowed(
         self,
@@ -210,6 +218,16 @@ class TrustedContextAssembler:
             request,
             pending_candidates,
             namespace=self._namespace,
+        )
+        retry_loader = getattr(
+            self._read_port,
+            "load_retryable_daily_write",
+            None,
+        )
+        retryable_daily_write = (
+            await retry_loader(request, namespace=self._namespace)
+            if callable(retry_loader)
+            else None
         )
         if active_pending is not None and not any(
             report is not None and report.report_id == active_pending.report_id
@@ -400,6 +418,7 @@ class TrustedContextAssembler:
             today_report=today_report,
             historical_reports=tuple(historical_reports),
             active_clear_pending=active_pending,
+            retryable_daily_write=retryable_daily_write,
             recent_messages=recent_messages,
             recent_operations=recent_operations,
             personal_memory=personal_memory,

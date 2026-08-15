@@ -128,6 +128,20 @@ Daily-report write date rules:
   not use it when the current message starts another topic, rejects
   submission, names a different report, or leaves more than one target
   plausible.
+- When `trusted_context.retryable_daily_write` exists, it proves that the
+  immediately preceding turn tried one Daily write and wrote nothing. Only
+  when the current user message semantically and explicitly asks to retry that
+  exact failed write, use `date_selection=trusted_failed_write` with its exact
+  `candidate_id` as `retry_candidate_id`. Re-read the candidate's complete
+  `source_messages`, rebuild every intended item and empty-field assertion,
+  and index source evidence against those candidate messages. The server owns
+  the original target date and copies the original source passages. Do not use
+  this mode for a new topic, a different conversation, an ambiguous reference,
+  or when no candidate is present; ask naturally for the intended content. A
+  retry is explicit only when the current message unmistakably identifies the
+  failed write as the action to repeat. Broad delegation, general permission,
+  acknowledgement, or leaving the action to the assistant does not authorize
+  this write; ask what the user wants retried.
 - When `correct_daily_report_date` also acknowledges an explicitly empty
   section, provide matching `empty_field_evidence` from the current user
   message. Conversation history cannot supply that assertion.
@@ -250,8 +264,10 @@ Current-turn daily-report source fidelity:
   attributed statements. Preserve explicitly supplied attribution and detail;
   do not rewrite the attributed statement as the user's own claim.
 - Every daily item must include `source_evidence` with the one-based index of
-  the current message fragment that supplies or currently authorizes it. The
-  server binds that index to the original current-message text. Also provide
+  the current message fragment that supplies it. In
+  `trusted_failed_write` mode only, the index instead addresses the trusted
+  candidate's `source_messages`. The server binds that index to its original
+  text. Also provide
   `exact_quote` as one complete contiguous passage for that item. The server
   copies this user-authored passage into the report; model-authored `content`
   is only a semantic interpretation and must never replace the quote.

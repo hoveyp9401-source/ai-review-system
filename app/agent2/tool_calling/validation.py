@@ -178,9 +178,30 @@ class ShadowCallBinder:
                 "INVALID_TOOL_ARGUMENTS",
                 validation_errors=exc.errors,
             )
-        if self._current_turn_source is not None:
+        evidence_source = self._current_turn_source
+        retry_candidate = None
+        if (
+            call.tool_name == "add_daily_items"
+            and arguments.get("date_selection")
+            == "trusted_failed_write"
+        ):
+            retry_candidate = self._context.retryable_daily_write
+            if (
+                retry_candidate is None
+                or arguments.get("retry_candidate_id")
+                != retry_candidate.candidate_id
+            ):
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_DAILY_RETRY_CANDIDATE",
+                )
+            evidence_source = CurrentTurnSource(
+                retry_candidate.source_messages
+            )
+        if evidence_source is not None:
             try:
-                arguments = self._current_turn_source.bind_tool_arguments(
+                arguments = evidence_source.bind_tool_arguments(
                     call.tool_name,
                     arguments,
                 )
@@ -299,6 +320,46 @@ class ShadowCallBinder:
             date_facts = {
                 "resolved_date": report.report_date.isoformat(),
                 "date_resolution_basis": "trusted_report_reference",
+            }
+        elif (
+            call.tool_name == "add_daily_items"
+            and arguments.get("date_selection")
+            == "trusted_failed_write"
+        ):
+            assert retry_candidate is not None
+            try:
+                report = await self.report_by_date(
+                    retry_candidate.target_date
+                )
+            except _UntrustedReadSnapshotError:
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "UNTRUSTED_READ_RESOURCE",
+                )
+            if (
+                (report is None) != retry_candidate.target_was_absent
+                or (
+                    report is not None
+                    and report.version
+                    != retry_candidate.target_version
+                )
+            ):
+                return None, failure_receipt(
+                    call,
+                    ReceiptStatus.BLOCKED,
+                    "DAILY_RETRY_TARGET_STALE",
+                )
+            date_facts = {
+                "resolved_date": retry_candidate.target_date.isoformat(),
+                "date_resolution_basis": "trusted_failed_write",
+                "retry_candidate_id": retry_candidate.candidate_id,
+                "retry_target_state_sha256": (
+                    retry_candidate.target_state_sha256
+                ),
+                "retry_target_was_absent": (
+                    retry_candidate.target_was_absent
+                ),
             }
         elif "date_expression" in arguments:
             proposed_date = date.fromisoformat(str(arguments["proposed_date"]))

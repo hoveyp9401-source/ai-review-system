@@ -131,7 +131,10 @@ class _ConversationSession:
     async def scalars(self, statement):
         names = _entity_names(statement)
         if "WebhookEvent" in names:
-            return _Rows(reversed(self.events))
+            rows = list(reversed(self.events))
+            if "webhook_events.status =" in str(statement).lower():
+                rows = [row for row in rows if row.status == "processed"]
+            return _Rows(rows)
         if "ToolCallCanaryReceipt" in names:
             return _Rows(reversed(self.committed["receipts"]))
         return _Rows()
@@ -221,8 +224,9 @@ class _ConversationSession:
         *,
         source_message_id: str,
         user_text: str,
-        assistant_text: str,
+        response_payload: dict,
         occurred_at: datetime,
+        conversation_id: str,
     ) -> None:
         self.events.append(
             SimpleNamespace(
@@ -231,10 +235,10 @@ class _ConversationSession:
                 dingtalk_user_id=f"ding-{USER_ID}",
                 status="processed",
                 payload={
-                    "conversationId": CONVERSATION_ID,
+                    "conversationId": conversation_id,
                     "text": {"content": user_text},
                 },
-                response_payload={"text": {"content": assistant_text}},
+                response_payload=response_payload,
                 received_at=occurred_at,
             )
         )
@@ -315,25 +319,10 @@ class _PendingRuntime:
             else:
                 bound.append(item)
         if failures:
-            receipts = tuple(
-                failures
-                + [
-                    ToolReceipt(
-                        status=ReceiptStatus.BLOCKED,
-                        tool_name=item.call.tool_name,
-                        changed=False,
-                        error_code="ATOMIC_GROUP_PREVALIDATION_FAILED",
-                        safe_user_facts={"actual_write": False},
-                        execution_mode=ExecutionMode.CANARY_EXECUTE,
-                    )
-                    for item in bound
-                ]
-            )
-            return ProductionRuntimeResult(
-                status="blocked",
-                receipts=receipts,
-                error_code=receipts[0].error_code,
-            )
+            # Pre-execution failures return before the real runtime touches the
+            # database, so use it here to preserve the exact production
+            # observation that the next public ingress turn must consume.
+            return await self._real.execute(tuple(calls))
 
         before = deepcopy(self._session.working)
         receipts: list[ToolReceipt] = []
@@ -582,6 +571,38 @@ def _daily_call(call_id: str, *, content: str) -> dict:
     }
 
 
+def _trusted_failed_daily_call(
+    call_id: str,
+    *,
+    candidate_id: str,
+    content: str,
+) -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "add_daily_items",
+            "arguments": json.dumps(
+                {
+                    "date_selection": "trusted_failed_write",
+                    "retry_candidate_id": candidate_id,
+                    "items": [
+                        {
+                            "field": "today_work",
+                            "content": content,
+                            "source_evidence": {
+                                "source_message_index": 1,
+                                "exact_quote": content,
+                            },
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
 def _weekly_item_to_daily_call(
     call_id: str,
     *,
@@ -656,7 +677,9 @@ async def _run_turn(
     source_message_id: str,
     user_text: str,
     now: datetime,
-    model_messages: list[dict],
+    model_messages: list[dict] | None = None,
+    model_client=None,
+    conversation_id: str = CONVERSATION_ID,
 ):
     settings = _settings()
     user = SimpleNamespace(
@@ -692,7 +715,9 @@ async def _run_turn(
             capability=capability,
         )
 
-    model = _ScriptedModel(model_messages)
+    if (model_messages is None) == (model_client is None):
+        raise ValueError("provide exactly one scripted model boundary")
+    model = model_client or _ScriptedModel(model_messages or [])
     monkeypatch.setattr(
         canary_service,
         "resolve_tool_call_canary_route",
@@ -716,7 +741,7 @@ async def _run_turn(
         dingtalk_user_id=user.dingtalk_user_id,
         user_text=user_text,
         source_channel="test",
-        conversation_id=CONVERSATION_ID,
+        conversation_id=conversation_id,
         source_message_id=source_message_id,
         settings=settings,
         llm_client=SimpleNamespace(native_http_client=model),
@@ -727,8 +752,11 @@ async def _run_turn(
     session.remember_turn(
         source_message_id=source_message_id,
         user_text=user_text,
-        assistant_text=outcome.message,
+        response_payload=(
+            canary_service.build_canary_persisted_response_payload(outcome)
+        ),
         occurred_at=now,
+        conversation_id=conversation_id,
     )
     return outcome, model
 
@@ -758,6 +786,325 @@ def _weekly_items(session: _ConversationSession) -> dict[str, list[str]]:
         for day in plan.days
         if day.items
     }
+
+
+class _RetrySelectingModel:
+    """The model selects a server-provided candidate; it does not infer one."""
+
+    def __init__(
+        self,
+        *,
+        original_text: str,
+        fail_terminal_reply: bool = False,
+    ) -> None:
+        self._original_text = original_text
+        self._fail_terminal_reply = fail_terminal_reply
+        self._candidate_id: str | None = None
+        self.calls: list[dict] = []
+
+    async def post(self, _endpoint, *, json, timeout):
+        del timeout
+        self.calls.append(json)
+        sequence = len(self.calls)
+        if sequence == 1:
+            turn_payload = __import__("json").loads(
+                json["messages"][1]["content"]
+            )
+            candidate = turn_payload["trusted_context"][
+                "retryable_daily_write"
+            ]
+            assert [
+                message["content"]
+                for message in candidate["source_messages"]
+            ] == [self._original_text]
+            self._candidate_id = candidate["candidate_id"]
+            message = _assistant_tools(
+                _trusted_failed_daily_call(
+                    "retry-selected",
+                    candidate_id=self._candidate_id,
+                    content=self._original_text,
+                )
+            )
+        elif sequence == 2:
+            assert self._candidate_id is not None
+            message = _assistant_tools(
+                _trusted_failed_daily_call(
+                    "retry-reviewed",
+                    candidate_id=self._candidate_id,
+                    content=self._original_text,
+                )
+            )
+        elif sequence == 3 and not self._fail_terminal_reply:
+            message = _terminal(
+                reply="已经按刚才的原句写入日报。",
+                actual_write=True,
+                outcome="changed",
+            )
+        elif self._fail_terminal_reply and 3 <= sequence <= 5:
+            message = _terminal(
+                reply="The write did not happen.",
+                actual_write=False,
+                outcome="not_executed",
+            )
+        else:
+            raise AssertionError("retry turn made an unexpected model call")
+        return _HttpResponse(message, sequence)
+
+
+@pytest.mark.asyncio
+async def test_short_retry_reuses_one_failed_daily_source_only_in_its_conversation(
+    monkeypatch,
+) -> None:
+    session = _ConversationSession()
+    original_text = "今天做了日报的基础功能优化"
+    failed_at = datetime(2026, 8, 15, 21, 36, tzinfo=SHANGHAI)
+    paraphrased = _daily_call(
+        "initial-paraphrase",
+        content="日报基础功能已经优化完成",
+    )
+    reviewed_paraphrase = deepcopy(paraphrased)
+    reviewed_paraphrase["id"] = "initial-paraphrase-reviewed"
+    blocked, _ = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="failed-original-message",
+        user_text=original_text,
+        now=failed_at,
+        model_messages=[
+            _assistant_tools(paraphrased),
+            _assistant_tools(reviewed_paraphrase),
+            _terminal(
+                reply="这次没有写入日报。",
+                actual_write=False,
+                outcome="not_executed",
+            ),
+        ],
+    )
+
+    assert blocked.actual_write is False
+    assert blocked.tool_blocked_count == 1
+    assert session.committed["daily"] == []
+
+    other_conversation, other_model = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="other-conversation-retry",
+        user_text="你再试试？",
+        now=failed_at + timedelta(minutes=1),
+        conversation_id="another-direct-conversation",
+        model_messages=[
+            {"role": "assistant", "content": "请把要写入的内容发给我。"},
+            {
+                "role": "assistant",
+                "content": json.dumps({"decision": "keep_original"}),
+            },
+        ],
+    )
+    other_context = _first_context(other_model)
+
+    assert other_conversation.actual_write is False
+    assert other_conversation.model_result_status == "success"
+    assert other_context.get("retryable_daily_write") is None
+    assert session.committed["daily"] == []
+
+    retry_model = _RetrySelectingModel(original_text=original_text)
+    retried, _ = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="same-conversation-retry",
+        user_text="你再试试？",
+        now=failed_at + timedelta(minutes=2),
+        model_client=retry_model,
+    )
+
+    assert retried.actual_write is True
+    assert retried.tool_success_count == 1
+    assert session.committed["daily"] == [original_text]
+
+    repeated, repeated_model = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="repeat-after-success",
+        user_text="再试试？",
+        now=failed_at + timedelta(minutes=3),
+        model_messages=[
+            {
+                "role": "assistant",
+                "content": "刚才的写入已经成功，没有重复写入。",
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps({"decision": "keep_original"}),
+            },
+        ],
+    )
+    repeated_context = _first_context(repeated_model)
+
+    assert repeated.actual_write is False
+    assert repeated.model_result_status == "success"
+    assert repeated_context.get("retryable_daily_write") is None
+    assert session.committed["daily"] == [original_text]
+
+
+@pytest.mark.asyncio
+async def test_selected_retry_survives_a_zero_write_terminal_failure(
+    monkeypatch,
+) -> None:
+    session = _ConversationSession()
+    original_text = "reviewed the daily report reminder logic"
+    failed_at = datetime(2026, 8, 15, 21, 0, tzinfo=SHANGHAI)
+    paraphrased = _daily_call(
+        "retry-chain-initial",
+        content="completed the daily report reminder optimization",
+    )
+    reviewed = deepcopy(paraphrased)
+    reviewed["id"] = "retry-chain-initial-reviewed"
+    first, _ = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="retry-chain-origin",
+        user_text=original_text,
+        now=failed_at,
+        model_messages=[
+            _assistant_tools(paraphrased),
+            _assistant_tools(reviewed),
+            _terminal(
+                reply="The report was not updated.",
+                actual_write=False,
+                outcome="not_executed",
+            ),
+        ],
+    )
+    assert first.tool_blocked_count == 1
+
+    failed_retry, _ = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="retry-chain-failed-terminal",
+        user_text="try that again",
+        now=failed_at + timedelta(minutes=1),
+        model_client=_RetrySelectingModel(
+            original_text=original_text,
+            fail_terminal_reply=True,
+        ),
+    )
+
+    assert failed_retry.actual_write is False
+    assert failed_retry.model_result_status == "failed"
+    assert session.committed["daily"] == []
+    failed_observation = session.events[-1].response_payload[
+        "_agent2_turn_observation_v1"
+    ]
+    assert (
+        failed_observation["daily_write_retry_continuation"][
+            "retry_chain_depth"
+        ]
+        == 1
+    )
+
+    final, final_model = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="retry-chain-success",
+        user_text="try it once more",
+        now=failed_at + timedelta(minutes=2),
+        model_client=_RetrySelectingModel(original_text=original_text),
+    )
+
+    assert final.actual_write is True
+    assert _first_context(final_model)["retryable_daily_write"][
+        "candidate_id"
+    ] == failed_observation["daily_write_retry_continuation"][
+        "candidate_id"
+    ]
+    assert session.committed["daily"] == [original_text]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intervening_status", ("failed", "processing"))
+async def test_retry_candidate_does_not_skip_an_intervening_same_conversation_turn(
+    monkeypatch,
+    intervening_status,
+) -> None:
+    session = _ConversationSession()
+    original_text = "reviewed the contract payment terms"
+    failed_at = datetime(2026, 8, 15, 20, 0, tzinfo=SHANGHAI)
+    paraphrased = _daily_call(
+        "intervened-initial",
+        content="completed the contract payment review",
+    )
+    reviewed = deepcopy(paraphrased)
+    reviewed["id"] = "intervened-initial-reviewed"
+    blocked, _ = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="intervened-failed-message",
+        user_text=original_text,
+        now=failed_at,
+        model_messages=[
+            _assistant_tools(paraphrased),
+            _assistant_tools(reviewed),
+            _terminal(
+                reply="The report was not updated.",
+                actual_write=False,
+                outcome="not_executed",
+            ),
+        ],
+    )
+    assert blocked.tool_blocked_count == 1
+
+    origin_observation = session.events[-1].response_payload[
+        "_agent2_turn_observation_v1"
+    ]
+    continuation = deepcopy(
+        origin_observation["pre_execution_blocks"][0][
+            "retry_candidate"
+        ]
+    )
+    continuation["retry_chain_depth"] = 1
+    continuation["retry_of_candidate_id"] = continuation[
+        "candidate_id"
+    ]
+
+    session.remember_turn(
+        source_message_id="intervening-message",
+        user_text="wait, I need to check something first",
+        response_payload={
+            "text": {"content": "Okay."},
+            "_agent2_turn_observation_v1": {
+                "message_processing_status": "consumed",
+                "business_write_committed": False,
+                "tool_success_count": 0,
+                "tool_no_op_count": 0,
+                "daily_write_retry_continuation": continuation,
+            },
+        },
+        occurred_at=failed_at + timedelta(minutes=1),
+        conversation_id=CONVERSATION_ID,
+    )
+    session.events[-1].status = intervening_status
+
+    retried, model = await _run_turn(
+        monkeypatch,
+        session,
+        source_message_id="retry-after-intervening-message",
+        user_text="try again",
+        now=failed_at + timedelta(minutes=2),
+        model_messages=[
+            {
+                "role": "assistant",
+                "content": "Please resend the report content you want recorded.",
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps({"decision": "keep_original"}),
+            },
+        ],
+    )
+
+    assert retried.actual_write is False
+    assert _first_context(model).get("retryable_daily_write") is None
+    assert session.committed["daily"] == []
 
 
 @pytest.mark.asyncio

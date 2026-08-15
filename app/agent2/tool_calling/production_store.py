@@ -43,11 +43,17 @@ from app.agent2.tool_calling.assembly import TrustedContextRequest
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedClearPending,
+    TrustedDailyWriteRetryCandidate,
     TrustedRecentMessage,
     TrustedRecentOperation,
     TrustedReportItem,
     TrustedReportReference,
     TrustedReportSnapshot,
+)
+from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
+from app.agent2.tool_calling.daily_write_retry import (
+    daily_retry_candidate_id,
+    validated_daily_retry_evidence,
 )
 from app.agent2.tool_calling.outbound_context import (
     OUTBOUND_CONTEXT_BACKEND_ACTION,
@@ -77,6 +83,7 @@ from app.services.dingtalk import extract_voice_text
 _RECENT_MESSAGE_MAX_AGE = timedelta(hours=2)
 _SCHEDULED_OUTBOUND_MAX_AGE = timedelta(hours=16)
 _RECENT_OPERATION_MAX_AGE = timedelta(hours=2)
+_TURN_OBSERVATION_KEY = "_agent2_turn_observation_v1"
 
 
 def _strict_ascii_allowlist(raw: object) -> frozenset[str]:
@@ -404,7 +411,6 @@ class ProductionContextStore:
                     .where(
                         WebhookEvent.dingtalk_user_id
                         == self._user.dingtalk_user_id,
-                        WebhookEvent.status == "processed",
                         WebhookEvent.idempotency_key
                         != request.source_message_id,
                         WebhookEvent.received_at
@@ -539,6 +545,142 @@ class ProductionContextStore:
         return _select_recent_messages_with_scheduled_outbound(
             timed_messages,
             limit=limit,
+        )
+
+    async def load_retryable_daily_write(
+        self,
+        request: TrustedContextRequest,
+        *,
+        namespace: str,
+    ) -> TrustedDailyWriteRetryCandidate | None:
+        """Recover one immediately preceding, server-observed failed write."""
+
+        self._assert_scope(request.tenant_id, request.user_id)
+        if (
+            namespace != CANARY_STATE_NAMESPACE
+            or request.conversation_kind != "direct"
+        ):
+            return None
+        rows = list(
+            (
+                await self._session.scalars(
+                    select(WebhookEvent)
+                    .where(
+                        WebhookEvent.dingtalk_user_id
+                        == self._user.dingtalk_user_id,
+                        WebhookEvent.idempotency_key
+                        != request.source_message_id,
+                        WebhookEvent.received_at
+                        >= request.server_now - _RECENT_MESSAGE_MAX_AGE,
+                        WebhookEvent.payload["conversationId"].astext
+                        == request.conversation_id,
+                    )
+                    .order_by(WebhookEvent.received_at.desc())
+                    .limit(8)
+                )
+            ).all()
+        )
+        scoped = sorted(
+            (
+                row
+                for row in rows
+                if _event_matches_request(
+                    row,
+                    request=request,
+                    dingtalk_user_id=self._user.dingtalk_user_id,
+                    require_processed=False,
+                )
+                and row.received_at <= request.server_now
+            ),
+            key=lambda row: (row.received_at, str(row.id)),
+            reverse=True,
+        )
+        if not scoped:
+            return None
+        latest = scoped[0]
+        if latest.status != "processed":
+            return None
+        latest_evidence = _retry_evidence_from_event(latest)
+        if latest_evidence is None:
+            return None
+
+        origin = latest
+        if latest_evidence["retry_of_candidate_id"]:
+            origins = [
+                row
+                for row in scoped[1:]
+                if (
+                    (candidate := _retry_evidence_from_event(row))
+                    is not None
+                    and candidate["candidate_id"]
+                    == latest_evidence["candidate_id"]
+                    and not candidate["retry_of_candidate_id"]
+                )
+            ]
+            if len(origins) != 1:
+                return None
+            origin = origins[0]
+
+        source_text = _text_content(origin.payload, max_length=None)
+        if not source_text:
+            return None
+        source = CurrentTurnSource((source_text,))
+        if source.sha256 != latest_evidence["source_bundle_sha256"]:
+            return None
+
+        expected_candidate_id = daily_retry_candidate_id(
+            tenant_id=request.tenant_id,
+            user_id=str(request.user_id),
+            conversation_id=request.conversation_id,
+            origin_source_message_id=origin.idempotency_key,
+            source_bundle_sha256=source.sha256,
+            target_report_date=latest_evidence[
+                "target_report_date"
+            ],
+            target_state_sha256=latest_evidence[
+                "target_state_sha256"
+            ],
+        )
+        if expected_candidate_id != latest_evidence["candidate_id"]:
+            return None
+
+        target_date = date.fromisoformat(
+            latest_evidence["target_report_date"]
+        )
+        live = await self._load_snapshot(
+            target_date,
+            provenance="trusted_context",
+        )
+        if (
+            (live is None) != latest_evidence["target_was_absent"]
+            or report_state_hash(live)
+            != latest_evidence["target_state_sha256"]
+            or (
+                live is not None
+                and live.version != latest_evidence["target_version"]
+            )
+        ):
+            return None
+
+        return TrustedDailyWriteRetryCandidate(
+            candidate_id=latest_evidence["candidate_id"],
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            conversation_id=request.conversation_id,
+            origin_source_message_id=origin.idempotency_key,
+            origin_received_at=origin.received_at,
+            source_messages=source.messages,
+            source_bundle_sha256=source.sha256,
+            target_date=target_date,
+            target_was_absent=latest_evidence["target_was_absent"],
+            target_version=latest_evidence["target_version"],
+            target_state_sha256=latest_evidence[
+                "target_state_sha256"
+            ],
+            failed_local_date=date.fromisoformat(
+                latest_evidence["failed_local_date"]
+            ),
+            retry_chain_depth=latest_evidence["retry_chain_depth"],
         )
 
     async def load_recent_operations(
@@ -855,15 +997,55 @@ def _event_matches_request(
     *,
     request: TrustedContextRequest,
     dingtalk_user_id: str,
+    require_processed: bool = True,
 ) -> bool:
     payload = event.payload if isinstance(event.payload, dict) else {}
     return (
         event.dingtalk_user_id == dingtalk_user_id
-        and event.status == "processed"
+        and (not require_processed or event.status == "processed")
         and event.idempotency_key != request.source_message_id
         and str(payload.get("conversationId") or "")
         == request.conversation_id
         and event.received_at >= request.server_now - _RECENT_MESSAGE_MAX_AGE
+    )
+
+
+def _retry_evidence_from_event(
+    event: WebhookEvent,
+) -> dict[str, Any] | None:
+    response = (
+        event.response_payload
+        if isinstance(event.response_payload, Mapping)
+        else {}
+    )
+    observation = response.get(_TURN_OBSERVATION_KEY)
+    if not isinstance(observation, Mapping):
+        return None
+    if (
+        observation.get("message_processing_status") != "consumed"
+        or observation.get("business_write_committed") is not False
+        or observation.get("tool_success_count") != 0
+        or observation.get("tool_no_op_count") != 0
+    ):
+        return None
+    continuation = validated_daily_retry_evidence(
+        observation.get("daily_write_retry_continuation")
+    )
+    if continuation is not None:
+        return continuation
+    blocks = observation.get("pre_execution_blocks")
+    if (
+        observation.get("tool_clarification_count") != 0
+        or observation.get("tool_failure_count") != 0
+        or observation.get("tool_blocked_count") != 1
+        or not isinstance(blocks, list)
+        or len(blocks) != 1
+        or not isinstance(blocks[0], Mapping)
+        or blocks[0].get("tool_name") != "add_daily_items"
+    ):
+        return None
+    return validated_daily_retry_evidence(
+        blocks[0].get("retry_candidate")
     )
 
 

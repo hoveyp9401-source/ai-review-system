@@ -553,7 +553,9 @@ class DailyItemSourceEvidence(CurrentUserMessageEvidence):
             max_length=4000,
             description=(
                 "Contiguous current-message quote authoritative for this one "
-                "persisted Daily Report item. It must cover the item's complete "
+                "persisted Daily Report item, or a quote from the one server-"
+                "verified immediately preceding failed write selected by "
+                "retry_candidate_id. It must cover the item's complete "
                 "meaning: never omit a negation, condition, deadline, consequence, "
                 "exception, or pending action, even when punctuation or whitespace "
                 "separates it. A date or section lead-in may be omitted only when "
@@ -593,6 +595,7 @@ class AddDailyItemsArgs(StrictContract):
         "agent2_semantic",
         "user_explicit",
         "trusted_report",
+        "trusted_failed_write",
     ] = (
         "server_default"
     )
@@ -600,6 +603,10 @@ class AddDailyItemsArgs(StrictContract):
     proposed_date: date | None = None
     report_id: UUID | None = None
     expected_version: int | None = Field(default=None, ge=0)
+    retry_candidate_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     date_evidence: DailyReportDateEvidence | None = None
     items: tuple[DailyItemInput, ...] = Field(default=(), max_length=30)
     acknowledged_empty_fields: tuple[ReportField, ...] = Field(
@@ -616,7 +623,25 @@ class AddDailyItemsArgs(StrictContract):
     def require_content_or_explicit_empty_acknowledgement(
         self,
     ) -> "AddDailyItemsArgs":
-        if self.date_selection == "trusted_report":
+        if self.date_selection == "trusted_failed_write":
+            if self.retry_candidate_id is None:
+                raise ValueError(
+                    "trusted failed write selection requires retry_candidate_id"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.date_expression,
+                    self.proposed_date,
+                    self.report_id,
+                    self.expected_version,
+                    self.date_evidence,
+                )
+            ):
+                raise ValueError(
+                    "trusted failed write selection uses only its server candidate"
+                )
+        elif self.date_selection == "trusted_report":
             if self.report_id is None or self.expected_version is None:
                 raise ValueError(
                     "trusted-report selection requires report_id and expected_version"
@@ -661,6 +686,13 @@ class AddDailyItemsArgs(StrictContract):
                 raise ValueError(
                     "the server default cannot carry semantic date evidence"
                 )
+        if (
+            self.date_selection != "trusted_failed_write"
+            and self.retry_candidate_id is not None
+        ):
+            raise ValueError(
+                "retry_candidate_id is valid only for a trusted failed write"
+            )
         if (
             not self.items
             and not self.acknowledged_empty_fields

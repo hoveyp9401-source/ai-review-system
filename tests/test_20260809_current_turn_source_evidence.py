@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -10,7 +10,9 @@ from pydantic import ValidationError
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedContext,
+    TrustedDailyWriteRetryCandidate,
     TrustedPrincipal,
+    TrustedReportSnapshot,
 )
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
@@ -20,6 +22,7 @@ from app.agent2.tool_calling.current_turn_source import (
     CurrentTurnSource,
     CurrentTurnSourceEvidenceError,
 )
+from app.agent2.tool_calling.production_store import report_state_hash
 from app.agent2.tool_calling.registry import deepseek_tool_schemas
 from app.agent2.tool_calling.validation import (
     NativeToolCall,
@@ -494,3 +497,93 @@ async def test_production_binder_blocks_invalid_source_index_before_date_resolut
     assert bound is None
     assert failure is not None
     assert failure.error_code == "CURRENT_MESSAGE_EVIDENCE_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_trusted_failed_write_is_blocked_when_the_target_changed() -> None:
+    now = datetime(
+        2026,
+        8,
+        9,
+        12,
+        0,
+        tzinfo=ZoneInfo("Asia/Shanghai"),
+    )
+    user_id = UUID("10000000-0000-0000-0000-000000000001")
+    target_date = date(2026, 8, 9)
+    source_text = "reviewed the contract payment terms"
+    source = CurrentTurnSource((source_text,))
+    candidate = TrustedDailyWriteRetryCandidate(
+        candidate_id="a" * 64,
+        tenant_id="test-tenant",
+        user_id=user_id,
+        conversation_id="test-conversation",
+        origin_source_message_id="failed-message",
+        origin_received_at=now - timedelta(minutes=1),
+        source_messages=(source_text,),
+        source_bundle_sha256=source.sha256,
+        target_date=target_date,
+        target_was_absent=True,
+        target_version=None,
+        target_state_sha256=report_state_hash(None),
+        failed_local_date=target_date,
+    )
+    context = TrustedContext(
+        namespace=CANARY_STATE_NAMESPACE,
+        now=now,
+        principal=TrustedPrincipal(
+            tenant_id="test-tenant",
+            user_id=user_id,
+            conversation_id="test-conversation",
+            source_message_id="retry-message",
+            timezone="Asia/Shanghai",
+            conversation_kind="direct",
+        ),
+        retryable_daily_write=candidate,
+        allowed_tool_names=frozenset({"add_daily_items"}),
+        gate_decisions={"add_daily_items": True},
+    )
+
+    class _TargetNowExists:
+        async def load_owned_report(self, **_kwargs):
+            return TrustedReportSnapshot(
+                report_id=UUID(
+                    "20000000-0000-0000-0000-000000000001"
+                ),
+                tenant_id="test-tenant",
+                owner_user_id=user_id,
+                report_date=target_date,
+                version=0,
+                status="collecting",
+                provenance="read_tool",
+            )
+
+    bound, failure = await ShadowCallBinder(
+        context,
+        UnavailableDateResolver(),
+        _TargetNowExists(),
+        current_turn_source=CurrentTurnSource(("try again",)),
+    ).bind(
+        NativeToolCall(
+            tool_call_id="retry-call",
+            tool_name="add_daily_items",
+            arguments={
+                "date_selection": "trusted_failed_write",
+                "retry_candidate_id": candidate.candidate_id,
+                "items": [
+                    {
+                        "field": "today_work",
+                        "content": source_text,
+                        "source_evidence": {
+                            "source_message_index": 1,
+                            "exact_quote": source_text,
+                        },
+                    }
+                ],
+            },
+        )
+    )
+
+    assert bound is None
+    assert failure is not None
+    assert failure.error_code == "DAILY_RETRY_TARGET_STALE"

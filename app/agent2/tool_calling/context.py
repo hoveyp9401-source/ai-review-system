@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.agent2.memory import TrustedPersonalMemoryContext
 from app.agent2.periodic_report_context import TrustedPeriodicReportContext
 from app.agent2.weekly_plan_context import TrustedWeeklyPlanContext
-
 
 SHADOW_STATE_NAMESPACE = "agent2.tool_calling.shadow.v1"
 CANARY_STATE_NAMESPACE = "agent2.tool_calling.canary.v1"
@@ -135,6 +134,78 @@ class TrustedClearPending(_FrozenModel):
         return value
 
 
+class TrustedDailyWriteRetryCandidate(_FrozenModel):
+    """One server-verified Daily write that the immediately next turn may retry."""
+
+    candidate_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tenant_id: str = Field(min_length=1, max_length=128)
+    user_id: UUID
+    conversation_id: str = Field(min_length=1, max_length=256)
+    origin_source_message_id: str = Field(min_length=1, max_length=512)
+    origin_received_at: datetime
+    source_messages: tuple[str, ...] = Field(min_length=1, max_length=1)
+    source_bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_date: date
+    target_was_absent: bool
+    target_version: int | None = Field(default=None, ge=0)
+    target_state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    failed_local_date: date
+    retry_chain_depth: int = Field(default=0, ge=0, le=3)
+    provenance: Literal["server_block_observation"] = (
+        "server_block_observation"
+    )
+
+    @field_validator("origin_received_at")
+    @classmethod
+    def origin_time_must_be_timezone_aware(
+        cls,
+        value: datetime,
+    ) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Daily retry origin time must be timezone-aware")
+        return value
+
+    @field_validator("source_messages")
+    @classmethod
+    def source_messages_must_be_complete(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if any(
+            not isinstance(message, str)
+            or not message.strip()
+            or len(message) > 12000
+            for message in value
+        ):
+            raise ValueError("Daily retry source message is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def target_existence_matches_version(
+        self,
+    ) -> "TrustedDailyWriteRetryCandidate":
+        if self.target_was_absent != (self.target_version is None):
+            raise ValueError(
+                "Daily retry target absence must match its recorded version"
+            )
+        return self
+
+    def model_payload(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "target_report_date": self.target_date.isoformat(),
+            "status": "previous_write_not_applied",
+            "source_messages": [
+                {"sequence": index, "content": content}
+                for index, content in enumerate(
+                    self.source_messages,
+                    start=1,
+                )
+            ],
+            "provenance": self.provenance,
+        }
+
+
 class TrustedRecentMessage(_FrozenModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=4000)
@@ -228,6 +299,7 @@ class TrustedContext(_FrozenModel):
     today_report: TrustedReportSnapshot | None = None
     historical_reports: tuple[TrustedReportSnapshot, ...] = ()
     active_clear_pending: TrustedClearPending | None = None
+    retryable_daily_write: TrustedDailyWriteRetryCandidate | None = None
     recent_messages: tuple[TrustedRecentMessage, ...] = ()
     recent_operations: tuple[TrustedRecentOperation, ...] = ()
     personal_memory: TrustedPersonalMemoryContext | None = None
@@ -344,6 +416,24 @@ class TrustedContext(_FrozenModel):
             or pending.conversation_id != self.principal.conversation_id
         ):
             raise ValueError("trusted Pending must match principal and conversation")
+        retry = self.retryable_daily_write
+        if retry is not None:
+            local_date = self.now.astimezone(
+                ZoneInfo(self.principal.timezone)
+            ).date()
+            if (
+                retry.tenant_id != self.principal.tenant_id
+                or retry.user_id != self.principal.user_id
+                or retry.conversation_id
+                != self.principal.conversation_id
+                or retry.failed_local_date != local_date
+                or retry.origin_received_at > self.now
+                or self.now - retry.origin_received_at
+                > timedelta(hours=2)
+            ):
+                raise ValueError(
+                    "trusted Daily retry candidate must match the current scope"
+                )
         return self
 
     def all_reports(self) -> tuple[TrustedReportSnapshot, ...]:
@@ -412,6 +502,11 @@ class TrustedContext(_FrozenModel):
                     "provenance": "server_pending",
                 }
                 if pending is not None
+                else None
+            ),
+            "retryable_daily_write": (
+                self.retryable_daily_write.model_payload()
+                if self.retryable_daily_write is not None
                 else None
             ),
             "recent_messages": [item.model_dump(mode="json") for item in self.recent_messages],

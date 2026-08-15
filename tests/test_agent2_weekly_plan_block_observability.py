@@ -301,7 +301,11 @@ async def test_daily_binder_block_has_safe_counts_without_content_or_identity() 
     observation = result.receipts[0].safe_user_facts[
         "pre_execution_block_observation"
     ]
-    assert observation == {
+    assert {
+        key: value
+        for key, value in observation.items()
+        if key != "retry_candidate"
+    } == {
         "schema_version": "agent2.pre_execution_block.observation.v1",
         "tool_name": "add_daily_items",
         "arguments_sha256": hashlib.sha256(
@@ -325,6 +329,26 @@ async def test_daily_binder_block_has_safe_counts_without_content_or_identity() 
         "error_code": "DAILY_ITEM_CONTENT_NOT_GROUNDED",
         "actual_write": False,
     }
+    retry_candidate = observation["retry_candidate"]
+    assert retry_candidate == {
+        "schema_version": "agent2.daily_write_retry_candidate.v1",
+        "candidate_id": retry_candidate["candidate_id"],
+        "block_stage": "source_binding",
+        "retry_class": "source_binding_recoverable",
+        "source_bundle_sha256": source.sha256,
+        "source_message_count": 1,
+        "target_report_date": "2026-08-14",
+        "target_was_absent": False,
+        "target_version": 7,
+        "target_state_sha256": retry_candidate["target_state_sha256"],
+        "failed_local_date": "2026-08-14",
+        "retry_chain_depth": 0,
+        "retry_of_candidate_id": "",
+    }
+    for digest_field in ("candidate_id", "target_state_sha256"):
+        digest = retry_candidate[digest_field]
+        assert len(digest) == 64
+        assert set(digest) <= set("0123456789abcdef")
     serialized = json.dumps(observation, ensure_ascii=False, sort_keys=True)
     for sensitive_value in (
         DAILY_SOURCE_MESSAGE,
@@ -336,6 +360,50 @@ async def test_daily_binder_block_has_safe_counts_without_content_or_identity() 
         "private daily display name",
     ):
         assert sensitive_value not in serialized
+
+
+@pytest.mark.asyncio
+async def test_stale_trusted_report_block_does_not_create_a_retry_candidate() -> None:
+    context = _daily_context()
+    source = CurrentTurnSource(
+        (DAILY_SOURCE_MESSAGE,),
+        occurred_at=(NOW,),
+    )
+    session = _NoTransactionSession()
+    runtime = ProductionRuntimeSession(
+        session=session,
+        user=SimpleNamespace(id=USER_ID, active=True),
+        settings=SimpleNamespace(),
+        context=context,
+        capability=SimpleNamespace(),
+        source_channel="dingtalk_private",
+        source_text_hash=source.sha256,
+        current_turn_source=source,
+        binder=ShadowCallBinder(
+            context,
+            UnavailableDateResolver(),
+            report_read_port=None,
+            execution_mode=ExecutionMode.CANARY_EXECUTE,
+            current_turn_source=source,
+        ),
+        date_resolver=UnavailableDateResolver(),
+    )
+    original = _blocked_daily_call()
+    call = NativeToolCall(
+        tool_call_id="daily-stale-source-block",
+        tool_name=original.tool_name,
+        arguments={**original.arguments, "expected_version": 6},
+    )
+
+    result = await runtime.execute((call,))
+
+    assert result.status == "blocked"
+    assert result.error_code == "DAILY_ITEM_CONTENT_NOT_GROUNDED"
+    observation = result.receipts[0].safe_user_facts[
+        "pre_execution_block_observation"
+    ]
+    assert "retry_candidate" not in observation
+    assert session.begin_nested_calls == 0
 
 
 @pytest.mark.asyncio
@@ -551,6 +619,57 @@ def test_daily_block_observation_is_whitelisted_and_never_exposed() -> None:
         str(REPORT_ID),
         str(USER_ID),
         "private daily display name",
+    ):
+        assert internal_or_sensitive_value not in externally_visible
+
+
+def test_retry_continuation_is_whitelisted_and_never_exposed() -> None:
+    safe_continuation = {
+        "schema_version": "agent2.daily_write_retry_candidate.v1",
+        "candidate_id": "a" * 64,
+        "block_stage": "source_binding",
+        "retry_class": "source_binding_recoverable",
+        "source_bundle_sha256": "b" * 64,
+        "source_message_count": 1,
+        "target_report_date": "2026-08-14",
+        "target_was_absent": False,
+        "target_version": 7,
+        "target_state_sha256": "c" * 64,
+        "failed_local_date": "2026-08-14",
+        "retry_chain_depth": 1,
+        "retry_of_candidate_id": "a" * 64,
+    }
+    outcome = CanaryIngressOutcome(
+        owner="blocked",
+        reason="tool_call_canary_execution_failed",
+        message="The write did not complete.",
+        handled=True,
+        actual_write=False,
+        messages_enabled=True,
+        model_result_status="failed",
+        daily_write_retry_continuation={
+            **safe_continuation,
+            "raw_content": DAILY_SOURCE_MESSAGE,
+            "report_id": str(REPORT_ID),
+            "user_id": str(USER_ID),
+        },
+        user_visible_result="failed",
+        reply_formed=True,
+    )
+
+    persisted = build_canary_persisted_response_payload(outcome)
+    provider = canary_provider_response_payload(persisted)
+    observation = persisted["_agent2_turn_observation_v1"]
+
+    assert observation["daily_write_retry_continuation"] == (
+        safe_continuation
+    )
+    externally_visible = json.dumps(provider, ensure_ascii=False)
+    for internal_or_sensitive_value in (
+        "daily_write_retry_continuation",
+        DAILY_SOURCE_MESSAGE,
+        str(REPORT_ID),
+        str(USER_ID),
     ):
         assert internal_or_sensitive_value not in externally_visible
 

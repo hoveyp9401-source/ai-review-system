@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
 
@@ -22,6 +23,11 @@ from app.agent2.tool_calling.contracts import (
     ToolReceipt,
 )
 from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
+from app.agent2.tool_calling.daily_write_retry import (
+    RECOVERABLE_DAILY_SOURCE_ERROR_CODES,
+    continued_daily_retry_evidence,
+    daily_retry_candidate_id,
+)
 from app.agent2.tool_calling.production_contracts import (
     ProductionExecutionCapability,
     ProductionRuntimeResult,
@@ -63,6 +69,7 @@ from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     runtime_registry_contract_digest,
 )
+from app.agent2.tool_calling.reporting_date import default_daily_write_date
 from app.agent2.tool_calling.runtime import conflicting_tool_call_ids
 from app.agent2.tool_calling.validation import (
     BoundCall,
@@ -223,6 +230,8 @@ class ProductionRuntimeSession:
                         failure,
                         context=self._context,
                         call=call,
+                        source_text_hash=self._source_text_hash,
+                        current_turn_source=self._current_turn_source,
                     )
                 )
                 continue
@@ -888,6 +897,8 @@ def _canary_failure_receipt(
     *,
     context: TrustedContext,
     call: NativeToolCall,
+    source_text_hash: str,
+    current_turn_source: CurrentTurnSource,
 ) -> ToolReceipt:
     safe_user_facts = {
         **receipt.safe_user_facts,
@@ -904,6 +915,8 @@ def _canary_failure_receipt(
                 context=context,
                 call=call,
                 error_code=str(receipt.error_code or ""),
+                source_text_hash=source_text_hash,
+                current_turn_source=current_turn_source,
             )
         )
     return receipt.model_copy(
@@ -919,6 +932,8 @@ def _pre_execution_block_observation(
     context: TrustedContext,
     call: NativeToolCall,
     error_code: str,
+    source_text_hash: str,
+    current_turn_source: CurrentTurnSource,
 ) -> dict[str, Any]:
     if call.tool_name == "add_daily_items":
         item_rows = call.arguments.get("items")
@@ -947,7 +962,14 @@ def _pre_execution_block_observation(
                 report_id = None
             if report_id is not None:
                 trusted_report = context.report_by_id(report_id)
-        return {
+        retry_evidence = _daily_retry_candidate_evidence(
+            context=context,
+            call=call,
+            error_code=error_code,
+            source_text_hash=source_text_hash,
+            current_turn_source=current_turn_source,
+        )
+        observation = {
             "schema_version": "agent2.pre_execution_block.observation.v1",
             "tool_name": call.tool_name,
             "arguments_sha256": _sha256(call.arguments),
@@ -967,6 +989,15 @@ def _pre_execution_block_observation(
             "error_code": error_code,
             "actual_write": False,
         }
+        if retry_evidence is not None:
+            observation["retry_candidate"] = retry_evidence
+            observation["target_report_date"] = retry_evidence[
+                "target_report_date"
+            ]
+            observation["target_version"] = retry_evidence[
+                "target_version"
+            ]
+        return observation
 
     operations = call.arguments.get("operations")
     operation_rows = (
@@ -1024,6 +1055,92 @@ def _pre_execution_block_observation(
         "operation_count": len(operation_rows),
         "error_code": error_code,
         "actual_write": False,
+    }
+
+
+def _daily_retry_candidate_evidence(
+    *,
+    context: TrustedContext,
+    call: NativeToolCall,
+    error_code: str,
+    source_text_hash: str,
+    current_turn_source: CurrentTurnSource,
+) -> dict[str, Any] | None:
+    if (
+        error_code not in RECOVERABLE_DAILY_SOURCE_ERROR_CODES
+        or context.principal.conversation_kind != "direct"
+        or len(current_turn_source.messages) != 1
+    ):
+        return None
+
+    active_retry = context.retryable_daily_write
+    if (
+        call.arguments.get("date_selection") == "trusted_failed_write"
+        and active_retry is not None
+        and call.arguments.get("retry_candidate_id")
+        == active_retry.candidate_id
+        and active_retry.retry_chain_depth < 3
+    ):
+        return continued_daily_retry_evidence(active_retry)
+
+    selection = call.arguments.get("date_selection")
+    local_date = context.now.astimezone(
+        ZoneInfo(context.principal.timezone)
+    ).date()
+    if selection == "server_default":
+        target_date = default_daily_write_date(
+            now=context.now,
+            timezone=context.principal.timezone,
+        )
+        trusted_report = context.report_by_date(target_date)
+        if target_date != local_date and trusted_report is None:
+            return None
+    elif selection == "trusted_report":
+        try:
+            report_id = UUID(str(call.arguments.get("report_id") or ""))
+        except (TypeError, ValueError):
+            return None
+        trusted_report = context.report_by_id(report_id)
+        if trusted_report is None:
+            return None
+        expected_version = call.arguments.get("expected_version")
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version != trusted_report.version
+        ):
+            return None
+        target_date = trusted_report.report_date
+    else:
+        return None
+
+    target_state_sha256 = report_state_hash(trusted_report)
+    target_report_date = target_date.isoformat()
+    candidate_id = daily_retry_candidate_id(
+        tenant_id=context.principal.tenant_id,
+        user_id=str(context.principal.user_id),
+        conversation_id=context.principal.conversation_id,
+        origin_source_message_id=context.principal.source_message_id,
+        source_bundle_sha256=source_text_hash,
+        target_report_date=target_report_date,
+        target_state_sha256=target_state_sha256,
+    )
+    return {
+        "schema_version": "agent2.daily_write_retry_candidate.v1",
+        "candidate_id": candidate_id,
+        "block_stage": "source_binding",
+        "retry_class": "source_binding_recoverable",
+        "source_bundle_sha256": source_text_hash,
+        "source_message_count": 1,
+        "target_report_date": target_report_date,
+        "target_was_absent": trusted_report is None,
+        "target_version": (
+            trusted_report.version if trusted_report is not None else None
+        ),
+        "target_state_sha256": target_state_sha256,
+        "failed_local_date": local_date.isoformat(),
+        "retry_chain_depth": 0,
+        "retry_of_candidate_id": "",
     }
 
 

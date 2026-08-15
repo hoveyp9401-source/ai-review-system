@@ -50,8 +50,12 @@ from app.agent2.tool_calling.canary_metrics import (
     CanaryMetricsRecorder,
 )
 from app.agent2.tool_calling.canary_store import ToolCallCanaryControl
-from app.agent2.tool_calling.context import CANARY_STATE_NAMESPACE
+from app.agent2.tool_calling.context import CANARY_STATE_NAMESPACE, TrustedContext
 from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
+from app.agent2.tool_calling.daily_write_retry import (
+    continued_daily_retry_evidence,
+    validated_daily_retry_evidence,
+)
 from app.agent2.tool_calling.deepseek_adapter import (
     DeepSeekToolCallingAdapter,
 )
@@ -158,6 +162,7 @@ class CanaryIngressOutcome:
     tool_blocked_count: int = 0
     tool_failure_count: int = 0
     pre_execution_block_observations: tuple[dict[str, Any], ...] = ()
+    daily_write_retry_continuation: dict[str, Any] | None = None
     user_visible_result: str = "unknown"
     reply_formed: bool = False
 
@@ -177,6 +182,7 @@ class CanaryIngressExecutionError(RuntimeError):
         model_request_attempt_count: int = 0,
         model_transport_retry_count: int = 0,
         model_elapsed_seconds: float = 0.0,
+        daily_write_retry_continuation: dict[str, Any] | None = None,
     ) -> None:
         self.reason = reason or self.reason
         super().__init__(self.reason)
@@ -194,6 +200,11 @@ class CanaryIngressExecutionError(RuntimeError):
         self.model_elapsed_seconds = max(
             0.0,
             float(model_elapsed_seconds),
+        )
+        self.daily_write_retry_continuation = (
+            validated_daily_retry_evidence(
+                daily_write_retry_continuation
+            )
         )
 
     def outcome(self) -> CanaryIngressOutcome:
@@ -214,6 +225,9 @@ class CanaryIngressExecutionError(RuntimeError):
                 or self.model_call_count
                 else "not_called"
             ),
+            daily_write_retry_continuation=(
+                self.daily_write_retry_continuation
+            ),
             user_visible_result="failed",
             reply_formed=True,
         )
@@ -229,6 +243,7 @@ def _record_canary_execution_failure(
     user_id: str = "",
     conversation_id: str = "",
     system_prompt_sha256: str | None = None,
+    daily_write_retry_continuation: dict[str, Any] | None = None,
 ) -> CanaryIngressExecutionError:
     model_turns = tuple(getattr(error, "model_turns", ()) or ())
     model_call_count = max(
@@ -295,6 +310,9 @@ def _record_canary_execution_failure(
         model_request_attempt_count=model_request_attempt_count,
         model_transport_retry_count=model_transport_retry_count,
         model_elapsed_seconds=model_elapsed_seconds,
+        daily_write_retry_continuation=(
+            daily_write_retry_continuation
+        ),
     )
 
 
@@ -353,6 +371,42 @@ def _canary_execution_failure_reason(error: Exception) -> str:
     return "tool_call_canary_execution_failed"
 
 
+def _selected_daily_retry_continuation(
+    *,
+    error: Exception,
+    context: TrustedContext | None,
+) -> dict[str, Any] | None:
+    """Keep a trusted candidate only after the model selected it exactly."""
+
+    candidate = (
+        getattr(context, "retryable_daily_write", None)
+        if context is not None
+        else None
+    )
+    if candidate is None:
+        return None
+    for audit in tuple(
+        getattr(error, "raw_tool_call_audit", ()) or ()
+    ):
+        if getattr(audit, "tool_name", "") != "add_daily_items":
+            continue
+        try:
+            arguments = json.loads(
+                str(getattr(audit, "raw_arguments", "") or "")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(arguments, Mapping)
+            and arguments.get("date_selection")
+            == "trusted_failed_write"
+            and arguments.get("retry_candidate_id")
+            == candidate.candidate_id
+        ):
+            return continued_daily_retry_evidence(candidate)
+    return None
+
+
 _CANARY_TRANSPORT_MARKER = "_agent2_tool_call_canary"
 _CANARY_TURN_OBSERVATION_MARKER = "_agent2_turn_observation_v1"
 
@@ -402,7 +456,7 @@ def canary_provider_response_payload(
 def _canary_turn_observation(
     outcome: CanaryIngressOutcome,
 ) -> dict[str, Any]:
-    return {
+    observation = {
         "schema_version": "agent2.turn.observation.v1",
         "message_processing_status": "consumed",
         "business_result_status": outcome.user_visible_result,
@@ -441,6 +495,12 @@ def _canary_turn_observation(
             for item in outcome.pre_execution_block_observations
         ],
     }
+    continuation = validated_daily_retry_evidence(
+        outcome.daily_write_retry_continuation
+    )
+    if continuation is not None:
+        observation["daily_write_retry_continuation"] = continuation
+    return observation
 
 
 def is_canary_message_delivery_suppressed(
@@ -719,6 +779,7 @@ async def process_tool_call_canary_ingress(
 
     turn_transaction = await session.begin_nested()
     rendered_prompt_sha256: str | None = None
+    context: TrustedContext | None = None
     try:
         context_store = ProductionContextStore(
             session,
@@ -921,6 +982,12 @@ async def process_tool_call_canary_ingress(
             user_id=str(getattr(user, "id", "") or ""),
             conversation_id=canonical_conversation_id,
             system_prompt_sha256=rendered_prompt_sha256,
+            daily_write_retry_continuation=(
+                _selected_daily_retry_continuation(
+                    error=exc,
+                    context=context,
+                )
+            ),
         )
         if failure.messages_enabled:
             return failure.outcome()
@@ -1095,6 +1162,9 @@ def _validated_daily_block_observation(
     target_version = candidate.get("target_version")
     item_count = candidate.get("item_count")
     raw_field_counts = candidate.get("field_item_counts")
+    retry_candidate = validated_daily_retry_evidence(
+        candidate.get("retry_candidate")
+    )
     if (
         candidate.get("schema_version")
         != _PRE_EXECUTION_BLOCK_SCHEMA_VERSION
@@ -1118,9 +1188,16 @@ def _validated_daily_block_observation(
         except ValueError:
             return None
         if (
-            not isinstance(target_version, int)
-            or isinstance(target_version, bool)
-            or target_version < 0
+            (
+                not isinstance(target_version, int)
+                or isinstance(target_version, bool)
+                or target_version < 0
+            )
+            and not (
+                retry_candidate is not None
+                and retry_candidate["target_was_absent"] is True
+                and target_version is None
+            )
         ):
             return None
     elif target_version is not None:
@@ -1142,7 +1219,7 @@ def _validated_daily_block_observation(
         field_item_counts[field_name] = value
     if sum(field_item_counts.values()) != item_count:
         return None
-    return {
+    projected = {
         "schema_version": _PRE_EXECUTION_BLOCK_SCHEMA_VERSION,
         "tool_name": tool_name,
         "arguments_sha256": arguments_sha256,
@@ -1154,6 +1231,15 @@ def _validated_daily_block_observation(
         "error_code": error_code,
         "actual_write": False,
     }
+    if retry_candidate is not None:
+        if (
+            retry_candidate["target_report_date"]
+            != target_report_date
+            or retry_candidate["target_version"] != target_version
+        ):
+            return None
+        projected["retry_candidate"] = retry_candidate
+    return projected
 
 
 def _model_elapsed_seconds(model_turns: tuple[Any, ...]) -> float:

@@ -23,3 +23,6 @@ def test_daily_source_policy_preserves_complete_risk_and_separate_matters() -> N
     assert "exact_quote must be contiguous user-authored text" in prompt
     assert "Never drop a negation, condition, deadline" in prompt
     assert "even when source punctuation or whitespace separates it" in prompt
+    assert "unmistakably identifies the failed write" in prompt
+    assert "Broad delegation, general permission" in prompt
+    assert "leaving the action to the assistant does not authorize" in prompt
