@@ -826,7 +826,27 @@ async def test_briefing_fact_batch_closes_tools_and_retries_an_ungrounded_reply(
                 ],
             }
         )
-        return next(completions)
+        try:
+            return next(completions)
+        except StopIteration:
+            review_facts = json.loads(messages[1]["content"])
+            return _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "decision": "keep",
+                            "classification": "ordinary_reply",
+                            "reviewed_reply_sha256": review_facts[
+                                "reviewed_reply_sha256"
+                            ],
+                            "pending_reference": None,
+                            "replacement_reply": None,
+                        }
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            )
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
     result = await adapter.run_canary_turn(
@@ -836,7 +856,7 @@ async def test_briefing_fact_batch_closes_tools_and_retries_an_ungrounded_reply(
         runtime_session=RuntimeSession(),
     )
 
-    assert result.iterations == 3
+    assert result.iterations == 4
     assert result.receipts == (_briefing_receipt(),)
     assert result.final_content == (
         "系统保存的这份晨报原文与问题中的情况不一致。\n\n"
@@ -844,9 +864,10 @@ async def test_briefing_fact_batch_closes_tools_and_retries_an_ungrounded_reply(
         f"系统保存的晨报原文片段：\n“{valid_reply}”\n\n"
         f"{LEGACY_LIMIT}"
     )
-    assert [item["tool_schema_count"] for item in calls] == [1, 0, 0]
+    assert [item["tool_schema_count"] for item in calls] == [1, 0, 0, 0]
     assert [item["thinking_enabled"] for item in calls] == [
         False,
+        True,
         True,
         True,
     ]

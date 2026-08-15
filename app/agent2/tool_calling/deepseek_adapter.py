@@ -521,6 +521,131 @@ class DeepSeekToolCallingAdapter:
                 )
             runtime_results[-1] = committed
 
+        async def review_zero_write_terminal_reply(
+            candidate_reply: str,
+            *,
+            write_domains: tuple[str, ...],
+        ) -> str:
+            """Run one bounded semantic review, plus one review of any replacement."""
+
+            nonlocal iterations
+            replacement_review_started = False
+            try:
+                review_completion = await self._complete(
+                    _zero_tool_write_invitation_review_messages(
+                        user_text=user_text,
+                        user_messages=user_messages,
+                        candidate_reply=candidate_reply,
+                        context=context,
+                        write_domains=write_domains,
+                    ),
+                    tool_schemas=[],
+                    thinking_enabled=True,
+                )
+                iterations += 1
+                model_turns.append(
+                    _model_turn_audit(
+                        iterations,
+                        review_completion.message,
+                        response_metadata={
+                            **review_completion.metadata,
+                            "zero_tool_write_invitation_review": True,
+                        },
+                    )
+                )
+                reviewed_reply = _parse_assistant_turn(
+                    review_completion.message
+                )
+                _validate_completion_protocol(
+                    review_completion,
+                    reviewed_reply,
+                )
+                audits.extend(reviewed_reply.audit)
+                if reviewed_reply.tool_calls:
+                    raise ValueError(
+                        "write invitation review cannot call tools"
+                    )
+                review_content = reviewed_reply.assistant_message.get(
+                    "content"
+                )
+                if not isinstance(review_content, str):
+                    raise ValueError(
+                        "write invitation review requires text"
+                    )
+                reviewed_content = _apply_zero_tool_write_invitation_review(
+                    review_content=review_content,
+                    candidate_reply=candidate_reply,
+                    context=context,
+                )
+                if reviewed_content == candidate_reply:
+                    return reviewed_content
+
+                replacement_review_started = True
+                replacement_completion = await self._complete(
+                    _zero_tool_write_invitation_review_messages(
+                        user_text=user_text,
+                        user_messages=user_messages,
+                        candidate_reply=reviewed_content,
+                        context=context,
+                        write_domains=write_domains,
+                    ),
+                    tool_schemas=[],
+                    thinking_enabled=True,
+                )
+                iterations += 1
+                model_turns.append(
+                    _model_turn_audit(
+                        iterations,
+                        replacement_completion.message,
+                        response_metadata={
+                            **replacement_completion.metadata,
+                            "zero_tool_write_invitation_replacement_review": True,
+                        },
+                    )
+                )
+                replacement_review = _parse_assistant_turn(
+                    replacement_completion.message
+                )
+                _validate_completion_protocol(
+                    replacement_completion,
+                    replacement_review,
+                )
+                audits.extend(replacement_review.audit)
+                if replacement_review.tool_calls:
+                    raise ValueError(
+                        "replacement safety review cannot call tools"
+                    )
+                replacement_review_content = (
+                    replacement_review.assistant_message.get("content")
+                )
+                if not isinstance(replacement_review_content, str):
+                    raise ValueError(
+                        "replacement safety review requires text"
+                    )
+                independently_reviewed = (
+                    _apply_zero_tool_write_invitation_review(
+                        review_content=replacement_review_content,
+                        candidate_reply=reviewed_content,
+                        context=context,
+                    )
+                )
+                if independently_reviewed != reviewed_content:
+                    raise ValueError(
+                        "replacement safety review must keep the candidate"
+                    )
+                return reviewed_content
+            except (DeepSeekToolCallingError, ValueError) as exc:
+                message = (
+                    "zero-tool replacement safety review failed"
+                    if replacement_review_started
+                    else "zero-tool write invitation review failed"
+                )
+                raise _with_canary_turn_state(
+                    DeepSeekResponseError(message),
+                    audits=audits,
+                    model_turns=model_turns,
+                ) from exc
+
         try:
             while True:
                 iterations += 1
@@ -1045,14 +1170,50 @@ class DeepSeekToolCallingAdapter:
                             model_turns=model_turns,
                         )
 
-                    if write_batch_seen:
+                    terminal_content = (
+                        reply_for_validation
+                        if briefing_envelope is not None
+                        else content
+                    )
+                    if not write_batch_seen:
+                        reviewed_terminal_content = (
+                            await review_zero_write_terminal_reply(
+                                terminal_content,
+                                write_domains=(
+                                    _exposed_business_write_domains(context)
+                                ),
+                            )
+                        )
+                        if (
+                            briefing_envelope is not None
+                            and reviewed_terminal_content != terminal_content
+                        ):
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "daily briefing safety review cannot replace a fact-bound reply"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            )
+                        replacement_validation_errors = (
+                            validate_managed_daily_reply(
+                                reviewed_terminal_content,
+                                tuple(receipts),
+                            )
+                        )
+                        if replacement_validation_errors:
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "zero-tool safety replacement failed factual validation"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            )
+                        terminal_content = reviewed_terminal_content
+                    else:
                         await commit_pending()
                     final_content, model_hash = finalize_canary_content(
-                        (
-                            reply_for_validation
-                            if briefing_envelope is not None
-                            else content
-                        ),
+                        terminal_content,
                         tuple(receipts),
                         write_batch_seen=write_batch_seen,
                         personal_memory=context.personal_memory,
@@ -1781,6 +1942,321 @@ _DAILY_REPORT_TRANSACTION_TARGETS = frozenset(
         "source_and_target_reports",
     }
 )
+
+_ZERO_TOOL_WRITE_INVITATION_REVIEW_KEYS = frozenset(
+    {
+        "decision",
+        "classification",
+        "reviewed_reply_sha256",
+        "pending_reference",
+        "replacement_reply",
+    }
+)
+
+
+def _exposed_business_write_domains(
+    context: TrustedContext,
+) -> tuple[str, ...]:
+    domains: set[str] = set()
+    for tool_name in context.allowed_tool_names:
+        definition = TOOL_REGISTRY.get(tool_name)
+        if (
+            definition is None
+            or definition.read_or_write != "write"
+            or context.gate_decisions.get(tool_name) is not True
+        ):
+            continue
+        target = definition.transaction_target_policy
+        if target in _DAILY_REPORT_TRANSACTION_TARGETS:
+            domains.add("daily_report")
+        elif target == "weekly_plan":
+            domains.add("weekly_plan")
+        elif target == "periodic_report":
+            domains.add("periodic_report")
+        elif target == "personal_memory":
+            domains.add("personal_memory")
+        else:
+            domains.add("business_record")
+    return tuple(sorted(domains))
+
+
+def _trusted_persisted_pending_summary(
+    context: TrustedContext,
+) -> tuple[dict[str, Any], ...]:
+    def tool_is_exposed(tool_name: str) -> bool:
+        return (
+            tool_name in context.allowed_tool_names
+            and context.gate_decisions.get(tool_name) is True
+        )
+
+    summaries: list[dict[str, Any]] = []
+
+    def review_reference() -> str:
+        # This value is deliberately scoped to this reviewer payload.  The
+        # provider never needs a database, report, plan, or pending identifier;
+        # the server recomputes the same ordered allow-list before accepting it.
+        return f"pending_{len(summaries) + 1}"
+
+    clear_pending = context.active_clear_pending
+    if clear_pending is not None:
+        clear_report = context.report_by_id(clear_pending.report_id)
+        executable = (
+            clear_pending.namespace == context.namespace
+            and not clear_pending.consumed
+            and clear_pending.expires_at > context.now
+            and clear_pending.source_message_id
+            != context.principal.source_message_id
+            and clear_report is not None
+            and clear_report.report_date == clear_pending.target_date
+            and clear_report.version == clear_pending.report_version
+            and clear_report.status
+            in {"collecting", "pending_confirmation", "completed"}
+            and tool_is_exposed("confirm_clear_report")
+        )
+        summaries.append(
+            {
+                "pending_reference": review_reference(),
+                "pending_kind": "daily_report_clear_confirmation",
+                "target": {
+                    "report_date": clear_pending.target_date.isoformat(),
+                },
+                "expires_at": clear_pending.expires_at.isoformat(),
+                "executable_now": executable,
+                "allows_bare_confirmation": executable,
+                "provenance": "server_pending",
+            }
+        )
+
+    daily_confirmation_exposed = tool_is_exposed("confirm_report")
+    for report in context.all_reports():
+        if report.status != "pending_confirmation":
+            continue
+        populated_fields = {item.field for item in report.items}
+        report_is_complete = all(
+            field_name in populated_fields
+            or field_name in report.acknowledged_empty_fields
+            for field_name in (
+                "today_work",
+                "problems",
+                "tomorrow_plan",
+            )
+        )
+        executable = daily_confirmation_exposed and report_is_complete
+        summaries.append(
+            {
+                "pending_reference": review_reference(),
+                "pending_kind": "daily_report_submission_confirmation",
+                "target": {
+                    "report_date": report.report_date.isoformat(),
+                },
+                "expires_at": None,
+                "executable_now": executable,
+                "allows_bare_confirmation": executable,
+                "provenance": "server_report_state",
+            }
+        )
+
+    weekly_confirmation_exposed = tool_is_exposed("submit_next_weekly_plan")
+    for plan in context.all_weekly_plans():
+        if plan.status != "pending_confirmation":
+            continue
+        local_date = context.now.astimezone(
+            ZoneInfo("Asia/Shanghai")
+        ).date()
+        executable = (
+            weekly_confirmation_exposed
+            and local_date <= plan.target_week_start
+            and all(day.state != "unfilled" for day in plan.days)
+        )
+        summaries.append(
+            {
+                "pending_reference": review_reference(),
+                "pending_kind": "weekly_plan_submission_confirmation",
+                "target": {
+                    "target_week_start": plan.target_week_start.isoformat(),
+                },
+                "expires_at": None,
+                "executable_now": executable,
+                "allows_bare_confirmation": executable,
+                "provenance": "server_weekly_plan_state",
+            }
+        )
+
+    retry = context.retryable_daily_write
+    if retry is not None:
+        retry_report = context.report_by_date(retry.target_date)
+        retry_target_matches = (
+            retry.target_was_absent
+            and retry_report is None
+        ) or (
+            not retry.target_was_absent
+            and retry_report is not None
+            and retry_report.version == retry.target_version
+            and retry_report.state_sha256 == retry.target_state_sha256
+        )
+        summaries.append(
+            {
+                "pending_reference": review_reference(),
+                "pending_kind": "daily_write_retry_candidate",
+                "target": {
+                    "report_date": retry.target_date.isoformat(),
+                },
+                "expires_at": None,
+                "executable_now": (
+                    tool_is_exposed("add_daily_items")
+                    and retry_target_matches
+                    and retry.retry_chain_depth < 3
+                    and retry.origin_source_message_id
+                    != context.principal.source_message_id
+                ),
+                "allows_bare_confirmation": False,
+                "provenance": "server_block_observation",
+            }
+        )
+    return tuple(summaries)
+
+
+def _zero_tool_write_invitation_review_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    candidate_reply: str,
+    context: TrustedContext,
+    write_domains: tuple[str, ...],
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    candidate_sha256 = hashlib.sha256(
+        candidate_reply.encode("utf-8")
+    ).hexdigest()
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the isolated Agent2 safety reviewer for one proposed "
+                "zero-tool terminal reply. Judge the whole semantic meaning; never "
+                "use keywords, phrase lists, or regular expressions. Your only task "
+                "is to prevent an assistant-authored reply from inventing cross-turn "
+                "write authority. A reply is unsafe when it asks, invites, or promises "
+                "that a later bare acknowledgement, agreement, or confirmation alone "
+                "will write, submit, clear, remember, or otherwise change a business "
+                "record, but no exactly matching persisted_pending entry has both "
+                "executable_now=true and allows_bare_confirmation=true. A failed-write "
+                "retry candidate explicitly has allows_bare_confirmation=false and "
+                "cannot support such an invitation. Never treat the proposed reply "
+                "itself or prior assistant wording as a Pending. Keep ordinary answers, "
+                "explanations, wording help, and clarifications that ask the user to "
+                "state a complete fresh request without promising that bare assent is "
+                "enough. A genuinely matching formal Pending may keep its invitation, "
+                "but identify that exact pending_reference. If unsafe, replace the reply "
+                "with concise natural Chinese that answers only the current request, "
+                "truthfully states that nothing was saved or made pending when relevant, "
+                "and creates no new write invitation. Do not call tools or execute any "
+                "write. Return exactly one JSON object with exactly these keys: decision, "
+                "classification, reviewed_reply_sha256, pending_reference, and "
+                "replacement_reply. decision is keep or replace. classification is "
+                "ordinary_reply, matched_persisted_pending, or "
+                "unbacked_future_write_invitation. Copy reviewed_reply_sha256 exactly. "
+                "For keep+ordinary_reply, both nullable fields are null. For "
+                "keep+matched_persisted_pending, pending_reference is one exact supplied "
+                "eligible reference and replacement_reply is null. For "
+                "replace+unbacked_future_write_invitation, pending_reference is null and "
+                "replacement_reply is the complete safe replacement."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "proposed_assistant_reply": candidate_reply,
+                    "reviewed_reply_sha256": candidate_sha256,
+                    "allowed_write_domains": list(write_domains),
+                    "persisted_pending": list(
+                        _trusted_persisted_pending_summary(context)
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _apply_zero_tool_write_invitation_review(
+    *,
+    review_content: str,
+    candidate_reply: str,
+    context: TrustedContext,
+) -> str:
+    try:
+        payload = json.loads(review_content)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("write invitation review must return JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _ZERO_TOOL_WRITE_INVITATION_REVIEW_KEYS
+    ):
+        raise ValueError("write invitation review has an invalid envelope")
+    candidate_sha256 = hashlib.sha256(
+        candidate_reply.encode("utf-8")
+    ).hexdigest()
+    if payload["reviewed_reply_sha256"] != candidate_sha256:
+        raise ValueError("write invitation review is not bound to the candidate")
+
+    decision = payload["decision"]
+    classification = payload["classification"]
+    pending_reference = payload["pending_reference"]
+    replacement_reply = payload["replacement_reply"]
+    pending_summaries = _trusted_persisted_pending_summary(context)
+    generated_pending_references = {
+        str(item["pending_reference"])
+        for item in pending_summaries
+    }
+    eligible_pending_references = {
+        str(item["pending_reference"])
+        for item in pending_summaries
+        if item["executable_now"] and item["allows_bare_confirmation"]
+    }
+
+    def reject_generated_reference_leak(reply: str) -> None:
+        if any(reference in reply for reference in generated_pending_references):
+            raise ValueError(
+                "write invitation review leaked a temporary Pending reference"
+            )
+
+    if decision == "keep" and classification == "ordinary_reply":
+        if pending_reference is not None or replacement_reply is not None:
+            raise ValueError("ordinary reply review cannot attach extra output")
+        reject_generated_reference_leak(candidate_reply)
+        return candidate_reply
+    if decision == "keep" and classification == "matched_persisted_pending":
+        if (
+            not isinstance(pending_reference, str)
+            or pending_reference not in eligible_pending_references
+            or replacement_reply is not None
+        ):
+            raise ValueError("write invitation review did not bind an eligible Pending")
+        reject_generated_reference_leak(candidate_reply)
+        return candidate_reply
+    if (
+        decision == "replace"
+        and classification == "unbacked_future_write_invitation"
+        and pending_reference is None
+        and isinstance(replacement_reply, str)
+        and replacement_reply.strip()
+        and len(replacement_reply) <= 8000
+        and replacement_reply != candidate_reply
+    ):
+        reject_generated_reference_leak(replacement_reply)
+        return replacement_reply
+    raise ValueError("write invitation review decision is inconsistent")
 
 
 def _daily_weekly_write_review_tool_names(

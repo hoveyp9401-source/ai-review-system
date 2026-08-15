@@ -576,11 +576,28 @@ async def test_correction_or_topic_change_does_not_reuse_a_prior_write_candidate
     )
     runtime = _DeferredRuntime()
     adapter = _adapter()
+    completion_count = 0
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, tool_schemas, thinking_enabled
+        nonlocal completion_count
+        del tool_schemas, thinking_enabled
+        completion_count += 1
+        content = model_reply
+        if completion_count == 2:
+            review_facts = json.loads(messages[1]["content"])
+            content = json.dumps(
+                {
+                    "decision": "keep",
+                    "classification": "ordinary_reply",
+                    "reviewed_reply_sha256": review_facts[
+                        "reviewed_reply_sha256"
+                    ],
+                    "pending_reference": None,
+                    "replacement_reply": None,
+                }
+            )
         return _CompletionResponse(
-            message={"role": "assistant", "content": model_reply},
+            message={"role": "assistant", "content": content},
             metadata={"finish_reason": "stop"},
         )
 
@@ -594,6 +611,7 @@ async def test_correction_or_topic_change_does_not_reuse_a_prior_write_candidate
     )
 
     assert result.final_content == model_reply
+    assert completion_count == 2
     assert runtime.execute_count == 0
     assert runtime.commit_count == 0
     assert runtime.rollback_count == 0

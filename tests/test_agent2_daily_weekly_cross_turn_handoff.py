@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from dataclasses import replace
@@ -545,6 +546,31 @@ def _terminal(*, reply: str, actual_write: bool, outcome: str) -> dict:
     }
 
 
+def _ordinary_reply_review(reply: str) -> dict:
+    return {
+        "role": "assistant",
+        "content": json.dumps(
+            {
+                "decision": "keep",
+                "classification": "ordinary_reply",
+                "reviewed_reply_sha256": hashlib.sha256(
+                    reply.encode("utf-8")
+                ).hexdigest(),
+                "pending_reference": None,
+                "replacement_reply": None,
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
+def _keep_original_review() -> dict:
+    return {
+        "role": "assistant",
+        "content": json.dumps({"decision": "keep_original"}),
+    }
+
+
 def _daily_call(call_id: str, *, content: str) -> dict:
     return {
         "id": call_id,
@@ -894,10 +920,8 @@ async def test_short_retry_reuses_one_failed_daily_source_only_in_its_conversati
         conversation_id="another-direct-conversation",
         model_messages=[
             {"role": "assistant", "content": "请把要写入的内容发给我。"},
-            {
-                "role": "assistant",
-                "content": json.dumps({"decision": "keep_original"}),
-            },
+            _keep_original_review(),
+            _ordinary_reply_review("请把要写入的内容发给我。"),
         ],
     )
     other_context = _first_context(other_model)
@@ -932,10 +956,8 @@ async def test_short_retry_reuses_one_failed_daily_source_only_in_its_conversati
                 "role": "assistant",
                 "content": "刚才的写入已经成功，没有重复写入。",
             },
-            {
-                "role": "assistant",
-                "content": json.dumps({"decision": "keep_original"}),
-            },
+            _keep_original_review(),
+            _ordinary_reply_review("刚才的写入已经成功，没有重复写入。"),
         ],
     )
     repeated_context = _first_context(repeated_model)
@@ -1095,10 +1117,10 @@ async def test_retry_candidate_does_not_skip_an_intervening_same_conversation_tu
                 "role": "assistant",
                 "content": "Please resend the report content you want recorded.",
             },
-            {
-                "role": "assistant",
-                "content": json.dumps({"decision": "keep_original"}),
-            },
+            _keep_original_review(),
+            _ordinary_reply_review(
+                "Please resend the report content you want recorded."
+            ),
         ],
     )
 
@@ -1193,13 +1215,10 @@ async def test_followup_this_with_two_trusted_candidates_asks_and_writes_nothing
                 "role": "assistant",
                 "content": "你说的“这个”是日常用印审核，还是合同台账复核？",
             },
-            {
-                "role": "assistant",
-                "content": json.dumps(
-                    {"decision": "keep_original"},
-                    ensure_ascii=False,
-                ),
-            },
+            _keep_original_review(),
+            _ordinary_reply_review(
+                "你说的“这个”是日常用印审核，还是合同台账复核？"
+            ),
         ],
     )
 

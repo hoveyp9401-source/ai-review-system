@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -369,6 +370,12 @@ async def test_canary_managed_query_initializes_reply_retry_state(
         max_tool_loops=2,
         endpoint="https://example.invalid/chat/completions",
     )
+    terminal_reply = (
+        "2026年8月7日，法务合约中心日报填写情况：\n"
+        "已完成 1人：丁益明\n"
+        "部分填写 1人：朱佳佳\n"
+        "未填写 1人：赵卫中"
+    )
     completions = iter(
         (
             _CompletionResponse(
@@ -398,11 +405,23 @@ async def test_canary_managed_query_initializes_reply_retry_state(
             _CompletionResponse(
                 message={
                     "role": "assistant",
-                    "content": (
-                        "2026年8月7日，法务合约中心日报填写情况：\n"
-                        "已完成 1人：丁益明\n"
-                        "部分填写 1人：朱佳佳\n"
-                        "未填写 1人：赵卫中"
+                    "content": terminal_reply,
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "decision": "keep",
+                            "classification": "ordinary_reply",
+                            "reviewed_reply_sha256": hashlib.sha256(
+                                terminal_reply.encode("utf-8")
+                            ).hexdigest(),
+                            "pending_reference": None,
+                            "replacement_reply": None,
+                        }
                     ),
                 },
                 metadata={"finish_reason": "stop"},
@@ -422,6 +441,6 @@ async def test_canary_managed_query_initializes_reply_retry_state(
         runtime_session=RuntimeSession(),
     )
 
-    assert result.iterations == 2
+    assert result.iterations == 3
     assert result.receipts == (_managed_receipt(),)
     assert "丁益明" in result.final_content

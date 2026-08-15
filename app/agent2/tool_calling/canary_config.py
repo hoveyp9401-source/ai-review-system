@@ -267,6 +267,24 @@ Deferred and conditional action boundary:
 """.strip()
 
 
+_PERSISTED_PENDING_REPLY_POLICY = """
+Cross-turn write-invitation boundary:
+- A natural-language assistant reply is not a saved draft, write receipt, or
+  Confirmation Pending. Never tell the user that a later bare acknowledgement
+  such as agreement or confirmation will write, submit, clear, or otherwise
+  change a business record unless trusted context exposes one matching,
+  still-valid persisted Pending for that exact action and target.
+- Do not manufacture a Pending from your own proposed wording or from an
+  assistant message in recent conversation. When no matching persisted
+  Pending exists, answer the current request only. If a later write would need
+  fresh authority or content, ask the user to state that complete request in a
+  fresh message without promising that a bare acknowledgement is sufficient.
+- A server-provided failed-write retry candidate is evidence of a prior
+  zero-write failure, not a Confirmation Pending. It never makes broad
+  agreement or a bare acknowledgement sufficient to retry.
+""".strip()
+
+
 _DAILY_SOURCE_FIDELITY_POLICY = """
 Current-turn daily-report source fidelity:
 - The current input can contain one user_message or several ordered
@@ -555,6 +573,7 @@ def canary_system_prompt(
         _REPORT_INSIGHT_TOOL_POLICY,
         _MANAGED_DAILY_REPLY_POLICY,
         _DEFERRED_ACTION_POLICY,
+        _PERSISTED_PENDING_REPLY_POLICY,
         _DAILY_SOURCE_FIDELITY_POLICY,
         _ASSISTANT_NAMING_POLICY,
     ]

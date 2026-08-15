@@ -21,6 +21,7 @@ from app.agent2.tool_calling.contracts import (
     ReceiptStatus,
     ToolReceipt,
 )
+from app.agent2.tool_calling.registry import TOOL_REGISTRY
 from app.agent2.tool_calling.production_contracts import (
     ProductionExecutionCapability,
 )
@@ -482,6 +483,24 @@ def _read_terminal() -> dict:
     return {"role": "assistant", "content": "这是你本周的周报。"}
 
 
+def _zero_tool_keep(reply: str) -> dict:
+    return {
+        "role": "assistant",
+        "content": json.dumps(
+            {
+                "decision": "keep",
+                "classification": "ordinary_reply",
+                "reviewed_reply_sha256": hashlib.sha256(
+                    reply.encode("utf-8")
+                ).hexdigest(),
+                "pending_reference": None,
+                "replacement_reply": None,
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
 def _settings(*, current_weekly_report_enabled: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
         timezone="Asia/Shanghai",
@@ -659,6 +678,11 @@ async def _run_ingress(
         scripted.append(_assistant_tools(*first_calls))
     if terminal is not None:
         scripted.append(terminal)
+        if not any(
+            TOOL_REGISTRY[call["function"]["name"]].read_or_write == "write"
+            for call in first_calls
+        ):
+            scripted.append(_zero_tool_keep(terminal["content"]))
     http = _ScriptedHttpClient(scripted)
     monkeypatch.setattr(
         canary_service,

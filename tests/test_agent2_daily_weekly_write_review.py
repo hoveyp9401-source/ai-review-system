@@ -524,6 +524,26 @@ def _keep_original_completion() -> _CompletionResponse:
     )
 
 
+def _zero_tool_keep_completion(candidate_reply: str) -> _CompletionResponse:
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "decision": "keep",
+                    "classification": "ordinary_reply",
+                    "reviewed_reply_sha256": hashlib.sha256(
+                        candidate_reply.encode("utf-8")
+                    ).hexdigest(),
+                    "pending_reference": None,
+                    "replacement_reply": None,
+                }
+            ),
+        },
+        metadata={"finish_reason": "stop"},
+    )
+
+
 @pytest.mark.asyncio
 async def test_daily_partial_quote_is_corrected_before_any_write(
     monkeypatch: pytest.MonkeyPatch,
@@ -578,7 +598,7 @@ async def test_daily_partial_quote_is_corrected_before_any_write(
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
 
-    await adapter.run_canary_turn(
+    result = await adapter.run_canary_turn(
         system_prompt="Agent2 test",
         user_text="未完成合同复核",
         context=_daily_only_context(),
@@ -597,6 +617,15 @@ async def test_daily_partial_quote_is_corrected_before_any_write(
         }
     ]
     assert requested_tool_schemas[1] == ("add_daily_items",)
+    assert result.final_content == "已按原话记入今日日报。"
+    assert runtime.commit_count == 1
+    assert not any(
+        turn.response_metadata.get("zero_tool_write_invitation_review")
+        or turn.response_metadata.get(
+            "zero_tool_write_invitation_replacement_review"
+        )
+        for turn in result.model_turns
+    )
 
 
 @pytest.mark.asyncio
@@ -695,6 +724,7 @@ async def test_daily_edit_partial_quote_review_can_fail_closed(
                 )
             ),
             _clarification_completion(question),
+            _zero_tool_keep_completion(question),
         )
     )
 
@@ -1568,6 +1598,7 @@ async def test_recurrence_semantic_review_can_ask_naturally_and_write_nothing(
         (
             _tool_completion(_weekly_recurrence_call(call_id="draft")),
             _clarification_completion(clarification),
+            _zero_tool_keep_completion(clarification),
         )
     )
 
@@ -1708,6 +1739,7 @@ async def test_ambiguous_friday_sentence_stays_a_question_and_executes_nothing(
         (
             _tool_completion(_daily_call(call_id="unsafe-guess")),
             _clarification_completion(question),
+            _zero_tool_keep_completion(question),
         )
     )
 
@@ -2198,6 +2230,7 @@ async def test_zero_tool_write_disagreement_becomes_a_model_clarification_withou
             _tool_completion(first),
             _tool_completion(second),
             _clarification_completion(reply),
+            _zero_tool_keep_completion(reply),
         )
     )
 
@@ -2255,6 +2288,7 @@ async def test_friday_daily_vs_weekly_disagreement_becomes_a_model_clarification
             _tool_completion(daily),
             _tool_completion(weekly),
             _clarification_completion(reply),
+            _zero_tool_keep_completion(reply),
         )
     )
 
@@ -2352,6 +2386,7 @@ async def test_plain_text_review_clarification_is_repaired_before_any_write(
             _tool_completion(_weekly_call(call_id="ambiguous-draft")),
             _direct_completion("请问你指的是哪一周？"),
             _clarification_completion(repaired_reply),
+            _zero_tool_keep_completion(repaired_reply),
         )
     )
 
@@ -2428,6 +2463,7 @@ async def test_zero_tool_chat_keeps_the_original_answer_without_writes(
         (
             _direct_completion("下午好，有什么需要我一起处理的？"),
             _keep_original_completion(),
+            _zero_tool_keep_completion("下午好，有什么需要我一起处理的？"),
         )
     )
 
@@ -2446,6 +2482,71 @@ async def test_zero_tool_chat_keeps_the_original_answer_without_writes(
 
     assert result.final_content == "下午好，有什么需要我一起处理的？"
     assert runtime.execute_count == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_tool_clarification_is_independently_reviewed_before_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    unsafe_clarification = "请问是日报还是周计划？回复确认后我就替你写入。"
+    safe_clarification = "请问你指的是今天的日报，还是下周工作计划？"
+    replacement_review = _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "decision": "replace",
+                    "classification": "unbacked_future_write_invitation",
+                    "reviewed_reply_sha256": hashlib.sha256(
+                        unsafe_clarification.encode("utf-8")
+                    ).hexdigest(),
+                    "pending_reference": None,
+                    "replacement_reply": safe_clarification,
+                },
+                ensure_ascii=False,
+            ),
+        },
+        metadata={"finish_reason": "stop"},
+    )
+    completions = iter(
+        (
+            _direct_completion("好的。"),
+            _clarification_completion(unsafe_clarification),
+            replacement_review,
+            _zero_tool_keep_completion(safe_clarification),
+        )
+    )
+    request_count = 0
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        nonlocal request_count
+        del messages, thinking_enabled
+        request_count += 1
+        if request_count >= 3:
+            assert tool_schemas == []
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="周五处理一下。",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == safe_clarification
+    assert request_count == 4
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
 
 
 @pytest.mark.asyncio
@@ -2510,6 +2611,7 @@ async def test_ordinary_monday_chat_is_reviewed_then_kept_without_a_write(
         (
             _direct_completion("早上好，有什么需要我一起处理的？"),
             _keep_original_completion(),
+            _zero_tool_keep_completion("早上好，有什么需要我一起处理的？"),
         )
     )
     request_count = 0
@@ -2530,7 +2632,7 @@ async def test_ordinary_monday_chat_is_reviewed_then_kept_without_a_write(
     )
 
     assert result.final_content == "早上好，有什么需要我一起处理的？"
-    assert request_count == 2
+    assert request_count == 3
     assert runtime.execute_count == 0
     assert runtime.commit_count == 0
 
@@ -2585,7 +2687,11 @@ async def test_monday_zero_tool_review_requires_private_role_bound_weekly_capabi
         nonlocal request_count
         del messages, tool_schemas, thinking_enabled
         request_count += 1
-        return _direct_completion("早上好。")
+        return (
+            _direct_completion("早上好。")
+            if request_count == 1
+            else _zero_tool_keep_completion("早上好。")
+        )
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
 
@@ -2597,7 +2703,14 @@ async def test_monday_zero_tool_review_requires_private_role_bound_weekly_capabi
     )
 
     assert result.final_content == "早上好。"
-    assert request_count == 1
+    assert request_count == 2
+    assert not any(
+        turn.response_metadata.get("daily_weekly_write_semantic_review")
+        for turn in result.model_turns
+    )
+    assert result.model_turns[-1].response_metadata[
+        "zero_tool_write_invitation_review"
+    ] is True
     assert runtime.execute_count == 0
 
 
@@ -2699,7 +2812,12 @@ async def test_zero_tool_recovery_is_bounded_to_friday_through_monday(
         nonlocal request_count
         del messages, tool_schemas, thinking_enabled
         request_count += 1
-        return _direct_completion("下午好，有什么需要我一起处理的？")
+        answer = "下午好，有什么需要我一起处理的？"
+        return (
+            _direct_completion(answer)
+            if request_count == 1
+            else _zero_tool_keep_completion(answer)
+        )
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
 
@@ -2711,5 +2829,12 @@ async def test_zero_tool_recovery_is_bounded_to_friday_through_monday(
     )
 
     assert result.final_content == "下午好，有什么需要我一起处理的？"
-    assert request_count == 1
+    assert request_count == 2
+    assert not any(
+        turn.response_metadata.get("daily_weekly_write_semantic_review")
+        for turn in result.model_turns
+    )
+    assert result.model_turns[-1].response_metadata[
+        "zero_tool_write_invitation_review"
+    ] is True
     assert runtime.execute_count == 0

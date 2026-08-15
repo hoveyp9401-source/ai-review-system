@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import hashlib
 import json
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -228,11 +229,28 @@ async def test_no_tool_weekly_report_entry_is_recovered_by_semantic_review(
     requested_tools: list[set[str]] = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, thinking_enabled
+        del thinking_enabled
         requested_tools.append(
             {item["function"]["name"] for item in tool_schemas}
         )
-        return next(responses)
+        try:
+            return next(responses)
+        except StopIteration:
+            candidate = "已经为你打开本周周报草稿。"
+            return _completion(
+                content=json.dumps(
+                    {
+                        "decision": "keep",
+                        "classification": "ordinary_reply",
+                        "reviewed_reply_sha256": hashlib.sha256(
+                            candidate.encode("utf-8")
+                        ).hexdigest(),
+                        "pending_reference": None,
+                        "replacement_reply": None,
+                    },
+                    ensure_ascii=False,
+                )
+            )
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
 
