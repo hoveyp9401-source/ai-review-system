@@ -817,6 +817,15 @@ class ProductionDailyExecutor:
             tenant_id=self._context.principal.tenant_id,
             source_report_id=source.report_id,
             expected_version=source.version,
+            expected_source_state_sha256=(
+                str(
+                    bound.date_facts.get(
+                        "receipt_bound_source_state_sha256"
+                    )
+                    or ""
+                )
+                or None
+            ),
             source_date=source_date,
             target_date=target_date,
             acknowledged_empty_fields=(

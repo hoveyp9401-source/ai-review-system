@@ -510,20 +510,25 @@ class ShadowCallBinder:
             "trusted_weekly_plan_version_and_item_ids_to_server_today_report",
         }:
             report = self._context.today_report
+        idempotent_date_correction_replay = False
         if (
             definition.object_binding_policy
             == "trusted_source_report_and_server_empty_target"
             and source_report is None
             and report is not None
-            and report.report_date
-            == date.fromisoformat(
-                str(date_facts.get("resolved_target_date") or "")
+            and _is_exact_date_correction_replay(
+                context=self._context,
+                definition=definition,
+                target_report=report,
+                date_facts=date_facts,
             )
         ):
-            # A provider replay can arrive after the first transaction moved
-            # the same report. Bind the stable report at the target so the
-            # production receipt can win idempotently before any new write.
+            # The source is absent only because this exact provider turn
+            # already moved the same report.  Binding the audited target lets
+            # the existing receipt win, or the SQL executor return a no-op.
             source_report = report
+            idempotent_date_correction_replay = True
+            date_facts["idempotent_date_correction_replay"] = True
         if (
             definition.object_binding_policy
             == "trusted_source_report_and_server_empty_target"
@@ -670,11 +675,28 @@ class ShadowCallBinder:
             ):
                 return None, failure_receipt(call, ReceiptStatus.BLOCKED, "CLEAR_PENDING_STALE")
 
+        receipt_bound_correction_state = (
+            _immediate_owned_report_date_correction_state(
+                context=self._context,
+                definition=definition,
+                source_report=source_report,
+                date_facts=date_facts,
+                arguments=arguments,
+            )
+        )
+        if receipt_bound_correction_state is not None:
+            date_facts["receipt_bound_source_state_sha256"] = (
+                receipt_bound_correction_state
+            )
         locked_report_date = _locked_historical_report_date(
             context=self._context,
             definition=definition,
             report=report,
             date_facts=date_facts,
+            allow_receipt_bound_date_correction=(
+                receipt_bound_correction_state is not None
+                or idempotent_date_correction_replay
+            ),
         )
         if locked_report_date is not None:
             return None, failure_receipt(
@@ -685,6 +707,12 @@ class ShadowCallBinder:
                 safe_user_facts={
                     "report_date": locked_report_date.isoformat(),
                     "locked_after": "09:00",
+                    "historical_report_lock": {
+                        "report_date": locked_report_date.isoformat(),
+                        "cutoff_local_time": "09:00",
+                        "automatically_unlocks": False,
+                        "allowed_actions": ["query_report_by_date"],
+                    },
                 },
             )
 
@@ -1145,6 +1173,7 @@ def _locked_historical_report_date(
     definition: Any,
     report: TrustedReportSnapshot | None,
     date_facts: dict[str, Any],
+    allow_receipt_bound_date_correction: bool = False,
 ) -> date | None:
     if (
         definition.read_or_write != "write"
@@ -1180,6 +1209,8 @@ def _locked_historical_report_date(
     )
     if target_date >= local_now.date():
         return None
+    if allow_receipt_bound_date_correction:
+        return None
     if (
         definition.object_binding_policy
         == "server_resolved_owner_report"
@@ -1192,6 +1223,130 @@ def _locked_historical_report_date(
     ):
         return None
     return target_date
+
+
+_RECENT_DATE_CORRECTION_MAX_AGE = timedelta(minutes=10)
+
+
+def _is_exact_date_correction_replay(
+    *,
+    context: TrustedContext,
+    definition: Any,
+    target_report: TrustedReportSnapshot,
+    date_facts: dict[str, Any],
+) -> bool:
+    """Accept only a zero-write replay backed by the atomic move audit."""
+
+    reference = target_report.date_correction_reference
+    if (
+        getattr(definition, "tool_name", "")
+        != "correct_daily_report_date"
+        or context.principal.conversation_kind != "direct"
+        or reference is None
+        or reference.report_id != target_report.report_id
+        or reference.source_message_id
+        != context.principal.source_message_id
+    ):
+        return False
+    try:
+        source_date = date.fromisoformat(
+            str(date_facts["resolved_source_date"])
+        )
+        target_date = date.fromisoformat(
+            str(date_facts["resolved_target_date"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    local_today = context.now.astimezone(
+        ZoneInfo(context.principal.timezone)
+    ).date()
+    return (
+        source_date == local_today
+        and target_date == source_date - timedelta(days=1)
+        and target_report.report_date == target_date
+        and reference.source_report_date == source_date
+        and reference.target_report_date == target_date
+    )
+
+
+def _immediate_owned_report_date_correction_state(
+    *,
+    context: TrustedContext,
+    definition: Any,
+    source_report: TrustedReportSnapshot | None,
+    date_facts: dict[str, Any],
+    arguments: dict[str, Any],
+) -> str | None:
+    """Recognize one narrow receipt-bound correction without interpreting text."""
+
+    local_now = context.now.astimezone(
+        ZoneInfo(context.principal.timezone)
+    )
+    if (
+        getattr(definition, "tool_name", "")
+        != "correct_daily_report_date"
+        or context.principal.conversation_kind != "direct"
+        or source_report is None
+        or source_report.status not in {
+            "collecting",
+            "pending_confirmation",
+        }
+        or arguments.get("submit_after_correction") is not False
+        or tuple(arguments.get("acknowledged_empty_fields") or ())
+        or tuple(arguments.get("empty_field_evidence") or ())
+    ):
+        return None
+    try:
+        source_date = date.fromisoformat(
+            str(date_facts["resolved_source_date"])
+        )
+        target_date = date.fromisoformat(
+            str(date_facts["resolved_target_date"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        source_report.report_date != source_date
+        or source_date != local_now.date()
+        or target_date != source_date - timedelta(days=1)
+    ):
+        return None
+
+    if not context.recent_messages:
+        return None
+    latest_turn_id = context.recent_messages[-1].source_turn_id
+    if latest_turn_id is None:
+        return None
+    candidates = tuple(
+        operation
+        for operation in context.recent_operations
+        if (
+            operation.source_message_id == latest_turn_id
+            and operation.tool_name == "add_daily_items"
+            and operation.status == "success"
+            and operation.changed
+            and operation.target_type == "daily_report"
+            and operation.target_id == str(source_report.report_id)
+            and operation.report_reference is not None
+            and operation.report_reference.report_id
+            == source_report.report_id
+            and operation.report_reference.report_date == source_date
+            and operation.report_reference.report_version
+            == source_report.version
+            and operation.report_reference.report_status
+            == source_report.status
+            and operation.report_reference.report_state_sha256
+            == source_report.state_sha256
+            and timedelta(0)
+            <= context.now - operation.occurred_at
+            <= _RECENT_DATE_CORRECTION_MAX_AGE
+        )
+    )
+    if len(candidates) != 1:
+        return None
+    reference = candidates[0].report_reference
+    assert reference is not None
+    return reference.report_state_sha256
 
 
 def failure_receipt(

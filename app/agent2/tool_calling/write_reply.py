@@ -21,6 +21,7 @@ WriteOperationOutcome = Literal[
 DailySectionState = Literal["filled", "acknowledged_empty", "missing"]
 _DAILY_MISSING_LABELS_TOKEN = "{{daily_missing_section_labels}}"
 _DAILY_MISSING_REPORT_SUMMARY_TOKEN = "{{daily_missing_report_summary}}"
+_HISTORICAL_REPORT_LOCK_FACTS_TOKEN = "{{historical_report_lock_facts}}"
 _DAILY_REPLY_STATE_FACT_KEYS = frozenset(
     {
         "section_states",
@@ -58,6 +59,17 @@ class DatedDailyReportReplyState(DailyReportReplyState):
     missing_section_labels: tuple[str, ...]
 
 
+class HistoricalReportLockReplyState(BaseModel):
+    """Immutable cutoff facts that Agent2 must preserve in its reply."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_date: str = Field(min_length=10, max_length=10)
+    cutoff_local_time: str = Field(min_length=5, max_length=5)
+    automatically_unlocks: Literal[False]
+    allowed_actions: tuple[Literal["query_report_by_date"], ...]
+
+
 class WriteReplyEnvelope(BaseModel):
     """Model-authored wording with server-checkable execution claims."""
 
@@ -68,6 +80,7 @@ class WriteReplyEnvelope(BaseModel):
     operation_outcome: WriteOperationOutcome
     daily_report_state: DailyReportReplyState | None = None
     daily_report_states: tuple[DatedDailyReportReplyState, ...] | None = None
+    historical_report_lock_state: HistoricalReportLockReplyState | None = None
 
 
 def expected_write_outcome(
@@ -123,6 +136,13 @@ def model_safe_user_facts(receipt: ToolReceipt) -> dict[str, Any]:
             "pre_execution_block_observation",
         }
     }
+    report_snapshot = facts.get("report_snapshot")
+    if isinstance(report_snapshot, dict):
+        facts["report_snapshot"] = {
+            key: value
+            for key, value in report_snapshot.items()
+            if key != "report_state_sha256"
+        }
     facts["actual_write"] = bool(receipt.changed)
     facts["operation_outcome"] = expected_write_outcome((receipt,))
     return facts
@@ -136,6 +156,9 @@ def write_reply_protocol(
     expected_daily_states = _expected_daily_report_states(receipts)
     required_daily_reply_mode = _required_daily_reply_mode(receipts)
     missing_label_requirements = _daily_missing_label_requirements(receipts)
+    expected_historical_lock_state = _expected_historical_report_lock_state(
+        receipts
+    )
     protocol = {
         "format": "json_object",
         "required_fields": {
@@ -234,6 +257,24 @@ def write_reply_protocol(
                 "a follow-up question, request confirmation, offer another report "
                 "action, or ask whether anything else is needed."
             )
+    if expected_historical_lock_state is not None:
+        protocol["required_fields"]["reply"] = (
+            "copy historical_report_lock_facts_token exactly"
+        )
+        protocol["required_fields"]["historical_report_lock_state"] = (
+            "copy expected_historical_report_lock_state exactly"
+        )
+        protocol["historical_report_lock_facts_token"] = (
+            _HISTORICAL_REPORT_LOCK_FACTS_TOKEN
+        )
+        protocol["expected_historical_report_lock_state"] = (
+            expected_historical_lock_state.model_dump(mode="json")
+        )
+        protocol["rules"].append(
+            "Set reply to historical_report_lock_facts_token exactly. Do not add "
+            "dates, unlocking claims, submission claims, or any other factual "
+            "wording around it; the server will render the verified facts."
+        )
     return protocol
 
 
@@ -266,6 +307,20 @@ def validate_write_reply(
         errors.append("daily_report_state does not match server receipts")
     if envelope.daily_report_states != (expected_daily_states or None):
         errors.append("daily_report_states do not match server receipts")
+    expected_historical_lock_state = _expected_historical_report_lock_state(
+        receipts
+    )
+    if envelope.historical_report_lock_state != expected_historical_lock_state:
+        errors.append(
+            "historical_report_lock_state does not match server receipts"
+        )
+    if expected_historical_lock_state is not None:
+        if envelope.reply != _HISTORICAL_REPORT_LOCK_FACTS_TOKEN:
+            errors.append(
+                "reply must use only the verified historical lock facts token"
+            )
+    elif _HISTORICAL_REPORT_LOCK_FACTS_TOKEN in envelope.reply:
+        errors.append("reply contains an unexpected historical lock facts token")
     internal_codes = {
         str(receipt.error_code).strip()
         for receipt in receipts
@@ -351,6 +406,14 @@ def write_reply_retry_instruction(
         required_exact_fields["daily_report_states"] = [
             state.model_dump(mode="json") for state in expected_daily_states
         ]
+    expected_historical_lock_state = _expected_historical_report_lock_state(
+        receipts
+    )
+    if expected_historical_lock_state is not None:
+        required_exact_fields["reply"] = _HISTORICAL_REPORT_LOCK_FACTS_TOKEN
+        required_exact_fields["historical_report_lock_state"] = (
+            expected_historical_lock_state.model_dump(mode="json")
+        )
     clarification_options = _required_clarification_options(receipts)
     missing_label_requirements = _daily_missing_label_requirements(receipts)
     return json.dumps(
@@ -394,7 +457,10 @@ def write_reply_retry_instruction(
                     "daily missing-section labels only through their exact "
                     "listed token placeholders. Follow required_daily_reply_mode; "
                     "completion_acknowledgement_only must end after acknowledging "
-                    "completion, without a follow-up question or further action. Do not "
+                    "completion, without a follow-up question or further action. "
+                    "When historical_report_lock_state is required, set reply to "
+                    "the required_exact_fields reply token with no surrounding "
+                    "factual wording; the server renders the verified facts. Do not "
                     "call tools. Do not return blank text or omit any field."
                 ),
             }
@@ -412,6 +478,23 @@ def _expected_daily_report_state(
     if len(state_receipts) != 1:
         return None
     return _daily_report_reply_state(state_receipts[0])
+
+
+def _expected_historical_report_lock_state(
+    receipts: tuple[ToolReceipt, ...],
+) -> HistoricalReportLockReplyState | None:
+    states: list[HistoricalReportLockReplyState] = []
+    for receipt in receipts:
+        raw_state = receipt.safe_user_facts.get("historical_report_lock")
+        if raw_state is None:
+            continue
+        try:
+            state = HistoricalReportLockReplyState.model_validate(raw_state)
+        except ValidationError:
+            continue
+        if state not in states:
+            states.append(state)
+    return states[0] if len(states) == 1 else None
 
 
 def _expected_daily_report_states(
@@ -532,6 +615,13 @@ def render_write_reply(
     receipts: tuple[ToolReceipt, ...],
 ) -> str:
     reply = envelope.reply
+    historical_lock = _expected_historical_report_lock_state(receipts)
+    if historical_lock is not None:
+        return (
+            f"{historical_lock.report_date} 的日报已在当日 "
+            f"{historical_lock.cutoff_local_time} 后锁定，不会在之后自动解锁；"
+            "目前只可查询，不能修改或移动。"
+        )
     states = _expected_daily_report_states(receipts)
     if states:
         summary = "；".join(

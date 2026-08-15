@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from app.agent2.tool_calling.context import (
     TrustedContext,
+    TrustedDateCorrectionReference,
     TrustedPrincipal,
     TrustedReportItem,
     TrustedReportSnapshot,
@@ -850,6 +851,7 @@ async def test_provider_replay_keeps_same_correction_fingerprint_after_move() ->
         conversation_id="ding-conversation",
         source_message_id="same-provider-message",
         timezone="Asia/Shanghai",
+        conversation_kind="direct",
     )
     call = NativeToolCall(
         tool_call_id="correct-1",
@@ -896,6 +898,12 @@ async def test_provider_replay_keeps_same_correction_fingerprint_after_move() ->
             "status": "completed",
             "items": moved_items,
             "acknowledged_empty_fields": frozenset({"problems"}),
+            "date_correction_reference": TrustedDateCorrectionReference(
+                report_id=source.report_id,
+                source_message_id="same-provider-message",
+                source_report_date=date(2026, 8, 11),
+                target_report_date=date(2026, 8, 10),
+            ),
         }
     )
     replay_context = TrustedContext(

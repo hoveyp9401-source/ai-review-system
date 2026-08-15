@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -16,14 +17,24 @@ from app.agent2.tool_calling.assembly import (
     TrustedContextRequest,
 )
 from app.agent2.tool_calling.context import CANARY_STATE_NAMESPACE
+from app.agent2.tool_calling.contracts import ExecutionMode
+from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
+from app.agent2.tool_calling.production_runtime import _safe_report_snapshot
 from app.agent2.tool_calling.production_store import (
     ProductionContextStore,
     ToolCallCanaryClearPending,
     ToolCallCanaryReceipt,
+    trusted_snapshot_from_report,
 )
 from app.agent2.tool_calling.turn_batching import (
     canonical_turn_batch_source_id,
 )
+from app.agent2.tool_calling.validation import (
+    NativeToolCall,
+    ShadowCallBinder,
+    UnavailableDateResolver,
+)
+from app.agent2.typed_daily_executor import DRAFT_ITEM_IDS_KEY
 from app.models import DailyReport, ReportInteractionEvent, User, WebhookEvent
 
 NOW = datetime(2026, 8, 16, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -71,14 +82,16 @@ class _PostgresShapeReadSession:
         events: tuple[WebhookEvent, ...] = (),
         receipts: tuple[ToolCallCanaryReceipt, ...] = (),
         outbound_events: tuple[ReportInteractionEvent, ...] = (),
+        report: Any | None = None,
     ) -> None:
         self._events = events
         self._receipts = receipts
         self._outbound_events = outbound_events
+        self._report = report
 
     async def scalar(self, statement: Any) -> Any | None:
         assert _statement_entity(statement) is DailyReport
-        return None
+        return self._report
 
     async def scalars(self, statement: Any) -> _Rows:
         entity = _statement_entity(statement)
@@ -221,6 +234,10 @@ def _receipt(
     user_id: UUID = USER_ID,
     conversation_id: str = CONVERSATION_ID,
     created_at: datetime | None = None,
+    target_type: str = "managed_daily_report",
+    target_id: str = "2026-08-15:test-user",
+    after_version: int | None = None,
+    safe_user_facts: dict[str, Any] | None = None,
 ) -> ToolCallCanaryReceipt:
     row_id = uuid4()
     occurred_at = created_at or NOW - timedelta(minutes=4)
@@ -238,12 +255,16 @@ def _receipt(
         operation_fingerprint="3" * 64,
         status=status,
         changed=changed,
-        target_type="managed_daily_report",
-        target_id="2026-08-15:test-user",
+        target_type=target_type,
+        target_id=target_id,
         before_version=None,
-        after_version=None,
+        after_version=after_version,
         affected_item_ids=[],
-        safe_user_facts={"actual_write": changed},
+        safe_user_facts=(
+            safe_user_facts
+            if safe_user_facts is not None
+            else {"actual_write": changed}
+        ),
         before_state_hash="4" * 64,
         after_state_hash="5" * 64,
         typed_receipt_ids=[],
@@ -276,16 +297,40 @@ def _proactive_briefing() -> ReportInteractionEvent:
     )
 
 
+def _current_daily_report_row() -> SimpleNamespace:
+    report_id = UUID("44444444-4444-4444-8444-444444444444")
+    return SimpleNamespace(
+        id=report_id,
+        user_id=USER_ID,
+        report_date=NOW.date(),
+        today_work=["脱敏工作事项"],
+        problems=[],
+        tomorrow_plan=[],
+        section_status={
+            "_agent2_report_version": 9,
+            DRAFT_ITEM_IDS_KEY: {
+                "today_work": ["today-work-1"],
+                "problems": [],
+                "tomorrow_plan": [],
+            },
+        },
+        status="collecting",
+    )
+
+
 async def _assemble(
     *,
     events: tuple[WebhookEvent, ...] = (),
     receipts: tuple[ToolCallCanaryReceipt, ...] = (),
     outbound_events: tuple[ReportInteractionEvent, ...] = (),
+    report: Any | None = None,
+    conversation_kind: str = "unknown",
 ):
     session = _PostgresShapeReadSession(
         events=events,
         receipts=receipts,
         outbound_events=outbound_events,
+        report=report,
     )
     store = ProductionContextStore(
         session,
@@ -306,7 +351,7 @@ async def _assemble(
             source_message_id=CURRENT_SOURCE_MESSAGE_ID,
             timezone="Asia/Shanghai",
             server_now=NOW,
-            conversation_kind="unknown",
+            conversation_kind=conversation_kind,
         )
     )
 
@@ -317,6 +362,217 @@ def _assistant_payloads(context) -> list[dict[str, Any]]:
         for message in context.model_payload()["recent_messages"]
         if message["role"] == "assistant"
     ]
+
+
+@pytest.mark.parametrize(
+    "provider_sources",
+    (
+        ("dingtalk:provider-write-single",),
+        (
+            "dingtalk:provider-write-batch-part-1",
+            "dingtalk:provider-write-batch-part-2",
+        ),
+    ),
+    ids=("single_stream_message", "multi_message_stream_batch"),
+)
+@pytest.mark.asyncio
+async def test_date_correction_uses_the_real_stream_canonical_write_turn(
+    provider_sources: tuple[str, ...],
+) -> None:
+    source_turn_id = canonical_turn_batch_source_id(provider_sources)
+    leader = _leader_event(
+        provider_source_message_id=provider_sources[0],
+        source_turn_id=source_turn_id,
+        receipt_count=1,
+        successful_pure_read=False,
+        business_write_committed=True,
+    )
+    events = [leader]
+    if len(provider_sources) == 2:
+        follower = _leader_event(
+            provider_source_message_id=provider_sources[1],
+            source_turn_id=source_turn_id,
+            receipt_count=1,
+            successful_pure_read=False,
+            business_write_committed=True,
+            received_at=NOW - timedelta(minutes=5) + timedelta(seconds=1),
+        )
+        follower.response_payload = {
+            "_agent2_tool_call_canary": {
+                "batch_id": source_turn_id,
+                "delivery": "batched_follower",
+                "leader_event_id": str(leader.id),
+            }
+        }
+        events.append(follower)
+
+    report = _current_daily_report_row()
+    trusted_report = trusted_snapshot_from_report(
+        user=_user(),
+        tenant_id=TENANT_ID,
+        report_date=NOW.date(),
+        report=report,
+    )
+    receipt = _receipt(
+        source_turn_id=source_turn_id,
+        tool_call_id="write-daily-items",
+        tool_name="add_daily_items",
+        changed=True,
+        target_type="daily_report",
+        target_id=str(report.id),
+        after_version=trusted_report.version,
+        safe_user_facts={
+            "actual_write": True,
+            "report_snapshot": _safe_report_snapshot(trusted_report),
+        },
+    )
+    context = await _assemble(
+        events=tuple(events),
+        receipts=(receipt,),
+        report=report,
+        conversation_kind="direct",
+    )
+
+    expected_roles = (
+        ("user", "assistant")
+        if len(provider_sources) == 1
+        else ("user", "assistant", "user")
+    )
+    assert tuple(message.role for message in context.recent_messages) == (
+        expected_roles
+    )
+    assert all(
+        message.source_turn_id == source_turn_id
+        for message in context.recent_messages
+    )
+    assert context.recent_messages[-1].source_turn_id == source_turn_id
+    assert all(
+        "source_turn_id" not in message
+        for message in context.model_payload()["recent_messages"]
+    )
+
+    internal_assistant = next(
+        message
+        for message in reversed(context.recent_messages)
+        if message.role == "assistant"
+    )
+    assert internal_assistant.source_message_id == (
+        f"{provider_sources[0]}:assistant"
+    )
+    assert internal_assistant.source_turn_id == source_turn_id
+    assert internal_assistant.source_turn_id != internal_assistant.source_message_id
+
+    call = NativeToolCall(
+        tool_call_id="correct-recent-write-date",
+        tool_name="correct_daily_report_date",
+        arguments={
+            "source_date_expression": "以上内容",
+            "proposed_source_date": NOW.date().isoformat(),
+            "target_date_expression": "8月15日",
+            "proposed_target_date": (NOW.date() - timedelta(days=1)).isoformat(),
+            "acknowledged_empty_fields": [],
+            "empty_field_evidence": [],
+            "submit_after_correction": False,
+        },
+    )
+    bound, failure = await ShadowCallBinder(
+        context,
+        UnavailableDateResolver(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource(("以上内容是8月15日的。",)),
+    ).bind(call)
+
+    assert failure is None
+    assert bound is not None
+    assert bound.source_report is not None
+    assert bound.source_report.report_id == report.id
+    assert bound.date_facts["receipt_bound_source_state_sha256"] == (
+        trusted_report.state_sha256
+    )
+
+
+@pytest.mark.asyncio
+async def test_later_user_only_turn_closes_the_date_correction_window() -> None:
+    write_provider_source = "dingtalk:provider-write-before-new-turn"
+    write_turn_id = canonical_turn_batch_source_id((write_provider_source,))
+    write_event = _leader_event(
+        provider_source_message_id=write_provider_source,
+        source_turn_id=write_turn_id,
+        receipt_count=1,
+        successful_pure_read=False,
+        business_write_committed=True,
+    )
+    later_provider_source = "dingtalk:provider-user-only-new-turn"
+    later_turn_id = canonical_turn_batch_source_id((later_provider_source,))
+    later_user_only_event = _leader_event(
+        provider_source_message_id=later_provider_source,
+        source_turn_id=later_turn_id,
+        receipt_count=0,
+        successful_pure_read=False,
+        received_at=NOW - timedelta(minutes=4),
+    )
+    later_user_only_event.response_payload = {
+        TURN_OBSERVATION_KEY: _turn_observation(
+            source_turn_id=later_turn_id,
+            receipt_count=0,
+            successful_pure_read=False,
+        )
+    }
+
+    report = _current_daily_report_row()
+    trusted_report = trusted_snapshot_from_report(
+        user=_user(),
+        tenant_id=TENANT_ID,
+        report_date=NOW.date(),
+        report=report,
+    )
+    receipt = _receipt(
+        source_turn_id=write_turn_id,
+        tool_call_id="write-daily-items-before-new-turn",
+        tool_name="add_daily_items",
+        changed=True,
+        target_type="daily_report",
+        target_id=str(report.id),
+        after_version=trusted_report.version,
+        safe_user_facts={
+            "actual_write": True,
+            "report_snapshot": _safe_report_snapshot(trusted_report),
+        },
+    )
+    context = await _assemble(
+        events=(write_event, later_user_only_event),
+        receipts=(receipt,),
+        report=report,
+        conversation_kind="direct",
+    )
+
+    assert context.recent_messages[-1].role == "user"
+    assert context.recent_messages[-1].source_turn_id == later_turn_id
+    call = NativeToolCall(
+        tool_call_id="reject-date-correction-after-new-user-turn",
+        tool_name="correct_daily_report_date",
+        arguments={
+            "source_date_expression": "以上内容",
+            "proposed_source_date": NOW.date().isoformat(),
+            "target_date_expression": "8月15日",
+            "proposed_target_date": (NOW.date() - timedelta(days=1)).isoformat(),
+            "acknowledged_empty_fields": [],
+            "empty_field_evidence": [],
+            "submit_after_correction": False,
+        },
+    )
+    bound, failure = await ShadowCallBinder(
+        context,
+        UnavailableDateResolver(),
+        None,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        current_turn_source=CurrentTurnSource(("以上内容是8月15日的。",)),
+    ).bind(call)
+
+    assert bound is None
+    assert failure is not None
+    assert failure.error_code == "HISTORICAL_REPORT_LOCKED_AFTER_CUTOFF"
 
 
 @pytest.mark.asyncio

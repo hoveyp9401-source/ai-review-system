@@ -804,6 +804,16 @@ def _prepare_call(
         bound.call.tool_name == "correct_daily_report_date"
     )
     relocation_report = bound.source_report or bound.report
+    fingerprint_date_facts = dict(bound.date_facts)
+    if is_date_correction:
+        fingerprint_date_facts.pop(
+            "receipt_bound_source_state_sha256",
+            None,
+        )
+        fingerprint_date_facts.pop(
+            "idempotent_date_correction_replay",
+            None,
+        )
     base = {
         "tenant_id": principal.tenant_id,
         "user_id": str(principal.user_id),
@@ -848,7 +858,7 @@ def _prepare_call(
                     else None
                 )
             ),
-            "date_facts": bound.date_facts,
+            "date_facts": fingerprint_date_facts,
             "periodic_report_id": (
                 str(bound.periodic_report.report_id)
                 if bound.periodic_report is not None
@@ -1164,6 +1174,7 @@ def _safe_report_snapshot(
         "report_date": report.report_date.isoformat(),
         "version": report.version,
         "status": report.status,
+        "report_state_sha256": report_state_hash(report),
         "fields": fields,
         "acknowledged_empty_fields": sorted(
             report.acknowledged_empty_fields

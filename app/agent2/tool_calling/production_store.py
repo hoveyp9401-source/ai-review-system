@@ -44,6 +44,7 @@ from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedClearPending,
     TrustedDailyWriteRetryCandidate,
+    TrustedDateCorrectionReference,
     TrustedRecentMessage,
     TrustedRecentOperation,
     TrustedReportItem,
@@ -61,11 +62,15 @@ from app.agent2.tool_calling.outbound_context import (
 )
 from app.agent2.tool_calling.registry import TOOL_REGISTRY, ToolDefinition
 from app.agent2.tool_calling.turn_batching import (
+    CANARY_TRANSPORT_MARKER,
     INGRESS_META_KEY,
     is_recoverable_ingress_payload,
 )
 from app.agent2.tool_calling.validation import DateResolution
-from app.agent2.typed_daily_executor import build_typed_daily_snapshot
+from app.agent2.typed_daily_executor import (
+    TYPED_AUDIT_KEY,
+    build_typed_daily_snapshot,
+)
 from app.agent2.weekly_plan_access import (
     WeeklyPlanAccessAction,
     WeeklyPlanAccessPolicy,
@@ -134,6 +139,10 @@ def _trusted_report_reference_from_receipt(
             ),
             report_version=int(snapshot.get("version")),
             report_status=str(snapshot.get("status") or ""),
+            report_state_sha256=(
+                str(snapshot.get("report_state_sha256") or "")
+                or None
+            ),
         )
     except (TypeError, ValueError):
         return None
@@ -486,6 +495,30 @@ class ProductionContextStore:
             )
             is not None
         }
+        leader_observations = {
+            str(row.id): observation
+            for row in scoped_rows
+            if (
+                observation := turn_observations.get(
+                    row.idempotency_key
+                )
+            )
+            is not None
+        }
+        source_turn_ids = {
+            row.idempotency_key: source_turn_id
+            for row in scoped_rows
+            if (
+                source_turn_id := _trusted_event_source_turn_id(
+                    row,
+                    observation=turn_observations.get(
+                        row.idempotency_key
+                    ),
+                    leader_observations=leader_observations,
+                )
+            )
+            is not None
+        }
         verified_read_sources = await _verified_pure_read_source_ids(
             self._session,
             request=request,
@@ -505,6 +538,9 @@ class ProductionContextStore:
                             role="user",
                             content=user_content,
                             source_message_id=row.idempotency_key,
+                            source_turn_id=source_turn_ids.get(
+                                row.idempotency_key
+                            ),
                         ),
                         False,
                     )
@@ -530,9 +566,9 @@ class ProductionContextStore:
                                 f"{row.idempotency_key}:assistant"
                             ),
                             source_turn_id=(
-                                observation.source_turn_id
-                                if observation is not None
-                                else None
+                                source_turn_ids.get(
+                                    row.idempotency_key
+                                )
                             ),
                             read_snapshot_verified=(
                                 observation is not None
@@ -1088,6 +1124,47 @@ def _trusted_turn_observation(
     )
 
 
+def _trusted_event_source_turn_id(
+    event: WebhookEvent,
+    *,
+    observation: _TrustedTurnObservation | None,
+    leader_observations: Mapping[str, _TrustedTurnObservation],
+) -> str | None:
+    """Recover only server-observed leader or bound follower turn IDs."""
+
+    if observation is not None:
+        return observation.source_turn_id
+    response = (
+        event.response_payload
+        if isinstance(event.response_payload, Mapping)
+        else {}
+    )
+    marker = response.get(CANARY_TRANSPORT_MARKER)
+    if not isinstance(marker, Mapping):
+        return None
+    batch_id = marker.get("batch_id")
+    leader_event_id = marker.get("leader_event_id")
+    if (
+        marker.get("delivery") != "batched_follower"
+        or not isinstance(batch_id, str)
+        or not batch_id
+        or batch_id != batch_id.strip()
+        or len(batch_id) > 512
+        or not isinstance(leader_event_id, str)
+        or not leader_event_id
+        or leader_event_id != leader_event_id.strip()
+        or leader_event_id == str(event.id)
+    ):
+        return None
+    leader_observation = leader_observations.get(leader_event_id)
+    if (
+        leader_observation is None
+        or leader_observation.source_turn_id != batch_id
+    ):
+        return None
+    return batch_id
+
+
 async def _verified_pure_read_source_ids(
     session: Any,
     *,
@@ -1619,8 +1696,55 @@ def trusted_snapshot_from_report(
         status=typed.status,
         items=tuple(items),
         acknowledged_empty_fields=typed.acknowledged_empty_fields,
+        date_correction_reference=_trusted_date_correction_reference(
+            report=report,
+            report_id=typed.report_id,
+            report_date=report_date,
+        ),
         provenance=provenance,
     )
+
+
+def _trusted_date_correction_reference(
+    *,
+    report: DailyReport,
+    report_id: uuid.UUID,
+    report_date: date,
+) -> TrustedDateCorrectionReference | None:
+    section_status = (
+        report.section_status
+        if isinstance(report.section_status, Mapping)
+        else {}
+    )
+    raw_audits = section_status.get(TYPED_AUDIT_KEY)
+    audits = raw_audits if isinstance(raw_audits, list) else []
+    for raw in reversed(audits):
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("command_type") != "correct_report_date"
+            or raw.get("result") != "executed"
+            or raw.get("actual_write") is not True
+        ):
+            continue
+        try:
+            reference = TrustedDateCorrectionReference(
+                report_id=uuid.UUID(str(raw.get("report_id") or "")),
+                source_message_id=str(raw.get("source_message_id") or ""),
+                source_report_date=date.fromisoformat(
+                    str(raw.get("source_report_date") or "")
+                ),
+                target_report_date=date.fromisoformat(
+                    str(raw.get("target_report_date") or "")
+                ),
+            )
+        except (TypeError, ValueError):
+            continue
+        if (
+            reference.report_id == report_id
+            and reference.target_report_date == report_date
+        ):
+            return reference
+    return None
 
 
 def report_state_hash(snapshot: TrustedReportSnapshot | None) -> str:

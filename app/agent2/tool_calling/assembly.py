@@ -320,6 +320,11 @@ class TrustedContextAssembler:
                 or report.report_id != reference.report_id
                 or report.version != reference.report_version
                 or report.status != reference.report_status
+                or (
+                    reference.report_state_sha256 is not None
+                    and report.state_sha256
+                    != reference.report_state_sha256
+                )
             ):
                 validated_recent_operations.append(
                     operation.model_copy(update={"report_reference": None})

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
@@ -62,6 +64,15 @@ class TrustedReportItem(_FrozenModel):
     provenance: ResourceProvenance = "trusted_context"
 
 
+class TrustedDateCorrectionReference(_FrozenModel):
+    """Server-owned evidence of the latest atomic date relocation."""
+
+    report_id: UUID
+    source_message_id: str = Field(min_length=1, max_length=512)
+    source_report_date: date
+    target_report_date: date
+
+
 class TrustedReportSnapshot(_FrozenModel):
     report_id: UUID
     tenant_id: str = Field(min_length=1, max_length=128)
@@ -71,6 +82,7 @@ class TrustedReportSnapshot(_FrozenModel):
     status: ReportStatus
     items: tuple[TrustedReportItem, ...] = ()
     acknowledged_empty_fields: frozenset[ReportField] = frozenset()
+    date_correction_reference: TrustedDateCorrectionReference | None = None
     provenance: ResourceProvenance = "trusted_context"
 
     @model_validator(mode="after")
@@ -88,6 +100,15 @@ class TrustedReportSnapshot(_FrozenModel):
         ):
             raise ValueError(
                 "a trusted report field cannot contain items and be acknowledged empty"
+            )
+        reference = self.date_correction_reference
+        if reference is not None and (
+            reference.report_id != self.report_id
+            or reference.target_report_date != self.report_date
+            or reference.source_report_date == reference.target_report_date
+        ):
+            raise ValueError(
+                "trusted date-correction evidence must bind this exact report and date"
             )
         return self
 
@@ -111,6 +132,16 @@ class TrustedReportSnapshot(_FrozenModel):
             ),
             "provenance": self.provenance,
         }
+
+    @property
+    def state_sha256(self) -> str:
+        canonical = json.dumps(
+            self.safe_snapshot(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class TrustedClearPending(_FrozenModel):
@@ -223,12 +254,10 @@ class TrustedRecentMessage(_FrozenModel):
         self,
     ) -> TrustedRecentMessage:
         if self.role != "assistant" and (
-            self.source_turn_id is not None
-            or self.read_snapshot_verified
-            or self.fact_time_scope is not None
+            self.read_snapshot_verified or self.fact_time_scope is not None
         ):
             raise ValueError(
-                "only an assistant reply can carry trusted turn evidence"
+                "only an assistant reply can carry a verified read snapshot"
             )
         if self.read_snapshot_verified and self.source_turn_id is None:
             raise ValueError(
@@ -244,6 +273,10 @@ class TrustedReportReference(_FrozenModel):
     report_date: date
     report_version: int = Field(ge=0)
     report_status: ReportStatus
+    report_state_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     provenance: Literal["server_receipt"] = "server_receipt"
 
 
@@ -305,7 +338,8 @@ class TrustedRecentOperation(_FrozenModel):
         }
         if self.report_reference is not None:
             payload["report_reference"] = self.report_reference.model_dump(
-                mode="json"
+                mode="json",
+                exclude={"report_state_sha256"},
             )
         return payload
 

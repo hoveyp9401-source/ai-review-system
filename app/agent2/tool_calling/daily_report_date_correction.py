@@ -9,6 +9,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from sqlalchemy import select
 
 from app.agent2.daily_state import REPORT_FIELD_ORDER
+from app.agent2.tool_calling.context import (
+    TrustedReportItem,
+    TrustedReportSnapshot,
+)
 from app.agent2.typed_daily_commands import (
     DailyReportMutationSnapshot,
     TypedDailyCommand,
@@ -64,6 +68,7 @@ class SqlDailyReportDateCorrection:
         idempotency_key: str,
         source_message_id: str,
         now: datetime,
+        expected_source_state_sha256: str | None = None,
     ) -> DailyReportDateCorrectionResult:
         if source_date == target_date:
             return DailyReportDateCorrectionResult(
@@ -130,6 +135,15 @@ class SqlDailyReportDateCorrection:
         if (
             source.id != source_report_id
             or source_snapshot.version != expected_version
+            or (
+                expected_source_state_sha256 is not None
+                and _trusted_state_snapshot(
+                    tenant_id=tenant_id,
+                    report_date=source_date,
+                    snapshot=source_snapshot,
+                ).state_sha256
+                != expected_source_state_sha256
+            )
         ):
             return DailyReportDateCorrectionResult(
                 "blocked",
@@ -421,3 +435,35 @@ class SqlDailyReportDateCorrection:
                 snapshot.acknowledged_empty_fields
             ),
         }
+
+
+def _trusted_state_snapshot(
+    *,
+    tenant_id: str,
+    report_date: date,
+    snapshot: DailyReportMutationSnapshot,
+) -> TrustedReportSnapshot:
+    items: list[TrustedReportItem] = []
+    for field_name in REPORT_FIELD_ORDER:
+        values = tuple(getattr(snapshot, field_name))
+        item_ids = tuple(snapshot.item_ids.get(field_name, ()))
+        items.extend(
+            TrustedReportItem(
+                item_id=item_id,
+                field=field_name,
+                content=content,
+                report_id=snapshot.report_id,
+                report_version=snapshot.version,
+            )
+            for item_id, content in zip(item_ids, values, strict=True)
+        )
+    return TrustedReportSnapshot(
+        report_id=snapshot.report_id,
+        tenant_id=tenant_id,
+        owner_user_id=snapshot.owner_user_id,
+        report_date=report_date,
+        version=snapshot.version,
+        status=snapshot.status,
+        items=tuple(items),
+        acknowledged_empty_fields=snapshot.acknowledged_empty_fields,
+    )
