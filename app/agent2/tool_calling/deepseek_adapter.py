@@ -2136,7 +2136,13 @@ def _zero_tool_write_invitation_review_messages(
                 "zero-tool terminal reply. Judge the whole semantic meaning; never "
                 "use keywords, phrase lists, or regular expressions. Your only task "
                 "is to prevent an assistant-authored reply from inventing cross-turn "
-                "write authority. A reply is unsafe when it asks, invites, or promises "
+                "write authority or claiming an unexecuted state change. This turn has "
+                "no successful business-write receipt. A reply is unsafe when it claims "
+                "or implies that any preference, setting, durable memory, business record, "
+                "or future automatic reminder behavior has already changed, been enabled, "
+                "or been disabled. A later admission that the setting was not changed does "
+                "not make an earlier promise about future behavior safe. A reply is also "
+                "unsafe when it asks, invites, or promises "
                 "that a later bare acknowledgement, agreement, or confirmation alone "
                 "will write, submit, clear, remember, or otherwise change a business "
                 "record, but no exactly matching persisted_pending entry has both "
@@ -2146,7 +2152,9 @@ def _zero_tool_write_invitation_review_messages(
                 "itself or prior assistant wording as a Pending. Keep ordinary answers, "
                 "explanations, wording help, and clarifications that ask the user to "
                 "state a complete fresh request without promising that bare assent is "
-                "enough. A genuinely matching formal Pending may keep its invitation, "
+                "enough. Keep conditional explanations of what the system could do in a "
+                "future turn when they do not claim that the current turn changed anything. "
+                "A genuinely matching formal Pending may keep its invitation, "
                 "but identify that exact pending_reference. If unsafe, replace the reply "
                 "with concise natural Chinese that answers only the current request, "
                 "truthfully states that nothing was saved or made pending when relevant, "
@@ -2154,13 +2162,14 @@ def _zero_tool_write_invitation_review_messages(
                 "write. Return exactly one JSON object with exactly these keys: decision, "
                 "classification, reviewed_reply_sha256, pending_reference, and "
                 "replacement_reply. decision is keep or replace. classification is "
-                "ordinary_reply, matched_persisted_pending, or "
-                "unbacked_future_write_invitation. Copy reviewed_reply_sha256 exactly. "
+                "ordinary_reply, matched_persisted_pending, "
+                "unbacked_future_write_invitation, or unbacked_state_change_claim. "
+                "Copy reviewed_reply_sha256 exactly. "
                 "For keep+ordinary_reply, both nullable fields are null. For "
                 "keep+matched_persisted_pending, pending_reference is one exact supplied "
                 "eligible reference and replacement_reply is null. For "
-                "replace+unbacked_future_write_invitation, pending_reference is null and "
-                "replacement_reply is the complete safe replacement."
+                "For replace with either unsafe classification, pending_reference is null "
+                "and replacement_reply is the complete safe replacement."
             ),
         },
         {
@@ -2247,7 +2256,10 @@ def _apply_zero_tool_write_invitation_review(
         return candidate_reply
     if (
         decision == "replace"
-        and classification == "unbacked_future_write_invitation"
+        and classification in {
+            "unbacked_future_write_invitation",
+            "unbacked_state_change_claim",
+        }
         and pending_reference is None
         and isinstance(replacement_reply, str)
         and replacement_reply.strip()

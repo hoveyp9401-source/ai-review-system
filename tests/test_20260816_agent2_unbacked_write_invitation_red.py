@@ -71,6 +71,67 @@ class _ReadOnlyRuntime:
         )
 
 
+def _reminder_write_receipt() -> ToolReceipt:
+    return ToolReceipt(
+        status=ReceiptStatus.SUCCESS,
+        tool_name="remember_personal_memory",
+        changed=True,
+        target_type="personal_memory",
+        target_id="report.daily_reminders_enabled",
+        before_version=0,
+        after_version=1,
+        affected_item_ids=(),
+        safe_user_facts={
+            "memory_key": "report.daily_reminders_enabled",
+            "memory": {
+                "memory_type": "response_preference",
+                "memory_key": "report.daily_reminders_enabled",
+                "value": {"enabled": False},
+                "provenance": "server_personal_memory",
+            },
+            "forgotten": False,
+        },
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+
+
+class _ReminderWriteRuntime:
+    mode = ExecutionMode.CANARY_EXECUTE
+
+    def __init__(self) -> None:
+        self.receipt = _reminder_write_receipt()
+        self.execute_count = 0
+        self.commit_count = 0
+
+    async def execute(self, calls, *, defer_finalization):
+        self.execute_count += 1
+        assert defer_finalization is True
+        assert len(calls) == 1
+        assert calls[0].tool_name == "remember_personal_memory"
+        return ProductionRuntimeResult(
+            status="success",
+            receipts=(self.receipt,),
+            transaction_opened=True,
+            transaction_pending=True,
+            handler_call_count=1,
+        )
+
+    async def commit_pending(self):
+        self.commit_count += 1
+        return ProductionRuntimeResult(
+            status="success",
+            receipts=(self.receipt,),
+            transaction_opened=True,
+            committed_to_outer_transaction=True,
+            handler_call_count=1,
+            business_write_count=1,
+            receipt_write_count=1,
+        )
+
+    async def rollback_pending(self):
+        raise AssertionError("a valid memory write must not roll back")
+
+
 def _daily_write_context(
     *,
     active_clear_pending: TrustedClearPending | None = None,
@@ -222,10 +283,194 @@ async def test_public_agent2_turn_does_not_offer_an_unbacked_next_turn_write(
 
 
 @pytest.mark.asyncio
-async def test_public_agent2_turn_keeps_an_ordinary_zero_tool_answer(
+async def test_public_agent2_turn_replaces_an_unbacked_reminder_setting_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    answer = "这个问题的原因是当前流程限制；这轮没有改动你的日报。"
+    """A zero-write reply cannot claim that future reminder behavior changed."""
+
+    unsafe_reply = (
+        "我不会再主动提醒你了。不过我还没有改设置，"
+        "你说的是日报提醒还是其他提醒？"
+    )
+    safe_reply = "我还没有改任何提醒设置。你说的是日报提醒还是其他提醒？"
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            unsafe_reply,
+            _review_envelope(
+                unsafe_reply,
+                decision="replace",
+                classification="unbacked_state_change_claim",
+                replacement_reply=safe_reply,
+            ),
+            _review_envelope(
+                safe_reply,
+                decision="keep",
+                classification="ordinary_reply",
+            ),
+        )
+    )
+    completion_count = 0
+    completion_requests: list[list[dict]] = []
+
+    async def scripted_completion(
+        messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count
+        del thinking_enabled
+        completion_count += 1
+        completion_requests.append(messages)
+        if completion_count >= 2:
+            assert tool_schemas == []
+        return _CompletionResponse(
+            message={"role": "assistant", "content": next(completions)},
+            metadata={"finish_reason": "stop"},
+        )
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 public turn regression",
+        user_text="不要再提醒我。",
+        context=_daily_write_context(
+            allowed_tool_names=frozenset({"remember_personal_memory"})
+        ),
+        runtime_session=_NoWriteRuntime(),
+    )
+
+    assert completion_count == 3
+    assert result.receipts == ()
+    assert result.runtime_results == ()
+    assert result.final_content == safe_reply
+    review_instruction = completion_requests[1][0]["content"]
+    assert "no successful business-write receipt" in review_instruction
+    assert "preference, setting, durable memory" in review_instruction
+    assert "future automatic reminder behavior" in review_instruction
+    assert "later admission that the setting was not changed" in review_instruction
+
+
+@pytest.mark.asyncio
+async def test_successful_reminder_memory_write_uses_receipt_reply_without_extra_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real preference-write receipt remains the authority for its acknowledgement."""
+
+    reply = "已关闭你自己的日报提醒。"
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "remember-reminder-1",
+                            "type": "function",
+                            "function": {
+                                "name": "remember_personal_memory",
+                                "arguments": json.dumps(
+                                    {
+                                        "memory_key": (
+                                            "report.daily_reminders_enabled"
+                                        ),
+                                        "value": {"enabled": False},
+                                        "source_evidence": {
+                                            "source_message_index": 1,
+                                            "intent": "explicit_preference",
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": reply,
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    completion_count = 0
+
+    async def scripted_completion(
+        _messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count
+        del tool_schemas, thinking_enabled
+        completion_count += 1
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+    runtime = _ReminderWriteRuntime()
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 public turn regression",
+        user_text="请关闭我自己的日报提醒。",
+        context=_daily_write_context(
+            allowed_tool_names=frozenset({"remember_personal_memory"})
+        ),
+        runtime_session=runtime,
+    )
+
+    assert completion_count == 2
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert len(result.receipts) == 1
+    assert result.receipts[0].changed is True
+    assert result.final_content == reply
+    assert all(
+        not turn.response_metadata.get("zero_tool_write_invitation_review")
+        for turn in result.model_turns
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    (
+        "这个问题的原因是当前流程限制；这轮没有改动你的日报。",
+        (
+            "如果你明确说明要调整哪一类提醒，我可以按你的完整请求处理；"
+            "这轮没有更改任何设置。"
+        ),
+    ),
+)
+async def test_public_agent2_turn_keeps_an_ordinary_zero_tool_answer(
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+) -> None:
     adapter = DeepSeekToolCallingAdapter(
         http_client=object(),
         model="deepseek-v4-flash",
