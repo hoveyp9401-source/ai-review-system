@@ -1762,8 +1762,10 @@ def _pre_execution_tool_argument_repair_message() -> dict[str, str]:
             "上一条原生工具调用尚未执行，也没有产生任何写入。其 arguments "
             "不是合法 JSON 或未满足当前工具结构。请重新读取当前用户消息与当前工具 "
             "schema，重新生成一次合法的原生工具调用。所有字符串必须正确 JSON 转义，"
-            "所有必填来源凭证必须完整。source_evidence 只填写必填的 "
-            "source_message_index，不要复制原文或引号。不要把中文弯引号改成英文双引号。"
+            "所有必填来源凭证必须完整。日报事项的 source_evidence 必须同时填写 "
+            "source_message_index 和 exact_quote；exact_quote 必须复制当前用户消息中"
+            "表达该事项完整含义的一段连续原文，保留否定、条件、期限和引号。"
+            "不要把中文弯引号改成英文双引号。"
             "日报 content 可用冒号保留引述归属，不要把未转义引号放进 JSON 字符串。"
             "不要改用文本描述工具调用，也不要假称已经执行。"
         ),
@@ -1786,7 +1788,7 @@ def _daily_weekly_write_review_tool_names(
     *,
     context: TrustedContext,
 ) -> frozenset[str]:
-    """Select schemas for one independent cross-domain semantic review.
+    """Select schemas for one independent report-write semantic review.
 
     This gate uses only trusted capabilities and registry metadata. It never
     interprets words in the user's message; that judgment remains with the
@@ -1798,8 +1800,6 @@ def _daily_weekly_write_review_tool_names(
         for name in context.allowed_tool_names
         if (domain := _daily_weekly_review_domain(name)) is not None
     }
-    if len(available_domains) < 2:
-        return frozenset()
     current_reviewed_operations = {
         call.tool_name
         for call in calls
@@ -1807,6 +1807,13 @@ def _daily_weekly_write_review_tool_names(
         and call.tool_name in context.allowed_tool_names
         and context.gate_decisions.get(call.tool_name) is True
     }
+    if len(available_domains) < 2:
+        if (
+            available_domains == {"daily"}
+            and "add_daily_items" in current_reviewed_operations
+        ):
+            return frozenset({"add_daily_items"})
+        return frozenset()
     if not current_reviewed_operations:
         if calls or not _in_daily_weekly_zero_tool_review_window(context):
             return frozenset()
@@ -2021,6 +2028,25 @@ def _daily_weekly_write_review_messages(
 ) -> list[dict[str, str]]:
     ordered_messages = user_messages or (user_text,)
     allowed_domains = _daily_weekly_review_domains(allowed_tool_names)
+    daily_only_constraint = (
+        "For this Daily-only correction review, the draft's report-date "
+        "binding is trusted and immutable. Do not change date_selection, "
+        "date_expression, proposed_date, date_evidence, report_id, "
+        "expected_version, or submit_after_write. You may correct only items "
+        "and explicit-empty-field evidence. Every exact_quote must preserve "
+        "the complete meaning of its item, including every negation, condition, "
+        "deadline, consequence, exception, and pending action even when separated "
+        "by punctuation. Put each independently editable action-object pair in a "
+        "separate Daily item; never use one quote to hide two separate matters. "
+        "Count the independently editable matters in the current user messages "
+        "before producing calls, then ensure the corrected item count covers each "
+        "one exactly once. Coordinating wording does not merge different actions "
+        "or different objects into one matter. The exact_quote source spans for "
+        "different items must not overlap, and each quote must contain only the "
+        "one matter persisted by that item. "
+        if allowed_domains == {"daily"}
+        else ""
+    )
     draft_calls = [
         {"tool_name": call.tool_name, "arguments": call.arguments}
         for call in calls
@@ -2044,6 +2070,7 @@ def _daily_weekly_write_review_messages(
                 "dates, fields, actors, conditions, evidence, stable IDs, and versions are "
                 "clear, return exactly one complete corrected native tool-call batch using "
                 "only the supplied tools. Preserve exact current-message grounding and do "
+                f"{daily_only_constraint}"
                 "not manufacture completion, certainty, or a formal weekday. If any "
                 "material routing or meaning remains ambiguous, return no tool calls and "
                 "exactly one JSON object with keys decision and reply, where decision is "
@@ -2095,6 +2122,11 @@ def _validate_daily_weekly_write_review(
             for call in reviewed.tool_calls
         ):
             raise ValueError("review returned an out-of-scope tool")
+        if original_has_domain_writes and any(
+            _daily_weekly_write_domain(call.tool_name) is None
+            for call in reviewed.tool_calls
+        ):
+            raise ValueError("write review returned a read tool")
         return
     content = reviewed.assistant_message.get("content")
     try:
@@ -2151,6 +2183,13 @@ def _merge_daily_weekly_write_review(
     reviewed: _ParsedAssistantTurn,
     reviewed_tool_names: frozenset[str],
 ) -> _ParsedAssistantTurn:
+    if any(call.tool_name == "add_daily_items" for call in original.tool_calls) and any(
+        call.tool_name == "add_daily_items" for call in reviewed.tool_calls
+    ):
+        reviewed = _constrain_daily_write_review(
+            original=original,
+            reviewed=reviewed,
+        )
     if not reviewed.tool_calls:
         payload = json.loads(reviewed.assistant_message["content"])
         if payload.get("decision") == "keep_original":
@@ -2165,17 +2204,26 @@ def _merge_daily_weekly_write_review(
             audit=(*original.audit, *reviewed.audit),
         )
 
+    original_has_reviewed_writes = any(
+        _daily_weekly_write_domain(call.tool_name) is not None
+        for call in original.tool_calls
+    )
+    is_review_target = (
+        (lambda call: _daily_weekly_write_domain(call.tool_name) is not None)
+        if original_has_reviewed_writes
+        else (lambda call: _daily_weekly_review_domain(call.tool_name) is not None)
+    )
     target_indexes = [
         index
         for index, call in enumerate(original.tool_calls)
-        if _daily_weekly_review_domain(call.tool_name) is not None
+        if is_review_target(call)
     ]
     insertion_index = target_indexes[0] if target_indexes else len(original.tool_calls)
     merged: list[NativeToolCall] = []
     for index, call in enumerate(original.tool_calls):
         if index == insertion_index:
             merged.extend(reviewed.tool_calls)
-        if _daily_weekly_review_domain(call.tool_name) is None:
+        if not is_review_target(call):
             merged.append(call)
     if insertion_index == len(original.tool_calls):
         merged.extend(reviewed.tool_calls)
@@ -2210,6 +2258,54 @@ def _merge_daily_weekly_write_review(
         assistant_message=merged_message,
         tool_calls=merged_calls,
         audit=(*original.audit, *reviewed.audit),
+    )
+
+
+def _constrain_daily_write_review(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Keep each Daily draft target while accepting reviewed Daily meaning."""
+
+    if not reviewed.tool_calls:
+        return reviewed
+    original_daily = tuple(
+        call for call in original.tool_calls if call.tool_name == "add_daily_items"
+    )
+    reviewed_daily = tuple(
+        call for call in reviewed.tool_calls if call.tool_name == "add_daily_items"
+    )
+    if len(original_daily) != 1 or len(reviewed_daily) != 1:
+        raise ValueError("Daily review must replace exactly one Daily draft")
+
+    draft_arguments = dict(original_daily[0].arguments)
+    reviewed_arguments = reviewed_daily[0].arguments
+    reviewed_empty_evidence = reviewed_arguments.get("empty_field_evidence", [])
+    if not isinstance(reviewed_empty_evidence, list):
+        raise ValueError("reviewed Daily empty-field evidence must be an array")
+    draft_arguments["items"] = reviewed_arguments.get("items", [])
+    draft_arguments["empty_field_evidence"] = reviewed_empty_evidence
+    draft_arguments["acknowledged_empty_fields"] = [
+        evidence.get("field")
+        for evidence in reviewed_empty_evidence
+        if isinstance(evidence, dict)
+    ]
+    constrained_arguments = validate_tool_arguments(
+        "add_daily_items",
+        draft_arguments,
+    )
+    constrained_call = NativeToolCall(
+        reviewed_daily[0].tool_call_id,
+        "add_daily_items",
+        constrained_arguments,
+    )
+    return replace(
+        reviewed,
+        tool_calls=tuple(
+            constrained_call if call is reviewed_daily[0] else call
+            for call in reviewed.tool_calls
+        ),
     )
 
 

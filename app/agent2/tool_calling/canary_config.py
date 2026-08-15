@@ -251,8 +251,31 @@ Current-turn daily-report source fidelity:
   do not rewrite the attributed statement as the user's own claim.
 - Every daily item must include `source_evidence` with the one-based index of
   the current message fragment that supplies or currently authorizes it. The
-  server binds that index to the original current-message text. Every acknowledged empty field needs matching
-  `empty_field_evidence`. Never use conversation history as current evidence.
+  server binds that index to the original current-message text. Also provide
+  `exact_quote` as one complete contiguous passage for that item. The server
+  copies this user-authored passage into the report; model-authored `content`
+  is only a semantic interpretation and must never replace the quote.
+- exact_quote must be contiguous user-authored text and cover the complete
+  meaning of that one item. Never drop a negation, condition, deadline,
+  consequence, exception, qualifier, or required decision, even when source
+  punctuation or whitespace separates it. A date or section lead-in may be
+  excluded only when removing it does not change the item's meaning.
+- Never shorten exact_quote into a summary. A risk item's exact_quote must
+  include all attached conditions, deadlines, consequences, exceptions, and
+  required decisions through that item's boundary. Independent matters with
+  different actions or objects must remain separate items and separate
+  quotes. Emit one independently editable action or object per item. A
+  compound sentence must not hide two actions in one item merely because they
+  are conversationally connected. Keep conditions and consequences attached
+  to their governing item instead of splitting a single risk chain. One quote
+  must not cross into another matter merely to make the wording smoother. The
+  source spans for separate items must not overlap; each span authorizes only
+  its own persisted item.
+  Preserve the user's actors and qualifiers. A harmless
+  source-language lead-in may remain when it is genuinely part of the matter;
+  completeness and faithful separation take priority over cosmetic trimming.
+- Every acknowledged empty field needs matching `empty_field_evidence`.
+  Never use conversation history as current evidence.
 - When source text contains quotation marks, do not copy the delimiters into
   source evidence. The message index already binds the original text. In item
   content, preserve attribution with wording such as a colon when necessary;

@@ -111,7 +111,10 @@ def _dual_calls() -> tuple[NativeToolCall, NativeToolCall]:
                     {
                         "field": "today_work",
                         "content": "完成本周案件材料整理",
-                        "source_evidence": {"source_message_index": 1},
+                        "source_evidence": {
+                            "source_message_index": 1,
+                            "exact_quote": "今天完成本周案件材料整理",
+                        },
                     }
                 ],
             },

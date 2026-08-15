@@ -197,19 +197,20 @@ class _PendingLedgerRuntime:
         receipts: list[ToolReceipt] = []
         for item in bound:
             call = item.call
+            arguments = item.arguments
             if call.tool_name == "add_daily_items":
-                contents = [value["content"] for value in call.arguments["items"]]
+                contents = [value["content"] for value in arguments["items"]]
                 self._ledger.working["daily"].extend(contents)
                 target_type = "daily_report"
                 target_id = f"daily:{NOW.date().isoformat()}"
             elif call.tool_name == "apply_next_weekly_plan":
                 contents = [
                     value.get("content", value["operation"])
-                    for value in call.arguments["operations"]
+                    for value in arguments["operations"]
                 ]
                 self._ledger.working["weekly"].extend(contents)
                 target_type = "weekly_plan"
-                target_id = str(call.arguments["plan_id"])
+                target_id = str(arguments["plan_id"])
             else:  # These entrance tests intentionally exercise only two write domains.
                 raise AssertionError(f"unexpected scripted tool: {call.tool_name}")
             receipts.append(
@@ -308,7 +309,14 @@ def _daily_call(
     call_id: str = "daily",
     *,
     content: str = "完成合同复核",
+    exact_quote: str | None = None,
 ) -> dict:
+    if exact_quote is None:
+        exact_quote = (
+            "今天完成合同复核"
+            if content == "完成合同复核"
+            else content
+        )
     return {
         "id": call_id,
         "type": "function",
@@ -321,7 +329,10 @@ def _daily_call(
                         {
                             "field": "today_work",
                             "content": content,
-                            "source_evidence": {"source_message_index": 1},
+                            "source_evidence": {
+                                "source_message_index": 1,
+                                "exact_quote": exact_quote,
+                            },
                         }
                     ],
                 },
@@ -558,7 +569,45 @@ async def test_private_daily_enters_daily_without_writing_weekly(monkeypatch) ->
 
     assert outcome.owner == "tool_call_core"
     assert outcome.actual_write is True
-    assert session.committed == {"daily": ["完成合同复核"], "weekly": []}
+    assert session.committed == {
+        "daily": ["今天完成合同复核"],
+        "weekly": [],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_text", "reviewed_quote"),
+    [
+        ("未完成合同复核", "未完成合同复核"),
+        ("完成合同复核但未提交", "完成合同复核但未提交"),
+    ],
+)
+async def test_daily_review_restores_adjacent_meaning_before_persisting(
+    monkeypatch,
+    user_text: str,
+    reviewed_quote: str,
+) -> None:
+    unsafe = _daily_call(
+        "unsafe-daily",
+        content="完成合同复核",
+        exact_quote="完成合同复核",
+    )
+    reviewed = _daily_call(
+        "reviewed-unsafe-daily",
+        content=reviewed_quote,
+        exact_quote=reviewed_quote,
+    )
+
+    outcome, session, _http = await _run_ingress(
+        monkeypatch,
+        first_calls=(unsafe,),
+        reviewed_calls=(reviewed,),
+        user_text=user_text,
+    )
+
+    assert outcome.actual_write is True
+    assert session.committed == {"daily": [reviewed_quote], "weekly": []}
 
 
 @pytest.mark.asyncio
@@ -597,12 +646,19 @@ async def test_production_prompt_is_built_from_this_users_allowed_tools(
 async def test_friday_daily_prompt_is_not_affected_when_weekly_plan_is_closed(
     monkeypatch,
 ) -> None:
-    draft = _daily_call("daily-only")
+    draft = _daily_call(
+        "daily-only",
+        exact_quote="完成合同复核",
+    )
+    reviewed = _daily_call(
+        "reviewed-daily-only",
+        exact_quote="完成合同复核",
+    )
 
     outcome, session, http = await _run_ingress(
         monkeypatch,
         first_calls=(draft,),
-        reviewed_calls=None,
+        reviewed_calls=(reviewed,),
         user_text="今天周五，完成合同复核",
         settings=_settings(
             weekly_plan_enabled=False,
@@ -618,7 +674,7 @@ async def test_friday_daily_prompt_is_not_affected_when_weekly_plan_is_closed(
     assert session.committed == {"daily": ["完成合同复核"], "weekly": []}
     assert "Weekly Work Plan boundary:" not in first_prompt
     assert "apply_next_weekly_plan" not in first_request_tools
-    assert len(http.calls) == 2
+    assert len(http.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -710,7 +766,7 @@ async def test_private_dual_intent_enters_both_domains_in_one_commit(monkeypatch
 
     assert outcome.actual_write is True
     assert session.committed == {
-        "daily": ["完成合同复核"],
+        "daily": ["今天完成合同复核"],
         "weekly": ["整理案件材料"],
     }
     assert session.outer_commit_count == 1
@@ -735,11 +791,14 @@ async def test_group_weekly_is_rejected_but_group_daily_still_enters(monkeypatch
         monkeypatch,
         conversation_kind="group",
         first_calls=(_daily_call(),),
-        reviewed_calls=None,
+        reviewed_calls=(_daily_call("reviewed-daily"),),
         user_text="今天完成合同复核",
     )
     assert daily_outcome.actual_write is True
-    assert daily_session.committed == {"daily": ["完成合同复核"], "weekly": []}
+    assert daily_session.committed == {
+        "daily": ["今天完成合同复核"],
+        "weekly": [],
+    }
 
 
 @pytest.mark.asyncio
@@ -765,11 +824,11 @@ async def test_non_allowlisted_user_keeps_daily_but_cannot_enter_weekly(monkeypa
         monkeypatch,
         user_id=OTHER_USER_ID,
         first_calls=(_daily_call(),),
-        reviewed_calls=None,
+        reviewed_calls=(_daily_call("reviewed-daily"),),
         user_text="今天完成合同复核",
     )
     assert daily_outcome.actual_write is True
-    assert daily_session.committed["daily"] == ["完成合同复核"]
+    assert daily_session.committed["daily"] == ["今天完成合同复核"]
 
     weekly_outcome, weekly_session, _ = await _run_ingress(
         monkeypatch,
@@ -926,7 +985,7 @@ async def test_monday_daily_plus_next_week_item_selects_natural_next_target(
 
     assert outcome.actual_write is True
     assert session.committed == {
-        "daily": ["完成合同复核"],
+        "daily": ["今天完成合同复核"],
         "weekly": ["提交案件材料"],
     }
 

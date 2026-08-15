@@ -6,7 +6,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import select, text
 
@@ -46,9 +46,6 @@ from app.agent2.tool_calling.production_performance_executor import (
 from app.agent2.tool_calling.production_periodic_report_executor import (
     ProductionPeriodicReportExecutor,
 )
-from app.agent2.tool_calling.production_weekly_plan_executor import (
-    ProductionWeeklyPlanExecutor,
-)
 from app.agent2.tool_calling.production_store import (
     ProductionContextStore,
     ProductionDateResolver,
@@ -58,6 +55,9 @@ from app.agent2.tool_calling.production_store import (
     load_tool_call_receipt_by_operation,
     load_typed_receipts,
     report_state_hash,
+)
+from app.agent2.tool_calling.production_weekly_plan_executor import (
+    ProductionWeeklyPlanExecutor,
 )
 from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
@@ -895,6 +895,7 @@ def _canary_failure_receipt(
         "actual_write": False,
     }
     if call.tool_name in {
+        "add_daily_items",
         "apply_next_weekly_plan",
         "submit_next_weekly_plan",
     }:
@@ -919,6 +920,54 @@ def _pre_execution_block_observation(
     call: NativeToolCall,
     error_code: str,
 ) -> dict[str, Any]:
+    if call.tool_name == "add_daily_items":
+        item_rows = call.arguments.get("items")
+        items = (
+            tuple(item_rows)
+            if isinstance(item_rows, (list, tuple))
+            else ()
+        )
+        field_item_counts = {
+            "today_work": 0,
+            "problems": 0,
+            "tomorrow_plan": 0,
+        }
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            field_name = str(item.get("field") or "")
+            if field_name in field_item_counts:
+                field_item_counts[field_name] += 1
+
+        trusted_report = None
+        if call.arguments.get("date_selection") == "trusted_report":
+            try:
+                report_id = UUID(str(call.arguments.get("report_id") or ""))
+            except (TypeError, ValueError):
+                report_id = None
+            if report_id is not None:
+                trusted_report = context.report_by_id(report_id)
+        return {
+            "schema_version": "agent2.pre_execution_block.observation.v1",
+            "tool_name": call.tool_name,
+            "arguments_sha256": _sha256(call.arguments),
+            "target_type": "daily_report",
+            "target_report_date": (
+                trusted_report.report_date.isoformat()
+                if trusted_report is not None
+                else ""
+            ),
+            "target_version": (
+                trusted_report.version
+                if trusted_report is not None
+                else None
+            ),
+            "field_item_counts": field_item_counts,
+            "item_count": len(items),
+            "error_code": error_code,
+            "actual_write": False,
+        }
+
     operations = call.arguments.get("operations")
     operation_rows = (
         tuple(operations)

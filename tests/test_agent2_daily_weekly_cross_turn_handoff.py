@@ -569,7 +569,10 @@ def _daily_call(call_id: str, *, content: str) -> dict:
                         {
                             "field": "today_work",
                             "content": content,
-                            "source_evidence": {"source_message_index": 1},
+                            "source_evidence": {
+                                "source_message_index": 1,
+                                "exact_quote": content,
+                            },
                         }
                     ],
                 },

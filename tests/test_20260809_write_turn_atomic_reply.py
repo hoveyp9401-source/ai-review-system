@@ -470,14 +470,16 @@ async def test_provider_model_mismatch_fails_closed_before_any_tool_execution() 
         )
 
 
-def _tool_call_completion() -> _CompletionResponse:
+def _tool_call_completion(
+    call_id: str = "call-1",
+) -> _CompletionResponse:
     return _CompletionResponse(
         message={
             "role": "assistant",
             "content": None,
             "tool_calls": [
                 {
-                    "id": "call-1",
+                    "id": call_id,
                     "type": "function",
                     "function": {
                         "name": "add_daily_items",
@@ -491,6 +493,7 @@ def _tool_call_completion() -> _CompletionResponse:
                                         "content": "虚构测试事项",
                                         "source_evidence": {
                                             "source_message_index": 1,
+                                            "exact_quote": "虚构测试事项",
                                         },
                                     }
                                 ],
@@ -525,12 +528,22 @@ def _submit_tool_call_completion(
                 "content": (
                     "核对付款节点" if reviewed else "核对付款节点，没有发现问题"
                 ),
-                "source_evidence": {"source_message_index": 1},
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": (
+                        "核对付款节点"
+                        if reviewed
+                        else "核对付款节点，没有发现问题"
+                    ),
+                },
             },
             {
                 "field": "tomorrow_plan",
                 "content": "继续跟进回款",
-                "source_evidence": {"source_message_index": 1},
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "继续跟进回款",
+                },
             },
         ],
         "acknowledged_empty_fields": ["problems"] if reviewed else [],
@@ -730,7 +743,9 @@ async def test_incomplete_atomic_submit_draft_gets_model_section_review(
     assert runtime.calls[0].arguments["acknowledged_empty_fields"] == ["problems"]
     assert runtime.calls[0].arguments["items"][0]["content"] == "核对付款节点"
     assert (
-        result.model_turns[0].response_metadata["pre_execution_daily_section_review"]
+        result.model_turns[0].response_metadata[
+            "pre_execution_daily_weekly_write_review"
+        ]
         is True
     )
     assert any(
@@ -740,7 +755,8 @@ async def test_incomplete_atomic_submit_draft_gets_model_section_review(
     )
     assert any(
         message.get("role") == "user"
-        and "unexecuted_draft_calls" in str(message.get("content"))
+        and "unexecuted_daily_periodic_weekly_operation_draft"
+        in str(message.get("content"))
         for message in captured_messages[1]
     )
 
@@ -761,6 +777,10 @@ async def test_trusted_report_existing_sections_allow_empty_problem_submit_witho
     completions = iter(
         (
             _trusted_report_empty_problem_submit_completion(report=report),
+            _trusted_report_empty_problem_submit_completion(
+                report=report,
+                call_id="reviewed-trusted-followup",
+            ),
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -791,10 +811,10 @@ async def test_trusted_report_existing_sections_allow_empty_problem_submit_witho
         runtime_session=runtime,
     )
 
-    assert result.iterations == 2
+    assert result.iterations == 3
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
-    assert runtime.calls[0].tool_call_id == "trusted-followup"
+    assert runtime.calls[0].tool_call_id == "reviewed-trusted-followup"
     assert "pre_execution_daily_section_review" not in (
         result.model_turns[0].response_metadata
     )
@@ -1220,6 +1240,10 @@ async def test_trusted_report_missing_another_section_still_requires_review(
                 report=report,
                 call_id="still-missing-plan-2",
             ),
+            _trusted_report_empty_problem_submit_completion(
+                report=report,
+                call_id="still-missing-plan-3",
+            ),
         )
     )
 
@@ -1331,6 +1355,7 @@ async def test_incomplete_daily_section_review_fails_before_execution(
             _submit_tool_call_completion(call_id="draft", reviewed=False),
             _submit_tool_call_completion(call_id="still-incomplete-1", reviewed=False),
             _submit_tool_call_completion(call_id="still-incomplete-2", reviewed=False),
+            _submit_tool_call_completion(call_id="still-incomplete-3", reviewed=False),
         )
     )
     captured_messages: list[tuple[dict, ...]] = []
@@ -1373,6 +1398,7 @@ async def test_incomplete_first_review_gets_one_structural_model_retry(
     completions = iter(
         (
             _submit_tool_call_completion(call_id="draft", reviewed=False),
+            _submit_tool_call_completion(call_id="unified-incomplete", reviewed=False),
             _submit_tool_call_completion(call_id="still-incomplete", reviewed=False),
             _submit_tool_call_completion(call_id="corrected", reviewed=True),
             _CompletionResponse(
@@ -1406,16 +1432,16 @@ async def test_incomplete_first_review_gets_one_structural_model_retry(
         runtime_session=runtime,
     )
 
-    assert result.iterations == 4
+    assert result.iterations == 5
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.calls[0].tool_call_id == "corrected"
     assert (
-        result.model_turns[2].response_metadata["daily_section_semantic_review_attempt"]
+        result.model_turns[3].response_metadata["daily_section_semantic_review_attempt"]
         == 2
     )
     retry_payload = "\n".join(
-        str(message.get("content") or "") for message in captured_messages[2]
+        str(message.get("content") or "") for message in captured_messages[3]
     )
     assert "previous_review_structural_feedback" in retry_payload
     assert '"missing_sections":["problems"]' in retry_payload
@@ -1444,6 +1470,14 @@ async def test_before_nine_main_agent_date_decision_executes_without_a_second_ro
                 proposed_date="2026-08-11",
                 date_evidence_quote="belongs to August 11",
                 reasoning_content=main_reasoning,
+            ),
+            _submit_tool_call_completion(
+                call_id="reviewed-date",
+                reviewed=True,
+                date_selection="user_explicit",
+                date_expression="2026-08-11",
+                proposed_date="2026-08-11",
+                date_evidence_quote="belongs to August 11",
             ),
             _CompletionResponse(
                 message={
@@ -1485,7 +1519,7 @@ async def test_before_nine_main_agent_date_decision_executes_without_a_second_ro
         runtime_session=runtime,
     )
 
-    assert result.iterations == 2
+    assert result.iterations == 3
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.calls[0].arguments["date_selection"] == "user_explicit"
@@ -1494,7 +1528,12 @@ async def test_before_nine_main_agent_date_decision_executes_without_a_second_ro
         "source_message_index": 1,
         "exact_quote": "belongs to August 11",
     }
-    assert captured_messages[1][-3]["reasoning_content"] == main_reasoning
+    assistant_tool_message = next(
+        message
+        for message in reversed(captured_messages[2])
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assert assistant_tool_message["reasoning_content"] == main_reasoning
     assert all(
         turn.response_metadata.get("daily_write_date_semantic_review") is not True
         for turn in result.model_turns
@@ -1516,6 +1555,10 @@ async def test_before_nine_server_default_preserves_unrelated_query_call(
     completions = iter(
         (
             _mixed_submit_and_query_completion(reviewed=True),
+            _submit_tool_call_completion(
+                call_id="reviewed-server-default",
+                reviewed=True,
+            ),
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -1547,7 +1590,7 @@ async def test_before_nine_server_default_preserves_unrelated_query_call(
         runtime_session=runtime,
     )
 
-    assert result.iterations == 2
+    assert result.iterations == 3
     assert [call.tool_name for call in runtime.calls] == [
         "query_today_report",
         "add_daily_items",
@@ -1670,6 +1713,7 @@ async def test_malformed_pre_execution_tool_json_gets_one_model_repair(
         (
             _malformed_tool_call_completion(),
             _tool_call_completion(),
+            _tool_call_completion("reviewed-call-1"),
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -1705,12 +1749,20 @@ async def test_malformed_pre_execution_tool_json_gets_one_model_repair(
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.rollback_count == 0
-    assert result.iterations == 3
+    assert result.iterations == 4
     assert any(
         message.get("role") == "system"
         and "重新生成一次合法的原生工具调用" in str(message.get("content"))
         for message in captured_messages[1]
     )
+    repair_prompt = " ".join(
+        str(message.get("content"))
+        for message in captured_messages[1]
+        if message.get("role") == "system"
+    )
+    assert "exact_quote" in repair_prompt
+    assert "连续原文" in repair_prompt
+    assert "不要复制原文" not in repair_prompt
 
 
 @pytest.mark.asyncio
@@ -1766,6 +1818,7 @@ async def test_empty_terminal_after_pending_write_gets_one_json_retry(
     completions = iter(
         (
             _tool_call_completion(),
+            _tool_call_completion("reviewed-call-1"),
             _CompletionResponse(
                 message={"role": "assistant", "content": "   "},
                 metadata={"finish_reason": "stop"},
@@ -1801,7 +1854,7 @@ async def test_empty_terminal_after_pending_write_gets_one_json_retry(
     )
 
     assert result.final_content == "已经按你的原话记录到今天的日报。"
-    assert result.iterations == 3
+    assert result.iterations == 4
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.rollback_count == 0
@@ -1822,6 +1875,7 @@ async def test_pending_write_gets_two_bounded_terminal_json_repairs(
     completions = iter(
         (
             _tool_call_completion(),
+            _tool_call_completion("reviewed-call-1"),
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -1870,7 +1924,7 @@ async def test_pending_write_gets_two_bounded_terminal_json_repairs(
         runtime_session=runtime,
     )
 
-    assert result.iterations == 4
+    assert result.iterations == 5
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.rollback_count == 0
@@ -1891,6 +1945,7 @@ async def test_third_empty_terminal_after_pending_write_rolls_back(
     completions = iter(
         (
             _tool_call_completion(),
+            _tool_call_completion("reviewed-call-1"),
             _CompletionResponse(
                 message={"role": "assistant", "content": "   "},
                 metadata={"finish_reason": "stop"},
@@ -1940,6 +1995,7 @@ async def test_write_reply_is_model_composed_then_committed_as_one_turn(
     completions = iter(
         (
             _tool_call_completion(),
+            _tool_call_completion("reviewed-call-1"),
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -1991,6 +2047,7 @@ async def test_internal_error_code_is_hidden_and_model_retries_naturally(
     completions = iter(
         (
             _tool_call_completion(),
+            _tool_call_completion("reviewed-call-1"),
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -2028,7 +2085,7 @@ async def test_internal_error_code_is_hidden_and_model_retries_naturally(
         nonlocal call_count
         del tool_schemas, thinking_enabled
         call_count += 1
-        if call_count == 2:
+        if call_count == 3:
             second_call_messages.extend(messages)
         return next(completions)
 
@@ -2041,7 +2098,7 @@ async def test_internal_error_code_is_hidden_and_model_retries_naturally(
         runtime_session=runtime,
     )
 
-    assert result.iterations == 3
+    assert result.iterations == 4
     assert result.final_content == "这次没有写入日报，请再确认一下日期。"
     assert "SOURCE_REPORT_DATE_MISMATCH" not in json.dumps(
         second_call_messages,
@@ -2071,6 +2128,8 @@ async def test_model_failure_after_write_receipts_rolls_back_the_whole_turn(
         call_count += 1
         if call_count == 1:
             return _tool_call_completion()
+        if call_count == 2:
+            return _tool_call_completion("reviewed-call-1")
         raise DeepSeekTimeoutError("test timeout")
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)

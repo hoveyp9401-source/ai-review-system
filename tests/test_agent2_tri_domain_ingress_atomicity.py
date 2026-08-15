@@ -355,8 +355,83 @@ def _daily_call(call_id: str = "daily") -> dict:
                 {
                     "field": "today_work",
                     "content": "今天完成合同复核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今天完成合同复核",
+                    },
                 }
+            ],
+        },
+    )
+
+
+def _daily_rephrased_call(call_id: str) -> dict:
+    return _native_call(
+        call_id,
+        "add_daily_items",
+        {
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成日报基础功能优化",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今天做了日报的基础功能优化",
+                    },
+                }
+            ],
+        },
+    )
+
+
+def _daily_three_field_rephrased_call(call_id: str) -> dict:
+    return _native_call(
+        call_id,
+        "add_daily_items",
+        {
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "已完成合同复核",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同复核",
+                    },
+                },
+                {
+                    "field": "today_work",
+                    "content": "完成日报台账整理",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "整理日报台账",
+                    },
+                },
+                {
+                    "field": "problems",
+                    "content": "供应商材料不齐风险",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "供应商材料尚未齐全",
+                    },
+                },
+                {
+                    "field": "tomorrow_plan",
+                    "content": "推进付款审批",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "跟进付款审批",
+                    },
+                },
+                {
+                    "field": "tomorrow_plan",
+                    "content": "完善风险清单",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "更新风险清单",
+                    },
+                },
             ],
         },
     )
@@ -703,6 +778,54 @@ async def test_production_prompt_omits_current_weekly_report_policy_when_closed(
     assert session.committed["daily_reports"] == ["今天完成合同复核"]
     assert "Current Weekly Report boundary:" not in first_prompt
     assert "query_current_weekly_report" not in supplied_tools
+
+
+@pytest.mark.asyncio
+async def test_daily_ingress_persists_server_owned_quote_when_model_rephrases(
+    monkeypatch,
+) -> None:
+    original_user_text = "今天做了日报的基础功能优化"
+
+    outcome, session, _ = await _run_ingress(
+        monkeypatch,
+        user_text=original_user_text,
+        first_calls=(_daily_rephrased_call("draft-daily-rephrased"),),
+        reviewed_calls=(_daily_rephrased_call("reviewed-daily-rephrased"),),
+        terminal=_write_terminal(),
+    )
+
+    assert outcome.actual_write is True
+    assert session.committed["daily_reports"] == ["今天做了日报的基础功能优化"]
+
+
+@pytest.mark.asyncio
+async def test_daily_ingress_copies_each_multi_field_item_from_its_own_quote(
+    monkeypatch,
+) -> None:
+    user_text = (
+        "今日工作：完成合同复核、整理日报台账；"
+        "问题风险：供应商材料尚未齐全；"
+        "明日计划：跟进付款审批、更新风险清单"
+    )
+
+    outcome, session, _ = await _run_ingress(
+        monkeypatch,
+        user_text=user_text,
+        first_calls=(_daily_three_field_rephrased_call("draft-daily-three-field"),),
+        reviewed_calls=(
+            _daily_three_field_rephrased_call("reviewed-daily-three-field"),
+        ),
+        terminal=_write_terminal(),
+    )
+
+    assert outcome.actual_write is True
+    assert session.committed["daily_reports"] == [
+        "完成合同复核",
+        "整理日报台账",
+        "供应商材料尚未齐全",
+        "跟进付款审批",
+        "更新风险清单",
+    ]
 
 
 @pytest.mark.asyncio

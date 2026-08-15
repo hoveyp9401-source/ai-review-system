@@ -264,7 +264,10 @@ async def test_semantic_review_keeps_daily_weekly_report_and_weekly_plan(
                 {
                     "field": "today_work",
                     "content": "今天完成台账核对",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今天完成台账核对",
+                    },
                 }
             ],
         },
@@ -367,7 +370,10 @@ async def test_semantic_reviewer_mentions_all_three_enabled_domains(
                 {
                     "field": "today_work",
                     "content": "今天完成台账核对",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今天完成台账核对",
+                    },
                 }
             ],
         },

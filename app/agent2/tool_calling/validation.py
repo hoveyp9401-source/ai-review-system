@@ -180,7 +180,7 @@ class ShadowCallBinder:
             )
         if self._current_turn_source is not None:
             try:
-                self._current_turn_source.validate_tool_arguments(
+                arguments = self._current_turn_source.bind_tool_arguments(
                     call.tool_name,
                     arguments,
                 )

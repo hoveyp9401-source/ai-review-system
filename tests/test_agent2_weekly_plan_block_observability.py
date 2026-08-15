@@ -16,15 +16,16 @@ from app.agent2.tool_calling.canary_service import (
     build_canary_response_payload,
     canary_provider_response_payload,
 )
-from app.agent2.tool_calling.contracts import (
-    ExecutionMode,
-    ReceiptStatus,
-    ToolReceipt,
-)
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedContext,
     TrustedPrincipal,
+    TrustedReportSnapshot,
+)
+from app.agent2.tool_calling.contracts import (
+    ExecutionMode,
+    ReceiptStatus,
+    ToolReceipt,
 )
 from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
 from app.agent2.tool_calling.deepseek_adapter import (
@@ -41,13 +42,15 @@ from app.agent2.weekly_plan_context import (
     TrustedWeeklyPlanDay,
 )
 
-
 NOW = datetime(2026, 8, 14, 18, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 USER_ID = UUID("10000000-0000-4000-8000-000000000001")
 PLAN_ID = UUID("30000000-0000-4000-8000-000000000001")
+REPORT_ID = UUID("20000000-0000-4000-8000-000000000001")
 TARGET_WEEK = date(2026, 8, 17)
 SENSITIVE_MATTER = "日常用印审核-不应进入观察记录"
 SOURCE_MESSAGE = f"下周每天都做{SENSITIVE_MATTER}"
+DAILY_SOURCE_MESSAGE = "review alpha contract and prepare beta note"
+DAILY_MODEL_ADDED_CONTENT = f"{DAILY_SOURCE_MESSAGE} zzz"
 
 
 class _NoTransactionSession:
@@ -134,6 +137,62 @@ def _blocked_call() -> NativeToolCall:
     )
 
 
+def _daily_context() -> TrustedContext:
+    return TrustedContext(
+        namespace=CANARY_STATE_NAMESPACE,
+        now=NOW,
+        principal=TrustedPrincipal(
+            tenant_id="tenant-private",
+            user_id=USER_ID,
+            conversation_id="conversation-private",
+            source_message_id="message-private",
+            timezone="Asia/Shanghai",
+            display_name="private daily display name",
+            conversation_kind="direct",
+        ),
+        today_report=TrustedReportSnapshot(
+            report_id=REPORT_ID,
+            tenant_id="tenant-private",
+            owner_user_id=USER_ID,
+            report_date=NOW.date(),
+            version=7,
+            status="collecting",
+        ),
+        allowed_tool_names=frozenset({"add_daily_items"}),
+        gate_decisions={"add_daily_items": True},
+    )
+
+
+def _blocked_daily_call() -> NativeToolCall:
+    return NativeToolCall(
+        tool_call_id="daily-blocked-1",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "trusted_report",
+            "report_id": str(REPORT_ID),
+            "expected_version": 7,
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": DAILY_MODEL_ADDED_CONTENT,
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": DAILY_MODEL_ADDED_CONTENT,
+                    },
+                },
+                {
+                    "field": "tomorrow_plan",
+                    "content": "prepare beta note",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "prepare beta note",
+                    },
+                },
+            ],
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_weekly_binder_block_has_safe_structured_observation_before_transaction() -> None:
     context = _context()
@@ -202,6 +261,79 @@ async def test_weekly_binder_block_has_safe_structured_observation_before_transa
         "tenant-private",
         "conversation-private",
         "测试姓名不应进入观察记录",
+    ):
+        assert sensitive_value not in serialized
+
+
+@pytest.mark.asyncio
+async def test_daily_binder_block_has_safe_counts_without_content_or_identity() -> None:
+    context = _daily_context()
+    source = CurrentTurnSource(
+        (DAILY_SOURCE_MESSAGE,),
+        occurred_at=(NOW,),
+    )
+    session = _NoTransactionSession()
+    runtime = ProductionRuntimeSession(
+        session=session,
+        user=SimpleNamespace(id=USER_ID, active=True),
+        settings=SimpleNamespace(),
+        context=context,
+        capability=SimpleNamespace(),
+        source_channel="dingtalk_private",
+        source_text_hash=source.sha256,
+        current_turn_source=source,
+        binder=ShadowCallBinder(
+            context,
+            UnavailableDateResolver(),
+            report_read_port=None,
+            execution_mode=ExecutionMode.CANARY_EXECUTE,
+            current_turn_source=source,
+        ),
+        date_resolver=UnavailableDateResolver(),
+    )
+    call = _blocked_daily_call()
+
+    result = await runtime.execute((call,))
+
+    assert result.status == "blocked"
+    assert result.error_code == "DAILY_ITEM_CONTENT_NOT_GROUNDED"
+    assert session.begin_nested_calls == 0
+    observation = result.receipts[0].safe_user_facts[
+        "pre_execution_block_observation"
+    ]
+    assert observation == {
+        "schema_version": "agent2.pre_execution_block.observation.v1",
+        "tool_name": "add_daily_items",
+        "arguments_sha256": hashlib.sha256(
+            json.dumps(
+                call.arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "target_type": "daily_report",
+        "target_report_date": "2026-08-14",
+        "target_version": 7,
+        "field_item_counts": {
+            "today_work": 1,
+            "problems": 0,
+            "tomorrow_plan": 1,
+        },
+        "item_count": 2,
+        "error_code": "DAILY_ITEM_CONTENT_NOT_GROUNDED",
+        "actual_write": False,
+    }
+    serialized = json.dumps(observation, ensure_ascii=False, sort_keys=True)
+    for sensitive_value in (
+        DAILY_SOURCE_MESSAGE,
+        DAILY_MODEL_ADDED_CONTENT,
+        str(REPORT_ID),
+        str(USER_ID),
+        "tenant-private",
+        "conversation-private",
+        "private daily display name",
     ):
         assert sensitive_value not in serialized
 
@@ -330,6 +462,97 @@ async def test_untrusted_plan_block_keeps_hash_and_code_without_claiming_a_week(
         ensure_ascii=False,
     )
     assert session.begin_nested_calls == 0
+
+
+def test_daily_block_observation_is_whitelisted_and_never_exposed() -> None:
+    call = _blocked_daily_call()
+    safe_block = {
+        "schema_version": "agent2.pre_execution_block.observation.v1",
+        "tool_name": "add_daily_items",
+        "arguments_sha256": hashlib.sha256(
+            json.dumps(
+                call.arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "target_type": "daily_report",
+        "target_report_date": "2026-08-14",
+        "target_version": 7,
+        "field_item_counts": {
+            "today_work": 1,
+            "problems": 0,
+            "tomorrow_plan": 1,
+        },
+        "item_count": 2,
+        "error_code": "DAILY_ITEM_CONTENT_NOT_GROUNDED",
+        "actual_write": False,
+    }
+    receipt = ToolReceipt(
+        status=ReceiptStatus.BLOCKED,
+        tool_name="add_daily_items",
+        changed=False,
+        error_code="DAILY_ITEM_CONTENT_NOT_GROUNDED",
+        safe_user_facts={
+            "actual_write": False,
+            "pre_execution_block_observation": {
+                **safe_block,
+                "raw_content": DAILY_MODEL_ADDED_CONTENT,
+                "report_id": str(REPORT_ID),
+                "user_id": str(USER_ID),
+                "user_name": "private daily display name",
+            },
+        },
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+    )
+
+    observations = canary_service._pre_execution_block_observations(
+        (receipt,)
+    )
+
+    assert observations == (safe_block,)
+    outcome = CanaryIngressOutcome(
+        owner="tool_call_core",
+        reason="enabled",
+        message="The write was blocked.",
+        handled=True,
+        actual_write=False,
+        messages_enabled=True,
+        tool_blocked_count=1,
+        user_visible_result="blocked",
+        reply_formed=True,
+        pre_execution_block_observations=observations,
+    )
+    persisted = build_canary_persisted_response_payload(outcome)
+    provider = build_canary_response_payload(outcome)
+    assert persisted["_agent2_turn_observation_v1"][
+        "pre_execution_blocks"
+    ] == [safe_block]
+    assert canary_provider_response_payload(persisted) == provider
+
+    model_messages = _canary_tool_result_messages(
+        (call,),
+        (receipt,),
+        write_batch_closed=True,
+    )
+    externally_visible = json.dumps(
+        {"provider": provider, "model": model_messages},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    for internal_or_sensitive_value in (
+        "pre_execution_block_observation",
+        "pre_execution_blocks",
+        safe_block["arguments_sha256"],
+        DAILY_SOURCE_MESSAGE,
+        DAILY_MODEL_ADDED_CONTENT,
+        str(REPORT_ID),
+        str(USER_ID),
+        "private daily display name",
+    ):
+        assert internal_or_sensitive_value not in externally_visible
 
 
 def test_block_observation_is_persisted_internally_but_never_sent_to_dingtalk() -> None:

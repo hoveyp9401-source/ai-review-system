@@ -298,12 +298,18 @@ async def test_undated_daily_write_before_nine_uses_previous_day() -> None:
                 {
                     "field": "today_work",
                     "content": "完成合同审核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同审核",
+                    },
                 },
                 {
                     "field": "tomorrow_plan",
                     "content": "继续跟进案件",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "继续跟进案件",
+                    },
                 },
             ],
             "acknowledged_empty_fields": ["problems"],
@@ -360,7 +366,10 @@ async def test_before_nine_agent2_can_semantically_choose_new_day_without_a_seco
                 {
                     "field": "today_work",
                     "content": "完成付款节点复核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "早上刚完成了付款节点复核",
+                    },
                 }
             ],
         },
@@ -415,7 +424,10 @@ async def test_agent2_semantic_date_tolerates_a_redundant_relative_expression() 
                 {
                     "field": "today_work",
                     "content": "完成付款节点复核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "早上刚完成付款节点复核",
+                    },
                 }
             ],
         },
@@ -467,7 +479,10 @@ async def test_agent2_semantic_date_cannot_escape_the_morning_today_or_default_w
                 {
                     "field": "today_work",
                     "content": "完成合同复核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今天完成合同复核",
+                    },
                 }
             ],
         },
@@ -537,7 +552,10 @@ async def test_one_am_yesterday_resolves_to_the_same_previous_day_prior() -> Non
                 {
                     "field": "today_work",
                     "content": "完成合同付款节点复核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "昨天完成了合同付款节点复核",
+                    },
                 }
             ],
         },
@@ -585,7 +603,10 @@ async def test_server_default_needs_no_model_repetition_of_the_server_date() -> 
                 {
                     "field": "today_work",
                     "content": "完成合同付款节点复核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同付款节点复核",
+                    },
                 }
             ],
         },
@@ -652,7 +673,10 @@ async def test_explicit_today_wins_and_nine_starts_current_day(
                 {
                     "field": "today_work",
                     "content": "完成合同审核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同审核",
+                    },
                 },
             ],
         },

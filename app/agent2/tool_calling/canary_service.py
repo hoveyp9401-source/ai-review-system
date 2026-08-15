@@ -950,9 +950,13 @@ _PRE_EXECUTION_BLOCK_SCHEMA_VERSION = (
 )
 _PRE_EXECUTION_BLOCK_TOOL_NAMES = frozenset(
     {
+        "add_daily_items",
         "apply_next_weekly_plan",
         "submit_next_weekly_plan",
     }
+)
+_SAFE_DAILY_REPORT_FIELDS = frozenset(
+    {"today_work", "problems", "tomorrow_plan"}
 )
 _SAFE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _SAFE_ERROR_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
@@ -1010,6 +1014,11 @@ def _validated_pre_execution_block_observation(
     receipt: Any,
 ) -> dict[str, Any] | None:
     tool_name = str(getattr(receipt, "tool_name", "") or "")
+    if tool_name == "add_daily_items":
+        return _validated_daily_block_observation(
+            candidate,
+            receipt=receipt,
+        )
     error_code = str(getattr(receipt, "error_code", "") or "")
     arguments_sha256 = str(candidate.get("arguments_sha256") or "")
     target_plan_ref_sha256 = str(
@@ -1069,6 +1078,79 @@ def _validated_pre_execution_block_observation(
         "target_version": target_version,
         "operation_type_counts": operation_type_counts,
         "operation_count": operation_count,
+        "error_code": error_code,
+        "actual_write": False,
+    }
+
+
+def _validated_daily_block_observation(
+    candidate: Mapping[str, Any],
+    *,
+    receipt: Any,
+) -> dict[str, Any] | None:
+    tool_name = str(getattr(receipt, "tool_name", "") or "")
+    error_code = str(getattr(receipt, "error_code", "") or "")
+    arguments_sha256 = str(candidate.get("arguments_sha256") or "")
+    target_report_date = str(candidate.get("target_report_date") or "")
+    target_version = candidate.get("target_version")
+    item_count = candidate.get("item_count")
+    raw_field_counts = candidate.get("field_item_counts")
+    if (
+        candidate.get("schema_version")
+        != _PRE_EXECUTION_BLOCK_SCHEMA_VERSION
+        or candidate.get("tool_name") != tool_name
+        or tool_name != "add_daily_items"
+        or candidate.get("target_type") != "daily_report"
+        or candidate.get("error_code") != error_code
+        or _SAFE_ERROR_CODE_RE.fullmatch(error_code) is None
+        or candidate.get("actual_write") is not False
+        or _SAFE_SHA256_RE.fullmatch(arguments_sha256) is None
+        or not isinstance(item_count, int)
+        or isinstance(item_count, bool)
+        or not 0 <= item_count <= 30
+        or not isinstance(raw_field_counts, Mapping)
+        or set(raw_field_counts) != _SAFE_DAILY_REPORT_FIELDS
+    ):
+        return None
+    if target_report_date:
+        try:
+            date.fromisoformat(target_report_date)
+        except ValueError:
+            return None
+        if (
+            not isinstance(target_version, int)
+            or isinstance(target_version, bool)
+            or target_version < 0
+        ):
+            return None
+    elif target_version is not None:
+        return None
+
+    field_item_counts: dict[str, int] = {}
+    for field_name in (
+        "today_work",
+        "problems",
+        "tomorrow_plan",
+    ):
+        value = raw_field_counts.get(field_name)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= 30
+        ):
+            return None
+        field_item_counts[field_name] = value
+    if sum(field_item_counts.values()) != item_count:
+        return None
+    return {
+        "schema_version": _PRE_EXECUTION_BLOCK_SCHEMA_VERSION,
+        "tool_name": tool_name,
+        "arguments_sha256": arguments_sha256,
+        "target_type": "daily_report",
+        "target_report_date": target_report_date,
+        "target_version": target_version,
+        "field_item_counts": field_item_counts,
+        "item_count": item_count,
         "error_code": error_code,
         "actual_write": False,
     }

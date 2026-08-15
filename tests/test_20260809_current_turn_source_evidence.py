@@ -20,6 +20,7 @@ from app.agent2.tool_calling.current_turn_source import (
     CurrentTurnSource,
     CurrentTurnSourceEvidenceError,
 )
+from app.agent2.tool_calling.registry import deepseek_tool_schemas
 from app.agent2.tool_calling.validation import (
     NativeToolCall,
     ShadowCallBinder,
@@ -40,6 +41,176 @@ def test_daily_item_requires_current_message_evidence() -> None:
                     }
                 ],
             }
+        )
+
+
+def test_daily_item_tool_schema_requires_exact_quote() -> None:
+    tool_schema = deepseek_tool_schemas(frozenset({"add_daily_items"}))[0]
+    schema = tool_schema["function"]["parameters"]
+
+    evidence_schema = schema["$defs"]["DailyItemSourceEvidence"]
+
+    assert "exact_quote" in evidence_schema["required"]
+    assert evidence_schema["properties"]["exact_quote"]["type"] == "string"
+
+
+def test_daily_item_input_rejects_missing_exact_quote() -> None:
+    with pytest.raises(ValidationError):
+        AddDailyItemsArgs.model_validate(
+            {
+                "items": [
+                    {
+                        "field": "today_work",
+                        "content": "完成合同复核",
+                        "source_evidence": {"source_message_index": 1},
+                    }
+                ]
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_message", "exact_quote"),
+    [
+        ("未完成合同复核", "完成合同复核"),
+        ("完成合同复核但未提交", "完成合同复核"),
+    ],
+)
+def test_daily_item_binder_accepts_a_contiguous_current_message_span(
+    source_message: str,
+    exact_quote: str,
+) -> None:
+    source = CurrentTurnSource((source_message,))
+    arguments = AddDailyItemsArgs.model_validate(
+        {
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成合同复核",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": exact_quote,
+                    },
+                }
+            ]
+        }
+    )
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        arguments.model_dump(mode="json"),
+    )
+
+    assert bound["items"][0]["content"] == exact_quote
+
+
+@pytest.mark.parametrize(
+    "source_message",
+    [
+        "今日工作：完成合同复核；明日继续跟进",
+        "今日工作 完成合同复核 明日继续跟进",
+    ],
+)
+def test_daily_item_quote_accepts_punctuation_or_whitespace_boundaries(
+    source_message: str,
+) -> None:
+    source = CurrentTurnSource((source_message,))
+    arguments = {
+        "items": [
+            {
+                "field": "today_work",
+                "content": "已完成合同审核",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成合同复核",
+                },
+            }
+        ]
+    }
+
+    bound = source.bind_tool_arguments("add_daily_items", arguments)
+
+    assert bound["items"][0]["content"] == "完成合同复核"
+
+
+def test_daily_item_quote_accepts_the_complete_joined_sentence() -> None:
+    source_message = "今天做了日报的基础功能优化"
+    source = CurrentTurnSource((source_message,))
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        {
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成日报基础功能优化",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": source_message,
+                    },
+                }
+            ]
+        },
+    )
+
+    assert bound["items"][0]["content"] == source_message
+
+
+def test_daily_item_quotes_cannot_overlap_in_one_source_message() -> None:
+    source = CurrentTurnSource(
+        ("目前对方还没寄回盖章版；明天我去催办并同步项目组",)
+    )
+
+    with pytest.raises(
+        CurrentTurnSourceEvidenceError,
+        match="DAILY_ITEM_SOURCE_SPAN_OVERLAP",
+    ):
+        source.bind_tool_arguments(
+            "add_daily_items",
+            {
+                "items": [
+                    {
+                        "field": "tomorrow_plan",
+                        "content": "催办",
+                        "source_evidence": {
+                            "source_message_index": 1,
+                            "exact_quote": "明天我去催办",
+                        },
+                    },
+                    {
+                        "field": "tomorrow_plan",
+                        "content": "同步项目组",
+                        "source_evidence": {
+                            "source_message_index": 1,
+                            "exact_quote": "明天我去催办并同步项目组",
+                        },
+                    },
+                ]
+            },
+        )
+
+
+def test_daily_item_quote_must_identify_one_source_occurrence() -> None:
+    source = CurrentTurnSource(("完成核对；完成核对",))
+
+    with pytest.raises(
+        CurrentTurnSourceEvidenceError,
+        match="DAILY_ITEM_SOURCE_SPAN_AMBIGUOUS",
+    ):
+        source.bind_tool_arguments(
+            "add_daily_items",
+            {
+                "items": [
+                    {
+                        "field": "today_work",
+                        "content": "完成核对",
+                        "source_evidence": {
+                            "source_message_index": 1,
+                            "exact_quote": "完成核对",
+                        },
+                    }
+                ]
+            },
         )
 
 
@@ -73,6 +244,7 @@ def test_current_turn_source_binds_daily_evidence_across_fragments() -> None:
                     "content": "参加经营管理会议，记录人才培养要求",
                     "source_evidence": {
                         "source_message_index": 1,
+                        "exact_quote": "今天参加经营管理会议，记录人才培养要求。",
                     },
                 },
                 {
@@ -80,6 +252,7 @@ def test_current_turn_source_binds_daily_evidence_across_fragments() -> None:
                     "content": "继续跟进降本方案",
                     "source_evidence": {
                         "source_message_index": 2,
+                        "exact_quote": "明天继续跟进降本方案。",
                     },
                 },
             ],
@@ -113,6 +286,7 @@ def test_current_turn_source_rejects_a_non_current_message_index() -> None:
                     "content": "完成合同审核",
                     "source_evidence": {
                         "source_message_index": 2,
+                        "exact_quote": "完成合同审核",
                     },
                 }
             ],
@@ -120,7 +294,7 @@ def test_current_turn_source_rejects_a_non_current_message_index() -> None:
     )
 
     with pytest.raises(CurrentTurnSourceEvidenceError) as caught:
-        source.validate_tool_arguments(
+        source.bind_tool_arguments(
             "add_daily_items",
             arguments.model_dump(mode="json"),
         )
@@ -143,14 +317,17 @@ def test_daily_item_text_must_be_grounded_in_current_message(
                 {
                     "field": "today_work",
                     "content": content,
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": content,
+                    },
                 }
             ],
         }
     )
 
     with pytest.raises(CurrentTurnSourceEvidenceError) as caught:
-        source.validate_tool_arguments(
+        source.bind_tool_arguments(
             "add_daily_items",
             arguments.model_dump(mode="json"),
         )
@@ -170,7 +347,10 @@ def test_quote_bearing_daily_item_can_bind_the_whole_current_message() -> None:
                 {
                     "field": "today_work",
                     "content": "老板原话：要么降薪，要么裁员",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "老板原话是“要么降薪，要么裁员”",
+                    },
                 }
             ],
         }
@@ -303,6 +483,7 @@ async def test_production_binder_blocks_invalid_source_index_before_date_resolut
                         "content": "完成合同审核",
                         "source_evidence": {
                             "source_message_index": 2,
+                            "exact_quote": "完成合同审核",
                         },
                     }
                 ],

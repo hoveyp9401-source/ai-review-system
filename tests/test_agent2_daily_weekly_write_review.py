@@ -73,6 +73,15 @@ def _context() -> TrustedContext:
     )
 
 
+def _daily_only_context() -> TrustedContext:
+    return _context().model_copy(
+        update={
+            "allowed_tool_names": frozenset({"add_daily_items"}),
+            "gate_decisions": {"add_daily_items": True},
+        }
+    )
+
+
 def _monday_dual_target_context() -> TrustedContext:
     base = _context()
     current = base.weekly_plan.model_copy(
@@ -125,12 +134,44 @@ def _daily_call(*, call_id: str = "daily") -> dict:
                         {
                             "field": "today_work",
                             "content": "今天完成合同审核",
-                            "source_evidence": {"source_message_index": 1},
+                            "source_evidence": {
+                                "source_message_index": 1,
+                                "exact_quote": "今天完成合同审核",
+                            },
                         }
                     ],
                 },
                 ensure_ascii=False,
             ),
+        },
+    }
+
+
+def _daily_items_call(
+    *,
+    call_id: str,
+    items: list[dict],
+    date_selection: str = "server_default",
+    date_expression: str | None = None,
+    proposed_date: str | None = None,
+    date_evidence: dict | None = None,
+) -> dict:
+    arguments = {
+        "date_selection": date_selection,
+        "items": items,
+    }
+    if date_expression is not None:
+        arguments["date_expression"] = date_expression
+    if proposed_date is not None:
+        arguments["proposed_date"] = proposed_date
+    if date_evidence is not None:
+        arguments["date_evidence"] = date_evidence
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "add_daily_items",
+            "arguments": json.dumps(arguments, ensure_ascii=False),
         },
     }
 
@@ -325,6 +366,386 @@ def _keep_original_completion() -> _CompletionResponse:
         },
         metadata={"finish_reason": "stop"},
     )
+
+
+@pytest.mark.asyncio
+async def test_daily_partial_quote_is_corrected_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    draft = _daily_items_call(
+        call_id="draft-daily",
+        items=[
+            {
+                "field": "today_work",
+                "content": "完成合同复核",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成合同复核",
+                },
+            }
+        ],
+    )
+    reviewed = _daily_items_call(
+        call_id="reviewed-daily",
+        items=[
+            {
+                "field": "today_work",
+                "content": "未完成合同复核",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "未完成合同复核",
+                },
+            }
+        ],
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(reviewed),
+            _terminal_completion("已按原话记入今日日报。"),
+        )
+    )
+    requested_tool_schemas: list[tuple[str, ...]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, thinking_enabled
+        requested_tool_schemas.append(_schema_names(tool_schemas))
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="未完成合同复核",
+        context=_daily_only_context(),
+        runtime_session=runtime,
+    )
+
+    assert runtime.execute_count == 1
+    assert runtime.calls[0].arguments["items"] == [
+        {
+            "field": "today_work",
+            "content": "未完成合同复核",
+            "source_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "未完成合同复核",
+            },
+        }
+    ]
+    assert requested_tool_schemas[1] == ("add_daily_items",)
+
+
+@pytest.mark.asyncio
+async def test_daily_partial_quote_review_splits_independent_items_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    draft = _daily_items_call(
+        call_id="draft-daily",
+        items=[
+            {
+                "field": "today_work",
+                "content": "完成A并整理B",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成A并整理B",
+                },
+            }
+        ],
+    )
+    reviewed = _daily_items_call(
+        call_id="reviewed-daily",
+        items=[
+            {
+                "field": "today_work",
+                "content": "完成A",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成A",
+                },
+            },
+            {
+                "field": "today_work",
+                "content": "整理B",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "整理B",
+                },
+            },
+        ],
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(reviewed),
+            _terminal_completion("两项工作已分别记入今日日报。"),
+        )
+    )
+    review_system_prompts: list[str] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        if thinking_enabled and tool_schemas:
+            review_system_prompts.append(messages[0]["content"])
+        del tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="今天完成A并整理B",
+        context=_daily_only_context(),
+        runtime_session=runtime,
+    )
+
+    assert [
+        item["content"] for item in runtime.calls[0].arguments["items"]
+    ] == ["完成A", "整理B"]
+    assert "including every negation, condition" in review_system_prompts[0]
+    assert "separate Daily item" in review_system_prompts[0]
+    assert "action-object pair" in review_system_prompts[0]
+    assert "Count the independently editable matters" in review_system_prompts[0]
+    assert "source spans for different items must not overlap" in review_system_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_daily_review_cannot_change_the_draft_date_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    draft = _daily_items_call(
+        call_id="draft-daily",
+        items=[
+            {
+                "field": "today_work",
+                "content": "完成A并整理B",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成A并整理B",
+                },
+            }
+        ],
+    )
+    reviewed = _daily_items_call(
+        call_id="reviewed-daily",
+        date_selection="agent2_semantic",
+        proposed_date="2026-08-13",
+        date_evidence={"source_message_index": 1, "exact_quote": "今天"},
+        items=[
+            {
+                "field": "today_work",
+                "content": "完成A",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成A",
+                },
+            },
+            {
+                "field": "today_work",
+                "content": "整理B",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "整理B",
+                },
+            },
+        ],
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(reviewed),
+            _terminal_completion("两项工作已分别记入今日日报。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="今天完成A并整理B",
+        context=_daily_only_context(),
+        runtime_session=runtime,
+    )
+
+    assert runtime.calls[0].arguments["date_selection"] == "server_default"
+    assert runtime.calls[0].arguments["date_expression"] is None
+    assert runtime.calls[0].arguments["proposed_date"] is None
+    assert runtime.calls[0].arguments["date_evidence"] is None
+
+
+@pytest.mark.asyncio
+async def test_cross_domain_review_cannot_change_the_daily_draft_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    draft = _daily_items_call(
+        call_id="draft-daily",
+        items=[
+            {
+                "field": "today_work",
+                "content": "完成A",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成A",
+                },
+            }
+        ],
+    )
+    reviewed_daily = _daily_items_call(
+        call_id="reviewed-daily",
+        date_selection="agent2_semantic",
+        proposed_date="2026-08-13",
+        date_evidence={"source_message_index": 1, "exact_quote": "今天"},
+        items=[
+            {
+                "field": "today_work",
+                "content": "完成A",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成A",
+                },
+            }
+        ],
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(reviewed_daily, _weekly_call(call_id="reviewed-weekly")),
+            _terminal_completion("日报和周计划已记录。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="今天完成A；下周三整理案件材料。",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    daily = next(call for call in runtime.calls if call.tool_name == "add_daily_items")
+    assert daily.arguments["date_selection"] == "server_default"
+    assert daily.arguments["date_expression"] is None
+    assert daily.arguments["proposed_date"] is None
+    assert daily.arguments["date_evidence"] is None
+
+
+@pytest.mark.asyncio
+async def test_one_full_message_daily_item_receives_exactly_one_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    message = "今天做了日报的基础功能优化"
+    draft = _daily_items_call(
+        call_id="draft-daily",
+        items=[
+            {
+                "field": "today_work",
+                "content": message,
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": message,
+                },
+            }
+        ],
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(
+                _daily_items_call(
+                    call_id="reviewed-daily",
+                    items=[
+                        {
+                            "field": "today_work",
+                            "content": message,
+                            "source_evidence": {
+                                "source_message_index": 1,
+                                "exact_quote": message,
+                            },
+                        }
+                    ],
+                )
+            ),
+            _terminal_completion("已按原话记入今日日报。"),
+        )
+    )
+    requested_tool_schemas: list[tuple[str, ...]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, thinking_enabled
+        requested_tool_schemas.append(_schema_names(tool_schemas))
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text=message,
+        context=_daily_only_context(),
+        runtime_session=runtime,
+    )
+
+    assert runtime.execute_count == 1
+    assert len(result.model_turns) == 3
+    assert sum(
+        bool(
+            turn.response_metadata.get(
+                "daily_weekly_write_semantic_review"
+            )
+        )
+        for turn in result.model_turns
+    ) == 1
+    assert requested_tool_schemas == [
+        ("add_daily_items",),
+        ("add_daily_items",),
+        (),
+    ]
 
 
 @pytest.mark.asyncio
@@ -800,6 +1221,59 @@ async def test_review_preserves_an_unrelated_read_call(
         "apply_next_weekly_plan",
     ]
     assert runtime.calls[0].tool_call_id == "original-query"
+
+
+@pytest.mark.asyncio
+async def test_review_preserves_a_weekly_read_beside_a_daily_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context()
+    allowed = frozenset((*context.allowed_tool_names, "query_next_weekly_plan"))
+    context = context.model_copy(
+        update={
+            "allowed_tool_names": allowed,
+            "gate_decisions": {name: True for name in allowed},
+        }
+    )
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    weekly_query = {
+        "id": "original-weekly-query",
+        "type": "function",
+        "function": {"name": "query_next_weekly_plan", "arguments": "{}"},
+    }
+    completions = iter(
+        (
+            _tool_completion(weekly_query, _daily_call(call_id="draft-daily")),
+            _tool_completion(_daily_call(call_id="reviewed-daily")),
+            _terminal_completion("日报已记录，并展示了下周计划。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="今天完成合同审核；再显示下周计划。",
+        context=context,
+        runtime_session=runtime,
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "query_next_weekly_plan",
+        "add_daily_items",
+    ]
+    assert runtime.calls[0].tool_call_id == "original-weekly-query"
 
 
 @pytest.mark.asyncio

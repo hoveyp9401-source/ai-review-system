@@ -545,10 +545,41 @@ class QueryDefendantPerformanceArgs(StrictContract):
         return self
 
 
+class DailyItemSourceEvidence(CurrentUserMessageEvidence):
+    exact_quote: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=4000,
+            description=(
+                "Contiguous current-message quote authoritative for this one "
+                "persisted Daily Report item. It must cover the item's complete "
+                "meaning: never omit a negation, condition, deadline, consequence, "
+                "exception, or pending action, even when punctuation or whitespace "
+                "separates it. A date or section lead-in may be omitted only when "
+                "doing so does not change the item's meaning. The server copies this "
+                "quote from its own current-turn source instead of persisting "
+                "model-authored wording."
+            ),
+        ),
+    ]
+
+
 class DailyItemInput(StrictContract):
     field: ReportField
-    content: NonEmptyText
-    source_evidence: CurrentUserMessageEvidence
+    content: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=4000,
+            description=(
+                "Agent2's semantic interpretation of this item. If it is not "
+                "verbatim current-message text, source_evidence.exact_quote must "
+                "carry the exact authoritative wording to persist."
+            ),
+        ),
+    ]
+    source_evidence: DailyItemSourceEvidence
 
 
 class DailyEmptyFieldEvidence(StrictContract):

@@ -79,6 +79,7 @@ def test_agent2_contract_carries_model_decided_empty_field_without_phrase_rules(
                 "content": "完成合同审核",
                 "source_evidence": {
                     "source_message_index": 1,
+                    "exact_quote": "完成合同审核",
                 },
             },
             {
@@ -86,6 +87,7 @@ def test_agent2_contract_carries_model_decided_empty_field_without_phrase_rules(
                 "content": "继续跟进案件",
                 "source_evidence": {
                     "source_message_index": 1,
+                    "exact_quote": "继续跟进案件",
                 },
             },
         ),

@@ -77,9 +77,11 @@ def _context(
     )
 
 
-def _long_daily_call() -> NativeToolCall:
+def _long_daily_call(
+    tool_call_id: str = "long-daily-1",
+) -> NativeToolCall:
     return NativeToolCall(
-        tool_call_id="long-daily-1",
+        tool_call_id=tool_call_id,
         tool_name="add_daily_items",
         arguments={
             "date_selection": "server_default",
@@ -89,17 +91,26 @@ def _long_daily_call() -> NativeToolCall:
                 {
                     "field": "today_work",
                     "content": "完成A合同复核并向业务反馈两项修改意见",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今天完成A合同复核并向业务反馈两项修改意见",
+                    },
                 },
                 {
                     "field": "today_work",
                     "content": "与财务核对B项目付款节点",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "随后与财务核对B项目付款节点",
+                    },
                 },
                 {
                     "field": "tomorrow_plan",
                     "content": "继续跟进C案件证据清单",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "明天继续跟进C案件证据清单",
+                    },
                 },
             ],
         },
@@ -214,9 +225,18 @@ async def test_long_daily_actions_bind_every_item_to_the_complete_current_source
     assert failure is None
     assert bound is not None
     assert [item["source_evidence"] for item in bound.arguments["items"]] == [
-        {"source_message_index": 1},
-        {"source_message_index": 1},
-        {"source_message_index": 1},
+        {
+            "source_message_index": 1,
+            "exact_quote": "今天完成A合同复核并向业务反馈两项修改意见",
+        },
+        {
+            "source_message_index": 1,
+            "exact_quote": "随后与财务核对B项目付款节点",
+        },
+        {
+            "source_message_index": 1,
+            "exact_quote": "明天继续跟进C案件证据清单",
+        },
     ]
 
 
@@ -226,7 +246,12 @@ async def test_final_model_timeout_after_long_write_draft_rolls_back_the_whole_t
 ) -> None:
     runtime = _DeferredRuntime()
     adapter = _adapter()
-    completions = iter((_tool_completion(_long_daily_call()),))
+    completions = iter(
+        (
+            _tool_completion(_long_daily_call()),
+            _tool_completion(_long_daily_call("reviewed-long-daily-1")),
+        )
+    )
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
         del messages, tool_schemas, thinking_enabled
@@ -262,6 +287,7 @@ async def test_persistently_empty_final_model_reply_rolls_back_the_whole_turn(
     completions = iter(
         (
             _tool_completion(_long_daily_call()),
+            _tool_completion(_long_daily_call("reviewed-long-daily-1")),
             _CompletionResponse(
                 message={"role": "assistant", "content": "  "},
                 metadata={"finish_reason": "stop"},
@@ -806,7 +832,10 @@ async def test_same_provider_write_uses_the_same_operation_fingerprint() -> None
                 {
                     "field": "today_work",
                     "content": "完成A合同复核",
-                    "source_evidence": {"source_message_index": 1},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今天完成A合同复核",
+                    },
                 }
             ],
         },

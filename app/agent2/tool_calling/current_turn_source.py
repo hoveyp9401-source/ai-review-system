@@ -25,19 +25,6 @@ class CurrentTurnSourceEvidenceError(ValueError):
         self.code = code
 
 
-def _is_ordered_text_grounded(content: str, source: str) -> bool:
-    """Allow punctuation/filler omission, but never model-added characters."""
-
-    expected = tuple(character.casefold() for character in content if character.isalnum())
-    available = iter(
-        character.casefold() for character in source if character.isalnum()
-    )
-    return bool(expected) and all(
-        any(candidate == character for candidate in available)
-        for character in expected
-    )
-
-
 @dataclass(frozen=True)
 class CurrentTurnSource:
     """Server-owned current-turn text and exact source-evidence checks."""
@@ -101,17 +88,7 @@ class CurrentTurnSource:
     ) -> None:
         if tool_name == "add_daily_items":
             typed = AddDailyItemsArgs.model_validate(arguments)
-            for item in typed.items:
-                source_message = self._validate_evidence(
-                    item.source_evidence
-                )
-                if not _is_ordered_text_grounded(
-                    item.content,
-                    source_message,
-                ):
-                    raise CurrentTurnSourceEvidenceError(
-                        "DAILY_ITEM_CONTENT_NOT_GROUNDED"
-                    )
+            self._validate_daily_item_spans(typed)
             for item in typed.empty_field_evidence:
                 self._validate_evidence(item.source_evidence)
             if typed.date_evidence is not None:
@@ -242,6 +219,65 @@ class CurrentTurnSource:
             raise CurrentTurnSourceEvidenceError(
                 "MEMORY_VALUE_NOT_GROUNDED"
             )
+
+    def bind_tool_arguments(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return validated arguments with writes materialized from server text."""
+
+        self.validate_tool_arguments(tool_name, arguments)
+        if tool_name != "add_daily_items":
+            return arguments
+
+        typed = AddDailyItemsArgs.model_validate(arguments)
+        bound = typed.model_dump(mode="json")
+        for index, item in enumerate(typed.items):
+            exact_quote = item.source_evidence.exact_quote
+            source_message = self._validate_evidence(item.source_evidence)
+            quote_start = source_message.find(exact_quote)
+            if quote_start < 0:
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_ITEM_EXACT_QUOTE_MISMATCH"
+                )
+            quote_end = quote_start + len(exact_quote)
+            bound["items"][index]["content"] = source_message[
+                quote_start:quote_end
+            ]
+        return bound
+
+    def _validate_daily_item_spans(self, typed: AddDailyItemsArgs) -> None:
+        spans_by_message: dict[int, list[tuple[int, int]]] = {}
+        for item in typed.items:
+            evidence = item.source_evidence
+            source_message = self._validate_evidence(evidence)
+            exact_quote = evidence.exact_quote
+            occurrence_count = source_message.count(exact_quote)
+            if occurrence_count == 0:
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_ITEM_CONTENT_NOT_GROUNDED"
+                    if exact_quote == item.content
+                    else "DAILY_ITEM_EXACT_QUOTE_MISMATCH"
+                )
+            if occurrence_count != 1:
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_ITEM_SOURCE_SPAN_AMBIGUOUS"
+                )
+            start = source_message.find(exact_quote)
+            end = start + len(exact_quote)
+            message_spans = spans_by_message.setdefault(
+                evidence.source_message_index,
+                [],
+            )
+            if any(
+                start < existing_end and existing_start < end
+                for existing_start, existing_end in message_spans
+            ):
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_ITEM_SOURCE_SPAN_OVERLAP"
+                )
+            message_spans.append((start, end))
 
     def _validate_evidence(
         self,
