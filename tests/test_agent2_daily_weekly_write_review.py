@@ -12,6 +12,8 @@ from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedContext,
     TrustedPrincipal,
+    TrustedReportItem,
+    TrustedReportSnapshot,
 )
 from app.agent2.tool_calling.contracts import (
     ExecutionMode,
@@ -19,6 +21,7 @@ from app.agent2.tool_calling.contracts import (
     ToolReceipt,
 )
 from app.agent2.tool_calling.deepseek_adapter import (
+    DeepSeekResponseError,
     DeepSeekToolCallingAdapter,
     InvalidNativeToolArgumentsError,
     _CompletionResponse,
@@ -78,6 +81,66 @@ def _daily_only_context() -> TrustedContext:
         update={
             "allowed_tool_names": frozenset({"add_daily_items"}),
             "gate_decisions": {"add_daily_items": True},
+        }
+    )
+
+
+def _daily_edit_only_context() -> TrustedContext:
+    base = _context()
+    report_id = UUID("20000000-0000-4000-8000-000000000009")
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="tenant-a",
+        owner_user_id=_USER_ID,
+        report_date=date(2026, 8, 14),
+        version=9,
+        status="collecting",
+        items=(
+            TrustedReportItem(
+                item_id="today-9",
+                field="today_work",
+                content="旧内容",
+                report_id=report_id,
+                report_version=9,
+            ),
+            TrustedReportItem(
+                item_id="today-10",
+                field="today_work",
+                content="另一条旧内容",
+                report_id=report_id,
+                report_version=9,
+            ),
+        ),
+    )
+    return base.model_copy(
+        update={
+            "today_report": report,
+            "allowed_tool_names": frozenset({"edit_daily_items"}),
+            "gate_decisions": {"edit_daily_items": True},
+        }
+    )
+
+
+def _daily_edit_and_weekly_context() -> TrustedContext:
+    base = _daily_edit_only_context()
+    allowed = frozenset(
+        {"edit_daily_items", "apply_next_weekly_plan"}
+    )
+    return base.model_copy(
+        update={
+            "allowed_tool_names": allowed,
+            "gate_decisions": {name: True for name in allowed},
+        }
+    )
+
+
+def _daily_context_with_tools(*tool_names: str) -> TrustedContext:
+    base = _daily_edit_only_context()
+    allowed = frozenset(tool_names)
+    return base.model_copy(
+        update={
+            "allowed_tool_names": allowed,
+            "gate_decisions": {name: True for name in allowed},
         }
     )
 
@@ -172,6 +235,57 @@ def _daily_items_call(
         "function": {
             "name": "add_daily_items",
             "arguments": json.dumps(arguments, ensure_ascii=False),
+        },
+    }
+
+
+def _daily_edit_call(
+    *,
+    call_id: str,
+    replacement: str,
+    exact_quote: str,
+    target_item_ids: list[str] | None = None,
+) -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "edit_daily_items",
+            "arguments": json.dumps(
+                {
+                    "report_id": "20000000-0000-4000-8000-000000000009",
+                    "expected_version": 9,
+                    "target_item_ids": target_item_ids or ["today-9"],
+                    "replacement": replacement,
+                    "replacement_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": exact_quote,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
+def _daily_delete_call(
+    *,
+    call_id: str,
+    target_item_ids: list[str],
+) -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "delete_daily_items",
+            "arguments": json.dumps(
+                {
+                    "report_id": "20000000-0000-4000-8000-000000000009",
+                    "expected_version": 9,
+                    "target_item_ids": target_item_ids,
+                },
+                ensure_ascii=False,
+            ),
         },
     }
 
@@ -313,7 +427,12 @@ class _RecordingRuntime:
 
     async def execute(self, calls, *, defer_finalization=False):
         has_write = any(
-            call.tool_name in {"add_daily_items", "apply_next_weekly_plan"}
+            call.tool_name
+            in {
+                "add_daily_items",
+                "edit_daily_items",
+                "apply_next_weekly_plan",
+            }
             for call in calls
         )
         assert defer_finalization is has_write
@@ -355,6 +474,43 @@ def _direct_completion(content: str) -> _CompletionResponse:
     return _CompletionResponse(
         message={"role": "assistant", "content": content},
         metadata={"finish_reason": "stop"},
+    )
+
+
+async def _run_scripted_write_review(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    runtime: _RecordingRuntime,
+    context: TrustedContext,
+    user_text: str,
+    draft_calls: tuple[dict, ...],
+    reviewed_calls: tuple[dict, ...],
+):
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _tool_completion(*draft_calls),
+            _tool_completion(*reviewed_calls),
+            _terminal_completion("日报已按原话处理。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+    return await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text=user_text,
+        context=context,
+        runtime_session=runtime,
     )
 
 
@@ -441,6 +597,550 @@ async def test_daily_partial_quote_is_corrected_before_any_write(
         }
     ]
     assert requested_tool_schemas[1] == ("add_daily_items",)
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_negation_partial_quote_is_corrected_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    draft = _daily_edit_call(
+        call_id="draft-edit",
+        replacement="每周一记录旧内容",
+        exact_quote="每周一记录",
+    )
+    reviewed = _daily_edit_call(
+        call_id="reviewed-edit",
+        replacement="复核模型生成的文字也不能直接写入",
+        exact_quote="不再每周一记录",
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(reviewed),
+            _terminal_completion("已按原话修改第9条。"),
+        )
+    )
+    requested_tool_schemas: list[tuple[str, ...]] = []
+    review_system_prompts: list[str] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        requested_tool_schemas.append(_schema_names(tool_schemas))
+        if thinking_enabled and tool_schemas:
+            review_system_prompts.append(messages[0]["content"])
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="第9条旧内容改为不再每周一记录",
+        context=_daily_edit_only_context(),
+        runtime_session=runtime,
+    )
+
+    assert runtime.execute_count == 1
+    assert runtime.calls[0].arguments == {
+        "report_id": "20000000-0000-4000-8000-000000000009",
+        "expected_version": 9,
+        "target_item_ids": ["today-9"],
+        "replacement": "每周一记录旧内容",
+        "replacement_evidence": {
+            "source_message_index": 1,
+            "exact_quote": "不再每周一记录",
+        },
+    }
+    assert requested_tool_schemas == [
+        ("edit_daily_items",),
+        ("edit_daily_items",),
+        (),
+    ]
+    assert "For edit_daily_items" in review_system_prompts[0]
+    assert result.model_turns[0].response_metadata[
+        "pre_execution_daily_weekly_write_review"
+    ] is True
+    assert [audit.tool_call_id for audit in result.raw_tool_call_audit] == [
+        "draft-edit",
+        "reviewed-edit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_partial_quote_review_can_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    question = "第9条是改为‘不再每周一记录’吗？"
+    completions = iter(
+        (
+            _tool_completion(
+                _daily_edit_call(
+                    call_id="draft-edit",
+                    replacement="每周一记录旧内容",
+                    exact_quote="每周一记录",
+                )
+            ),
+            _clarification_completion(question),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="第9条旧内容改为不再每周一记录",
+        context=_daily_edit_only_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == question
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_review_cannot_change_the_stable_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    changed_target = _daily_edit_call(
+        call_id="reviewed-edit",
+        replacement="不再每周一记录",
+        exact_quote="不再每周一记录",
+    )
+    changed_arguments = json.loads(
+        changed_target["function"]["arguments"]
+    )
+    changed_arguments["target_item_ids"] = ["today-1"]
+    changed_target["function"]["arguments"] = json.dumps(
+        changed_arguments,
+        ensure_ascii=False,
+    )
+    completions = iter(
+        (
+            _tool_completion(
+                _daily_edit_call(
+                    call_id="draft-edit",
+                    replacement="每周一记录旧内容",
+                    exact_quote="每周一记录",
+                )
+            ),
+            _tool_completion(changed_target),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(
+        ValueError,
+        match="cannot change report, version, or stable item IDs",
+    ):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="第9条旧内容改为不再每周一记录",
+            context=_daily_edit_only_context(),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_replacement_rule_is_present_with_weekly_tools_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    draft_edit = _daily_edit_call(
+        call_id="draft-edit",
+        replacement="每周一记录旧内容",
+        exact_quote="每周一记录",
+    )
+    reviewed_edit = _daily_edit_call(
+        call_id="reviewed-edit",
+        replacement="不再每周一记录旧内容",
+        exact_quote="不再每周一记录",
+    )
+    completions = iter(
+        (
+            _tool_completion(draft_edit),
+            _tool_completion(reviewed_edit),
+            _terminal_completion("已按原话修改第9条。"),
+        )
+    )
+    requested_tool_schemas: list[tuple[str, ...]] = []
+    review_system_prompts: list[str] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        requested_tool_schemas.append(_schema_names(tool_schemas))
+        if thinking_enabled and tool_schemas:
+            review_system_prompts.append(messages[0]["content"])
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="第9条旧内容改为不再每周一记录",
+        context=_daily_edit_and_weekly_context(),
+        runtime_session=runtime,
+    )
+
+    assert requested_tool_schemas == [
+        ("apply_next_weekly_plan", "edit_daily_items"),
+        ("apply_next_weekly_plan", "edit_daily_items"),
+        (),
+    ]
+    assert "For edit_daily_items" in review_system_prompts[0]
+    assert "complete contiguous new replacement" in review_system_prompts[0]
+    assert [call.tool_name for call in runtime.calls] == [
+        "edit_daily_items"
+    ]
+
+
+def _daily_add_call(*, call_id: str) -> dict:
+    return _daily_items_call(
+        call_id=call_id,
+        items=[
+            {
+                "field": "today_work",
+                "content": "新增事项",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "新增事项",
+                },
+            }
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_review_cannot_drop_a_sibling_add(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    edit = _daily_edit_call(
+        call_id="draft-edit",
+        replacement="每周一记录",
+        exact_quote="每周一记录",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="preserve non-edit Daily write names and order",
+    ):
+        await _run_scripted_write_review(
+            monkeypatch,
+            runtime=runtime,
+            context=_daily_context_with_tools(
+                "add_daily_items",
+                "edit_daily_items",
+            ),
+            user_text="新增事项；第9条旧内容改为每周一记录",
+            draft_calls=(_daily_add_call(call_id="draft-add"), edit),
+            reviewed_calls=(
+                _daily_edit_call(
+                    call_id="reviewed-edit",
+                    replacement="每周一记录",
+                    exact_quote="每周一记录",
+                ),
+            ),
+        )
+
+    assert runtime.execute_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_review_cannot_reorder_a_sibling_add(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+
+    with pytest.raises(
+        ValueError,
+        match="preserve non-edit Daily write names and order",
+    ):
+        await _run_scripted_write_review(
+            monkeypatch,
+            runtime=runtime,
+            context=_daily_context_with_tools(
+                "add_daily_items",
+                "edit_daily_items",
+            ),
+            user_text="新增事项；第9条旧内容改为每周一记录",
+            draft_calls=(
+                _daily_add_call(call_id="draft-add"),
+                _daily_edit_call(
+                    call_id="draft-edit",
+                    replacement="每周一记录",
+                    exact_quote="每周一记录",
+                ),
+            ),
+            reviewed_calls=(
+                _daily_edit_call(
+                    call_id="reviewed-edit",
+                    replacement="每周一记录",
+                    exact_quote="每周一记录",
+                ),
+                _daily_add_call(call_id="reviewed-add"),
+            ),
+        )
+
+    assert runtime.execute_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_review_cannot_add_a_sibling_daily_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+
+    with pytest.raises(
+        ValueError,
+        match="preserve non-edit Daily write names and order",
+    ):
+        await _run_scripted_write_review(
+            monkeypatch,
+            runtime=runtime,
+            context=_daily_context_with_tools(
+                "add_daily_items",
+                "edit_daily_items",
+                "apply_next_weekly_plan",
+            ),
+            user_text="第9条旧内容改为每周一记录",
+            draft_calls=(
+                _daily_edit_call(
+                    call_id="draft-edit",
+                    replacement="每周一记录",
+                    exact_quote="每周一记录",
+                ),
+            ),
+            reviewed_calls=(
+                _daily_add_call(call_id="reviewed-add"),
+                _daily_edit_call(
+                    call_id="reviewed-edit",
+                    replacement="每周一记录",
+                    exact_quote="每周一记录",
+                ),
+            ),
+        )
+
+    assert runtime.execute_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_review_cannot_change_a_sibling_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+
+    with pytest.raises(
+        ValueError,
+        match="cannot change non-edit Daily write arguments",
+    ):
+        await _run_scripted_write_review(
+            monkeypatch,
+            runtime=runtime,
+            context=_daily_context_with_tools(
+                "edit_daily_items",
+                "delete_daily_items",
+                "apply_next_weekly_plan",
+            ),
+            user_text="第9条改为每周一记录，并删除第10条",
+            draft_calls=(
+                _daily_edit_call(
+                    call_id="draft-edit",
+                    replacement="每周一记录",
+                    exact_quote="每周一记录",
+                ),
+                _daily_delete_call(
+                    call_id="draft-delete",
+                    target_item_ids=["today-10"],
+                ),
+            ),
+            reviewed_calls=(
+                _daily_edit_call(
+                    call_id="reviewed-edit",
+                    replacement="每周一记录",
+                    exact_quote="每周一记录",
+                ),
+                _daily_delete_call(
+                    call_id="reviewed-delete",
+                    target_item_ids=["today-9"],
+                ),
+            ),
+        )
+
+    assert runtime.execute_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_review_keeps_multiple_same_text_edit_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    result = await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=_daily_context_with_tools(
+            "edit_daily_items",
+            "apply_next_weekly_plan",
+        ),
+        user_text="第9条和第10条都改为每周一记录",
+        draft_calls=(
+            _daily_edit_call(
+                call_id="draft-edit-9",
+                replacement="每周一记录旧内容",
+                exact_quote="每周一记录",
+                target_item_ids=["today-9"],
+            ),
+            _daily_edit_call(
+                call_id="draft-edit-10",
+                replacement="每周一记录另一条旧内容",
+                exact_quote="每周一记录",
+                target_item_ids=["today-10"],
+            ),
+        ),
+        reviewed_calls=(
+            _daily_edit_call(
+                call_id="reviewed-edit-10",
+                replacement="复核模型文字10",
+                exact_quote="每周一记录",
+                target_item_ids=["today-10"],
+            ),
+            _daily_edit_call(
+                call_id="reviewed-edit-9",
+                replacement="复核模型文字9",
+                exact_quote="每周一记录",
+                target_item_ids=["today-9"],
+            ),
+        ),
+    )
+
+    assert [
+        tuple(call.arguments["target_item_ids"])
+        for call in runtime.calls
+    ] == [("today-10",), ("today-9",)]
+    assert all(
+        call.arguments["replacement_evidence"]["exact_quote"]
+        == "每周一记录"
+        for call in runtime.calls
+    )
+    assert result.model_turns[1].response_metadata[
+        "daily_weekly_write_semantic_review"
+    ] is True
+
+
+def _daily_edit_weekly_batch(label: str) -> tuple[dict, dict]:
+    return (
+        _daily_edit_call(
+            call_id=f"{label}-edit",
+            replacement="每周一记录",
+            exact_quote="每周一记录",
+        ),
+        _weekly_call(call_id=f"{label}-weekly"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_and_weekly_write_remain_one_atomic_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=_daily_edit_and_weekly_context(),
+        user_text="第9条改为每周一记录；下周三整理案件材料",
+        draft_calls=_daily_edit_weekly_batch("draft"),
+        reviewed_calls=_daily_edit_weekly_batch("reviewed"),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "edit_daily_items",
+        "apply_next_weekly_plan",
+    ]
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_and_weekly_batch_rolls_back_on_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _tool_completion(*_daily_edit_weekly_batch("draft")),
+            _tool_completion(*_daily_edit_weekly_batch("reviewed")),
+            _direct_completion("   "),
+            _direct_completion("\n"),
+            _direct_completion("\t"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(DeepSeekResponseError):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="第9条改为每周一记录；下周三整理案件材料",
+            context=_daily_edit_and_weekly_context(),
+            runtime_session=runtime,
+        )
+
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 1
 
 
 @pytest.mark.asyncio

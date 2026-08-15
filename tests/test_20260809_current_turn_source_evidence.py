@@ -12,6 +12,7 @@ from app.agent2.tool_calling.context import (
     TrustedContext,
     TrustedDailyWriteRetryCandidate,
     TrustedPrincipal,
+    TrustedReportItem,
     TrustedReportSnapshot,
 )
 from app.agent2.tool_calling.contracts import (
@@ -215,6 +216,140 @@ def test_daily_item_quote_must_identify_one_source_occurrence() -> None:
                 ]
             },
         )
+
+
+def test_daily_edit_replacement_is_copied_from_the_current_message() -> None:
+    source = CurrentTurnSource(("第9条旧内容改为每周一记录",))
+
+    bound = source.bind_tool_arguments(
+        "edit_daily_items",
+        {
+            "report_id": "20000000-0000-0000-0000-000000000001",
+            "expected_version": 9,
+            "target_item_ids": ["today-9"],
+            "replacement": "每周一记录旧内容",
+            "replacement_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "每周一记录",
+            },
+        },
+    )
+
+    assert bound["replacement"] == "每周一记录"
+
+
+def test_daily_edit_replacement_quote_must_identify_one_source_occurrence() -> None:
+    source = CurrentTurnSource(
+        ("第9条旧内容改为每周一记录，另一条仍是每周一记录",)
+    )
+
+    with pytest.raises(
+        CurrentTurnSourceEvidenceError,
+        match="DAILY_EDIT_REPLACEMENT_SPAN_AMBIGUOUS",
+    ):
+        source.bind_tool_arguments(
+            "edit_daily_items",
+            {
+                "report_id": "20000000-0000-0000-0000-000000000001",
+                "expected_version": 9,
+                "target_item_ids": ["today-9"],
+                "replacement": "每周一记录",
+                "replacement_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "每周一记录",
+                },
+            },
+        )
+
+
+def test_daily_edit_tool_contract_requires_the_replacement_quote() -> None:
+    tool_schema = deepseek_tool_schemas(
+        frozenset({"edit_daily_items"})
+    )[0]
+    schema = tool_schema["function"]["parameters"]
+
+    assert "replacement_evidence" in schema["required"]
+    assert (
+        "replacement_evidence.exact_quote"
+        in tool_schema["function"]["description"]
+    )
+    assert "exclude the target description" in tool_schema["function"][
+        "description"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent2_daily_edit_binds_the_server_copied_replacement() -> None:
+    owner_id = UUID("10000000-0000-0000-0000-000000000001")
+    report_id = UUID("20000000-0000-0000-0000-000000000001")
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="test-tenant",
+        owner_user_id=owner_id,
+        report_date=date(2026, 8, 9),
+        version=9,
+        status="collecting",
+        items=(
+            TrustedReportItem(
+                item_id="today-9",
+                field="today_work",
+                content="旧内容",
+                report_id=report_id,
+                report_version=9,
+            ),
+        ),
+    )
+    context = TrustedContext(
+        namespace=CANARY_STATE_NAMESPACE,
+        now=datetime(
+            2026,
+            8,
+            9,
+            12,
+            0,
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        ),
+        principal=TrustedPrincipal(
+            tenant_id="test-tenant",
+            user_id=owner_id,
+            conversation_id="test-conversation",
+            source_message_id="test-edit-message",
+            timezone="Asia/Shanghai",
+        ),
+        today_report=report,
+        allowed_tool_names=frozenset({"edit_daily_items"}),
+        gate_decisions={"edit_daily_items": True},
+    )
+
+    bound, failure = await ShadowCallBinder(
+        context,
+        UnavailableDateResolver(),
+        None,
+        current_turn_source=CurrentTurnSource(
+            ("第9条旧内容改为每周一记录",)
+        ),
+    ).bind(
+        NativeToolCall(
+            tool_call_id="edit-call-9",
+            tool_name="edit_daily_items",
+            arguments={
+                "report_id": str(report_id),
+                "expected_version": 9,
+                "target_item_ids": ["today-9"],
+                "replacement": "每周一记录旧内容",
+                "replacement_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "每周一记录",
+                },
+            },
+        )
+    )
+
+    assert failure is None
+    assert bound is not None
+    assert bound.arguments["replacement"] == "每周一记录"
+    assert bound.report == report
+    assert bound.target_item_ids == ("today-9",)
 
 
 def test_empty_acknowledgement_requires_matching_source_evidence() -> None:

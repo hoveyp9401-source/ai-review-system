@@ -737,6 +737,7 @@ class _VersionedItemTarget(StrictContract):
 
 class EditDailyItemsArgs(_VersionedItemTarget):
     replacement: NonEmptyText
+    replacement_evidence: DailyItemSourceEvidence
 
 
 class DeleteDailyItemsArgs(_VersionedItemTarget):

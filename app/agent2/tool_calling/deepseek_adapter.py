@@ -1808,11 +1808,12 @@ def _daily_weekly_write_review_tool_names(
         and context.gate_decisions.get(call.tool_name) is True
     }
     if len(available_domains) < 2:
-        if (
-            available_domains == {"daily"}
-            and "add_daily_items" in current_reviewed_operations
-        ):
-            return frozenset({"add_daily_items"})
+        if available_domains == {"daily"}:
+            source_fidelity_operations = current_reviewed_operations.intersection(
+                {"add_daily_items", "edit_daily_items"}
+            )
+            if source_fidelity_operations:
+                return frozenset(current_reviewed_operations)
         return frozenset()
     if not current_reviewed_operations:
         if calls or not _in_daily_weekly_zero_tool_review_window(context):
@@ -2033,7 +2034,7 @@ def _daily_weekly_write_review_messages(
         "binding is trusted and immutable. Do not change date_selection, "
         "date_expression, proposed_date, date_evidence, report_id, "
         "expected_version, retry_candidate_id, or submit_after_write. You may correct only items "
-        "and explicit-empty-field evidence. Every exact_quote must preserve "
+        "and explicit-empty-field evidence for add_daily_items. Every exact_quote must preserve "
         "the complete meaning of its item, including every negation, condition, "
         "deadline, consequence, exception, and pending action even when separated "
         "by punctuation. Put each independently editable action-object pair in a "
@@ -2049,6 +2050,18 @@ def _daily_weekly_write_review_messages(
         "between two objects remains one item. Do not preserve the draft's item "
         "grouping without independently recounting the source matters. "
         if allowed_domains == {"daily"}
+        and any(call.tool_name == "add_daily_items" for call in calls)
+        else ""
+    )
+    edit_source_constraint = (
+        "For edit_daily_items, the report, version, and target stable item IDs "
+        "are immutable; correct only replacement_evidence. Its exact_quote must "
+        "be the complete contiguous new replacement stated by the user, excluding "
+        "the target description, old content, ordinal, and edit instruction. It "
+        "must preserve every negation, condition, deadline, consequence, and "
+        "exception attached to that replacement. If no complete replacement-only "
+        "span exists, ask a clarification and return no tools. "
+        if any(call.tool_name == "edit_daily_items" for call in calls)
         else ""
     )
     draft_calls = [
@@ -2078,7 +2091,7 @@ def _daily_weekly_write_review_messages(
                 "dates, fields, actors, conditions, evidence, stable IDs, and versions are "
                 "clear, return exactly one complete corrected native tool-call batch using "
                 "only the supplied tools. Preserve exact current-message grounding and do "
-                f"{daily_only_constraint}"
+                f"{daily_only_constraint}{edit_source_constraint}"
                 "not manufacture completion, certainty, or a formal weekday. If any "
                 "material routing or meaning remains ambiguous, return no tool calls and "
                 "exactly one JSON object with keys decision and reply, where decision is "
@@ -2191,6 +2204,11 @@ def _merge_daily_weekly_write_review(
     reviewed: _ParsedAssistantTurn,
     reviewed_tool_names: frozenset[str],
 ) -> _ParsedAssistantTurn:
+    if any(call.tool_name == "edit_daily_items" for call in original.tool_calls):
+        reviewed = _constrain_daily_edit_review(
+            original=original,
+            reviewed=reviewed,
+        )
     if any(call.tool_name == "add_daily_items" for call in original.tool_calls) and any(
         call.tool_name == "add_daily_items" for call in reviewed.tool_calls
     ):
@@ -2266,6 +2284,108 @@ def _merge_daily_weekly_write_review(
         assistant_message=merged_message,
         tool_calls=merged_calls,
         audit=(*original.audit, *reviewed.audit),
+    )
+
+
+def _constrain_daily_edit_review(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Keep trusted edit targets and accept only reviewed source evidence."""
+
+    if not reviewed.tool_calls:
+        return reviewed
+    original_daily_names = tuple(
+        call.tool_name
+        for call in original.tool_calls
+        if _daily_weekly_write_domain(call.tool_name) == "daily"
+    )
+    reviewed_daily_names = tuple(
+        call.tool_name
+        for call in reviewed.tool_calls
+        if _daily_weekly_write_domain(call.tool_name) == "daily"
+    )
+    if original_daily_names != reviewed_daily_names:
+        raise ValueError(
+            "Daily edit review must preserve non-edit Daily write names and order"
+        )
+    original_siblings = tuple(
+        call
+        for call in original.tool_calls
+        if _daily_weekly_write_domain(call.tool_name) == "daily"
+        and call.tool_name != "edit_daily_items"
+    )
+    reviewed_siblings = tuple(
+        call
+        for call in reviewed.tool_calls
+        if _daily_weekly_write_domain(call.tool_name) == "daily"
+        and call.tool_name != "edit_daily_items"
+    )
+    for original_call, reviewed_call in zip(
+        original_siblings,
+        reviewed_siblings,
+        strict=True,
+    ):
+        if original_call.tool_name == "add_daily_items":
+            continue
+        if original_call.arguments != reviewed_call.arguments:
+            raise ValueError(
+                "Daily edit review cannot change non-edit Daily write arguments"
+            )
+
+    original_edits = tuple(
+        call for call in original.tool_calls if call.tool_name == "edit_daily_items"
+    )
+    reviewed_edits = tuple(
+        call for call in reviewed.tool_calls if call.tool_name == "edit_daily_items"
+    )
+    if len(original_edits) != len(reviewed_edits):
+        raise ValueError("Daily edit review must preserve every edit target")
+
+    def target_key(call: NativeToolCall) -> tuple[Any, Any, tuple[Any, ...]]:
+        raw_item_ids = call.arguments.get("target_item_ids")
+        item_ids = tuple(raw_item_ids) if isinstance(raw_item_ids, list) else ()
+        return (
+            call.arguments.get("report_id"),
+            call.arguments.get("expected_version"),
+            item_ids,
+        )
+
+    original_by_target = {target_key(call): call for call in original_edits}
+    reviewed_by_target = {target_key(call): call for call in reviewed_edits}
+    if (
+        len(original_by_target) != len(original_edits)
+        or len(reviewed_by_target) != len(reviewed_edits)
+        or set(original_by_target) != set(reviewed_by_target)
+    ):
+        raise ValueError(
+            "Daily edit review cannot change report, version, or stable item IDs"
+        )
+
+    constrained_by_review_id: dict[str, NativeToolCall] = {}
+    for target, reviewed_call in reviewed_by_target.items():
+        draft_call = original_by_target[target]
+        constrained_arguments = dict(draft_call.arguments)
+        constrained_arguments["replacement_evidence"] = (
+            reviewed_call.arguments.get("replacement_evidence")
+        )
+        validated_arguments = validate_tool_arguments(
+            "edit_daily_items",
+            constrained_arguments,
+        )
+        constrained_by_review_id[reviewed_call.tool_call_id] = NativeToolCall(
+            reviewed_call.tool_call_id,
+            "edit_daily_items",
+            validated_arguments,
+        )
+
+    return replace(
+        reviewed,
+        tool_calls=tuple(
+            constrained_by_review_id.get(call.tool_call_id, call)
+            for call in reviewed.tool_calls
+        ),
     )
 
 

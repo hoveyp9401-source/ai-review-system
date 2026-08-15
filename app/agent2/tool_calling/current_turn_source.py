@@ -12,6 +12,7 @@ from app.agent2.tool_calling.contracts import (
     ApplyNextWeeklyPlanArgs,
     CorrectDailyReportDateArgs,
     CurrentUserMessageEvidence,
+    EditDailyItemsArgs,
     RecordWeeklyPlanItemsAsTodayWorkArgs,
     RememberPersonalMemoryArgs,
     SubmitCurrentWeeklyReportArgs,
@@ -97,6 +98,22 @@ class CurrentTurnSource:
                     raise CurrentTurnSourceEvidenceError(
                         "CURRENT_DATE_EVIDENCE_MISMATCH"
                     )
+            return
+        if tool_name == "edit_daily_items":
+            typed_edit = EditDailyItemsArgs.model_validate(arguments)
+            source_message = self._validate_evidence(
+                typed_edit.replacement_evidence
+            )
+            exact_quote = typed_edit.replacement_evidence.exact_quote
+            occurrence_count = source_message.count(exact_quote)
+            if occurrence_count == 0:
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_EDIT_REPLACEMENT_QUOTE_MISMATCH"
+                )
+            if occurrence_count != 1:
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_EDIT_REPLACEMENT_SPAN_AMBIGUOUS"
+                )
             return
         if tool_name == "correct_daily_report_date":
             typed_correction = CorrectDailyReportDateArgs.model_validate(
@@ -228,8 +245,20 @@ class CurrentTurnSource:
         """Return validated arguments with writes materialized from server text."""
 
         self.validate_tool_arguments(tool_name, arguments)
-        if tool_name != "add_daily_items":
+        if tool_name not in {"add_daily_items", "edit_daily_items"}:
             return arguments
+
+        if tool_name == "edit_daily_items":
+            typed_edit = EditDailyItemsArgs.model_validate(arguments)
+            bound_edit = typed_edit.model_dump(mode="json")
+            evidence = typed_edit.replacement_evidence
+            source_message = self._validate_evidence(evidence)
+            quote_start = source_message.find(evidence.exact_quote)
+            quote_end = quote_start + len(evidence.exact_quote)
+            bound_edit["replacement"] = source_message[
+                quote_start:quote_end
+            ]
+            return bound_edit
 
         typed = AddDailyItemsArgs.model_validate(arguments)
         bound = typed.model_dump(mode="json")

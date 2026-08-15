@@ -772,9 +772,12 @@ TOOL_REGISTRY = MappingProxyType(
         "edit_daily_items": _definition(
             "edit_daily_items",
             "Replace trusted stable item IDs at an exact report version. The replacement must "
-            "faithfully preserve the new content intended by the current user_message. Minimal "
-            "professional cleanup is allowed only when it does not add, remove, or change "
-            "meaning. Do not replace it with another item's content merely because the "
+            "faithfully preserve the new content intended by the current user_message. Supply "
+            "replacement_evidence.exact_quote as the complete contiguous "
+            "current-message passage that states only the intended new item content; exclude "
+            "the target description, ordinal, old content, and edit instruction. The server "
+            "copies that passage and never persists model-authored replacement wording. Do not "
+            "replace it with another item's content merely because the "
             "replacement resembles an item label or ordinal. Trusted context may resolve the "
             "target but cannot supply replacement content unless the current user_message "
             "explicitly requests copying content from an existing item. Do not edit an item "
