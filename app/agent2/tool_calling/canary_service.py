@@ -161,6 +161,9 @@ class CanaryIngressOutcome:
     tool_clarification_count: int = 0
     tool_blocked_count: int = 0
     tool_failure_count: int = 0
+    source_turn_id: str | None = None
+    tool_receipt_count: int = 0
+    successful_pure_read: bool = False
     pre_execution_block_observations: tuple[dict[str, Any], ...] = ()
     daily_write_retry_continuation: dict[str, Any] | None = None
     user_visible_result: str = "unknown"
@@ -495,6 +498,19 @@ def _canary_turn_observation(
             for item in outcome.pre_execution_block_observations
         ],
     }
+    if outcome.source_turn_id is not None:
+        observation.update(
+            {
+                "source_turn_id": outcome.source_turn_id,
+                "tool_receipt_count": max(
+                    0,
+                    outcome.tool_receipt_count,
+                ),
+                "successful_pure_read": bool(
+                    outcome.successful_pure_read
+                ),
+            }
+        )
     continuation = validated_daily_retry_evidence(
         outcome.daily_write_retry_continuation
     )
@@ -961,6 +977,11 @@ async def process_tool_call_canary_ingress(
             ],
             tool_blocked_count=receipt_counts["blocked"],
             tool_failure_count=receipt_counts["failed"],
+            source_turn_id=source_message_id,
+            tool_receipt_count=len(result.receipts),
+            successful_pure_read=(
+                _is_successful_pure_read_turn(result.receipts)
+            ),
             pre_execution_block_observations=(
                 _pre_execution_block_observations(result.receipts)
             ),
@@ -1010,6 +1031,31 @@ def _receipt_status_counts(receipts: tuple[Any, ...]) -> dict[str, int]:
         if value in counts:
             counts[value] += 1
     return counts
+
+
+def _is_successful_pure_read_turn(
+    receipts: tuple[Any, ...],
+) -> bool:
+    """Classify the complete receipt set without interpreting reply text."""
+
+    if not receipts:
+        return False
+    for receipt in receipts:
+        tool_name = str(
+            getattr(receipt, "tool_name", "") or ""
+        )
+        definition = TOOL_REGISTRY.get(tool_name)
+        status = getattr(receipt, "status", "")
+        status_value = str(
+            getattr(status, "value", status) or ""
+        )
+        if (
+            definition is None
+            or definition.read_or_write != "read"
+            or status_value not in {"success", "no_op"}
+        ):
+            return False
+    return True
 
 
 _PRE_EXECUTION_BLOCK_SCHEMA_VERSION = (

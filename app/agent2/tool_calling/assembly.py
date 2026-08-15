@@ -340,6 +340,9 @@ class TrustedContextAssembler:
             loaded_report_ids.add(report.report_id)
             loaded_report_dates.add(report.report_date)
         recent_operations = tuple(validated_recent_operations)
+        recent_messages = _mark_past_read_snapshots(
+            recent_messages,
+        )
 
         personal_memory = (
             await self._personal_memory_module.read_for_turn(
@@ -451,6 +454,25 @@ def _validate_loaded_report(
     ):
         raise ValueError("read port returned a report outside the requested trusted scope")
     return report
+
+
+def _mark_past_read_snapshots(
+    messages: tuple[TrustedRecentMessage, ...],
+) -> tuple[TrustedRecentMessage, ...]:
+    """Expose only server-verified full-turn read snapshots to the model."""
+
+    return tuple(
+        message.model_copy(
+            update={"fact_time_scope": "past_snapshot"}
+        )
+        if message.role == "assistant" and message.read_snapshot_verified
+        else (
+            message.model_copy(update={"fact_time_scope": None})
+            if message.fact_time_scope is not None
+            else message
+        )
+        for message in messages
+    )
 
 
 def _select_active_pending(

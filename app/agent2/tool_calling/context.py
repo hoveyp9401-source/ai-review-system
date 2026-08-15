@@ -210,6 +210,31 @@ class TrustedRecentMessage(_FrozenModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=4000)
     source_message_id: str = Field(min_length=1, max_length=512)
+    source_turn_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+    )
+    read_snapshot_verified: bool = False
+    fact_time_scope: Literal["past_snapshot"] | None = None
+
+    @model_validator(mode="after")
+    def only_assistant_replies_can_be_read_snapshots(
+        self,
+    ) -> TrustedRecentMessage:
+        if self.role != "assistant" and (
+            self.source_turn_id is not None
+            or self.read_snapshot_verified
+            or self.fact_time_scope is not None
+        ):
+            raise ValueError(
+                "only an assistant reply can carry trusted turn evidence"
+            )
+        if self.read_snapshot_verified and self.source_turn_id is None:
+            raise ValueError(
+                "a verified read snapshot requires a trusted source turn"
+            )
+        return self
 
 
 class TrustedReportReference(_FrozenModel):
@@ -509,7 +534,17 @@ class TrustedContext(_FrozenModel):
                 if self.retryable_daily_write is not None
                 else None
             ),
-            "recent_messages": [item.model_dump(mode="json") for item in self.recent_messages],
+            "recent_messages": [
+                item.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                    exclude={
+                        "source_turn_id",
+                        "read_snapshot_verified",
+                    },
+                )
+                for item in self.recent_messages
+            ],
             "recent_operations": [
                 item.model_payload(item_contents=item_contents)
                 for item in self.recent_operations

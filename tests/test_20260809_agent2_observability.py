@@ -276,25 +276,39 @@ async def test_successful_canary_turn_exposes_actual_model_call_evidence(
         async def begin_nested(self):
             return Savepoint()
 
-    outcome = await canary_service.process_tool_call_canary_ingress(
-        Session(),
-        user=SimpleNamespace(
-            id="user-1",
-            name="测试用户",
-            timezone="Asia/Shanghai",
-        ),
-        dingtalk_user_id="ding-user-1",
-        user_text="查看我的日报",
-        source_channel="test",
-        conversation_id="conversation-1",
-        source_message_id="message-1",
-        settings=SimpleNamespace(
-            timezone="Asia/Shanghai",
-            llm_base_url="https://example.invalid",
-        ),
-        llm_client=SimpleNamespace(native_http_client=object()),
-        now=datetime(2026, 8, 9, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
-    )
+    async def process_turn(
+        source_message_id: str,
+        user_text: str,
+        minute: int,
+    ):
+        return await canary_service.process_tool_call_canary_ingress(
+            Session(),
+            user=SimpleNamespace(
+                id="user-1",
+                name="测试用户",
+                timezone="Asia/Shanghai",
+            ),
+            dingtalk_user_id="ding-user-1",
+            user_text=user_text,
+            source_channel="test",
+            conversation_id="conversation-1",
+            source_message_id=source_message_id,
+            settings=SimpleNamespace(
+                timezone="Asia/Shanghai",
+                llm_base_url="https://example.invalid",
+            ),
+            llm_client=SimpleNamespace(native_http_client=object()),
+            now=datetime(
+                2026,
+                8,
+                9,
+                9,
+                minute,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+        )
+
+    outcome = await process_turn("message-1", "查看我的日报", 0)
 
     assert outcome.model_call_count == 2
     assert outcome.model_request_attempt_count == 3
@@ -306,8 +320,66 @@ async def test_successful_canary_turn_exposes_actual_model_call_evidence(
     assert outcome.tool_clarification_count == 0
     assert outcome.tool_blocked_count == 0
     assert outcome.tool_failure_count == 0
+    assert outcome.source_turn_id == "message-1"
+    assert outcome.tool_receipt_count == 2
+    assert outcome.successful_pure_read is True
     assert outcome.user_visible_result == "success"
     assert outcome.reply_formed is True
+
+    persisted = build_canary_persisted_response_payload(outcome)
+    observation = persisted["_agent2_turn_observation_v1"]
+    assert observation["source_turn_id"] == "message-1"
+    assert observation["tool_receipt_count"] == 2
+    assert observation["successful_pure_read"] is True
+    assert "source_turn_id" not in json.dumps(
+        canary_provider_response_payload(persisted),
+        ensure_ascii=False,
+    )
+
+    result.receipts = (
+        receipts[0],
+        SimpleNamespace(
+            tool_name="query_today_report",
+            status=SimpleNamespace(value="failed"),
+            changed=False,
+            target_type="daily_report",
+            target_id="report-1",
+        ),
+    )
+    mixed_outcome = await process_turn(
+        "message-2",
+        "重新查看我的日报",
+        1,
+    )
+    assert mixed_outcome.tool_receipt_count == 2
+    assert mixed_outcome.successful_pure_read is False
+
+    result.receipts = (
+        SimpleNamespace(
+            tool_name="add_daily_items",
+            status=SimpleNamespace(value="success"),
+            changed=True,
+            target_type="daily_report",
+            target_id="report-1",
+        ),
+        *tuple(
+            SimpleNamespace(
+                tool_name="query_today_report",
+                status=SimpleNamespace(value="success"),
+                changed=False,
+                target_type="daily_report",
+                target_id="report-1",
+            )
+            for _ in range(6)
+        ),
+    )
+    seven_receipt_outcome = await process_turn(
+        "message-3",
+        "更新后再查看我的日报",
+        2,
+    )
+    assert seven_receipt_outcome.tool_receipt_count == 7
+    assert seven_receipt_outcome.successful_pure_read is False
 
 
 def test_stream_wires_success_and_fail_closed_model_evidence() -> None:

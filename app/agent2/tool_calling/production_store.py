@@ -59,7 +59,7 @@ from app.agent2.tool_calling.outbound_context import (
     OUTBOUND_CONTEXT_BACKEND_ACTION,
     trusted_recent_outbound_message,
 )
-from app.agent2.tool_calling.registry import ToolDefinition
+from app.agent2.tool_calling.registry import TOOL_REGISTRY, ToolDefinition
 from app.agent2.tool_calling.turn_batching import (
     INGRESS_META_KEY,
     is_recoverable_ingress_payload,
@@ -84,6 +84,13 @@ _RECENT_MESSAGE_MAX_AGE = timedelta(hours=2)
 _SCHEDULED_OUTBOUND_MAX_AGE = timedelta(hours=16)
 _RECENT_OPERATION_MAX_AGE = timedelta(hours=2)
 _TURN_OBSERVATION_KEY = "_agent2_turn_observation_v1"
+
+
+@dataclass(frozen=True)
+class _TrustedTurnObservation:
+    source_turn_id: str
+    tool_receipt_count: int
+    successful_pure_read: bool
 
 
 def _strict_ascii_allowlist(raw: object) -> frozenset[str]:
@@ -462,13 +469,32 @@ class ProductionContextStore:
             user_id=request.user_id,
             now=request.server_now,
         )
-        for row in reversed(rows):
-            if not _event_matches_request(
+        scoped_rows = tuple(
+            row
+            for row in reversed(rows)
+            if _event_matches_request(
                 row,
                 request=request,
                 dingtalk_user_id=self._user.dingtalk_user_id,
-            ):
-                continue
+            )
+        )
+        turn_observations = {
+            row.idempotency_key: observation
+            for row in scoped_rows
+            if (
+                observation := _trusted_turn_observation(row)
+            )
+            is not None
+        }
+        verified_read_sources = await _verified_pure_read_source_ids(
+            self._session,
+            request=request,
+            observations=tuple(turn_observations.values()),
+        )
+        for row in scoped_rows:
+            observation = turn_observations.get(
+                row.idempotency_key
+            )
             user_content = _text_content(row.payload)
             if user_content:
                 timed_messages.append(
@@ -502,6 +528,17 @@ class ProductionContextStore:
                             content=assistant_content,
                             source_message_id=(
                                 f"{row.idempotency_key}:assistant"
+                            ),
+                            source_turn_id=(
+                                observation.source_turn_id
+                                if observation is not None
+                                else None
+                            ),
+                            read_snapshot_verified=(
+                                observation is not None
+                                and observation.successful_pure_read
+                                and observation.source_turn_id
+                                in verified_read_sources
                             ),
                         ),
                         False,
@@ -1008,6 +1045,101 @@ def _event_matches_request(
         == request.conversation_id
         and event.received_at >= request.server_now - _RECENT_MESSAGE_MAX_AGE
     )
+
+
+def _trusted_turn_observation(
+    event: WebhookEvent,
+) -> _TrustedTurnObservation | None:
+    response = (
+        event.response_payload
+        if isinstance(event.response_payload, Mapping)
+        else {}
+    )
+    raw = response.get(_TURN_OBSERVATION_KEY)
+    if not isinstance(raw, Mapping):
+        return None
+    source_turn_id = raw.get("source_turn_id")
+    receipt_count = raw.get("tool_receipt_count")
+    successful_pure_read = raw.get("successful_pure_read")
+    if (
+        raw.get("schema_version")
+        != "agent2.turn.observation.v1"
+        or raw.get("message_processing_status") != "consumed"
+        or raw.get("reply_status") != "formed"
+        or raw.get("model_result_status") != "success"
+        or not isinstance(source_turn_id, str)
+        or not source_turn_id
+        or source_turn_id != source_turn_id.strip()
+        or len(source_turn_id) > 512
+        or type(receipt_count) is not int
+        or receipt_count < 0
+        or type(successful_pure_read) is not bool
+        or (successful_pure_read and receipt_count == 0)
+        or (
+            successful_pure_read
+            and raw.get("business_write_committed") is not False
+        )
+    ):
+        return None
+    return _TrustedTurnObservation(
+        source_turn_id=source_turn_id,
+        tool_receipt_count=receipt_count,
+        successful_pure_read=successful_pure_read,
+    )
+
+
+async def _verified_pure_read_source_ids(
+    session: Any,
+    *,
+    request: TrustedContextRequest,
+    observations: tuple[_TrustedTurnObservation, ...],
+) -> frozenset[str]:
+    expected_counts = {
+        observation.source_turn_id: observation.tool_receipt_count
+        for observation in observations
+        if observation.successful_pure_read
+    }
+    if not expected_counts:
+        return frozenset()
+    rows = list(
+        (
+            await session.scalars(
+                select(ToolCallCanaryReceipt).where(
+                    ToolCallCanaryReceipt.tenant_id
+                    == request.tenant_id,
+                    ToolCallCanaryReceipt.user_id
+                    == str(request.user_id),
+                    ToolCallCanaryReceipt.conversation_id
+                    == request.conversation_id,
+                    ToolCallCanaryReceipt.source_message_id.in_(
+                        tuple(expected_counts)
+                    ),
+                    ToolCallCanaryReceipt.created_at
+                    >= request.server_now - _RECENT_OPERATION_MAX_AGE,
+                )
+            )
+        ).all()
+    )
+    by_source: dict[str, list[ToolCallCanaryReceipt]] = {}
+    for row in rows:
+        by_source.setdefault(row.source_message_id, []).append(row)
+
+    verified: set[str] = set()
+    for source_turn_id, expected_count in expected_counts.items():
+        source_rows = by_source.get(source_turn_id, [])
+        if len(source_rows) != expected_count:
+            continue
+        if all(
+            row.status in {"success", "no_op"}
+            and (
+                definition := TOOL_REGISTRY.get(row.tool_name)
+            )
+            is not None
+            and definition.read_or_write == "read"
+            for row in source_rows
+        ):
+            verified.add(source_turn_id)
+    return frozenset(verified)
 
 
 def _retry_evidence_from_event(
