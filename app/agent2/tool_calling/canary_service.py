@@ -64,6 +64,10 @@ from app.agent2.tool_calling.production_contracts import (
 )
 from app.agent2.tool_calling.production_runtime import ProductionRuntime
 from app.agent2.tool_calling.production_store import ProductionContextStore
+from app.agent2.tool_calling.reply_delivery import (
+    REPLY_DELIVERY_KEY,
+    cached_reply_is_retry_safe,
+)
 from app.agent2.tool_calling.receipt_reply import (
     canary_block_message,
 )
@@ -453,6 +457,7 @@ def canary_provider_response_payload(
         return {}
     payload = dict(persisted_payload)
     payload.pop(_CANARY_TURN_OBSERVATION_MARKER, None)
+    payload.pop(REPLY_DELIVERY_KEY, None)
     return payload
 
 
@@ -527,11 +532,12 @@ def is_canary_message_delivery_suppressed(
     if not isinstance(response_payload, Mapping):
         return False
     marker = response_payload.get(_CANARY_TRANSPORT_MARKER)
+    if not isinstance(marker, Mapping):
+        return False
     return (
-        isinstance(marker, Mapping)
-        and marker.get("messages_enabled") is False
+        marker.get("messages_enabled") is False
         and marker.get("delivery") == "suppressed"
-    )
+    ) or marker.get("delivery") == "batched_follower"
 
 
 def canary_route_suppresses_delivery(
@@ -563,9 +569,11 @@ async def deliver_cached_canary_message_if_enabled(
     response_payload: Mapping[str, Any] | None,
     sender: Callable[[str], Awaitable[Any]],
 ) -> bool:
-    """Deliver cached text unless its server marker forbids delivery."""
+    """Retry only a reply proven to have failed before any provider request."""
 
     if is_canary_message_delivery_suppressed(response_payload):
+        return False
+    if not cached_reply_is_retry_safe(response_payload):
         return False
     if not isinstance(response_payload, Mapping):
         return False

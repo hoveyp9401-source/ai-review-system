@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from types import SimpleNamespace
@@ -30,6 +31,8 @@ from app.repositories import (
     maybe_create_report_interaction_event,
 )
 from app.services.dingtalk import (
+    DingTalkDeliveryError,
+    DingTalkOutboundContentError,
     DingTalkRobotClient,
     UNSUPPORTED_FILE_REPLY_TEXT,
     VOICE_CONTENT_UNAVAILABLE_REPLY_TEXT,
@@ -37,6 +40,12 @@ from app.services.dingtalk import (
     extract_voice_download_code,
     extract_voice_text,
     normalize_dingtalk_conversation_kind,
+)
+from app.agent2.tool_calling.reply_delivery import (
+    REPLY_DELIVERY_KEY,
+    build_reply_delivery_record,
+    cached_reply_is_retry_safe,
+    validated_reply_delivery_record,
 )
 from app.services.performance_service import (
     NO_ACTIVE_PERFORMANCE_TASK_MESSAGE,
@@ -404,9 +413,13 @@ def _apply_reply_observability(
             "suppressed"
             if observation.transport_status == "suppressed"
             else (
-                "unverified"
-                if observation.provider_accepted
-                else "not_delivered"
+                "failed"
+                if observation.transport_status == "delivery_failed"
+                else (
+                    "unverified"
+                    if observation.provider_accepted
+                    else "not_delivered"
+                )
             )
         )
     )
@@ -416,7 +429,7 @@ def _canary_stream_status(
     outcome: Any,
     observation: StreamReplyObservation,
 ) -> str:
-    if observation.transport_status == "failed":
+    if observation.transport_status in {"failed", "delivery_failed"}:
         return "tool_call_canary_reply_failed"
     if observation.transport_status == "suppressed":
         return "tool_call_canary_delivery_suppressed"
@@ -872,17 +885,130 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
         self,
         incoming: dingtalk_stream.ChatbotMessage,
         response_payload: dict[str, Any],
+        event_id: uuid.UUID,
     ) -> None:
         async def _safe_reply() -> None:
             try:
+                async def retry_proven_preacceptance_failure(
+                    text: str,
+                ) -> None:
+                    async with AsyncSessionLocal() as session:
+                        event = await session.get(
+                            WebhookEvent,
+                            event_id,
+                            with_for_update=True,
+                        )
+                        if event is None or not cached_reply_is_retry_safe(
+                            event.response_payload
+                        ):
+                            return
+                        evidence = validated_reply_delivery_record(
+                            event.response_payload
+                        )
+                        if evidence is None:
+                            return
+                        try:
+                            retry_conversation_kind = (
+                                normalize_dingtalk_conversation_kind(
+                                    getattr(
+                                        incoming,
+                                        "conversation_type",
+                                        None,
+                                    )
+                                )
+                            )
+                        except Exception:
+                            return
+                        if retry_conversation_kind not in {
+                            "direct",
+                            "group",
+                        }:
+                            return
+                        expected_channel = (
+                            "direct_robot"
+                            if retry_conversation_kind == "direct"
+                            else "session_webhook"
+                        )
+                        persisted_payload = (
+                            event.payload
+                            if isinstance(event.payload, dict)
+                            else {}
+                        )
+                        persisted_response_payload = (
+                            event.response_payload
+                            if isinstance(event.response_payload, dict)
+                            else {}
+                        )
+                        persisted_text_block = (
+                            persisted_response_payload.get("text")
+                        )
+                        persisted_reply_text = (
+                            str(persisted_text_block.get("content") or "")
+                            if isinstance(persisted_text_block, dict)
+                            else ""
+                        )
+                        incoming_conversation_id = str(
+                            getattr(incoming, "conversation_id", "")
+                            or ""
+                        ).strip()
+                        persisted_conversation_id = str(
+                            persisted_payload.get("conversationId") or ""
+                        ).strip()
+                        incoming_message_id = str(
+                            getattr(incoming, "message_id", "") or ""
+                        ).strip()
+                        persisted_message_id = str(
+                            event.external_message_id or ""
+                        ).strip()
+                        if (
+                            event.status not in {"processed", "failed"}
+                            or evidence.channel != expected_channel
+                            or _stream_user_id(incoming)
+                            != event.dingtalk_user_id
+                            or not incoming_conversation_id
+                            or incoming_conversation_id
+                            != persisted_conversation_id
+                            or not incoming_message_id
+                            or incoming_message_id != persisted_message_id
+                            or not persisted_reply_text
+                            or persisted_reply_text != text
+                        ):
+                            return
+                        claim = build_reply_delivery_record(
+                            channel=evidence.channel,
+                            provider_reference=None,
+                            provider_accepted=False,
+                            delivery_verified=False,
+                            status="unknown",
+                            error="RetryClaimedBeforeSend",
+                            checked_at=now_in_timezone(
+                                self.settings.timezone
+                            ),
+                        )
+                        await _persist_agent2_reply_delivery(
+                            session=session,
+                            event=event,
+                            record=claim,
+                        )
+                        retry_job = StreamJob(
+                            message=incoming,
+                            text="",
+                            payload={},
+                            event_id=event_id,
+                            idempotency_key=event.idempotency_key,
+                        )
+                        await _reply_with_observability(
+                            self,
+                            self.robot,
+                            retry_job,
+                            text,
+                            session=session,
+                            event=event,
+                        )
+
                 await deliver_cached_canary_message_if_enabled(
                     response_payload,
-                    lambda text: _send_stream_reply(
-                        self.robot,
-                        incoming,
-                        text,
-                        self.settings.stream_reply_timeout_seconds,
-                    ),
+                    retry_proven_preacceptance_failure,
                 )
             except Exception:
                 logger.exception("stream cached reply failed")
@@ -1147,6 +1273,7 @@ class DailyReviewStreamHandler(dingtalk_stream.ChatbotHandler):
                 self._reply_cached_soon(
                     incoming,
                     persisted.response_payload,
+                    persisted.event_id,
                 )
             return dingtalk_stream.AckMessage.STATUS_OK, "duplicate"
 
@@ -1326,33 +1453,340 @@ async def _reply(
     return observation.elapsed_seconds
 
 
+async def _persist_agent2_reply_delivery(
+    *,
+    session: Any | None,
+    event: WebhookEvent | None,
+    record: dict[str, Any],
+) -> None:
+    if session is None or event is None:
+        return
+    response_payload = dict(event.response_payload or {})
+    response_payload[REPLY_DELIVERY_KEY] = record
+    event.response_payload = response_payload
+    await session.flush()
+    await session.commit()
+
+
 async def _reply_with_observability(
     handler: DailyReviewStreamHandler,
     robot: DingTalkRobotClient,
     job: StreamJob,
     text: str,
+    *,
+    session: Any | None = None,
+    event: WebhookEvent | None = None,
 ) -> StreamReplyObservation:
     send_start = time.perf_counter()
+    timeout_seconds = handler.settings.stream_reply_timeout_seconds
     try:
-        await _send_stream_reply(robot, job.message, text, handler.settings.stream_reply_timeout_seconds)
+        conversation_kind = normalize_dingtalk_conversation_kind(
+            getattr(job.message, "conversation_type", None)
+        )
+    except Exception:
+        conversation_kind = "unknown"
+    if conversation_kind == "unknown" and session is None and event is None:
+        try:
+            await _send_stream_reply(
+                robot,
+                job.message,
+                text,
+                timeout_seconds,
+            )
+        except Exception as exc:
+            return StreamReplyObservation(
+                elapsed_seconds=_elapsed_seconds(send_start),
+                transport_status="failed",
+                provider_accepted=False,
+                delivery_verified=False,
+                error_type=type(exc).__name__,
+            )
+        return StreamReplyObservation(
+            elapsed_seconds=_elapsed_seconds(send_start),
+            transport_status="provider_accepted",
+            provider_accepted=True,
+            delivery_verified=False,
+        )
+    channel = (
+        "session_webhook"
+        if conversation_kind == "group"
+        else "direct_robot"
+    )
+
+    async def persist_record(
+        *,
+        provider_reference: str | None,
+        provider_accepted: bool,
+        delivery_verified: bool,
+        status: str,
+        error: str | None,
+        retry_safe_preacceptance_failure: bool = False,
+    ) -> bool:
+        try:
+            record = build_reply_delivery_record(
+                channel=channel,
+                provider_reference=provider_reference,
+                provider_accepted=provider_accepted,
+                delivery_verified=delivery_verified,
+                status=status,
+                error=error,
+                checked_at=now_in_timezone(handler.settings.timezone),
+                retry_safe_preacceptance_failure=(
+                    retry_safe_preacceptance_failure
+                ),
+            )
+            await _persist_agent2_reply_delivery(
+                session=session,
+                event=event,
+                record=record,
+            )
+        except Exception:
+            logger.exception(
+                "stream reply delivery evidence persistence failed status=%s",
+                status,
+            )
+            return False
+        return True
+
+    if conversation_kind == "group":
+        session_webhook = str(
+            getattr(job.message, "session_webhook", "") or ""
+        ).strip()
+        if not session_webhook:
+            await persist_record(
+                provider_reference=None,
+                provider_accepted=False,
+                delivery_verified=False,
+                status="unknown",
+                error="MissingSessionWebhook",
+            )
+            return StreamReplyObservation(
+                elapsed_seconds=_elapsed_seconds(send_start),
+                transport_status="not_attempted",
+                provider_accepted=False,
+                delivery_verified=False,
+                error_type="MissingSessionWebhook",
+            )
+        try:
+            await asyncio.wait_for(
+                robot.send_session_webhook_text(
+                    session_webhook=session_webhook,
+                    text=text,
+                ),
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            error_type = type(exc).__name__
+            await persist_record(
+                provider_reference=None,
+                provider_accepted=False,
+                delivery_verified=False,
+                status="unknown",
+                error=error_type,
+            )
+            logger.exception("stream group reply acceptance unknown: %s", exc)
+            return StreamReplyObservation(
+                elapsed_seconds=_elapsed_seconds(send_start),
+                transport_status="unknown",
+                provider_accepted=False,
+                delivery_verified=False,
+                error_type=error_type,
+            )
+        await persist_record(
+            provider_reference=None,
+            provider_accepted=True,
+            delivery_verified=False,
+            status="accepted_unverified",
+            error=None,
+        )
         send_seconds = _elapsed_seconds(send_start)
-        logger.info("stream final reply sent message=%s send_seconds=%s", job.message.message_id, send_seconds)
+        logger.info(
+            "stream group reply accepted message=%s send_seconds=%s",
+            job.message.message_id,
+            send_seconds,
+        )
         return StreamReplyObservation(
             elapsed_seconds=send_seconds,
             transport_status="provider_accepted",
             provider_accepted=True,
             delivery_verified=False,
         )
-    except Exception as exc:
-        send_seconds = _elapsed_seconds(send_start)
-        logger.exception("stream final reply failed: %s", exc)
-        return StreamReplyObservation(
-            elapsed_seconds=send_seconds,
-            transport_status="failed",
+
+    user_id = _stream_user_id(job.message)
+    if conversation_kind != "direct" or not user_id:
+        error_type = (
+            "UnknownConversationKind"
+            if conversation_kind != "direct"
+            else "MissingDirectRecipient"
+        )
+        await persist_record(
+            provider_reference=None,
             provider_accepted=False,
             delivery_verified=False,
-            error_type=type(exc).__name__,
+            status="unknown",
+            error=error_type,
         )
+        return StreamReplyObservation(
+            elapsed_seconds=_elapsed_seconds(send_start),
+            transport_status="not_attempted",
+            provider_accepted=False,
+            delivery_verified=False,
+            error_type=error_type,
+        )
+
+    try:
+        accepted_payload = await asyncio.wait_for(
+            robot.send_robot_direct_text(
+                user_ids=[user_id],
+                text=text,
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        error_type = type(exc).__name__
+        proven_local_failure = isinstance(
+            exc,
+            DingTalkOutboundContentError,
+        )
+        await persist_record(
+            provider_reference=None,
+            provider_accepted=False,
+            delivery_verified=False,
+            status="failed" if proven_local_failure else "unknown",
+            error=error_type,
+            retry_safe_preacceptance_failure=proven_local_failure,
+        )
+        logger.exception("stream direct reply acceptance unknown: %s", exc)
+        return StreamReplyObservation(
+            elapsed_seconds=_elapsed_seconds(send_start),
+            transport_status=("failed" if proven_local_failure else "unknown"),
+            provider_accepted=False,
+            delivery_verified=False,
+            error_type=error_type,
+        )
+
+    if not isinstance(accepted_payload, Mapping):
+        await persist_record(
+            provider_reference=None,
+            provider_accepted=False,
+            delivery_verified=False,
+            status="unknown",
+            error="InvalidDirectAcceptancePayload",
+        )
+        return StreamReplyObservation(
+            elapsed_seconds=_elapsed_seconds(send_start),
+            transport_status="unknown",
+            provider_accepted=False,
+            delivery_verified=False,
+            error_type="InvalidDirectAcceptancePayload",
+        )
+
+    provider_reference = str(
+        accepted_payload.get("processQueryKey") or ""
+    ).strip()
+    if not provider_reference:
+        await persist_record(
+            provider_reference=None,
+            provider_accepted=False,
+            delivery_verified=False,
+            status="unknown",
+            error="MissingProcessQueryKey",
+        )
+        return StreamReplyObservation(
+            elapsed_seconds=_elapsed_seconds(send_start),
+            transport_status="unknown",
+            provider_accepted=False,
+            delivery_verified=False,
+            error_type="MissingProcessQueryKey",
+        )
+
+    accepted_persisted = await persist_record(
+        provider_reference=provider_reference,
+        provider_accepted=True,
+        delivery_verified=False,
+        status="accepted_unverified",
+        error=None,
+    )
+    if not accepted_persisted:
+        return StreamReplyObservation(
+            elapsed_seconds=_elapsed_seconds(send_start),
+            transport_status="provider_accepted",
+            provider_accepted=True,
+            delivery_verified=False,
+            error_type="DeliveryEvidencePersistenceError",
+        )
+
+    try:
+        await asyncio.wait_for(
+            robot.wait_for_robot_direct_delivery(
+                process_query_key=provider_reference,
+                expected_user_ids=[user_id],
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        error_type = type(exc).__name__
+        terminal_delivery_failure = (
+            isinstance(exc, DingTalkDeliveryError)
+            and exc.terminal_failure
+        )
+        persisted_error_type = (
+            "DingTalkDeliveryError"
+            if terminal_delivery_failure
+            else error_type
+        )
+        await persist_record(
+            provider_reference=provider_reference,
+            provider_accepted=True,
+            delivery_verified=False,
+            status=(
+                "delivery_failed"
+                if terminal_delivery_failure
+                else "accepted_unverified"
+            ),
+            error=persisted_error_type,
+        )
+        logger.info(
+            "stream direct reply accepted delivery_status=%s message=%s error=%s",
+            (
+                "failed"
+                if terminal_delivery_failure
+                else "unverified"
+            ),
+            job.message.message_id,
+            error_type,
+        )
+        return StreamReplyObservation(
+            elapsed_seconds=_elapsed_seconds(send_start),
+            transport_status=(
+                "delivery_failed"
+                if terminal_delivery_failure
+                else "provider_accepted"
+            ),
+            provider_accepted=True,
+            delivery_verified=False,
+            error_type=error_type,
+        )
+
+    await persist_record(
+        provider_reference=provider_reference,
+        provider_accepted=True,
+        delivery_verified=True,
+        status="verified",
+        error=None,
+    )
+    send_seconds = _elapsed_seconds(send_start)
+    logger.info(
+        "stream direct reply delivery verified message=%s send_seconds=%s",
+        job.message.message_id,
+        send_seconds,
+    )
+    return StreamReplyObservation(
+        elapsed_seconds=send_seconds,
+        transport_status="delivery_verified",
+        provider_accepted=True,
+        delivery_verified=True,
+    )
 
 
 async def _evaluate_stream_daily_shadow(
@@ -3101,6 +3535,8 @@ async def _handle_job(
                         robot,
                         job,
                         reply_text,
+                        session=session,
+                        event=event,
                     )
 
                 await deliver_canary_message_if_enabled(
@@ -3179,6 +3615,8 @@ async def _handle_job(
                     robot,
                     job,
                     reply_text,
+                    session=session,
+                    event=event,
                 )
 
             await deliver_canary_message_if_enabled(

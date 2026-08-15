@@ -248,6 +248,13 @@ class TrustedRecentMessage(_FrozenModel):
     )
     read_snapshot_verified: bool = False
     fact_time_scope: Literal["past_snapshot"] | None = None
+    delivery_status: Literal[
+        "verified",
+        "accepted_unverified",
+        "delivery_failed",
+        "failed",
+        "unknown",
+    ] = Field(default="unknown", exclude=True)
 
     @model_validator(mode="after")
     def only_assistant_replies_can_be_read_snapshots(
@@ -262,6 +269,10 @@ class TrustedRecentMessage(_FrozenModel):
         if self.read_snapshot_verified and self.source_turn_id is None:
             raise ValueError(
                 "a verified read snapshot requires a trusted source turn"
+            )
+        if self.role != "assistant" and self.delivery_status != "unknown":
+            raise ValueError(
+                "only an assistant reply can carry delivery evidence"
             )
         return self
 

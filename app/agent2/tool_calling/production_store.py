@@ -61,6 +61,9 @@ from app.agent2.tool_calling.outbound_context import (
     trusted_recent_outbound_message,
 )
 from app.agent2.tool_calling.registry import TOOL_REGISTRY, ToolDefinition
+from app.agent2.tool_calling.reply_delivery import (
+    validated_reply_delivery_record,
+)
 from app.agent2.tool_calling.turn_batching import (
     CANARY_TRANSPORT_MARKER,
     INGRESS_META_KEY,
@@ -528,6 +531,9 @@ class ProductionContextStore:
             observation = turn_observations.get(
                 row.idempotency_key
             )
+            reply_delivery = validated_reply_delivery_record(
+                row.response_payload
+            )
             user_content = _text_content(row.payload)
             if user_content:
                 timed_messages.append(
@@ -549,6 +555,11 @@ class ProductionContextStore:
                 row.response_payload,
                 max_length=None,
             )
+            if (
+                reply_delivery is not None
+                and reply_delivery.status in {"failed", "delivery_failed"}
+            ):
+                assistant_content = ""
             if assistant_content:
                 assistant_content = strip_server_rendered_salutations(
                     content=assistant_content,
@@ -575,6 +586,11 @@ class ProductionContextStore:
                                 and observation.successful_pure_read
                                 and observation.source_turn_id
                                 in verified_read_sources
+                            ),
+                            delivery_status=(
+                                reply_delivery.status
+                                if reply_delivery is not None
+                                else "unknown"
                             ),
                         ),
                         False,
