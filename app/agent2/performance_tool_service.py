@@ -8,7 +8,10 @@ from typing import Any, Literal
 from app.agent2.performance_knowledge import (
     load_live_performance_evidence,
 )
-from app.agent2.performance_qa import render_performance_report
+from app.agent2.performance_qa import (
+    SUBSTANTIAL_LOSS_AMOUNT_DEFINITION,
+    render_performance_report,
+)
 
 PerformanceView = Literal["week", "month"]
 PerformanceScopeType = Literal["department", "team", "self"]
@@ -316,7 +319,10 @@ def _performance_fact_packet(
         "reply_guidance": {
             "answer_scope": (
                 "只回答用户这一轮真正问到的内容；只有用户要求完整概览时"
-                "才展开全部指标。"
+                "才展开全部指标。当用户只询问某个指标的定义或计算口径时，"
+                "只回答对应定义或口径，不主动追加该指标的当前数值、件数、"
+                "截止日期或其他报表事实；只有用户同时明确询问当前结果时，"
+                "才引用独立事实回答。"
             ),
             "grounding": (
                 "只能使用 claim_catalog 中的同一条事实，不得把不同"
@@ -337,10 +343,22 @@ def _performance_fact_packet(
             ),
             "selection_contract": (
                 "最终回复必须在每个准备采用的事实后附"
-                "[依据:claim_catalog中的事实编号]。需要多个事实支撑时可以"
-                "引用多个编号，但每条事实必须和本行内容一致。系统只核验"
-                "事实并移除编号，不会替你选择事实或重写用户可见文字；"
-                "未引用的业务结论不会发送。"
+                "[依据:<claim_id>]。<claim_id> 必须逐字复制 claim_catalog "
+                "对象的键原文；例如键为 definition.7 就写"
+                "[依据:definition.7]。不得在编号中加入“claim_catalog中的”、"
+                "中文类别名或翻译。需要多个事实支撑时可以"
+                "引用多个编号，但每条事实必须和本行内容一致。系统会按编号"
+                "核验事实并隐藏编号，不会重写用户可见文字；"
+                "未引用的业务结论不会发送。若某条事实含"
+                "validation_policy=exact_canonical_text，引用该事实的一整行"
+                "只能是它的 canonical_text 后紧接行末事实编号；不得在该行"
+                "增加标题、前缀、后缀或同一行其他事实。可直接输出该行，"
+                "不必另写引导。"
+            ),
+            "citation_format": "[依据:<claim_id>]",
+            "claim_id_source": (
+                "<claim_id> 必须逐字复制 claim_catalog 对象的键原文，"
+                "不得添加说明、中文类别名或翻译。"
             ),
         },
         "data_context": {
@@ -426,6 +444,7 @@ def _performance_definitions(
             "按“分公司→法务对接人→法务团队”映射确定，"
             "不直接采用底表中可能存在的团队文字。"
         ),
+        "实质减损金额": SUBSTANTIAL_LOSS_AMOUNT_DEFINITION,
     }
 
 
@@ -792,6 +811,16 @@ def _performance_claim_catalog(
         "同比下降率": ["去年", "同一截止日", "比较", "下降"],
         "较上期变化": ["比较", "确定性计算"],
         "团队归属": ["分公司", "法务对接人", "法务团队"],
+        "实质减损金额": [
+            "年初",
+            "统计截止日",
+            "已结案",
+            "供应商",
+            "班组",
+            "无争议-债权债务明确",
+            "减损金额",
+            "汇总",
+        ],
     }
     required_definition_term_groups = {
         "存量": [
@@ -815,11 +844,24 @@ def _performance_claim_catalog(
             ["法务对接人"],
             ["法务团队"],
         ],
+        "实质减损金额": [
+            ["年初", "当年1月1日", "本年度"],
+            ["统计截止日", "截止日"],
+            ["已结案", "已经结案"],
+            ["供应商"],
+            ["班组"],
+            ["无争议-债权债务明确", "债权债务明确"],
+            ["减损金额"],
+            ["汇总", "合计", "累计"],
+        ],
+    }
+    definition_validation_policies = {
+        "实质减损金额": "exact_canonical_text",
     }
     for index, (term, definition) in enumerate(
         definitions.items()
     ):
-        claims[f"definition.{index}"] = {
+        definition_claim = {
             "kind": "definition",
             "term": str(term),
             "canonical_text": str(definition),
@@ -835,6 +877,12 @@ def _performance_claim_catalog(
             ),
             "entities": [str(term)],
         }
+        validation_policy = definition_validation_policies.get(
+            str(term)
+        )
+        if validation_policy:
+            definition_claim["validation_policy"] = validation_policy
+        claims[f"definition.{index}"] = definition_claim
     return claims
 
 

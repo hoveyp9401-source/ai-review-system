@@ -11,6 +11,13 @@ from app.utils.json import extract_json_object
 logger = logging.getLogger(__name__)
 
 
+SUBSTANTIAL_LOSS_AMOUNT_DEFINITION = (
+    "实质减损金额按年初至统计截止日累计：仅纳入已结案，且对方单位性质为"
+    "供应商或班组、案情原因为“无争议-债权债务明确”、减损金额大于0的案件，"
+    "并汇总这些案件的减损金额。"
+)
+
+
 @dataclass(frozen=True)
 class PerformanceQaReply:
     text: str
@@ -456,10 +463,7 @@ def _substantial_explanation(
     if not metric or metric.get("status") != "calculated":
         return ["- 实质减损金额：当前规则字段或数据不足，暂不可计算"]
     return [
-        (
-            "- 实质减损口径：年初至截止日已结案，且对方单位性质为供应商或班组、"
-            "案情原因为“无争议-债权债务明确”、减损金额大于0"
-        ),
+        f"- 实质减损口径：{SUBSTANTIAL_LOSS_AMOUNT_DEFINITION}",
         (
             f"- 本次符合条件{_int(metric.get('eligible_case_count'))}件，"
             f"减损金额合计{metric.get('display') or '暂不可计算'}"

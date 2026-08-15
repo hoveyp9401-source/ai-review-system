@@ -1424,6 +1424,14 @@ _INTERNAL_FACT_KEY_RE = re.compile(
 _TEAM_NAME_RE = re.compile(r"法务[一二三四五六七八九十百]+部")
 _DECLINE_WORDS = ("下降", "降低", "减少", "下滑")
 _GROWTH_WORDS = ("增长", "上升", "增加", "上涨")
+_CANONICAL_QUOTE_TRANSLATION = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+)
 
 
 def _validated_performance_reply(
@@ -3138,13 +3146,9 @@ def _performance_line_matches_claims(
         return False
     if definition_claims:
         return any(
-            str(claim.get("canonical_text") or "").strip()
-            and (
-                str(claim.get("canonical_text")) in plain_text
-                or _definition_required_terms_match(
-                    plain_text,
-                    claim=claim,
-                )
+            _definition_text_matches_claim(
+                plain_text,
+                claim=claim,
             )
             for claim in definition_claims
         )
@@ -3333,13 +3337,9 @@ def _infer_performance_line_claims(
         claim
         for claim in claims
         if str(claim.get("kind") or "") == "definition"
-        and str(claim.get("canonical_text") or "").strip()
-        and (
-            str(claim.get("canonical_text")) in plain_text
-            or _definition_required_terms_match(
-                plain_text,
-                claim=claim,
-            )
+        and _definition_text_matches_claim(
+            plain_text,
+            claim=claim,
         )
     )
     if exact_definitions:
@@ -3614,6 +3614,30 @@ def _definition_required_terms_match(
         if str(value or "").strip()
     )
     return bool(terms) and all(term in text for term in terms)
+
+
+def _definition_text_matches_claim(
+    text: str,
+    *,
+    claim: dict[str, Any],
+) -> bool:
+    canonical = str(claim.get("canonical_text") or "").strip()
+    if not canonical:
+        return False
+    if claim.get("validation_policy") == "exact_canonical_text":
+        candidate = re.sub(
+            r"^\s*[-*+]\s+",
+            "",
+            _plain_performance_text(text),
+            count=1,
+        ).strip()
+        return candidate.translate(
+            _CANONICAL_QUOTE_TRANSLATION
+        ) == canonical.translate(_CANONICAL_QUOTE_TRANSLATION)
+    return canonical in text or _definition_required_terms_match(
+        text,
+        claim=claim,
+    )
 
 
 def _target_status_matches(
