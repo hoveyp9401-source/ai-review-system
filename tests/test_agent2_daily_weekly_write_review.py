@@ -687,9 +687,11 @@ async def test_recent_daily_followup_terminal_gets_one_independent_write_review(
             _terminal_completion("已删除刚才日报中的两条内容。"),
         )
     )
+    review_messages_seen: list[list[dict]] = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, tool_schemas, thinking_enabled
+        del tool_schemas, thinking_enabled
+        review_messages_seen.append(messages)
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
@@ -706,6 +708,10 @@ async def test_recent_daily_followup_terminal_gets_one_independent_write_review(
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.rollback_count == 0
+    assert any(
+        "brief standalone follow-up may correct" in str(message.get("content") or "")
+        for message in review_messages_seen[1]
+    )
 
 
 @pytest.mark.asyncio
