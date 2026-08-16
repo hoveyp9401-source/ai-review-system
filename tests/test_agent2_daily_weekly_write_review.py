@@ -2410,6 +2410,60 @@ async def test_invalid_reviewed_batch_fails_closed_before_runtime_execution(
 
 
 @pytest.mark.asyncio
+async def test_invalid_daily_review_arguments_get_one_full_review_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    invalid_daily = _daily_call(call_id="invalid-reviewed-daily")
+    invalid_arguments = json.loads(invalid_daily["function"]["arguments"])
+    invalid_arguments["date_selection"] = "trusted_report"
+    invalid_daily["function"]["arguments"] = json.dumps(
+        invalid_arguments,
+        ensure_ascii=False,
+    )
+    completions = iter(
+        (
+            _tool_completion(_daily_call(call_id="draft-daily")),
+            _tool_completion(invalid_daily),
+            _tool_completion(_daily_call(call_id="retried-review")),
+            _terminal_completion("已记入今天的日报。"),
+        )
+    )
+    review_retry_seen = False
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        nonlocal review_retry_seen
+        del tool_schemas, thinking_enabled
+        review_retry_seen = review_retry_seen or any(
+            "previous Daily review returned invalid arguments" in str(message.get("content") or "")
+            for message in messages
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="今天完成合同审核，记到今天日报。",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert review_retry_seen is True
+    assert result.final_content == "已记入今天的日报。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
 async def test_argument_repair_is_followed_by_complete_cross_domain_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

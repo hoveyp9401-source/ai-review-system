@@ -1124,21 +1124,20 @@ class DeepSeekToolCallingAdapter:
                             "draft_executed": False,
                         },
                     )
+                    review_messages = _daily_weekly_write_review_messages(
+                        user_text=user_text,
+                        user_messages=user_messages,
+                        calls=parsed.tool_calls,
+                        context=context,
+                        trusted_completed_daily_query_results=(
+                            completed_daily_tool_inspection.trusted_query_results
+                        ),
+                        selected_targets=trusted_daily_selected_targets,
+                        allowed_tool_names=daily_weekly_review_tool_names,
+                    )
                     try:
                         review_completion = await complete_model(
-                            _daily_weekly_write_review_messages(
-                                user_text=user_text,
-                                user_messages=user_messages,
-                                calls=parsed.tool_calls,
-                                context=context,
-                                trusted_completed_daily_query_results=(
-                                    completed_daily_tool_inspection.trusted_query_results
-                                ),
-                                selected_targets=trusted_daily_selected_targets,
-                                allowed_tool_names=(
-                                    daily_weekly_review_tool_names
-                                ),
-                            ),
+                            review_messages,
                             tool_schemas=deepseek_tool_schemas(
                                 daily_weekly_review_tool_names
                             ),
@@ -1173,6 +1172,110 @@ class DeepSeekToolCallingAdapter:
                                 for call in parsed.tool_calls
                             ),
                         )
+                    except InvalidNativeToolArgumentsError as exc:
+                        invalid_review_tools = {
+                            item.tool_name for item in exc.raw_tool_call_audit
+                        }
+                        add_argument_fields = set(
+                            TOOL_REGISTRY["add_daily_items"].input_model.model_fields
+                        )
+                        retryable_arguments = True
+                        for item in exc.raw_tool_call_audit:
+                            try:
+                                decoded_arguments = json.loads(item.raw_arguments)
+                            except (json.JSONDecodeError, TypeError):
+                                retryable_arguments = False
+                                break
+                            if not isinstance(decoded_arguments, dict):
+                                retryable_arguments = False
+                                break
+                            if set(decoded_arguments) == {"arguments"}:
+                                decoded_arguments = decoded_arguments.get("arguments")
+                            elif set(decoded_arguments) == {"tool_name", "arguments"}:
+                                if decoded_arguments.get("tool_name") != item.tool_name:
+                                    retryable_arguments = False
+                                    break
+                                decoded_arguments = decoded_arguments.get("arguments")
+                            if (
+                                not isinstance(decoded_arguments, dict)
+                                or not set(decoded_arguments).issubset(add_argument_fields)
+                            ):
+                                retryable_arguments = False
+                                break
+                        if (
+                            invalid_review_tools != {"add_daily_items"}
+                            or not retryable_arguments
+                        ):
+                            raise _with_canary_turn_state(
+                                exc,
+                                audits=audits,
+                                model_turns=model_turns,
+                            ) from exc
+                        audits.extend(exc.raw_tool_call_audit)
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "daily_weekly_write_review_invalid_arguments": True,
+                                "draft_executed": False,
+                            },
+                        )
+                        try:
+                            retry_completion = await complete_model(
+                                [
+                                    *review_messages,
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "The previous Daily review returned invalid arguments. "
+                                            "Perform one fresh complete independent review from the "
+                                            "trusted input above. Return either one schema-valid allowed "
+                                            "tool batch or the exact no-tool review decision envelope."
+                                        ),
+                                    },
+                                ],
+                                tool_schemas=deepseek_tool_schemas(
+                                    daily_weekly_review_tool_names
+                                ),
+                                thinking_enabled=True,
+                            )
+                            iterations += 1
+                            model_turns.append(
+                                _model_turn_audit(
+                                    iterations,
+                                    retry_completion.message,
+                                    response_metadata={
+                                        **retry_completion.metadata,
+                                        "daily_weekly_write_semantic_review_retry": True,
+                                    },
+                                )
+                            )
+                            reviewed = _parse_assistant_turn(
+                                retry_completion.message,
+                                allow_review_arguments_envelope=True,
+                            )
+                            _validate_completion_protocol(
+                                retry_completion,
+                                reviewed,
+                            )
+                            audits.extend(reviewed.audit)
+                            _validate_daily_weekly_write_review(
+                                reviewed=reviewed,
+                                allowed_tool_names=daily_weekly_review_tool_names,
+                                original_has_domain_writes=any(
+                                    _daily_weekly_write_domain(call.tool_name)
+                                    is not None
+                                    for call in parsed.tool_calls
+                                ),
+                            )
+                        except (DeepSeekToolCallingError, ValueError) as retry_exc:
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "daily and weekly write semantic review retry returned an invalid replacement"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            ) from retry_exc
                     except DeepSeekToolCallingError as exc:
                         raise _with_canary_turn_state(
                             exc,
