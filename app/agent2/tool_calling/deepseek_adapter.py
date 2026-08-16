@@ -2948,6 +2948,8 @@ def _daily_weekly_write_review_tool_names(
                         }
                     )
                 return frozenset(current_reviewed_operations)
+            if not calls:
+                return _daily_focus_write_tool_names(context)
         return frozenset()
     if not current_reviewed_operations:
         if calls or not _in_daily_weekly_zero_tool_review_window(context):
@@ -2994,6 +2996,36 @@ _PERSONAL_MEMORY_WRITE_TOOLS = frozenset(
 )
 
 
+def _daily_focus_write_tool_names(
+    context: TrustedContext,
+) -> frozenset[str]:
+    if context.principal.conversation_kind != "direct":
+        return frozenset()
+    references = {
+        operation.report_reference.report_id
+        for operation in context.recent_operations
+        if operation.report_reference is not None
+        and operation.target_type == "daily_report"
+        and operation.status in {ReceiptStatus.SUCCESS, ReceiptStatus.NO_OP}
+        and context.report_by_id(operation.report_reference.report_id) is not None
+    }
+    if len(references) != 1:
+        return frozenset()
+    report = context.report_by_id(next(iter(references)))
+    if report is None or report.status not in {
+        "collecting",
+        "pending_confirmation",
+        "completed",
+    }:
+        return frozenset()
+    return frozenset(
+        name
+        for name in completed_daily_follow_through.DAILY_CONTENT_WRITE_TOOLS
+        if name in context.allowed_tool_names
+        and context.gate_decisions.get(name) is True
+    )
+
+
 def _memory_daily_focus_review_tool_names(
     calls: tuple[NativeToolCall, ...],
     *,
@@ -3006,22 +3038,7 @@ def _memory_daily_focus_review_tool_names(
         or calls[0].tool_name not in _PERSONAL_MEMORY_WRITE_TOOLS
     ):
         return frozenset()
-    references = {
-        operation.report_reference.report_id
-        for operation in context.recent_operations
-        if operation.report_reference is not None
-        and operation.target_type == "daily_report"
-        and operation.status in {ReceiptStatus.SUCCESS, ReceiptStatus.NO_OP}
-        and context.report_by_id(operation.report_reference.report_id) is not None
-    }
-    if len(references) != 1:
-        return frozenset()
-    daily_tools = {
-        name
-        for name in completed_daily_follow_through.DAILY_CONTENT_WRITE_TOOLS
-        if name in context.allowed_tool_names
-        and context.gate_decisions.get(name) is True
-    }
+    daily_tools = _daily_focus_write_tool_names(context)
     if not daily_tools:
         return frozenset()
     return frozenset({calls[0].tool_name, *daily_tools})

@@ -534,6 +534,8 @@ class _RecordingRuntime:
             in {
                 "add_daily_items",
                 "edit_daily_items",
+                "delete_daily_items",
+                "move_daily_items",
                 "apply_next_weekly_plan",
                 "remember_personal_memory",
             }
@@ -655,6 +657,95 @@ def _zero_tool_keep_completion(candidate_reply: str) -> _CompletionResponse:
         },
         metadata={"finish_reason": "stop"},
     )
+
+
+@pytest.mark.asyncio
+async def test_recent_daily_followup_terminal_gets_one_independent_write_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    reviewed_delete = _daily_delete_call(
+        call_id="zero-draft-daily-review",
+        target_item_ids=["today-9", "today-10"],
+    )
+    confirmed_delete = _daily_delete_call(
+        call_id="zero-draft-confirmation",
+        target_item_ids=["today-9", "today-10"],
+    )
+    completions = iter(
+        (
+            _terminal_completion("已经看到了。"),
+            _tool_completion(reviewed_delete),
+            _tool_completion(confirmed_delete),
+            _terminal_completion("已删除刚才日报中的两条内容。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="把刚才日报里的两条都去掉。",
+        context=_daily_edit_context_with_recent_focus(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == "已删除刚才日报中的两条内容。"
+    assert [call.tool_name for call in runtime.calls] == ["delete_daily_items"]
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_recent_daily_focus_does_not_force_an_ordinary_reply_into_a_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    reply = "下午好，有什么需要一起处理的？"
+    completions = iter(
+        (
+            _direct_completion(reply),
+            _keep_original_completion(),
+            _zero_tool_keep_completion(reply),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="下午好。",
+        context=_daily_edit_context_with_recent_focus(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == reply
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
 
 
 @pytest.mark.asyncio
