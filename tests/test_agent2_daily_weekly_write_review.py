@@ -485,6 +485,7 @@ async def _run_scripted_write_review(
     user_text: str,
     draft_calls: tuple[dict, ...],
     reviewed_calls: tuple[dict, ...],
+    adjudicated_calls: tuple[dict, ...] | None = None,
 ):
     adapter = DeepSeekToolCallingAdapter(
         http_client=object(),
@@ -493,13 +494,14 @@ async def _run_scripted_write_review(
         max_tool_loops=2,
         endpoint="https://example.invalid/chat/completions",
     )
-    completions = iter(
-        (
-            _tool_completion(*draft_calls),
-            _tool_completion(*reviewed_calls),
-            _terminal_completion("日报已按原话处理。"),
-        )
-    )
+    scripted = [
+        _tool_completion(*draft_calls),
+        _tool_completion(*reviewed_calls),
+    ]
+    if adjudicated_calls is not None:
+        scripted.append(_tool_completion(*adjudicated_calls))
+    scripted.append(_terminal_completion("日报已按原话处理。"))
+    completions = iter(scripted)
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
         del messages, tool_schemas, thinking_enabled
@@ -882,7 +884,7 @@ def _daily_add_call(*, call_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_daily_edit_review_cannot_drop_a_sibling_add(
+async def test_daily_edit_review_restores_a_dropped_sibling_add_only_after_adjudication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _RecordingRuntime()
@@ -892,29 +894,87 @@ async def test_daily_edit_review_cannot_drop_a_sibling_add(
         exact_quote="每周一记录",
     )
 
+    result = await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=_daily_context_with_tools(
+            "add_daily_items",
+            "edit_daily_items",
+        ),
+        user_text="新增事项；第9条旧内容改为每周一记录",
+        draft_calls=(_daily_add_call(call_id="draft-add"), edit),
+        reviewed_calls=(
+            _daily_edit_call(
+                call_id="reviewed-edit",
+                replacement="每周一记录",
+                exact_quote="每周一记录",
+            ),
+        ),
+        adjudicated_calls=(_daily_add_call(call_id="adjudicated-add"),),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "add_daily_items",
+        "edit_daily_items",
+    ]
+    assert [call.tool_call_id for call in runtime.calls] == [
+        "adjudicated-add",
+        "reviewed-edit",
+    ]
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert result.model_turns[2].response_metadata[
+        "dropped_daily_add_independent_adjudication"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_multiple_daily_adds_dropped_beside_weekly_fail_before_adjudication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _tool_completion(
+                _daily_call(call_id="draft-daily-1"),
+                _daily_add_call(call_id="draft-daily-2"),
+                _weekly_call(call_id="draft-weekly"),
+            ),
+            _tool_completion(_weekly_call(call_id="reviewed-weekly")),
+        )
+    )
+    request_count = 0
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        nonlocal request_count
+        del messages, tool_schemas, thinking_enabled
+        request_count += 1
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
     with pytest.raises(
-        ValueError,
-        match="preserve non-edit Daily write names and order",
+        DeepSeekResponseError,
+        match="multiple Daily add drafts cannot enter adjudication",
     ):
-        await _run_scripted_write_review(
-            monkeypatch,
-            runtime=runtime,
-            context=_daily_context_with_tools(
-                "add_daily_items",
-                "edit_daily_items",
-            ),
-            user_text="新增事项；第9条旧内容改为每周一记录",
-            draft_calls=(_daily_add_call(call_id="draft-add"), edit),
-            reviewed_calls=(
-                _daily_edit_call(
-                    call_id="reviewed-edit",
-                    replacement="每周一记录",
-                    exact_quote="每周一记录",
-                ),
-            ),
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="今天完成合同审核并新增事项；下周三整理案件材料。",
+            context=_context(),
+            runtime_session=runtime,
         )
 
+    assert request_count == 2
     assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
 
 
 @pytest.mark.asyncio
@@ -1738,6 +1798,7 @@ async def test_ambiguous_friday_sentence_stays_a_question_and_executes_nothing(
     completions = iter(
         (
             _tool_completion(_daily_call(call_id="unsafe-guess")),
+            _clarification_completion(question),
             _clarification_completion(question),
             _zero_tool_keep_completion(question),
         )

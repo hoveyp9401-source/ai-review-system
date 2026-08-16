@@ -646,6 +646,108 @@ class DeepSeekToolCallingAdapter:
                     model_turns=model_turns,
                 ) from exc
 
+        async def adjudicate_dropped_daily_adds(
+            *,
+            original: _ParsedAssistantTurn,
+            reviewed: _ParsedAssistantTurn,
+        ) -> _ParsedAssistantTurn:
+            """Resolve only a full Daily-add deletion without replaying the draft."""
+
+            nonlocal iterations
+            original_daily_adds = tuple(
+                call
+                for call in original.tool_calls
+                if call.tool_name == "add_daily_items"
+            )
+            reviewed_daily_adds = tuple(
+                call
+                for call in reviewed.tool_calls
+                if call.tool_name == "add_daily_items"
+            )
+            if not original_daily_adds or reviewed_daily_adds:
+                return reviewed
+            if len(original_daily_adds) != 1:
+                if not reviewed.tool_calls:
+                    return reviewed
+                raise _with_canary_turn_state(
+                    DeepSeekResponseError(
+                        "multiple Daily add drafts cannot enter adjudication"
+                    ),
+                    audits=audits,
+                    model_turns=model_turns,
+                )
+
+            try:
+                adjudication_completion = await self._complete(
+                    _dropped_daily_add_adjudication_messages(
+                        user_text=user_text,
+                        user_messages=user_messages,
+                        context=context,
+                    ),
+                    tool_schemas=deepseek_tool_schemas(
+                        frozenset({"add_daily_items"})
+                    ),
+                    thinking_enabled=True,
+                )
+                iterations += 1
+                model_turns.append(
+                    _model_turn_audit(
+                        iterations,
+                        adjudication_completion.message,
+                        response_metadata={
+                            **adjudication_completion.metadata,
+                            "dropped_daily_add_independent_adjudication": True,
+                            "draft_executed": False,
+                        },
+                    )
+                )
+                adjudicated = _parse_assistant_turn(
+                    adjudication_completion.message
+                )
+                _validate_completion_protocol(
+                    adjudication_completion,
+                    adjudicated,
+                )
+                audits.extend(adjudicated.audit)
+                _validate_daily_weekly_write_review(
+                    reviewed=adjudicated,
+                    allowed_tool_names=frozenset({"add_daily_items"}),
+                    original_has_domain_writes=True,
+                )
+            except DeepSeekToolCallingError as exc:
+                raise _with_canary_turn_state(
+                    exc,
+                    audits=audits,
+                    model_turns=model_turns,
+                ) from exc
+            except ValueError as exc:
+                raise _with_canary_turn_state(
+                    DeepSeekResponseError(
+                        "dropped Daily add adjudication returned an invalid decision"
+                    ),
+                    audits=audits,
+                    model_turns=model_turns,
+                ) from exc
+
+            if not adjudicated.tool_calls:
+                return adjudicated
+            try:
+                return _restore_dropped_daily_adds(
+                    original=original,
+                    reviewed=reviewed,
+                    adjudicated=adjudicated,
+                )
+            except ValueError as exc:
+                if not reviewed.tool_calls:
+                    return reviewed
+                raise _with_canary_turn_state(
+                    DeepSeekResponseError(
+                        "dropped Daily add reviewers did not independently agree"
+                    ),
+                    audits=audits,
+                    model_turns=model_turns,
+                ) from exc
+
         try:
             while True:
                 iterations += 1
@@ -865,6 +967,10 @@ class DeepSeekToolCallingAdapter:
                                 audits=audits,
                                 model_turns=model_turns,
                             ) from exc
+                    reviewed = await adjudicate_dropped_daily_adds(
+                        original=parsed,
+                        reviewed=reviewed,
+                    )
                     original_has_domain_writes = any(
                         _daily_weekly_write_domain(call.tool_name) is not None
                         for call in parsed.tool_calls
@@ -2618,6 +2724,61 @@ def _daily_weekly_write_review_messages(
     ]
 
 
+def _dropped_daily_add_adjudication_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+) -> list[dict[str, str]]:
+    """Ask one fresh reviewer to resolve a Daily-add/no-Daily-add split."""
+
+    ordered_messages = user_messages or (user_text,)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the final isolated Agent2 semantic reviewer and Daily Report "
+                "adjudicator. One "
+                "unexecuted model decision selected add_daily_items and another "
+                "independent review selected no Daily add. You are not shown either "
+                "decision or any draft arguments. Independently reread every exact "
+                "current user message and the trusted context. Decide semantically "
+                "from the whole utterance; never use keywords, phrase lists, or regular "
+                "expressions. Only when the user clearly and presently authorizes Daily "
+                "Report content, return exactly one complete native add_daily_items call "
+                "using the supplied tool. Put all Daily matters in that call's one complete "
+                "items array; never split them across calls. Preserve every independently "
+                "editable matter, "
+                "its Daily field, exact contiguous source quote and source-message index, "
+                "every explicit empty field and its evidence, the requested report date, "
+                "trusted target/version or retry candidate, and submit intent. The server "
+                "will compare this fresh decision with the other independently grounded "
+                "decision and copy persisted content from its own current-message text. "
+                "Do not reproduce only a partial items array. If a Daily write or any material "
+                "part remains unclear, return no tool calls and exactly one JSON object "
+                "with keys decision and reply, where decision is clarification and reply "
+                "is one concise natural Chinese question. Never claim that anything was "
+                "saved, submitted, or executed."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(ordered_messages, start=1)
+                    ],
+                    "trusted_context": context.model_payload(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
 def _validate_daily_weekly_write_review(
     *,
     reviewed: _ParsedAssistantTurn,
@@ -2684,6 +2845,168 @@ def _daily_weekly_review_envelope_repair_messages(
             ),
         },
     ]
+
+
+def _daily_add_agreement_signature(call: NativeToolCall) -> dict[str, Any]:
+    """Compare model decisions without trusting model-authored item prose."""
+
+    if call.tool_name != "add_daily_items":
+        raise ValueError("Daily add agreement requires add_daily_items")
+    arguments = call.arguments
+    date_target = {
+        key: arguments.get(key)
+        for key in (
+            "date_selection",
+            "date_expression",
+            "proposed_date",
+            "report_id",
+            "expected_version",
+            "retry_candidate_id",
+            "date_evidence",
+            "submit_after_write",
+        )
+    }
+    items = []
+    for item in arguments.get("items", ()):  # already schema-validated
+        evidence = item.get("source_evidence") or {}
+        items.append(
+            {
+                "field": item.get("field"),
+                "source_message_index": evidence.get("source_message_index"),
+                "exact_quote": evidence.get("exact_quote"),
+            }
+        )
+    empty_evidence = sorted(
+        (
+            item.get("field"),
+            (item.get("source_evidence") or {}).get("source_message_index"),
+        )
+        for item in arguments.get("empty_field_evidence", ())
+    )
+    return {
+        "date_target": date_target,
+        "items": items,
+        "acknowledged_empty_fields": sorted(
+            arguments.get("acknowledged_empty_fields", ())
+        ),
+        "empty_field_evidence": empty_evidence,
+    }
+
+
+def _constrain_daily_add_call_group(
+    *,
+    original_daily: tuple[NativeToolCall, ...],
+    reviewed_daily: tuple[NativeToolCall, ...],
+) -> tuple[NativeToolCall, ...]:
+    """Keep every trusted target while taking grounded content from the review."""
+
+    if len(original_daily) != 1 or len(reviewed_daily) != 1:
+        raise ValueError("Daily review must replace exactly one Daily draft")
+    constrained: list[NativeToolCall] = []
+    for draft_call, reviewed_call in zip(
+        original_daily,
+        reviewed_daily,
+        strict=True,
+    ):
+        draft_arguments = dict(draft_call.arguments)
+        reviewed_arguments = reviewed_call.arguments
+        reviewed_empty_evidence = reviewed_arguments.get(
+            "empty_field_evidence",
+            [],
+        )
+        if not isinstance(reviewed_empty_evidence, list):
+            raise ValueError("reviewed Daily empty-field evidence must be an array")
+        draft_arguments["items"] = reviewed_arguments.get("items", [])
+        draft_arguments["empty_field_evidence"] = reviewed_empty_evidence
+        draft_arguments["acknowledged_empty_fields"] = [
+            evidence.get("field")
+            for evidence in reviewed_empty_evidence
+            if isinstance(evidence, dict)
+        ]
+        constrained_arguments = validate_tool_arguments(
+            "add_daily_items",
+            draft_arguments,
+        )
+        constrained.append(
+            NativeToolCall(
+                reviewed_call.tool_call_id,
+                "add_daily_items",
+                constrained_arguments,
+            )
+        )
+    return tuple(constrained)
+
+
+def _restore_dropped_daily_adds(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+    adjudicated: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Restore a fully matching fresh Daily decision into the first review batch."""
+
+    original_daily = tuple(
+        call for call in original.tool_calls if call.tool_name == "add_daily_items"
+    )
+    reviewed_daily = tuple(
+        call for call in reviewed.tool_calls if call.tool_name == "add_daily_items"
+    )
+    adjudicated_daily = tuple(
+        call
+        for call in adjudicated.tool_calls
+        if call.tool_name == "add_daily_items"
+    )
+    if reviewed_daily:
+        raise ValueError("Daily add recovery requires a full first-review deletion")
+    if len(original_daily) != 1 or len(adjudicated_daily) != 1:
+        raise ValueError(
+            "Daily add adjudication requires exactly one original and fresh call"
+        )
+    if len(adjudicated_daily) != len(adjudicated.tool_calls):
+        raise ValueError("Daily add adjudication cannot introduce another tool")
+    if [
+        _daily_add_agreement_signature(call) for call in original_daily
+    ] != [
+        _daily_add_agreement_signature(call) for call in adjudicated_daily
+    ]:
+        raise ValueError("Daily add adjudication does not match the original decision")
+
+    constrained_daily = _constrain_daily_add_call_group(
+        original_daily=original_daily,
+        reviewed_daily=adjudicated_daily,
+    )
+    restored_calls = list(reviewed.tool_calls)
+    inserted = 0
+    original_reviewed_calls = tuple(
+        call
+        for call in original.tool_calls
+        if _daily_weekly_write_domain(call.tool_name) is not None
+    )
+    for original_call, recovered_call in zip(
+        original_daily,
+        constrained_daily,
+        strict=True,
+    ):
+        original_position = next(
+            index
+            for index, call in enumerate(original_reviewed_calls)
+            if call is original_call
+        )
+        preceding_non_adds = sum(
+            call.tool_name != "add_daily_items"
+            for call in original_reviewed_calls[:original_position]
+        )
+        insertion_index = min(
+            preceding_non_adds + inserted,
+            len(restored_calls),
+        )
+        restored_calls.insert(insertion_index, recovered_call)
+        inserted += 1
+    return replace(
+        reviewed,
+        tool_calls=tuple(restored_calls),
+        audit=(*reviewed.audit, *adjudicated.audit),
+    )
 
 
 def _merge_daily_weekly_write_review(
@@ -2892,34 +3215,18 @@ def _constrain_daily_write_review(
     reviewed_daily = tuple(
         call for call in reviewed.tool_calls if call.tool_name == "add_daily_items"
     )
-    if len(original_daily) != 1 or len(reviewed_daily) != 1:
-        raise ValueError("Daily review must replace exactly one Daily draft")
-
-    draft_arguments = dict(original_daily[0].arguments)
-    reviewed_arguments = reviewed_daily[0].arguments
-    reviewed_empty_evidence = reviewed_arguments.get("empty_field_evidence", [])
-    if not isinstance(reviewed_empty_evidence, list):
-        raise ValueError("reviewed Daily empty-field evidence must be an array")
-    draft_arguments["items"] = reviewed_arguments.get("items", [])
-    draft_arguments["empty_field_evidence"] = reviewed_empty_evidence
-    draft_arguments["acknowledged_empty_fields"] = [
-        evidence.get("field")
-        for evidence in reviewed_empty_evidence
-        if isinstance(evidence, dict)
-    ]
-    constrained_arguments = validate_tool_arguments(
-        "add_daily_items",
-        draft_arguments,
-    )
-    constrained_call = NativeToolCall(
-        reviewed_daily[0].tool_call_id,
-        "add_daily_items",
-        constrained_arguments,
+    constrained_calls = iter(
+        _constrain_daily_add_call_group(
+            original_daily=original_daily,
+            reviewed_daily=reviewed_daily,
+        )
     )
     return replace(
         reviewed,
         tool_calls=tuple(
-            constrained_call if call is reviewed_daily[0] else call
+            next(constrained_calls)
+            if call.tool_name == "add_daily_items"
+            else call
             for call in reviewed.tool_calls
         ),
     )
