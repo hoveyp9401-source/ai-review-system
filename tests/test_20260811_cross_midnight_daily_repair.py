@@ -35,6 +35,7 @@ from app.agent2.tool_calling.production_store import report_state_hash
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
     CorrectDailyReportDateArgs,
+    DeleteDailyItemsArgs,
 )
 from app.agent2.typed_daily_commands import DailyReportMutationSnapshot
 from app.agent2.tool_calling.validation import BoundCall
@@ -1030,6 +1031,126 @@ async def test_empty_acknowledgement_and_submit_are_one_atomic_add_call() -> Non
         "submit_report",
     ]
     assert [command.report_version for command in captured] == [2, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_item_ids", "expected_command_types"),
+    (
+        (
+            ["today-1", "today-2"],
+            ["delete_item", "delete_item", "acknowledge_empty_section"],
+        ),
+        (["today-1"], ["delete_item"]),
+    ),
+)
+async def test_delete_marks_section_empty_only_when_every_item_is_selected(
+    target_item_ids: list[str],
+    expected_command_types: list[str],
+) -> None:
+    owner_id = UUID("22222222-2222-2222-2222-222222222222")
+    report_id = UUID("11111111-1111-1111-1111-111111111111")
+    call = NativeToolCall(
+        tool_call_id="delete-all-work",
+        tool_name="delete_daily_items",
+        arguments={
+            "report_id": str(report_id),
+            "expected_version": 9,
+            "target_item_ids": target_item_ids,
+        },
+    )
+    arguments = DeleteDailyItemsArgs.model_validate(call.arguments)
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="tenant",
+        owner_user_id=owner_id,
+        report_date=date(2026, 8, 10),
+        version=9,
+        status="collecting",
+        items=(
+            TrustedReportItem(
+                item_id="today-1",
+                field="today_work",
+                content="第一项",
+                report_id=report_id,
+                report_version=9,
+            ),
+            TrustedReportItem(
+                item_id="today-2",
+                field="today_work",
+                content="第二项",
+                report_id=report_id,
+                report_version=9,
+            ),
+        ),
+    )
+    bound = BoundCall(
+        call=call,
+        arguments=arguments.model_dump(mode="json"),
+        report=report,
+        target_item_ids=arguments.target_item_ids,
+        source_report=None,
+        date_facts={},
+    )
+    executor = ProductionDailyExecutor.__new__(ProductionDailyExecutor)
+    executor._bound_calls = {call.tool_call_id: bound}
+    executor._context = SimpleNamespace(
+        principal=SimpleNamespace(
+            tenant_id="tenant",
+            user_id=owner_id,
+            conversation_id="conversation",
+            source_message_id="source-message",
+        )
+    )
+    typed = DailyReportMutationSnapshot(
+        report_id=report_id,
+        owner_user_id=owner_id,
+        version=9,
+        status="collecting",
+        today_work=("第一项", "第二项"),
+        problems=(),
+        tomorrow_plan=(),
+        item_ids={
+            "today_work": ("today-1", "today-2"),
+            "problems": (),
+            "tomorrow_plan": (),
+        },
+    )
+    captured = []
+
+    async def snapshot_for_date(_report_date):
+        return report
+
+    async def typed_snapshot_for_date(_report_date):
+        return typed
+
+    async def execute_typed(_report_date, commands, **_kwargs):
+        captured.extend(commands)
+        return tuple(f"receipt-{index}" for index, _ in enumerate(commands))
+
+    executor._snapshot = snapshot_for_date
+    executor._typed_snapshot = typed_snapshot_for_date
+    executor._execute_typed = execute_typed
+    executor._outcome = lambda *args, **kwargs: SimpleNamespace(
+        args=args,
+        kwargs=kwargs,
+    )
+    request = ProductionHandlerRequest(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        arguments=arguments,
+        executor=executor,
+        memory_executor=None,
+    )
+
+    await executor.delete_daily_items(request)
+
+    assert [command.command_type for command in captured] == expected_command_types
+    assert [command.report_version for command in captured] == list(
+        range(9, 9 + len(expected_command_types))
+    )
+    if len(target_item_ids) == 2:
+        assert captured[-1].patch == {"field": "today_work"}
 
 
 @pytest.mark.asyncio

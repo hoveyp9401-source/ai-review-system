@@ -701,21 +701,44 @@ class ProductionDailyExecutor:
         before = await self._snapshot(report.report_date)
         live = await self._typed_snapshot(report.report_date)
         self._require_same_report(report, live.report_id)
-        commands = tuple(
-            self._command(
-                request,
-                ordinal=index,
-                command_type="delete_item",
-                report_id=report.report_id,
-                report_version=live.version + index,
-                target_item_ids=(item_id,),
-                patch={},
+        commands: list[TypedDailyCommand] = []
+        next_version = live.version
+        for item_id in arguments.target_item_ids:
+            commands.append(
+                self._command(
+                    request,
+                    ordinal=len(commands),
+                    command_type="delete_item",
+                    report_id=report.report_id,
+                    report_version=next_version,
+                    target_item_ids=(item_id,),
+                    patch={},
+                )
             )
-            for index, item_id in enumerate(arguments.target_item_ids)
-        )
+            next_version += 1
+        selected_item_ids = set(arguments.target_item_ids)
+        for field_name in ("today_work", "problems", "tomorrow_plan"):
+            field_item_ids = set(live.item_ids[field_name])
+            if (
+                not field_item_ids
+                or not field_item_ids.issubset(selected_item_ids)
+                or field_name in live.acknowledged_empty_fields
+            ):
+                continue
+            commands.append(
+                self._command(
+                    request,
+                    ordinal=len(commands),
+                    command_type="acknowledge_empty_section",
+                    report_id=report.report_id,
+                    report_version=next_version,
+                    patch={"field": field_name},
+                )
+            )
+            next_version += 1
         typed_receipts = await self._execute_typed(
             report.report_date,
-            commands,
+            tuple(commands),
             allow_completed_content_mutation=True,
         )
         after = await self._snapshot(report.report_date)
