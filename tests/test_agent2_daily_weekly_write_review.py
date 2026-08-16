@@ -1763,8 +1763,14 @@ async def test_one_full_message_daily_item_receives_exactly_one_review(
 
 
 @pytest.mark.asyncio
-async def test_daily_write_review_accepts_one_exact_arguments_envelope(
+@pytest.mark.parametrize(
+    "inner_tool_name",
+    (None, "add_daily_items", "delete_daily_items"),
+    ids=("arguments-only", "matching-tool", "mismatched-tool"),
+)
+async def test_daily_write_review_accepts_exact_arguments_envelope(
     monkeypatch: pytest.MonkeyPatch,
+    inner_tool_name: str | None,
 ) -> None:
     runtime = _RecordingRuntime()
     adapter = DeepSeekToolCallingAdapter(
@@ -1786,10 +1792,10 @@ async def test_daily_write_review_accepts_one_exact_arguments_envelope(
     draft = _daily_items_call(call_id="draft-daily", items=[item])
     reviewed = _daily_items_call(call_id="reviewed-daily", items=[item])
     reviewed_arguments = json.loads(reviewed["function"]["arguments"])
-    reviewed["function"]["arguments"] = json.dumps(
-        {"arguments": reviewed_arguments},
-        ensure_ascii=False,
-    )
+    envelope = {"arguments": reviewed_arguments}
+    if inner_tool_name is not None:
+        envelope["tool_name"] = inner_tool_name
+    reviewed["function"]["arguments"] = json.dumps(envelope, ensure_ascii=False)
     completions = iter(
         (
             _tool_completion(draft),
@@ -1803,6 +1809,18 @@ async def test_daily_write_review_accepts_one_exact_arguments_envelope(
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    if inner_tool_name == "delete_daily_items":
+        with pytest.raises(InvalidNativeToolArgumentsError):
+            await adapter.run_canary_turn(
+                system_prompt="Agent2 test",
+                user_text=message,
+                context=_daily_only_context(),
+                runtime_session=runtime,
+            )
+        assert runtime.execute_count == 0
+        assert runtime.commit_count == 0
+        return
 
     result = await adapter.run_canary_turn(
         system_prompt="Agent2 test",

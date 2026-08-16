@@ -2193,8 +2193,14 @@ def _parse_native_tool_call(
     if (
         allow_review_arguments_envelope
         and isinstance(decoded, dict)
-        and set(decoded) == {"arguments"}
-        and isinstance(decoded["arguments"], dict)
+        and (
+            set(decoded) == {"arguments"}
+            or (
+                set(decoded) == {"tool_name", "arguments"}
+                and decoded.get("tool_name") == name
+            )
+        )
+        and isinstance(decoded.get("arguments"), dict)
     ):
         decoded = decoded["arguments"]
         parse_status = "validated_review_arguments_envelope"
