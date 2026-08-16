@@ -69,6 +69,7 @@ from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     runtime_registry_contract_digest,
 )
+from app.agent2.tool_calling.receipt_provenance import principal_scope_sha256
 from app.agent2.tool_calling.reporting_date import default_daily_write_date
 from app.agent2.tool_calling.runtime import conflicting_tool_call_ids
 from app.agent2.tool_calling.validation import (
@@ -1226,6 +1227,12 @@ def _receipt_from_row(
             "after_state_hash": row.after_state_hash,
             "typed_receipt_ids": list(row.typed_receipt_ids or ()),
             "idempotent_replay": replayed,
+            "principal_scope_sha256": principal_scope_sha256(
+                tenant_id=row.tenant_id,
+                user_id=row.user_id,
+                conversation_id=row.conversation_id,
+                source_message_id=row.source_message_id,
+            ),
         },
         execution_mode=ExecutionMode.CANARY_EXECUTE,
         would_change=False,

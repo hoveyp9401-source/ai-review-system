@@ -290,6 +290,30 @@ def _daily_delete_call(
     }
 
 
+def _daily_move_call(
+    *,
+    call_id: str,
+    target_item_ids: list[str],
+) -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "move_daily_items",
+            "arguments": json.dumps(
+                {
+                    "report_id": "20000000-0000-4000-8000-000000000009",
+                    "expected_version": 9,
+                    "target_item_ids": target_item_ids,
+                    "source_field": "today_work",
+                    "target_field": "tomorrow_plan",
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
 def _weekly_call(*, call_id: str = "weekly") -> dict:
     return {
         "id": call_id,
@@ -806,6 +830,120 @@ async def test_daily_edit_review_cannot_change_the_stable_target(
 
     assert runtime.execute_count == 0
     assert runtime.commit_count == 0
+
+
+@pytest.mark.parametrize(
+    "call_factory",
+    (_daily_delete_call, _daily_move_call),
+    ids=("delete", "move"),
+)
+@pytest.mark.asyncio
+async def test_daily_targeted_review_cannot_switch_delete_or_move_target(
+    monkeypatch: pytest.MonkeyPatch,
+    call_factory,
+) -> None:
+    runtime = _RecordingRuntime()
+
+    with pytest.raises(
+        ValueError,
+        match="cannot change non-edit Daily write arguments",
+    ):
+        await _run_scripted_write_review(
+            monkeypatch,
+            runtime=runtime,
+            context=_daily_context_with_tools(
+                "delete_daily_items",
+                "move_daily_items",
+            ),
+            user_text="Apply the requested change to the first Daily item.",
+            draft_calls=(
+                call_factory(
+                    call_id="draft-targeted-write",
+                    target_item_ids=["today-10"],
+                ),
+            ),
+            reviewed_calls=(
+                call_factory(
+                    call_id="reviewed-targeted-write",
+                    target_item_ids=["today-9"],
+                ),
+            ),
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_delete_cannot_be_dropped_from_atomic_weekly_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+
+    with pytest.raises(
+        ValueError,
+        match="preserve non-edit Daily write names and order",
+    ):
+        await _run_scripted_write_review(
+            monkeypatch,
+            runtime=runtime,
+            context=_daily_context_with_tools(
+                "delete_daily_items",
+                "apply_next_weekly_plan",
+            ),
+            user_text="Delete the selected Daily item and keep the weekly update.",
+            draft_calls=(
+                _daily_delete_call(
+                    call_id="draft-delete",
+                    target_item_ids=["today-10"],
+                ),
+                _weekly_call(call_id="draft-weekly"),
+            ),
+            reviewed_calls=(_weekly_call(call_id="reviewed-weekly"),),
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_weekly_write_cannot_be_dropped_from_atomic_daily_delete_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+
+    with pytest.raises(
+        ValueError,
+        match="preserve every reviewed write domain",
+    ):
+        await _run_scripted_write_review(
+            monkeypatch,
+            runtime=runtime,
+            context=_daily_context_with_tools(
+                "delete_daily_items",
+                "apply_next_weekly_plan",
+            ),
+            user_text="Delete the selected Daily item and keep the weekly update.",
+            draft_calls=(
+                _daily_delete_call(
+                    call_id="draft-delete",
+                    target_item_ids=["today-10"],
+                ),
+                _weekly_call(call_id="draft-weekly"),
+            ),
+            reviewed_calls=(
+                _daily_delete_call(
+                    call_id="reviewed-delete",
+                    target_item_ids=["today-10"],
+                ),
+            ),
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
 
 
 @pytest.mark.asyncio

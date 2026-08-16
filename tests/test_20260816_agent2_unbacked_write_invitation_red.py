@@ -29,6 +29,7 @@ from app.agent2.tool_calling.deepseek_adapter import (
 )
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
 from app.agent2.tool_calling.production_runtime import _safe_report_snapshot
+from app.agent2.tool_calling.receipt_provenance import principal_scope_sha256
 from app.agent2.weekly_plan_context import (
     TrustedWeeklyPlanContext,
     TrustedWeeklyPlanDay,
@@ -36,6 +37,17 @@ from app.agent2.weekly_plan_context import (
 
 
 _USER_ID = UUID("10000000-0000-4000-8000-000000000004")
+
+
+def _query_server_evidence() -> dict[str, str]:
+    return {
+        "principal_scope_sha256": principal_scope_sha256(
+            tenant_id="tenant-a",
+            user_id=_USER_ID,
+            conversation_id="direct-user-a",
+            source_message_id="message-current",
+        )
+    }
 
 
 def _completed_report_state_hash(snapshot: dict) -> str:
@@ -115,6 +127,7 @@ class _CompletedReportEditRuntime:
         query_target_id: str | None = None,
         query_execution_mode: ExecutionMode = ExecutionMode.CANARY_EXECUTE,
         query_receipt_overrides: dict | None = None,
+        query_server_evidence: dict | None = None,
     ) -> None:
         self.report_id = UUID("20000000-0000-4000-8000-000000000004")
         self.snapshot_report_id = snapshot_report_id or self.report_id
@@ -148,6 +161,15 @@ class _CompletedReportEditRuntime:
         self.query_target_id = query_target_id or str(self.report_id)
         self.query_execution_mode = query_execution_mode
         self.query_receipt_overrides = query_receipt_overrides or {}
+        self.query_server_evidence = (
+            (
+                _query_server_evidence()
+                if query_execution_mode == ExecutionMode.CANARY_EXECUTE
+                else {}
+            )
+            if query_server_evidence is None
+            else query_server_evidence
+        )
         self.executed_tools: list[str] = []
         self.commit_count = 0
         self.rollback_count = 0
@@ -178,6 +200,7 @@ class _CompletedReportEditRuntime:
                             "report_date": self.snapshot["report_date"],
                             **self.query_safe_fact_overrides,
                         },
+                        server_evidence=self.query_server_evidence,
                         execution_mode=self.query_execution_mode,
                         **self.query_receipt_overrides,
                     ),
@@ -295,6 +318,7 @@ class _OneForgedOfTwoCompletedReportQueryRuntime(_CompletedReportEditRuntime):
                     "report_snapshot": snapshot,
                     "report_date": snapshot["report_date"],
                 },
+                server_evidence=_query_server_evidence(),
                 execution_mode=ExecutionMode.CANARY_EXECUTE,
             )
             for snapshot in (self.snapshot, self.second_snapshot)
@@ -338,6 +362,7 @@ class _NoOpReportQueryRuntime:
                 "report_snapshot": None,
                 "report_date": "2026-08-11",
             },
+            "server_evidence": _query_server_evidence(),
             "execution_mode": ExecutionMode.CANARY_EXECUTE,
             **self.receipt_overrides,
         }
@@ -1594,6 +1619,683 @@ async def test_completed_report_content_write_follow_through_uses_existing_revie
     assert completion_tool_names[6] == []
 
 
+@pytest.mark.asyncio
+async def test_direct_completed_edit_review_receives_trusted_ordinal_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _CompletedReportEditRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=4,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    edit_arguments = {
+        "report_id": str(runtime.report_id),
+        "expected_version": 4,
+        "target_item_ids": ["tw-1"],
+        "replacement": "完成合同终稿复核",
+        "replacement_evidence": {
+            "source_message_index": 1,
+            "exact_quote": "完成合同终稿复核",
+        },
+    }
+    edit_call = {
+        "id": "direct-edit-with-trusted-ordinal",
+        "type": "function",
+        "function": {
+            "name": "edit_daily_items",
+            "arguments": json.dumps(edit_arguments, ensure_ascii=False),
+        },
+    }
+    final_reply = "已修改昨天日报今日工作的第一条，日报仍保持已提交状态。"
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "load-before-trusted-ordinal-edit",
+                            "type": "function",
+                            "function": {
+                                "name": "query_report_by_date",
+                                "arguments": json.dumps(
+                                    {
+                                        "date_expression": "昨天",
+                                        "proposed_date": "2026-08-11",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={"role": "assistant", "content": None, "tool_calls": [edit_call]},
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{**edit_call, "id": "reviewed-trusted-ordinal-edit"}],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": final_reply,
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": _follow_through_review_envelope(
+                        final_reply,
+                        decision="keep_no_write",
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    completion_count = 0
+    review_payload: dict | None = None
+
+    async def scripted_completion(
+        messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count, review_payload
+        del thinking_enabled
+        completion_count += 1
+        if completion_count == 3:
+            assert [
+                schema["function"]["name"] for schema in tool_schemas
+            ] == ["edit_daily_items"]
+            assert "field positions and content" in messages[0]["content"]
+            assert "existing binder" in messages[0]["content"]
+            review_payload = json.loads(messages[1]["content"])
+            assert review_payload["trusted_completed_daily_query_results"] == [
+                {
+                    "tool_name": "query_report_by_date",
+                    "status": "success",
+                    "changed": False,
+                    "snapshot_available": True,
+                    "report_date": "2026-08-11",
+                    "report_status": "completed",
+                    "fields": {
+                        "today_work": [
+                            {"position": 1, "content": "完成合同初稿复核"},
+                            {"position": 2, "content": "整理付款材料"},
+                        ],
+                        "problems": [],
+                        "tomorrow_plan": [],
+                    },
+                    "acknowledged_empty_fields": [],
+                }
+            ]
+            assert review_payload["selected_targets"] == [
+                {
+                    "call_index": 1,
+                    "tool_name": "edit_daily_items",
+                    "field": "today_work",
+                    "position": 1,
+                    "content": "完成合同初稿复核",
+                }
+            ]
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 trusted completed-report ordinal edit",
+        user_text="把昨天日报今日工作的第一条改成：完成合同终稿复核。",
+        context=_daily_write_context(
+            allowed_tool_names=frozenset(
+                {"query_report_by_date", "edit_daily_items"}
+            )
+        ),
+        runtime_session=runtime,
+    )
+
+    assert review_payload is not None
+    serialized_summary = json.dumps(
+        review_payload["trusted_completed_daily_query_results"],
+        ensure_ascii=False,
+    )
+    assert str(runtime.report_id) not in serialized_summary
+    assert runtime.snapshot["report_state_sha256"] not in serialized_summary
+    assert "report_id" not in serialized_summary
+    assert "report_state_sha256" not in serialized_summary
+    assert "item_id" not in serialized_summary
+    assert "version" not in serialized_summary
+    assert runtime.executed_tools == ["query_report_by_date", "edit_daily_items"]
+    assert runtime.commit_count == 1
+    assert result.final_content == final_reply
+
+
+@pytest.mark.asyncio
+async def test_direct_completed_edit_wrong_ordinal_is_rejected_before_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _CompletedReportEditRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=4,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    wrong_edit_call = {
+        "id": "direct-edit-wrong-second-item",
+        "type": "function",
+        "function": {
+            "name": "edit_daily_items",
+            "arguments": json.dumps(
+                {
+                    "report_id": str(runtime.report_id),
+                    "expected_version": 4,
+                    "target_item_ids": ["tw-2"],
+                    "replacement": "完成合同终稿复核",
+                    "replacement_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同终稿复核",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+    clarification = "你指定的是第一条，但当前选择对应第二条；请确认要修改哪一条？"
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "load-before-wrong-ordinal-edit",
+                            "type": "function",
+                            "function": {
+                                "name": "query_report_by_date",
+                                "arguments": json.dumps(
+                                    {
+                                        "date_expression": "昨天",
+                                        "proposed_date": "2026-08-11",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [wrong_edit_call],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"decision": "clarification", "reply": clarification},
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": _follow_through_review_envelope(
+                        clarification,
+                        decision="continue_once",
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    completion_count = 0
+    selected_targets: list[dict] | None = None
+
+    async def scripted_completion(
+        messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count, selected_targets
+        del tool_schemas, thinking_enabled
+        completion_count += 1
+        if completion_count == 3:
+            review_payload = json.loads(messages[1]["content"])
+            selected_targets = review_payload["selected_targets"]
+            assert selected_targets == [
+                {
+                    "call_index": 1,
+                    "tool_name": "edit_daily_items",
+                    "field": "today_work",
+                    "position": 2,
+                    "content": "整理付款材料",
+                }
+            ]
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+
+    with pytest.raises(
+        DeepSeekResponseError,
+        match="clarification was not independently confirmed",
+    ):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 wrong completed-report ordinal control",
+            user_text="把昨天日报今日工作的第一条改成：完成合同终稿复核。",
+            context=_daily_write_context(
+                allowed_tool_names=frozenset(
+                    {"query_report_by_date", "edit_daily_items"}
+                )
+            ),
+            runtime_session=runtime,
+        )
+
+    assert selected_targets is not None
+    serialized_targets = json.dumps(selected_targets, ensure_ascii=False)
+    assert str(runtime.report_id) not in serialized_targets
+    assert runtime.snapshot["report_state_sha256"] not in serialized_targets
+    assert "item_id" not in serialized_targets
+    assert "version" not in serialized_targets
+    assert completion_count == 4
+    assert runtime.executed_tools == ["query_report_by_date"]
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_review_without_query_keeps_its_original_payload_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=4,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    edit_call = {
+        "id": "unbound-edit-without-query",
+        "type": "function",
+        "function": {
+            "name": "edit_daily_items",
+            "arguments": json.dumps(
+                {
+                    "report_id": "20000000-0000-4000-8000-000000000004",
+                    "expected_version": 4,
+                    "target_item_ids": ["tw-1"],
+                    "replacement": "完成合同终稿复核",
+                    "replacement_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同终稿复核",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+    clarification = "请先说明要修改哪一天日报中的哪一条。"
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={"role": "assistant", "content": None, "tool_calls": [edit_call]},
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"decision": "clarification", "reply": clarification},
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": _review_envelope(
+                        clarification,
+                        decision="keep",
+                        classification="ordinary_reply",
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    completion_count = 0
+
+    async def scripted_completion(
+        messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count
+        del thinking_enabled
+        completion_count += 1
+        if completion_count == 2:
+            assert [
+                schema["function"]["name"] for schema in tool_schemas
+            ] == ["edit_daily_items"]
+            review_payload = json.loads(messages[1]["content"])
+            assert set(review_payload) == {
+                "ordered_current_user_messages",
+                "trusted_context",
+                "unexecuted_daily_periodic_weekly_operation_draft",
+            }
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 ordinary unbound edit review",
+        user_text="把日报里的那条改成：完成合同终稿复核。",
+        context=_daily_write_context(
+            allowed_tool_names=frozenset({"edit_daily_items"})
+        ),
+        runtime_session=_NoWriteRuntime(),
+    )
+
+    assert result.final_content == clarification
+    assert completion_count == 3
+
+
+@pytest.mark.asyncio
+async def test_no_op_daily_query_is_not_injected_into_edit_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _NoOpReportQueryRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=4,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    clarification = "没有查到这一天的日报，无法按条目位置修改。"
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "load-missing-before-edit-review",
+                            "type": "function",
+                            "function": {
+                                "name": "query_report_by_date",
+                                "arguments": json.dumps(
+                                    {
+                                        "date_expression": "昨天",
+                                        "proposed_date": "2026-08-11",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "edit-after-missing-query",
+                            "type": "function",
+                            "function": {
+                                "name": "edit_daily_items",
+                                "arguments": json.dumps(
+                                    {
+                                        "report_id": (
+                                            "20000000-0000-4000-8000-000000000004"
+                                        ),
+                                        "expected_version": 4,
+                                        "target_item_ids": ["tw-1"],
+                                        "replacement": "完成合同终稿复核",
+                                        "replacement_evidence": {
+                                            "source_message_index": 1,
+                                            "exact_quote": "完成合同终稿复核",
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"decision": "clarification", "reply": clarification},
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": _review_envelope(
+                        clarification,
+                        decision="keep",
+                        classification="ordinary_reply",
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    completion_count = 0
+
+    async def scripted_completion(
+        messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count
+        del tool_schemas, thinking_enabled
+        completion_count += 1
+        if completion_count == 3:
+            review_payload = json.loads(messages[1]["content"])
+            assert "trusted_completed_daily_query_results" not in review_payload
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 no-op query edit review control",
+        user_text="把昨天日报第一条改成：完成合同终稿复核。",
+        context=_daily_write_context(
+            allowed_tool_names=frozenset(
+                {"query_report_by_date", "edit_daily_items"}
+            )
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == clarification
+    assert completion_count == 4
+    assert runtime.executed_tools == ["query_report_by_date"]
+
+
+@pytest.mark.asyncio
+async def test_multiple_daily_queries_are_not_injected_into_edit_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _TwoCompletedReportQueryRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=4,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    clarification = "这一轮查了两个日期，请重新指定要修改哪一天。"
+    edit_call = {
+        "id": "edit-after-multiple-query-review",
+        "type": "function",
+        "function": {
+            "name": "edit_daily_items",
+            "arguments": json.dumps(
+                {
+                    "report_id": str(runtime.report_id),
+                    "expected_version": 4,
+                    "target_item_ids": ["tw-1"],
+                    "replacement": "完成合同终稿复核",
+                    "replacement_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同终稿复核",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+    query_calls = [
+        {
+            "id": f"load-before-multi-review-{index}",
+            "type": "function",
+            "function": {
+                "name": "query_report_by_date",
+                "arguments": json.dumps(
+                    {
+                        "date_expression": expression,
+                        "proposed_date": proposed_date,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        }
+        for index, (expression, proposed_date) in enumerate(
+            (("昨天", "2026-08-11"), ("前天", "2026-08-10")),
+            start=1,
+        )
+    ]
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": query_calls,
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={"role": "assistant", "content": None, "tool_calls": [edit_call]},
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"decision": "clarification", "reply": clarification},
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": _follow_through_review_envelope(
+                        clarification,
+                        decision="keep_clarification",
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": _review_envelope(
+                        clarification,
+                        decision="keep",
+                        classification="ordinary_reply",
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    completion_count = 0
+
+    async def scripted_completion(
+        messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count
+        del tool_schemas, thinking_enabled
+        completion_count += 1
+        if completion_count == 3:
+            review_payload = json.loads(messages[1]["content"])
+            assert "trusted_completed_daily_query_results" not in review_payload
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 multiple-query edit review control",
+        user_text="查昨天和前天，再把第一条改成：完成合同终稿复核。",
+        context=_daily_write_context(
+            allowed_tool_names=frozenset(
+                {"query_report_by_date", "edit_daily_items"}
+            )
+        ),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == clarification
+    assert completion_count == 5
+    assert runtime.executed_tools == [
+        "query_report_by_date",
+        "query_report_by_date",
+    ]
+
+
 @pytest.mark.parametrize(
     ("write_tool_name", "write_details", "user_text"),
     (
@@ -1709,14 +2411,16 @@ async def test_direct_completed_report_delete_and_move_use_existing_review(
         )
     )
     completion_tool_names: list[list[str]] = []
+    completion_messages: list[list[dict]] = []
 
     async def scripted_completion(
-        _messages,
+        messages,
         *,
         tool_schemas,
         thinking_enabled,
     ) -> _CompletionResponse:
         del thinking_enabled
+        completion_messages.append(messages)
         completion_tool_names.append(
             [schema["function"]["name"] for schema in tool_schemas]
         )
@@ -1740,6 +2444,319 @@ async def test_direct_completed_report_delete_and_move_use_existing_review(
     assert result.final_content == final_reply
     assert completion_tool_names[2] == [write_tool_name]
     assert completion_tool_names[4] == []
+    selected_targets = json.loads(completion_messages[2][1]["content"])[
+        "selected_targets"
+    ]
+    expected_target = {
+        "call_index": 1,
+        "tool_name": write_tool_name,
+        "field": "today_work",
+        "position": 2 if write_tool_name == "delete_daily_items" else 1,
+        "content": (
+            "整理付款材料"
+            if write_tool_name == "delete_daily_items"
+            else "完成合同初稿复核"
+        ),
+    }
+    if write_tool_name == "move_daily_items":
+        expected_target.update(
+            {"source_field": "today_work", "target_field": "tomorrow_plan"}
+        )
+    assert selected_targets == [expected_target]
+
+
+@pytest.mark.asyncio
+async def test_completed_delete_review_maps_multiple_targets_across_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_arguments = {
+        "report_id": "20000000-0000-4000-8000-000000000004",
+        "expected_version": 4,
+        "target_item_ids": ["tw-1", "p-1"],
+    }
+    runtime = _CompletedReportContentWriteRuntime(
+        write_tool_name="delete_daily_items",
+        write_arguments=write_arguments,
+    )
+    runtime.snapshot["fields"]["problems"] = [
+        {"item_id": "p-1", "content": "等待对方确认"}
+    ]
+    runtime.snapshot["report_state_sha256"] = _completed_report_state_hash(
+        runtime.snapshot
+    )
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=4,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    delete_call = {
+        "id": "delete-completed-cross-field-targets",
+        "type": "function",
+        "function": {
+            "name": "delete_daily_items",
+            "arguments": json.dumps(write_arguments, ensure_ascii=False),
+        },
+    }
+    final_reply = "已删除昨天日报今日工作的第一条和问题困难的第一条。"
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "load-before-cross-field-delete",
+                            "type": "function",
+                            "function": {
+                                "name": "query_report_by_date",
+                                "arguments": json.dumps(
+                                    {
+                                        "date_expression": "昨天",
+                                        "proposed_date": "2026-08-11",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [delete_call],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {**delete_call, "id": "reviewed-cross-field-delete"}
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": final_reply,
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": _follow_through_review_envelope(
+                        final_reply,
+                        decision="keep_no_write",
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    completion_count = 0
+    selected_targets: list[dict] | None = None
+
+    async def scripted_completion(
+        messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count, selected_targets
+        del tool_schemas, thinking_enabled
+        completion_count += 1
+        if completion_count == 3:
+            selected_targets = json.loads(messages[1]["content"])[
+                "selected_targets"
+            ]
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 completed cross-field delete mapping",
+        user_text="删除昨天日报今日工作的第一条和问题困难的第一条。",
+        context=_daily_write_context(
+            allowed_tool_names=frozenset(
+                {"query_report_by_date", "delete_daily_items"}
+            )
+        ),
+        runtime_session=runtime,
+    )
+
+    assert selected_targets == [
+        {
+            "call_index": 1,
+            "tool_name": "delete_daily_items",
+            "field": "today_work",
+            "position": 1,
+            "content": "完成合同初稿复核",
+        },
+        {
+            "call_index": 1,
+            "tool_name": "delete_daily_items",
+            "field": "problems",
+            "position": 1,
+            "content": "等待对方确认",
+        },
+    ]
+    serialized_targets = json.dumps(selected_targets, ensure_ascii=False)
+    assert str(runtime.report_id) not in serialized_targets
+    assert "tw-1" not in serialized_targets
+    assert "p-1" not in serialized_targets
+    assert "version" not in serialized_targets
+    assert runtime.executed_tools == ["query_report_by_date", "delete_daily_items"]
+    assert runtime.commit_count == 1
+    assert result.final_content == final_reply
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "argument_overrides"),
+    (
+        (
+            "edit_daily_items",
+            {"report_id": "20000000-0000-4000-8000-000000000099"},
+        ),
+        ("edit_daily_items", {"expected_version": 3}),
+        ("edit_daily_items", {"target_item_ids": ["unknown-item"]}),
+        (
+            "move_daily_items",
+            {"source_field": "problems", "target_field": "tomorrow_plan"},
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_completed_target_draft_mismatch_fails_before_semantic_review(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    argument_overrides: dict,
+) -> None:
+    runtime = _CompletedReportEditRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=4,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    arguments = {
+        "report_id": str(runtime.report_id),
+        "expected_version": 4,
+        "target_item_ids": ["tw-1"],
+        **(
+            {
+                "replacement": "完成合同终稿复核",
+                "replacement_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "完成合同终稿复核",
+                },
+            }
+            if tool_name == "edit_daily_items"
+            else {"source_field": "today_work", "target_field": "tomorrow_plan"}
+        ),
+        **argument_overrides,
+    }
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "load-before-mismatched-target-draft",
+                            "type": "function",
+                            "function": {
+                                "name": "query_report_by_date",
+                                "arguments": json.dumps(
+                                    {
+                                        "date_expression": "昨天",
+                                        "proposed_date": "2026-08-11",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "mismatched-completed-target-draft",
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(
+                                    arguments,
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+        )
+    )
+    completion_count = 0
+
+    async def scripted_completion(
+        _messages,
+        *,
+        tool_schemas,
+        thinking_enabled,
+    ) -> _CompletionResponse:
+        nonlocal completion_count
+        del tool_schemas, thinking_enabled
+        completion_count += 1
+        if completion_count > 2:
+            raise AssertionError(
+                "a mismatched completed target must fail before semantic review"
+            )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", scripted_completion)
+
+    with pytest.raises(
+        DeepSeekResponseError,
+        match="does not match the trusted completed query",
+    ):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 completed target binding control",
+            user_text="把昨天日报今日工作的第一条改成：完成合同终稿复核。",
+            context=_daily_write_context(
+                allowed_tool_names=frozenset(
+                    {"query_report_by_date", tool_name}
+                )
+            ),
+            runtime_session=runtime,
+        )
+
+    assert completion_count == 2
+    assert runtime.executed_tools == ["query_report_by_date"]
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
 
 
 @pytest.mark.parametrize("leak_kind", ("report_id", "state_hash"))
@@ -2841,6 +3858,17 @@ async def test_completed_report_follow_through_cannot_end_without_a_write_again(
         {"query_receipt_overrides": {"error_code": "FORGED"}},
         {"query_receipt_overrides": {"would_change": True}},
         {"query_receipt_overrides": {"validation_errors": ("forged",)}},
+        {"query_server_evidence": {}},
+        {
+            "query_server_evidence": {
+                "principal_scope_sha256": principal_scope_sha256(
+                    tenant_id="tenant-a",
+                    user_id=UUID("10000000-0000-4000-8000-000000000099"),
+                    conversation_id="direct-user-a",
+                    source_message_id="message-current",
+                )
+            }
+        },
     ),
 )
 @pytest.mark.asyncio
@@ -3634,7 +4662,13 @@ async def test_multiple_report_queries_cannot_open_edit_follow_through(
         ({"target_id": "2026-08-11"}, True),
         ({"before_version": 1}, True),
         ({"after_version": 1}, True),
-        ({"execution_mode": ExecutionMode.SHADOW_PROPOSAL}, True),
+        (
+            {
+                "execution_mode": ExecutionMode.SHADOW_PROPOSAL,
+                "server_evidence": {},
+            },
+            True,
+        ),
         (
             {
                 "safe_user_facts": {
