@@ -3008,7 +3008,7 @@ def _daily_weekly_write_review_messages(
         else ""
     )
     draft_calls = [
-        {"tool_name": call.tool_name, "arguments": call.arguments}
+        _daily_weekly_review_draft_payload(call)
         for call in calls
         if _daily_weekly_write_domain(call.tool_name) is not None
     ]
@@ -3030,7 +3030,12 @@ def _daily_weekly_write_review_messages(
                 f"{_daily_weekly_review_domain_policy(allowed_domains)} "
                 "Treat the supplied draft as fallible: it may omit one domain, omit a "
                 "matter, or contain the wrong otherwise-valid arguments. The draft has "
-                "not executed and has written nothing. If all intended writes and their "
+                "not executed and has written nothing. For targeted_daily_items the "
+                "fallible draft operation name is deliberately omitted: independently "
+                "choose edit, delete, or move from the exact user meaning while copying "
+                "immutable_target exactly. For add_daily_items the fallible date target "
+                "is deliberately omitted: independently choose the date only from the "
+                "user messages and trusted_context. If all intended writes and their "
                 "dates, fields, actors, conditions, evidence, stable IDs, and versions are "
                 "clear, return exactly one complete corrected native tool-call batch using "
                 "only the supplied tools. Preserve exact current-message grounding and do "
@@ -3088,6 +3093,48 @@ def _daily_weekly_write_review_messages(
             ),
         },
     ]
+
+
+def _daily_weekly_review_draft_payload(
+    call: NativeToolCall,
+) -> dict[str, Any]:
+    """Remove fallible operation/date choices while preserving server-bound targets."""
+
+    if call.tool_name in {
+        "edit_daily_items",
+        "delete_daily_items",
+        "move_daily_items",
+    }:
+        return {
+            "draft_kind": "targeted_daily_items",
+            "immutable_target": {
+                key: call.arguments.get(key)
+                for key in (
+                    "report_id",
+                    "expected_version",
+                    "target_item_ids",
+                )
+            },
+        }
+    if call.tool_name == "add_daily_items":
+        hidden_target_keys = {
+            "date_selection",
+            "date_expression",
+            "proposed_date",
+            "report_id",
+            "expected_version",
+            "retry_candidate_id",
+            "date_evidence",
+        }
+        return {
+            "tool_name": call.tool_name,
+            "arguments_without_fallible_date_target": {
+                key: value
+                for key, value in call.arguments.items()
+                if key not in hidden_target_keys
+            },
+        }
+    return {"tool_name": call.tool_name, "arguments": call.arguments}
 
 
 def _dropped_daily_add_adjudication_messages(

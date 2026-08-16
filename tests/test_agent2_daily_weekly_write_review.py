@@ -516,6 +516,7 @@ async def _run_scripted_write_review(
     draft_calls: tuple[dict, ...],
     reviewed_calls: tuple[dict, ...],
     adjudicated_calls: tuple[dict, ...] | None = None,
+    captured_review_payloads: list[dict] | None = None,
 ):
     adapter = DeepSeekToolCallingAdapter(
         http_client=object(),
@@ -534,7 +535,13 @@ async def _run_scripted_write_review(
     completions = iter(scripted)
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, tool_schemas, thinking_enabled
+        if (
+            captured_review_payloads is not None
+            and thinking_enabled
+            and tool_schemas
+            and "isolated Agent2 semantic reviewer" in messages[0]["content"]
+        ):
+            captured_review_payloads.append(json.loads(messages[1]["content"]))
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
@@ -759,7 +766,6 @@ async def test_daily_edit_partial_quote_review_can_fail_closed(
             _zero_tool_keep_completion(question),
         )
     )
-
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
         del messages, tool_schemas, thinking_enabled
         return next(completions)
@@ -886,6 +892,7 @@ async def test_daily_targeted_review_can_correct_delete_draft_to_edit_same_targe
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _RecordingRuntime()
+    review_payloads: list[dict] = []
     await _run_scripted_write_review(
         monkeypatch,
         runtime=runtime,
@@ -910,11 +917,22 @@ async def test_daily_targeted_review_can_correct_delete_draft_to_edit_same_targe
                 target_item_ids=["today-9"],
             ),
         ),
+        captured_review_payloads=review_payloads,
     )
 
     assert [call.tool_name for call in runtime.calls] == ["edit_daily_items"]
     assert runtime.calls[0].arguments["target_item_ids"] == ["today-9"]
     assert runtime.commit_count == 1
+    assert review_payloads[0]["unexecuted_daily_periodic_weekly_operation_draft"] == [
+        {
+            "draft_kind": "targeted_daily_items",
+            "immutable_target": {
+                "report_id": "20000000-0000-4000-8000-000000000009",
+                "expected_version": 9,
+                "target_item_ids": ["today-9"],
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1593,9 +1611,11 @@ async def test_daily_review_rebinds_server_default_to_exact_trusted_open_report(
             _terminal_completion("两项工作已分别记入今日日报。"),
         )
     )
+    review_payloads: list[dict] = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, tool_schemas, thinking_enabled
+        if thinking_enabled and tool_schemas:
+            review_payloads.append(json.loads(messages[1]["content"]))
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
@@ -1610,6 +1630,11 @@ async def test_daily_review_rebinds_server_default_to_exact_trusted_open_report(
     assert runtime.calls[0].arguments["date_selection"] == "trusted_report"
     assert runtime.calls[0].arguments["report_id"] == str(historical.report_id)
     assert runtime.calls[0].arguments["expected_version"] == historical.version
+    draft_payload = review_payloads[0][
+        "unexecuted_daily_periodic_weekly_operation_draft"
+    ][0]
+    assert draft_payload["tool_name"] == "add_daily_items"
+    assert "date_selection" not in draft_payload["arguments_without_fallible_date_target"]
 
 
 @pytest.mark.asyncio
