@@ -1031,7 +1031,8 @@ class DeepSeekToolCallingAdapter:
                             )
                         )
                         reviewed = _parse_assistant_turn(
-                            review_completion.message
+                            review_completion.message,
+                            allow_review_arguments_envelope=True,
                         )
                         _validate_completion_protocol(
                             review_completion,
@@ -2059,7 +2060,11 @@ def _server_requests_json_object(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _parse_assistant_turn(message: dict[str, Any]) -> _ParsedAssistantTurn:
+def _parse_assistant_turn(
+    message: dict[str, Any],
+    *,
+    allow_review_arguments_envelope: bool = False,
+) -> _ParsedAssistantTurn:
     raw_calls = message.get("tool_calls")
     if raw_calls is None:
         raw_calls = ()
@@ -2069,7 +2074,12 @@ def _parse_assistant_turn(message: dict[str, Any]) -> _ParsedAssistantTurn:
     audits: list[RawToolCallAudit] = []
     for raw_call in raw_calls:
         try:
-            call, audit = _parse_native_tool_call(raw_call)
+            call, audit = _parse_native_tool_call(
+                raw_call,
+                allow_review_arguments_envelope=(
+                    allow_review_arguments_envelope
+                ),
+            )
         except DeepSeekToolCallingError as exc:
             raise _with_accumulated_audit(exc, audits) from exc
         audits.append(audit)
@@ -2145,7 +2155,11 @@ def _validate_completion_protocol(
     return None
 
 
-def _parse_native_tool_call(raw_call: Any) -> tuple[NativeToolCall, RawToolCallAudit]:
+def _parse_native_tool_call(
+    raw_call: Any,
+    *,
+    allow_review_arguments_envelope: bool = False,
+) -> tuple[NativeToolCall, RawToolCallAudit]:
     if not isinstance(raw_call, dict):
         raise MalformedToolCallError("tool call must be an object")
     try:
@@ -2174,6 +2188,15 @@ def _parse_native_tool_call(raw_call: Any) -> tuple[NativeToolCall, RawToolCallA
             "tool arguments are not valid JSON",
             raw_tool_call_audit=(audit,),
         ) from exc
+    parse_status = "validated"
+    if (
+        allow_review_arguments_envelope
+        and isinstance(decoded, dict)
+        and set(decoded) == {"arguments"}
+        and isinstance(decoded["arguments"], dict)
+    ):
+        decoded = decoded["arguments"]
+        parse_status = "validated_review_arguments_envelope"
     try:
         validated = validate_tool_arguments(name, decoded)
     except UnknownToolError as exc:
@@ -2191,7 +2214,7 @@ def _parse_native_tool_call(raw_call: Any) -> tuple[NativeToolCall, RawToolCallA
         tool_name=audit.tool_name,
         raw_arguments=audit.raw_arguments,
         arguments_sha256=audit.arguments_sha256,
-        parse_status="validated",
+        parse_status=parse_status,
     )
 
 

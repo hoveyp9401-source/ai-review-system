@@ -42,6 +42,13 @@ def _model_calls(
         for turn in turns:
             if not isinstance(turn, dict):
                 continue
+            response_metadata = turn.get("response_metadata")
+            if isinstance(response_metadata, dict) and response_metadata.get(
+                "daily_weekly_write_semantic_review"
+            ) is True:
+                # The independent write reviewer deliberately echoes the proposed
+                # tool call.  It is a safety review, not a second business draft.
+                continue
             message = turn.get("message")
             if not isinstance(message, dict):
                 continue

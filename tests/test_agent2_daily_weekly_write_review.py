@@ -1681,6 +1681,61 @@ async def test_one_full_message_daily_item_receives_exactly_one_review(
 
 
 @pytest.mark.asyncio
+async def test_daily_write_review_accepts_one_exact_arguments_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    message = "今天完成合同复核"
+    item = {
+        "field": "today_work",
+        "content": message,
+        "source_evidence": {
+            "source_message_index": 1,
+            "exact_quote": message,
+        },
+    }
+    draft = _daily_items_call(call_id="draft-daily", items=[item])
+    reviewed = _daily_items_call(call_id="reviewed-daily", items=[item])
+    reviewed_arguments = json.loads(reviewed["function"]["arguments"])
+    reviewed["function"]["arguments"] = json.dumps(
+        {"arguments": reviewed_arguments},
+        ensure_ascii=False,
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(reviewed),
+            _terminal_completion("已按原话记入今日日报。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text=message,
+        context=_daily_only_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == "已按原话记入今日日报。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
 async def test_independent_review_restores_a_weekly_write_omitted_from_daily_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
