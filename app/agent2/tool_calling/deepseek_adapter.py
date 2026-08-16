@@ -946,6 +946,7 @@ class DeepSeekToolCallingAdapter:
                     context=context,
                 )
                 if memory_daily_focus_tools:
+                    focus_reviewed: _ParsedAssistantTurn | None = None
                     try:
                         focus_completion = await complete_model(
                             _memory_daily_focus_review_messages(
@@ -992,13 +993,73 @@ class DeepSeekToolCallingAdapter:
                             model_turns=model_turns,
                         ) from exc
                     except ValueError as exc:
-                        raise _with_canary_turn_state(
-                            DeepSeekResponseError(
-                                "personal-memory and Daily focus review failed"
-                            ),
-                            audits=audits,
-                            model_turns=model_turns,
-                        ) from exc
+                        focus_content = (
+                            focus_reviewed.assistant_message.get("content")
+                            if focus_reviewed is not None
+                            else None
+                        )
+                        if (
+                            focus_reviewed is None
+                            or focus_reviewed.tool_calls
+                            or not isinstance(focus_content, str)
+                            or not focus_content.strip()
+                        ):
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "personal-memory and Daily focus review failed"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            ) from exc
+                        recovery_tools = frozenset(
+                            memory_daily_focus_tools
+                            - _PERSONAL_MEMORY_WRITE_TOOLS
+                        )
+                        try:
+                            recovery_completion = await complete_model(
+                                _memory_daily_focus_recovery_messages(
+                                    user_text=user_text,
+                                    user_messages=user_messages,
+                                    context=context,
+                                ),
+                                tool_schemas=deepseek_tool_schemas(
+                                    recovery_tools
+                                ),
+                                thinking_enabled=True,
+                            )
+                            iterations += 1
+                            model_turns.append(
+                                _model_turn_audit(
+                                    iterations,
+                                    recovery_completion.message,
+                                    response_metadata={
+                                        **recovery_completion.metadata,
+                                        "personal_memory_daily_focus_recovery": True,
+                                        "draft_executed": False,
+                                    },
+                                )
+                            )
+                            recovered = _parse_assistant_turn(
+                                recovery_completion.message
+                            )
+                            _validate_completion_protocol(
+                                recovery_completion,
+                                recovered,
+                            )
+                            audits.extend(recovered.audit)
+                            _validate_memory_daily_focus_recovery(
+                                reviewed=recovered,
+                                allowed_tool_names=recovery_tools,
+                            )
+                            parsed = recovered
+                        except (DeepSeekToolCallingError, ValueError) as recovery_exc:
+                            raise _with_canary_turn_state(
+                                DeepSeekResponseError(
+                                    "personal-memory and Daily focus recovery failed"
+                                ),
+                                audits=audits,
+                                model_turns=model_turns,
+                            ) from recovery_exc
 
                 default_daily_weekly_review_tool_names = (
                     _daily_weekly_write_review_tool_names(
@@ -2918,6 +2979,63 @@ def _memory_daily_focus_review_messages(
             ),
         },
     ]
+
+
+def _memory_daily_focus_recovery_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the final isolated Agent2 Daily-focus adjudicator. A prior "
+                "unexecuted personal-memory draft was not independently confirmed. "
+                "Ignore that draft and decide afresh from the complete current user "
+                "message plus trusted context. If the user clearly continues, adds, "
+                "edits, deletes, or moves Daily Report content, return exactly one "
+                "complete native Daily content tool call. Never infer meaning from a "
+                "keyword, phrase list, or regular expression. If the Daily action or "
+                "target is not clear, return exactly one JSON object with "
+                "decision=clarification and a concise natural Chinese question. "
+                "Personal-memory tools and all other domains are unavailable. Nothing "
+                "has executed; never claim that anything was saved."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "trusted_context": context.model_payload(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _validate_memory_daily_focus_recovery(
+    *,
+    reviewed: _ParsedAssistantTurn,
+    allowed_tool_names: frozenset[str],
+) -> None:
+    _validate_daily_weekly_write_review(
+        reviewed=reviewed,
+        allowed_tool_names=allowed_tool_names,
+        original_has_domain_writes=True,
+    )
 
 
 def _validate_memory_daily_focus_review(

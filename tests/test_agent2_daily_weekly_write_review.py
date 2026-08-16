@@ -682,6 +682,7 @@ async def test_recent_daily_followup_cannot_be_silently_written_as_memory(
     completions = iter(
         (
             _tool_completion(_memory_call()),
+            _direct_completion("这不是个人记忆，需要结合刚才的日报处理。"),
             _tool_completion(corrected_edit),
             _tool_completion(reviewed_edit),
             _terminal_completion("已把刚才第一条改为复核付款条件。"),
@@ -711,6 +712,12 @@ async def test_recent_daily_followup_cannot_be_silently_written_as_memory(
     assert "remember_personal_memory" in requested_schemas[1]
     assert "edit_daily_items" in requested_schemas[1]
     assert set(requested_schemas[2]) == {
+        "add_daily_items",
+        "delete_daily_items",
+        "edit_daily_items",
+        "move_daily_items",
+    }
+    assert set(requested_schemas[3]) == {
         "delete_daily_items",
         "edit_daily_items",
         "move_daily_items",
