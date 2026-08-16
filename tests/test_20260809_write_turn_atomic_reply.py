@@ -1919,8 +1919,11 @@ async def test_pending_write_gets_two_bounded_terminal_json_repairs(
         )
     )
 
+    captured_messages: list[tuple[dict, ...]] = []
+
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del messages, tool_schemas, thinking_enabled
+        del tool_schemas, thinking_enabled
+        captured_messages.append(tuple(messages))
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
@@ -1936,6 +1939,29 @@ async def test_pending_write_gets_two_bounded_terminal_json_repairs(
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.rollback_count == 0
+    assert len(captured_messages[3]) == 2
+    assert len(captured_messages[4]) == 2
+    assert [message["role"] for message in captured_messages[3]] == [
+        "system",
+        "user",
+    ]
+    assert [message["role"] for message in captured_messages[4]] == [
+        "system",
+        "user",
+    ]
+    first_retry_payload = json.loads(captured_messages[3][1]["content"])
+    second_retry_payload = json.loads(captured_messages[4][1]["content"])
+    assert first_retry_payload["write_reply_composer"]["retry_number"] == 1
+    assert second_retry_payload["write_reply_composer"]["retry_number"] == 2
+    assert first_retry_payload["write_reply_composer"]["safe_receipts"]
+    assert second_retry_payload["write_reply_composer"]["safe_receipts"]
+    assert "invalid_candidate_reply" not in first_retry_payload[
+        "write_reply_composer"
+    ]
+    assert "Agent2 test" not in json.dumps(
+        captured_messages[3],
+        ensure_ascii=False,
+    )
 
 
 @pytest.mark.asyncio

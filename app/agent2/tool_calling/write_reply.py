@@ -471,6 +471,52 @@ def write_reply_retry_instruction(
     )
 
 
+def write_reply_retry_messages(
+    *,
+    errors: tuple[str, ...],
+    receipts: tuple[ToolReceipt, ...],
+    retry_number: int,
+) -> list[dict[str, str]]:
+    """Build an isolated, receipt-bound retry for a failed write reply."""
+
+    retry_contract = json.loads(write_reply_retry_instruction(errors, receipts))
+    safe_receipts = [
+        {
+            "tool_name": receipt.tool_name,
+            "status": receipt.status.value,
+            "changed": bool(receipt.changed),
+            "safe_user_facts": model_safe_user_facts(receipt),
+        }
+        for receipt in receipts
+    ]
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an isolated Agent2 final-reply composer. Return exactly "
+                "one JSON object and no other text. Do not call tools. Use only "
+                "the supplied safe receipt facts. Copy every server-required "
+                "field exactly. Write a concise natural reply without internal "
+                "codes, identifiers, hashes, or unsupported claims."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "write_reply_composer": {
+                        "retry_number": retry_number,
+                        "safe_receipts": safe_receipts,
+                        **retry_contract["write_reply_retry"],
+                    }
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
 def _expected_daily_report_state(
     receipts: tuple[ToolReceipt, ...],
 ) -> DailyReportReplyState | None:

@@ -53,7 +53,7 @@ from app.agent2.tool_calling.write_reply import (
     model_safe_user_facts,
     validate_write_reply,
     write_reply_protocol,
-    write_reply_retry_instruction,
+    write_reply_retry_messages,
 )
 
 _TEXTUAL_TOOL_PROTOCOL_MARKERS = (
@@ -1346,16 +1346,10 @@ class DeepSeekToolCallingAdapter:
                         )
                         if write_batch_seen:
                             if write_reply_retry_count < 2:
-                                if content.strip():
-                                    messages.append(parsed.assistant_message)
-                                messages.append(
-                                    {
-                                        "role": "system",
-                                        "content": write_reply_retry_instruction(
-                                            tuple(validation_errors),
-                                            tuple(receipts),
-                                        ),
-                                    }
+                                messages = write_reply_retry_messages(
+                                    errors=tuple(validation_errors),
+                                    receipts=tuple(receipts),
+                                    retry_number=write_reply_retry_count + 1,
                                 )
                                 model_turns[-1] = replace(
                                     model_turns[-1],
