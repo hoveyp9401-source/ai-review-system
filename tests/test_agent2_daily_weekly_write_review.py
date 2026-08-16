@@ -218,6 +218,8 @@ def _daily_items_call(
     date_expression: str | None = None,
     proposed_date: str | None = None,
     date_evidence: dict | None = None,
+    report_id: str | None = None,
+    expected_version: int | None = None,
 ) -> dict:
     arguments = {
         "date_selection": date_selection,
@@ -229,6 +231,10 @@ def _daily_items_call(
         arguments["proposed_date"] = proposed_date
     if date_evidence is not None:
         arguments["date_evidence"] = date_evidence
+    if report_id is not None:
+        arguments["report_id"] = report_id
+    if expected_version is not None:
+        arguments["expected_version"] = expected_version
     return {
         "id": call_id,
         "type": "function",
@@ -876,6 +882,76 @@ async def test_daily_targeted_review_cannot_switch_delete_or_move_target(
 
 
 @pytest.mark.asyncio
+async def test_daily_targeted_review_can_correct_delete_draft_to_edit_same_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=_daily_context_with_tools(
+            "add_daily_items",
+            "edit_daily_items",
+            "delete_daily_items",
+            "move_daily_items",
+        ),
+        user_text="把第一条改成新的完整内容",
+        draft_calls=(
+            _daily_delete_call(
+                call_id="draft-delete",
+                target_item_ids=["today-9"],
+            ),
+        ),
+        reviewed_calls=(
+            _daily_edit_call(
+                call_id="reviewed-edit",
+                replacement="新的完整内容",
+                exact_quote="新的完整内容",
+                target_item_ids=["today-9"],
+            ),
+        ),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == ["edit_daily_items"]
+    assert runtime.calls[0].arguments["target_item_ids"] == ["today-9"]
+    assert runtime.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_daily_targeted_review_cannot_escalate_edit_draft_to_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    with pytest.raises(ValueError, match="cannot escalate or redirect"):
+        await _run_scripted_write_review(
+            monkeypatch,
+            runtime=runtime,
+            context=_daily_context_with_tools(
+                "edit_daily_items",
+                "delete_daily_items",
+            ),
+            user_text="把第一条改成新的完整内容",
+            draft_calls=(
+                _daily_edit_call(
+                    call_id="draft-edit",
+                    replacement="新的完整内容",
+                    exact_quote="新的完整内容",
+                    target_item_ids=["today-9"],
+                ),
+            ),
+            reviewed_calls=(
+                _daily_delete_call(
+                    call_id="reviewed-delete",
+                    target_item_ids=["today-9"],
+                ),
+            ),
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+
+
+@pytest.mark.asyncio
 async def test_daily_delete_cannot_be_dropped_from_atomic_weekly_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1456,7 +1532,7 @@ async def test_daily_partial_quote_review_splits_independent_items_before_write(
 
 
 @pytest.mark.asyncio
-async def test_daily_review_cannot_change_the_draft_date_binding(
+async def test_daily_review_rebinds_server_default_to_exact_trusted_open_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _RecordingRuntime()
@@ -1480,11 +1556,17 @@ async def test_daily_review_cannot_change_the_draft_date_binding(
             }
         ],
     )
+    trusted = _daily_edit_only_context().today_report
+    assert trusted is not None
+    historical = trusted.model_copy(update={"report_date": date(2026, 8, 13)})
+    context = _daily_only_context().model_copy(
+        update={"historical_reports": (historical,)}
+    )
     reviewed = _daily_items_call(
         call_id="reviewed-daily",
-        date_selection="agent2_semantic",
-        proposed_date="2026-08-13",
-        date_evidence={"source_message_index": 1, "exact_quote": "今天"},
+        date_selection="trusted_report",
+        report_id=str(historical.report_id),
+        expected_version=historical.version,
         items=[
             {
                 "field": "today_work",
@@ -1521,18 +1603,17 @@ async def test_daily_review_cannot_change_the_draft_date_binding(
     await adapter.run_canary_turn(
         system_prompt="Agent2 test",
         user_text="今天完成A并整理B",
-        context=_daily_only_context(),
+        context=context,
         runtime_session=runtime,
     )
 
-    assert runtime.calls[0].arguments["date_selection"] == "server_default"
-    assert runtime.calls[0].arguments["date_expression"] is None
-    assert runtime.calls[0].arguments["proposed_date"] is None
-    assert runtime.calls[0].arguments["date_evidence"] is None
+    assert runtime.calls[0].arguments["date_selection"] == "trusted_report"
+    assert runtime.calls[0].arguments["report_id"] == str(historical.report_id)
+    assert runtime.calls[0].arguments["expected_version"] == historical.version
 
 
 @pytest.mark.asyncio
-async def test_cross_domain_review_cannot_change_the_daily_draft_target(
+async def test_cross_domain_review_fails_closed_on_untrusted_daily_target_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _RecordingRuntime()
@@ -1586,18 +1667,19 @@ async def test_cross_domain_review_cannot_change_the_daily_draft_target(
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
 
-    await adapter.run_canary_turn(
-        system_prompt="Agent2 test",
-        user_text="今天完成A；下周三整理案件材料。",
-        context=_context(),
-        runtime_session=runtime,
-    )
+    with pytest.raises(
+        ValueError,
+        match="cannot change an untrusted report-date binding",
+    ):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 test",
+            user_text="今天完成A；下周三整理案件材料。",
+            context=_context(),
+            runtime_session=runtime,
+        )
 
-    daily = next(call for call in runtime.calls if call.tool_name == "add_daily_items")
-    assert daily.arguments["date_selection"] == "server_default"
-    assert daily.arguments["date_expression"] is None
-    assert daily.arguments["proposed_date"] is None
-    assert daily.arguments["date_evidence"] is None
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
 
 
 @pytest.mark.asyncio

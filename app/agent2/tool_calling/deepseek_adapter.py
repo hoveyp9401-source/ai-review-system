@@ -1247,6 +1247,7 @@ class DeepSeekToolCallingAdapter:
                         original=parsed,
                         reviewed=reviewed,
                         reviewed_tool_names=daily_weekly_review_tool_names,
+                        context=context,
                     )
 
                 completed_daily_tool_turn_error = (
@@ -2694,6 +2695,21 @@ def _daily_weekly_write_review_tool_names(
                 completed_daily_follow_through.DAILY_CONTENT_WRITE_TOOLS
             )
             if source_fidelity_operations:
+                targeted_operations = {
+                    "edit_daily_items",
+                    "delete_daily_items",
+                    "move_daily_items",
+                }
+                if source_fidelity_operations.intersection(targeted_operations):
+                    return frozenset(
+                        current_reviewed_operations
+                        | {
+                            name
+                            for name in targeted_operations
+                            if name in context.allowed_tool_names
+                            and context.gate_decisions.get(name) is True
+                        }
+                    )
                 return frozenset(current_reviewed_operations)
         return frozenset()
     if not current_reviewed_operations:
@@ -2913,10 +2929,13 @@ def _daily_weekly_write_review_messages(
     ordered_messages = user_messages or (user_text,)
     allowed_domains = _daily_weekly_review_domains(allowed_tool_names)
     daily_only_constraint = (
-        "For this Daily-only correction review, the draft's report-date "
-        "binding is trusted and immutable. Do not change date_selection, "
-        "date_expression, proposed_date, date_evidence, report_id, "
-        "expected_version, retry_candidate_id, or submit_after_write. You may correct only items "
+        "For this Daily-only correction review, do not invent a report date or "
+        "target. Preserve the draft target unless trusted_context proves that the "
+        "current multi-turn collection belongs to one exact collecting or "
+        "pending-confirmation report; in that case you may replace server_default "
+        "only with that exact trusted_report report_id and version. Any other date "
+        "disagreement requires clarification. Do not change retry_candidate_id or "
+        "submit_after_write. You may correct items "
         "and explicit-empty-field evidence for add_daily_items. Every exact_quote must preserve "
         "the complete meaning of its item, including every negation, condition, "
         "deadline, consequence, exception, and pending action even when separated "
@@ -2944,7 +2963,21 @@ def _daily_weekly_write_review_messages(
         "must preserve every negation, condition, deadline, consequence, and "
         "exception attached to that replacement. If no complete replacement-only "
         "span exists, ask a clarification and return no tools. "
-        if any(call.tool_name == "edit_daily_items" for call in calls)
+        if "edit_daily_items" in allowed_tool_names
+        else ""
+    )
+    targeted_operation_constraint = (
+        "For edit_daily_items, delete_daily_items, and move_daily_items, the draft "
+        "operation name is fallible but its report ID, version, and stable target "
+        "item IDs are immutable. You may correct a delete_daily_items draft to "
+        "edit_daily_items when the current message supplies a complete replacement, "
+        "while copying that exact target identity. All other operation-type changes "
+        "require clarification. Never add, drop, or substitute a target item. "
+        if {
+            "edit_daily_items",
+            "delete_daily_items",
+            "move_daily_items",
+        }.intersection(allowed_tool_names)
         else ""
     )
     trusted_completed_daily_query_constraint = (
@@ -2996,6 +3029,7 @@ def _daily_weekly_write_review_messages(
                 "clear, return exactly one complete corrected native tool-call batch using "
                 "only the supplied tools. Preserve exact current-message grounding and do "
                 f"{daily_only_constraint}{edit_source_constraint}"
+                f"{targeted_operation_constraint}"
                 f"{trusted_completed_daily_query_constraint}"
                 f"{selected_target_constraint}"
                 "not manufacture completion, certainty, or a formal weekday. If any "
@@ -3223,6 +3257,7 @@ def _constrain_daily_add_call_group(
     *,
     original_daily: tuple[NativeToolCall, ...],
     reviewed_daily: tuple[NativeToolCall, ...],
+    context: TrustedContext | None = None,
 ) -> tuple[NativeToolCall, ...]:
     """Keep every trusted target while taking grounded content from the review."""
 
@@ -3236,6 +3271,45 @@ def _constrain_daily_add_call_group(
     ):
         draft_arguments = dict(draft_call.arguments)
         reviewed_arguments = reviewed_call.arguments
+        date_target_keys = (
+            "date_selection",
+            "date_expression",
+            "proposed_date",
+            "report_id",
+            "expected_version",
+            "retry_candidate_id",
+            "date_evidence",
+        )
+        draft_target = {
+            key: draft_arguments.get(key) for key in date_target_keys
+        }
+        reviewed_target = {
+            key: reviewed_arguments.get(key) for key in date_target_keys
+        }
+        if reviewed_target != draft_target:
+            reviewed_report_id = reviewed_arguments.get("report_id")
+            try:
+                trusted_report = (
+                    context.report_by_id(UUID(str(reviewed_report_id)))
+                    if context is not None and reviewed_report_id is not None
+                    else None
+                )
+            except ValueError:
+                trusted_report = None
+            if (
+                draft_arguments.get("date_selection") != "server_default"
+                or reviewed_arguments.get("date_selection") != "trusted_report"
+                or trusted_report is None
+                or trusted_report.status
+                not in {"collecting", "pending_confirmation"}
+                or reviewed_arguments.get("expected_version")
+                != trusted_report.version
+            ):
+                raise ValueError(
+                    "Daily review cannot change an untrusted report-date binding"
+                )
+            for key in date_target_keys:
+                draft_arguments[key] = reviewed_arguments.get(key)
         reviewed_empty_evidence = reviewed_arguments.get(
             "empty_field_evidence",
             [],
@@ -3340,6 +3414,7 @@ def _merge_daily_weekly_write_review(
     original: _ParsedAssistantTurn,
     reviewed: _ParsedAssistantTurn,
     reviewed_tool_names: frozenset[str],
+    context: TrustedContext,
 ) -> _ParsedAssistantTurn:
     original_reviewed_domains = {
         domain
@@ -3373,6 +3448,7 @@ def _merge_daily_weekly_write_review(
         reviewed = _constrain_daily_write_review(
             original=original,
             reviewed=reviewed,
+            context=context,
         )
     if not reviewed.tool_calls:
         payload = json.loads(reviewed.assistant_message["content"])
@@ -3450,21 +3526,35 @@ def _constrain_daily_edit_review(
     original: _ParsedAssistantTurn,
     reviewed: _ParsedAssistantTurn,
 ) -> _ParsedAssistantTurn:
-    """Keep trusted edit targets and accept only reviewed source evidence."""
+    """Keep trusted item targets while accepting reviewed Daily semantics."""
 
     if not reviewed.tool_calls:
         return reviewed
-    original_daily_names = tuple(
-        call.tool_name
-        for call in original.tool_calls
-        if _daily_weekly_write_domain(call.tool_name) == "daily"
-    )
-    reviewed_daily_names = tuple(
-        call.tool_name
-        for call in reviewed.tool_calls
-        if _daily_weekly_write_domain(call.tool_name) == "daily"
-    )
-    if original_daily_names != reviewed_daily_names:
+    targeted_tools = {
+        "edit_daily_items",
+        "delete_daily_items",
+        "move_daily_items",
+    }
+
+    def target_key(call: NativeToolCall) -> tuple[Any, Any, tuple[Any, ...]]:
+        raw_item_ids = call.arguments.get("target_item_ids")
+        item_ids = tuple(raw_item_ids) if isinstance(raw_item_ids, list) else ()
+        return (
+            call.arguments.get("report_id"),
+            call.arguments.get("expected_version"),
+            item_ids,
+        )
+
+    def daily_sequence(parsed: _ParsedAssistantTurn) -> tuple[Any, ...]:
+        return tuple(
+            ("targeted",)
+            if call.tool_name in targeted_tools
+            else ("fixed", call.tool_name)
+            for call in parsed.tool_calls
+            if _daily_weekly_write_domain(call.tool_name) == "daily"
+        )
+
+    if daily_sequence(original) != daily_sequence(reviewed):
         raise ValueError(
             "Daily edit review must preserve non-edit Daily write names and order"
         )
@@ -3472,13 +3562,13 @@ def _constrain_daily_edit_review(
         call
         for call in original.tool_calls
         if _daily_weekly_write_domain(call.tool_name) == "daily"
-        and call.tool_name != "edit_daily_items"
+        and call.tool_name not in targeted_tools
     )
     reviewed_siblings = tuple(
         call
         for call in reviewed.tool_calls
         if _daily_weekly_write_domain(call.tool_name) == "daily"
-        and call.tool_name != "edit_daily_items"
+        and call.tool_name not in targeted_tools
     )
     for original_call, reviewed_call in zip(
         original_siblings,
@@ -3493,22 +3583,13 @@ def _constrain_daily_edit_review(
             )
 
     original_edits = tuple(
-        call for call in original.tool_calls if call.tool_name == "edit_daily_items"
+        call for call in original.tool_calls if call.tool_name in targeted_tools
     )
     reviewed_edits = tuple(
-        call for call in reviewed.tool_calls if call.tool_name == "edit_daily_items"
+        call for call in reviewed.tool_calls if call.tool_name in targeted_tools
     )
     if len(original_edits) != len(reviewed_edits):
-        raise ValueError("Daily edit review must preserve every edit target")
-
-    def target_key(call: NativeToolCall) -> tuple[Any, Any, tuple[Any, ...]]:
-        raw_item_ids = call.arguments.get("target_item_ids")
-        item_ids = tuple(raw_item_ids) if isinstance(raw_item_ids, list) else ()
-        return (
-            call.arguments.get("report_id"),
-            call.arguments.get("expected_version"),
-            item_ids,
-        )
+        raise ValueError("Daily targeted review must preserve every target")
 
     original_by_target = {target_key(call): call for call in original_edits}
     reviewed_by_target = {target_key(call): call for call in reviewed_edits}
@@ -3518,23 +3599,56 @@ def _constrain_daily_edit_review(
         or set(original_by_target) != set(reviewed_by_target)
     ):
         raise ValueError(
-            "Daily edit review cannot change report, version, or stable item IDs"
+            "Daily targeted review cannot change report, version, or stable item IDs; "
+            "cannot change non-edit Daily write arguments"
         )
 
     constrained_by_review_id: dict[str, NativeToolCall] = {}
     for target, reviewed_call in reviewed_by_target.items():
         draft_call = original_by_target[target]
-        constrained_arguments = dict(draft_call.arguments)
-        constrained_arguments["replacement_evidence"] = (
-            reviewed_call.arguments.get("replacement_evidence")
-        )
+        if (
+            reviewed_call.tool_name != draft_call.tool_name
+            and (
+                draft_call.tool_name,
+                reviewed_call.tool_name,
+            )
+            != ("delete_daily_items", "edit_daily_items")
+        ):
+            raise ValueError(
+                "Daily targeted review cannot escalate or redirect the draft operation"
+            )
+        constrained_arguments = {
+            "report_id": draft_call.arguments.get("report_id"),
+            "expected_version": draft_call.arguments.get("expected_version"),
+            "target_item_ids": draft_call.arguments.get("target_item_ids"),
+        }
+        if reviewed_call.tool_name == "edit_daily_items":
+            constrained_arguments.update(
+                {
+                    "replacement": (
+                        draft_call.arguments.get("replacement")
+                        if draft_call.tool_name == "edit_daily_items"
+                        else reviewed_call.arguments.get("replacement")
+                    ),
+                    "replacement_evidence": reviewed_call.arguments.get(
+                        "replacement_evidence"
+                    ),
+                }
+            )
+        elif reviewed_call.tool_name == "move_daily_items":
+            constrained_arguments.update(
+                {
+                    "source_field": reviewed_call.arguments.get("source_field"),
+                    "target_field": reviewed_call.arguments.get("target_field"),
+                }
+            )
         validated_arguments = validate_tool_arguments(
-            "edit_daily_items",
+            reviewed_call.tool_name,
             constrained_arguments,
         )
         constrained_by_review_id[reviewed_call.tool_call_id] = NativeToolCall(
             reviewed_call.tool_call_id,
-            "edit_daily_items",
+            reviewed_call.tool_name,
             validated_arguments,
         )
 
@@ -3551,6 +3665,7 @@ def _constrain_daily_write_review(
     *,
     original: _ParsedAssistantTurn,
     reviewed: _ParsedAssistantTurn,
+    context: TrustedContext,
 ) -> _ParsedAssistantTurn:
     """Keep each Daily draft target while accepting reviewed Daily meaning."""
 
@@ -3566,6 +3681,7 @@ def _constrain_daily_write_review(
         _constrain_daily_add_call_group(
             original_daily=original_daily,
             reviewed_daily=reviewed_daily,
+            context=context,
         )
     )
     return replace(
