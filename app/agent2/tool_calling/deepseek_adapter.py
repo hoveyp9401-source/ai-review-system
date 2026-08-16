@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 from dataclasses import dataclass, field, replace
 from datetime import date
@@ -13,7 +14,11 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from app.agent2.report_domain import period_bounds
-from app.agent2.tool_calling.context import TrustedContext
+from app.agent2.tool_calling.context import (
+    TrustedContext,
+    TrustedReportItem,
+    TrustedReportSnapshot,
+)
 from app.agent2.tool_calling.contracts import ExecutionMode, ToolReceipt
 from app.agent2.tool_calling.daily_briefing_reply import (
     daily_briefing_composer_messages,
@@ -491,6 +496,8 @@ class DeepSeekToolCallingAdapter:
         incomplete_confirm_review_count = 0
         daily_submit_section_review_count = 0
         daily_weekly_write_review_count = 0
+        daily_content_follow_through_used = False
+        daily_content_follow_through_tool_names: frozenset[str] = frozenset()
         tool_schemas = deepseek_tool_schemas(context.allowed_tool_names)
 
         async def rollback_pending() -> None:
@@ -646,6 +653,72 @@ class DeepSeekToolCallingAdapter:
                     model_turns=model_turns,
                 ) from exc
 
+        async def review_daily_content_follow_through(
+            candidate_reply: str,
+            *,
+            allowed_write_tool_names: frozenset[str],
+            query_state: str,
+            pending_write_review: bool = False,
+        ) -> str:
+            """Ask one isolated model whether a dated-report write was dropped."""
+
+            nonlocal iterations
+            try:
+                review_completion = await self._complete(
+                    _daily_content_follow_through_review_messages(
+                        user_text=user_text,
+                        user_messages=user_messages,
+                        candidate_reply=candidate_reply,
+                        receipts=tuple(receipts),
+                        allowed_write_tool_names=allowed_write_tool_names,
+                        query_state=query_state,
+                        pending_write_review=pending_write_review,
+                    ),
+                    tool_schemas=[],
+                    thinking_enabled=True,
+                )
+                iterations += 1
+                model_turns.append(
+                    _model_turn_audit(
+                        iterations,
+                        review_completion.message,
+                        response_metadata={
+                            **review_completion.metadata,
+                            "daily_content_follow_through_review": True,
+                        },
+                    )
+                )
+                reviewed = _parse_assistant_turn(review_completion.message)
+                _validate_completion_protocol(review_completion, reviewed)
+                audits.extend(reviewed.audit)
+                if reviewed.tool_calls:
+                    raise ValueError(
+                        "daily content follow-through review cannot call tools"
+                    )
+                review_content = reviewed.assistant_message.get("content")
+                if not isinstance(review_content, str):
+                    raise TypeError(
+                        "daily content follow-through review requires text"
+                    )
+                decision = _parse_daily_content_follow_through_review(
+                    review_content=review_content,
+                    candidate_reply=candidate_reply,
+                )
+                model_turns[-1] = replace(
+                    model_turns[-1],
+                    response_metadata={
+                        **model_turns[-1].response_metadata,
+                        "daily_content_follow_through_decision": decision,
+                    },
+                )
+                return decision
+            except (DeepSeekToolCallingError, TypeError, ValueError) as exc:
+                raise _with_canary_turn_state(
+                    DeepSeekResponseError("daily content follow-through review failed"),
+                    audits=audits,
+                    model_turns=model_turns,
+                ) from exc
+
         async def adjudicate_dropped_daily_adds(
             *,
             original: _ParsedAssistantTurn,
@@ -750,6 +823,7 @@ class DeepSeekToolCallingAdapter:
 
         try:
             while True:
+                follow_through_review_clarification = False
                 iterations += 1
                 try:
                     completion = await self._complete(
@@ -763,7 +837,13 @@ class DeepSeekToolCallingAdapter:
                                 or managed_daily_reply_retry_count
                                 or write_reply_retry_count
                             )
-                            else tool_schemas
+                            else (
+                                deepseek_tool_schemas(
+                                    daily_content_follow_through_tool_names
+                                )
+                                if daily_content_follow_through_used
+                                else tool_schemas
+                            )
                         ),
                         thinking_enabled=(thinking_enabled or briefing_fact_batch_seen),
                     )
@@ -809,6 +889,7 @@ class DeepSeekToolCallingAdapter:
                         tool_argument_repair_count == 0
                         and not write_batch_seen
                         and not briefing_fact_batch_seen
+                        and not daily_content_follow_through_used
                     ):
                         audits.extend(exc.raw_tool_call_audit)
                         model_turns[-1] = replace(
@@ -834,14 +915,54 @@ class DeepSeekToolCallingAdapter:
                         model_turns=model_turns,
                     ) from exc
 
+                daily_query_integrity_error = _daily_query_receipt_integrity_error(
+                    tuple(receipts)
+                )
+                if daily_query_integrity_error is not None:
+                    raise _with_canary_turn_state(
+                        DeepSeekResponseError(daily_query_integrity_error),
+                        audits=audits,
+                        model_turns=model_turns,
+                    )
+
+                if daily_content_follow_through_used and parsed.tool_calls and any(
+                    call.tool_name not in daily_content_follow_through_tool_names
+                    or TOOL_REGISTRY[call.tool_name].read_or_write != "write"
+                    for call in parsed.tool_calls
+                ):
+                    raise _with_canary_turn_state(
+                        DeepSeekResponseError(
+                            "daily content follow-through selected a disallowed tool"
+                        ),
+                        audits=audits,
+                        model_turns=model_turns,
+                    )
+
                 daily_weekly_review_tool_names = (
                     _daily_weekly_write_review_tool_names(
                         parsed.tool_calls,
                         context=context,
                     )
                 )
+                if daily_content_follow_through_used:
+                    continuation_review_tool_names = frozenset(
+                        call.tool_name
+                        for call in parsed.tool_calls
+                        if call.tool_name in daily_content_follow_through_tool_names
+                        and call.tool_name in _DAILY_CONTENT_WRITE_TOOLS
+                    )
+                    if continuation_review_tool_names:
+                        daily_weekly_review_tool_names = (
+                            continuation_review_tool_names
+                        )
                 if (
-                    daily_weekly_write_review_count == 0
+                    (
+                        daily_weekly_write_review_count == 0
+                        or (
+                            daily_content_follow_through_used
+                            and not write_batch_seen
+                        )
+                    )
                     and daily_weekly_review_tool_names
                     and (parsed.tool_calls or tool_loops == 0)
                 ):
@@ -971,6 +1092,10 @@ class DeepSeekToolCallingAdapter:
                         original=parsed,
                         reviewed=reviewed,
                     )
+                    follow_through_review_clarification = (
+                        _qualified_completed_daily_query(tuple(receipts)) is not None
+                        and _is_strict_daily_weekly_review_clarification(reviewed)
+                    )
                     original_has_domain_writes = any(
                         _daily_weekly_write_domain(call.tool_name) is not None
                         for call in parsed.tool_calls
@@ -1093,6 +1218,31 @@ class DeepSeekToolCallingAdapter:
                         reviewed=reviewed,
                         reviewed_tool_names=daily_weekly_review_tool_names,
                     )
+
+                if daily_content_follow_through_used and not write_batch_seen:
+                    if (
+                        not parsed.tool_calls
+                        and not follow_through_review_clarification
+                    ):
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "daily content follow-through ended without a write call"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
+                    if any(
+                        call.tool_name not in daily_content_follow_through_tool_names
+                        or TOOL_REGISTRY[call.tool_name].read_or_write != "write"
+                        for call in parsed.tool_calls
+                    ):
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "daily content follow-through selected a disallowed tool"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        )
 
                 if not parsed.tool_calls:
                     content = parsed.assistant_message.get("content")
@@ -1281,7 +1431,96 @@ class DeepSeekToolCallingAdapter:
                         if briefing_envelope is not None
                         else content
                     )
+                    daily_query_state = _daily_content_query_state(tuple(receipts))
+                    _assert_no_trusted_daily_identifier_leak(
+                        terminal_content,
+                        tuple(receipts),
+                    )
                     if not write_batch_seen:
+                        if follow_through_review_clarification:
+                            clarification_write_tool_names = (
+                                daily_content_follow_through_tool_names
+                                if daily_content_follow_through_used
+                                else _daily_content_follow_through_tool_names(
+                                    context=context,
+                                    receipts=tuple(receipts),
+                                )
+                            )
+                            clarification_decision = (
+                                await review_daily_content_follow_through(
+                                    terminal_content,
+                                    allowed_write_tool_names=(
+                                        clarification_write_tool_names
+                                    ),
+                                    query_state="qualified",
+                                )
+                            )
+                            if clarification_decision != "keep_clarification":
+                                raise _with_canary_turn_state(
+                                    DeepSeekResponseError(
+                                        "daily content follow-through clarification was not independently confirmed"
+                                    ),
+                                    audits=audits,
+                                    model_turns=model_turns,
+                                )
+                        follow_through_tool_names = frozenset()
+                        if not daily_content_follow_through_used:
+                            follow_through_tool_names = (
+                                _daily_content_follow_through_tool_names(
+                                    context=context,
+                                    receipts=tuple(receipts),
+                                )
+                            )
+                        follow_through_review_required = (
+                            not daily_content_follow_through_used
+                            and not follow_through_review_clarification
+                            and daily_query_state in {"qualified", "multiple"}
+                        )
+                        if follow_through_review_required:
+                            follow_through_decision = (
+                                await review_daily_content_follow_through(
+                                    terminal_content,
+                                    allowed_write_tool_names=(
+                                        follow_through_tool_names
+                                    ),
+                                    query_state=daily_query_state,
+                                )
+                            )
+                            if follow_through_decision == "continue_once":
+                                if daily_query_state == "multiple":
+                                    raise _with_canary_turn_state(
+                                        DeepSeekResponseError(
+                                            "multiple Daily queries cannot authorize write follow-through"
+                                        ),
+                                        audits=audits,
+                                        model_turns=model_turns,
+                                    )
+                                if not follow_through_tool_names:
+                                    raise _with_canary_turn_state(
+                                        DeepSeekResponseError(
+                                            "daily content follow-through has no allowed write tool"
+                                        ),
+                                        audits=audits,
+                                        model_turns=model_turns,
+                                    )
+                                # The corrected Managed Daily reply has already passed
+                                # its factual validator. Its bounded retry must not hide
+                                # the one tool-enabled follow-through turn that this
+                                # independent reviewer has just authorized.
+                                managed_daily_reply_retry_count = 0
+                                daily_content_follow_through_used = True
+                                daily_content_follow_through_tool_names = (
+                                    follow_through_tool_names
+                                )
+                                messages.append(
+                                    _daily_content_follow_through_protocol_message(
+                                        candidate_reply=terminal_content,
+                                        allowed_write_tool_names=(
+                                            follow_through_tool_names
+                                        ),
+                                    )
+                                )
+                                continue
                         reviewed_terminal_content = (
                             await review_zero_write_terminal_reply(
                                 terminal_content,
@@ -1289,6 +1528,10 @@ class DeepSeekToolCallingAdapter:
                                     _exposed_business_write_domains(context)
                                 ),
                             )
+                        )
+                        _assert_no_trusted_daily_identifier_leak(
+                            reviewed_terminal_content,
+                            tuple(receipts),
                         )
                         if (
                             briefing_envelope is not None
@@ -1317,6 +1560,30 @@ class DeepSeekToolCallingAdapter:
                             )
                         terminal_content = reviewed_terminal_content
                     else:
+                        if (
+                            daily_query_state == "qualified"
+                        ):
+                            follow_through_decision = (
+                                await review_daily_content_follow_through(
+                                    reply_for_validation,
+                                    allowed_write_tool_names=(
+                                        _daily_content_follow_through_tool_names(
+                                            context=context,
+                                            receipts=tuple(receipts),
+                                        )
+                                    ),
+                                    query_state="qualified",
+                                    pending_write_review=True,
+                                )
+                            )
+                            if follow_through_decision != "keep_no_write":
+                                raise _with_canary_turn_state(
+                                    DeepSeekResponseError(
+                                        "Daily content write remained unfulfilled before commit"
+                                    ),
+                                    audits=audits,
+                                    model_turns=model_turns,
+                                )
                         await commit_pending()
                     final_content, model_hash = finalize_canary_content(
                         terminal_content,
@@ -2059,6 +2326,585 @@ _ZERO_TOOL_WRITE_INVITATION_REVIEW_KEYS = frozenset(
     }
 )
 
+_DAILY_CONTENT_FOLLOW_THROUGH_REVIEW_KEYS = frozenset(
+    {"decision", "reviewed_reply_sha256"}
+)
+_DAILY_CONTENT_FOLLOW_THROUGH_DECISIONS = frozenset(
+    {"keep_no_write", "keep_clarification", "continue_once"}
+)
+_DAILY_CONTENT_WRITE_TOOLS = frozenset(
+    {
+        "add_daily_items",
+        "edit_daily_items",
+        "delete_daily_items",
+        "move_daily_items",
+    }
+)
+_INTERNAL_DAILY_VERSION_LABELS = (
+    "expected_version",
+    "report_version",
+    "version",
+)
+
+
+def _contains_labeled_internal_version(reply: str, version: int) -> bool:
+    lowered = reply.casefold()
+    expected = str(version)
+    separators = frozenset(" \t\r\n\"'`=:：")
+    for label in _INTERNAL_DAILY_VERSION_LABELS:
+        offset = 0
+        while True:
+            index = lowered.find(label, offset)
+            if index < 0:
+                break
+            if index > 0 and (
+                lowered[index - 1].isalnum() or lowered[index - 1] == "_"
+            ):
+                offset = index + len(label)
+                continue
+            label_end = index + len(label)
+            value_start = label_end
+            if (
+                value_start >= len(lowered)
+                or lowered[value_start] not in separators
+            ):
+                offset = index + len(label)
+                continue
+            while (
+                value_start < len(lowered)
+                and lowered[value_start] in separators
+            ):
+                value_start += 1
+            if label == "version" and not any(
+                marker in lowered[label_end:value_start]
+                for marker in "=:："
+            ):
+                offset = index + len(label)
+                continue
+            if lowered.startswith(expected, value_start):
+                value_end = value_start + len(expected)
+                if value_end == len(lowered) or not (
+                    lowered[value_end].isalnum() or lowered[value_end] == "_"
+                ):
+                    return True
+            offset = index + len(label)
+    return False
+
+
+def _assert_no_trusted_daily_identifier_leak(
+    reply: str,
+    receipts: tuple[ToolReceipt, ...],
+) -> None:
+    for receipt in receipts:
+        snapshot = _validated_daily_query_snapshot(receipt)
+        if snapshot is None:
+            continue
+        casefold_tokens: set[str] = set()
+        for value in (
+            snapshot.get("report_id"),
+            snapshot.get("report_state_sha256"),
+        ):
+            if isinstance(value, str) and value:
+                casefold_tokens.add(value.casefold())
+        exact_item_ids: set[str] = set()
+        fields = snapshot.get("fields")
+        if isinstance(fields, dict):
+            for items in fields.values():
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_id = item.get("item_id")
+                    if isinstance(item_id, str) and item_id:
+                        exact_item_ids.add(item_id)
+        if any(token in reply.casefold() for token in casefold_tokens) or any(
+            item_id in reply for item_id in exact_item_ids
+        ):
+            raise DeepSeekResponseError(
+                "terminal reply exposed internal Daily identifiers"
+            )
+        version = snapshot.get("version")
+        if type(version) is int and _contains_labeled_internal_version(
+            reply,
+            version,
+        ):
+            raise DeepSeekResponseError(
+                "terminal reply exposed internal Daily identifiers"
+            )
+
+
+def _validated_daily_query_snapshot(
+    receipt: ToolReceipt,
+) -> dict[str, Any] | None:
+    status = str(getattr(receipt.status, "value", receipt.status) or "")
+    snapshot = receipt.safe_user_facts.get("report_snapshot")
+    if (
+        receipt.tool_name != "query_report_by_date"
+        or status != "success"
+        or receipt.execution_mode != ExecutionMode.CANARY_EXECUTE
+        or receipt.changed is not False
+        or receipt.target_type != "daily_report"
+        or not isinstance(receipt.target_id, str)
+        or not receipt.target_id
+        or receipt.affected_item_ids != ()
+        or receipt.error_code is not None
+        or receipt.would_change is not False
+        or receipt.validation_errors != ()
+        or not isinstance(snapshot, dict)
+        or set(snapshot)
+        != {
+            "report_id",
+            "report_date",
+            "version",
+            "status",
+            "report_state_sha256",
+            "fields",
+            "acknowledged_empty_fields",
+        }
+        or snapshot.get("report_id") != receipt.target_id
+        or type(snapshot.get("version")) is not int
+        or snapshot.get("version") != receipt.before_version
+        or snapshot.get("version") != receipt.after_version
+        or snapshot.get("status")
+        not in {
+            "collecting",
+            "pending_confirmation",
+            "completed",
+            "skipped",
+            "cancelled",
+        }
+        or not isinstance(snapshot.get("report_date"), str)
+        or not snapshot.get("report_date")
+        or not isinstance(snapshot.get("report_state_sha256"), str)
+        or len(snapshot.get("report_state_sha256")) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in snapshot.get("report_state_sha256")
+        )
+        or not isinstance(snapshot.get("acknowledged_empty_fields"), list)
+        or receipt.safe_user_facts.get("actual_write") is not False
+        or receipt.safe_user_facts.get("report_found") is not True
+        or receipt.safe_user_facts.get("report_date")
+        != snapshot.get("report_date")
+    ):
+        return None
+    try:
+        report_id = UUID(snapshot["report_id"])
+        if str(report_id) != snapshot["report_id"]:
+            return None
+        report_date = date.fromisoformat(snapshot["report_date"])
+        if report_date.isoformat() != snapshot["report_date"]:
+            return None
+    except ValueError:
+        return None
+    fields = snapshot.get("fields")
+    expected_fields = {"today_work", "problems", "tomorrow_plan"}
+    if not isinstance(fields, dict) or set(fields) != expected_fields:
+        return None
+    acknowledged = snapshot["acknowledged_empty_fields"]
+    if (
+        any(not isinstance(field_name, str) for field_name in acknowledged)
+        or set(acknowledged) - expected_fields
+        or len(acknowledged) != len(set(acknowledged))
+        or acknowledged != sorted(acknowledged)
+    ):
+        return None
+    item_ids: set[str] = set()
+    trusted_items: list[TrustedReportItem] = []
+    for field_name, items in fields.items():
+        if not isinstance(items, list):
+            return None
+        if field_name in acknowledged and items:
+            return None
+        for item in items:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"item_id", "content"}
+                or not isinstance(item.get("item_id"), str)
+                or not item.get("item_id")
+                or not isinstance(item.get("content"), str)
+                or not item.get("content")
+                or item["item_id"] in item_ids
+            ):
+                return None
+            item_ids.add(item["item_id"])
+            trusted_items.append(
+                TrustedReportItem(
+                    item_id=item["item_id"],
+                    field=field_name,
+                    content=item["content"],
+                    report_id=report_id,
+                    report_version=snapshot["version"],
+                    provenance="trusted_context",
+                )
+            )
+    try:
+        trusted_snapshot = TrustedReportSnapshot(
+            report_id=report_id,
+            tenant_id="daily-query-snapshot-integrity",
+            owner_user_id=UUID(int=0),
+            report_date=report_date,
+            version=snapshot["version"],
+            status=snapshot["status"],
+            items=tuple(trusted_items),
+            acknowledged_empty_fields=frozenset(acknowledged),
+            provenance="trusted_context",
+        )
+    except ValueError:
+        return None
+    if not hmac.compare_digest(
+        snapshot["report_state_sha256"],
+        trusted_snapshot.state_sha256,
+    ):
+        return None
+    return snapshot
+
+
+def _daily_content_query_state(
+    receipts: tuple[ToolReceipt, ...],
+) -> str:
+    query_receipts = tuple(
+        receipt for receipt in receipts if receipt.tool_name == "query_report_by_date"
+    )
+    if not query_receipts:
+        return "none"
+    if len(query_receipts) > 1:
+        for receipt in query_receipts:
+            status = str(getattr(receipt.status, "value", receipt.status) or "")
+            if status == "success" and _validated_daily_query_snapshot(receipt) is None:
+                return "invalid_success"
+            if status == "no_op" and not _is_valid_no_op_daily_query_receipt(
+                receipt
+            ):
+                return "invalid_no_op"
+        return "multiple"
+    receipt = query_receipts[0]
+    status = str(getattr(receipt.status, "value", receipt.status) or "")
+    if status == "success":
+        snapshot = _validated_daily_query_snapshot(receipt)
+        if snapshot is None:
+            return "invalid_success"
+        return "qualified" if snapshot["status"] == "completed" else "other"
+    if status == "no_op":
+        if _is_valid_no_op_daily_query_receipt(receipt):
+            return "no_op"
+        return "invalid_no_op"
+    return "other"
+
+
+def _daily_query_receipt_integrity_error(
+    receipts: tuple[ToolReceipt, ...],
+) -> str | None:
+    query_state = _daily_content_query_state(receipts)
+    if query_state == "invalid_success":
+        return "successful Daily query returned an inconsistent snapshot"
+    if query_state == "invalid_no_op":
+        return "no-op Daily query returned an inconsistent snapshot"
+    return None
+
+
+def _is_valid_no_op_daily_query_receipt(receipt: ToolReceipt) -> bool:
+    report_date = receipt.safe_user_facts.get("report_date")
+    try:
+        canonical_report_date = (
+            isinstance(report_date, str)
+            and bool(report_date)
+            and date.fromisoformat(report_date).isoformat() == report_date
+        )
+    except ValueError:
+        canonical_report_date = False
+    try:
+        canonical_target_id = str(UUID(receipt.target_id)) == receipt.target_id
+    except (AttributeError, ValueError):
+        canonical_target_id = False
+    return bool(
+        receipt.tool_name == "query_report_by_date"
+        and receipt.execution_mode == ExecutionMode.CANARY_EXECUTE
+        and receipt.changed is False
+        and receipt.target_type == "daily_report"
+        and isinstance(receipt.target_id, str)
+        and bool(receipt.target_id)
+        and canonical_target_id
+        and receipt.before_version is None
+        and receipt.after_version is None
+        and receipt.affected_item_ids == ()
+        and receipt.error_code is None
+        and receipt.would_change is False
+        and receipt.validation_errors == ()
+        and receipt.safe_user_facts.get("actual_write") is False
+        and receipt.safe_user_facts.get("report_found") is False
+        and receipt.safe_user_facts.get("report_snapshot") is None
+        and canonical_report_date
+    )
+
+
+def _qualified_completed_daily_query(
+    receipts: tuple[ToolReceipt, ...],
+) -> tuple[ToolReceipt, dict[str, Any]] | None:
+    query_receipts = tuple(
+        receipt for receipt in receipts if receipt.tool_name == "query_report_by_date"
+    )
+    if len(query_receipts) != 1:
+        return None
+    receipt = query_receipts[0]
+    snapshot = _validated_daily_query_snapshot(receipt)
+    if snapshot is None or snapshot["status"] != "completed":
+        return None
+    return receipt, snapshot
+
+
+def _daily_content_follow_through_tool_names(
+    *,
+    context: TrustedContext,
+    receipts: tuple[ToolReceipt, ...],
+) -> frozenset[str]:
+    """Return only exposed Daily content writes after one trusted completed read."""
+
+    if _qualified_completed_daily_query(receipts) is None:
+        return frozenset()
+    return frozenset(
+        tool_name
+        for tool_name in _DAILY_CONTENT_WRITE_TOOLS
+        if tool_name in context.allowed_tool_names
+        and context.gate_decisions.get(tool_name) is True
+        and TOOL_REGISTRY[tool_name].read_or_write == "write"
+    )
+
+
+def _daily_content_query_result_summaries(
+    receipts: tuple[ToolReceipt, ...],
+) -> list[dict[str, Any]]:
+    """Give the semantic reviewer useful shape without report or item IDs."""
+
+    qualified = _qualified_completed_daily_query(receipts)
+    if qualified is None:
+        return []
+    receipt, snapshot = qualified
+    fields = snapshot["fields"]
+    return [
+        {
+            "tool_name": receipt.tool_name,
+            "status": "success",
+            "changed": False,
+            "snapshot_available": True,
+            "report_date": snapshot["report_date"],
+            "report_status": snapshot["status"],
+            "fields": {
+                field_name: [
+                    {
+                        "position": position,
+                        "content": item["content"],
+                    }
+                    for position, item in enumerate(items, start=1)
+                ]
+                for field_name, items in fields.items()
+            },
+            "acknowledged_empty_fields": snapshot["acknowledged_empty_fields"],
+        }
+    ]
+
+
+def _daily_content_write_result_summaries(
+    receipts: tuple[ToolReceipt, ...],
+) -> list[dict[str, Any]]:
+    qualified = _qualified_completed_daily_query(receipts)
+    if qualified is None:
+        return []
+    _, snapshot = qualified
+    return [
+        {
+            "tool_name": receipt.tool_name,
+            "changed": receipt.changed,
+            "report_date": (
+                receipt.safe_user_facts.get("report_date")
+                if isinstance(receipt.safe_user_facts.get("report_date"), str)
+                else None
+            ),
+            "target_matches_query": (
+                receipt.target_type == "daily_report"
+                and receipt.target_id == snapshot["report_id"]
+            ),
+        }
+        for receipt in receipts
+        if receipt.tool_name in TOOL_REGISTRY
+        and TOOL_REGISTRY[receipt.tool_name].read_or_write == "write"
+    ]
+
+
+def _daily_content_follow_through_review_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    candidate_reply: str,
+    receipts: tuple[ToolReceipt, ...],
+    allowed_write_tool_names: frozenset[str],
+    query_state: str,
+    pending_write_review: bool = False,
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    candidate_sha256 = hashlib.sha256(candidate_reply.encode("utf-8")).hexdigest()
+    query_rule = (
+        "Exactly one successful query_report_by_date has loaded one owned "
+        "completed Daily Report. continue_once is available only under the "
+        "strict conditions below."
+        if query_state == "qualified"
+        else (
+            "More than one query_report_by_date receipt exists. This review "
+            "may classify the reply as keep_no_write or keep_clarification, "
+            "but multiple reads can never authorize continue_once."
+        )
+    )
+    write_state_rule = (
+        "This turn has one pending write batch. Use the supplied de-identified write "
+        "result summaries to decide whether the requested content write against the "
+        "queried completed Daily Report remains unfulfilled. A continue_once decision "
+        "means the server must roll back; it does not authorize another write batch."
+        if pending_write_review
+        else "This turn has no business-write receipt."
+    )
+    decision_rule = (
+        "In this pending-write mode, use keep_no_write only when the executed write "
+        "summaries and proposed reply show that every requested content change to the "
+        "queried Daily Report is already complete, or that the user did not request "
+        "such a content change, so no additional write is needed. Use continue_once "
+        "only when a requested content change to that queried report is still "
+        "unfulfilled; the server will roll back instead of opening another write "
+        "batch. Use keep_clarification only when the proposed reply truthfully asks a "
+        "genuinely necessary clarification and does not claim that an unperformed "
+        "Daily content change succeeded."
+        if pending_write_review
+        else (
+            "Use continue_once only when the user explicitly requested one actionable "
+            "Daily content-write request, including a request with multiple compatible "
+            "changes in one atomic batch, the supplied successful query summary makes "
+            "the target sufficiently bound for the main Agent2 to call an allowed "
+            "content-write tool, and the proposed reply leaves that requested change "
+            "unexecuted. Use keep_no_write when the current request is actually a read, "
+            "explanation, wording task, or other non-write. Use keep_clarification only "
+            "when the proposed reply is a genuinely necessary clarification because "
+            "the requested target, replacement, or authority remains ambiguous; do not "
+            "use it merely because a read had to happen first."
+        )
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an isolated Agent2 semantic follow-through reviewer. "
+                "Judge the whole meaning of the current user messages; never use "
+                "keywords, phrase lists, or regular expressions. "
+                f"{query_rule} "
+                f"{write_state_rule} Decide whether the proposed terminal reply may "
+                f"safely end the turn. {decision_rule} You do not choose a tool, create tool "
+                "arguments, authorize a write, replay a draft, or write a reply. "
+                "Do not copy any report ID, item ID, version, or content into your "
+                "output. Return exactly one JSON object with exactly two keys: "
+                "decision and reviewed_reply_sha256. decision must be "
+                "keep_no_write, keep_clarification, or continue_once. Copy the "
+                "supplied hash exactly. Do not call tools."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "proposed_terminal_reply": candidate_reply,
+                    "reviewed_reply_sha256": candidate_sha256,
+                    "query_state": query_state,
+                    "pending_write_review": pending_write_review,
+                    "pending_write_results": (
+                        _daily_content_write_result_summaries(receipts)
+                        if pending_write_review
+                        else []
+                    ),
+                    "successful_query_results": (
+                        _daily_content_query_result_summaries(receipts)
+                    ),
+                    "allowed_daily_content_write_tools": sorted(
+                        allowed_write_tool_names
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _parse_daily_content_follow_through_review(
+    *,
+    review_content: str,
+    candidate_reply: str,
+) -> str:
+    try:
+        payload = json.loads(review_content)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(
+            "daily content follow-through review must return JSON"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _DAILY_CONTENT_FOLLOW_THROUGH_REVIEW_KEYS
+    ):
+        raise ValueError("daily content follow-through review has an invalid envelope")
+    decision = payload["decision"]
+    if decision not in _DAILY_CONTENT_FOLLOW_THROUGH_DECISIONS:
+        raise ValueError("daily content follow-through review has an invalid decision")
+    candidate_sha256 = hashlib.sha256(candidate_reply.encode("utf-8")).hexdigest()
+    if payload["reviewed_reply_sha256"] != candidate_sha256:
+        raise ValueError(
+            "daily content follow-through review is not bound to the candidate"
+        )
+    return str(decision)
+
+
+def _daily_content_follow_through_protocol_message(
+    *,
+    candidate_reply: str,
+    allowed_write_tool_names: frozenset[str],
+) -> dict[str, str]:
+    return {
+        "role": "system",
+        "content": json.dumps(
+            {
+                "daily_content_follow_through": {
+                    "decision": "continue_once",
+                    "rejected_terminal_reply_sha256": hashlib.sha256(
+                        candidate_reply.encode("utf-8")
+                    ).hexdigest(),
+                    "allowed_write_tool_names": sorted(allowed_write_tool_names),
+                    "read_tools_allowed": False,
+                    "additional_tool_enabled_turns": 1,
+                    "instruction": (
+                        "Continue the original current user request using only "
+                        "the already returned trusted report snapshot and exactly "
+                        "one complete atomic batch of applicable exposed write calls. "
+                        "Derive every target, "
+                        "replacement, version and source-evidence value through the "
+                        "ordinary tool contract from the original user messages and "
+                        "trusted tool result. This reviewer decision supplies no "
+                        "business content or write authority and must never be used "
+                        "as source evidence. Do not call another read tool. If a safe "
+                        "write call cannot be formed, emit no tool call; the server "
+                        "will fail closed rather than guess."
+                    ),
+                }
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    }
+
 
 def _exposed_business_write_domains(
     context: TrustedContext,
@@ -2404,7 +3250,7 @@ def _daily_weekly_write_review_tool_names(
     if len(available_domains) < 2:
         if available_domains == {"daily"}:
             source_fidelity_operations = current_reviewed_operations.intersection(
-                {"add_daily_items", "edit_daily_items"}
+                _DAILY_CONTENT_WRITE_TOOLS
             )
             if source_fidelity_operations:
                 return frozenset(current_reviewed_operations)
@@ -2815,6 +3661,26 @@ def _validate_daily_weekly_write_review(
     reply = payload.get("reply")
     if not isinstance(reply, str) or not reply.strip() or len(reply) > 8000:
         raise ValueError("clarification review requires a bounded reply")
+
+
+def _is_strict_daily_weekly_review_clarification(
+    reviewed: _ParsedAssistantTurn,
+) -> bool:
+    if reviewed.tool_calls:
+        return False
+    content = reviewed.assistant_message.get("content")
+    try:
+        payload = json.loads(content) if isinstance(content, str) else None
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {"decision", "reply"}
+        and payload.get("decision") == "clarification"
+        and isinstance(payload.get("reply"), str)
+        and bool(payload["reply"].strip())
+        and len(payload["reply"]) <= 8000
+    )
 
 
 def _daily_weekly_review_envelope_repair_messages(
