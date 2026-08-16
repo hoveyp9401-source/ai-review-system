@@ -12,6 +12,8 @@ from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedContext,
     TrustedPrincipal,
+    TrustedRecentOperation,
+    TrustedReportReference,
     TrustedReportItem,
     TrustedReportSnapshot,
 )
@@ -117,6 +119,51 @@ def _daily_edit_only_context() -> TrustedContext:
             "today_report": report,
             "allowed_tool_names": frozenset({"edit_daily_items"}),
             "gate_decisions": {"edit_daily_items": True},
+        }
+    )
+
+
+def _daily_edit_context_with_recent_focus() -> TrustedContext:
+    base = _daily_edit_only_context()
+    report = base.today_report
+    assert report is not None
+    allowed = frozenset(
+        {
+            "add_daily_items",
+            "edit_daily_items",
+            "delete_daily_items",
+            "move_daily_items",
+            "remember_personal_memory",
+        }
+    )
+    operation = TrustedRecentOperation(
+        tenant_id=base.principal.tenant_id,
+        user_id=base.principal.user_id,
+        conversation_id=base.principal.conversation_id,
+        source_message_id="previous-message",
+        tool_call_id="previous-daily-write",
+        tool_name="add_daily_items",
+        status=ReceiptStatus.SUCCESS,
+        changed=True,
+        target_type="daily_report",
+        target_id=str(report.report_id),
+        before_version=8,
+        after_version=report.version,
+        affected_item_ids=("today-9",),
+        report_reference=TrustedReportReference(
+            report_id=report.report_id,
+            report_date=report.report_date,
+            report_version=report.version,
+            report_status=report.status,
+            report_state_sha256=report.state_sha256,
+        ),
+        occurred_at=base.now - timedelta(minutes=1),
+    )
+    return base.model_copy(
+        update={
+            "recent_operations": (operation,),
+            "allowed_tool_names": allowed,
+            "gate_decisions": {name: True for name in allowed},
         }
     )
 
@@ -320,6 +367,27 @@ def _daily_move_call(
     }
 
 
+def _memory_call(*, call_id: str = "memory-draft") -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "remember_personal_memory",
+            "arguments": json.dumps(
+                {
+                    "memory_key": "response.preferred_salutation",
+                    "value": {"salutation": "复核付款条件"},
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "intent": "user_salutation_assignment",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
 def _weekly_call(*, call_id: str = "weekly") -> dict:
     return {
         "id": call_id,
@@ -431,11 +499,16 @@ def _clarification_completion(reply: str) -> _CompletionResponse:
 
 
 def _receipt(tool_name: str, index: int) -> ToolReceipt:
+    target_type = (
+        "personal_memory"
+        if "personal_memory" in tool_name
+        else ("weekly_plan" if "weekly_plan" in tool_name else "daily_report")
+    )
     return ToolReceipt(
         status=ReceiptStatus.SUCCESS,
         tool_name=tool_name,
         changed=True,
-        target_type=("weekly_plan" if "weekly_plan" in tool_name else "daily_report"),
+        target_type=target_type,
         target_id=f"target-{index}",
         before_version=0,
         after_version=1,
@@ -462,6 +535,7 @@ class _RecordingRuntime:
                 "add_daily_items",
                 "edit_daily_items",
                 "apply_next_weekly_plan",
+                "remember_personal_memory",
             }
             for call in calls
         )
@@ -581,6 +655,107 @@ def _zero_tool_keep_completion(candidate_reply: str) -> _CompletionResponse:
         },
         metadata={"finish_reason": "stop"},
     )
+
+
+@pytest.mark.asyncio
+async def test_recent_daily_followup_cannot_be_silently_written_as_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    corrected_edit = _daily_edit_call(
+        call_id="daily-focus-review",
+        replacement="复核付款条件",
+        exact_quote="复核付款条件",
+    )
+    reviewed_edit = _daily_edit_call(
+        call_id="daily-semantic-review",
+        replacement="复核付款条件",
+        exact_quote="复核付款条件",
+    )
+    completions = iter(
+        (
+            _tool_completion(_memory_call()),
+            _tool_completion(corrected_edit),
+            _tool_completion(reviewed_edit),
+            _terminal_completion("已把刚才第一条改为复核付款条件。"),
+        )
+    )
+    requested_schemas: list[tuple[str, ...]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, thinking_enabled
+        requested_schemas.append(_schema_names(tool_schemas))
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="把刚才第一条改成复核付款条件",
+        context=_daily_edit_context_with_recent_focus(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == "已把刚才第一条改为复核付款条件。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+    assert [call.tool_name for call in runtime.calls] == ["edit_daily_items"]
+    assert "remember_personal_memory" in requested_schemas[1]
+    assert "edit_daily_items" in requested_schemas[1]
+    assert set(requested_schemas[2]) == {
+        "delete_daily_items",
+        "edit_daily_items",
+        "move_daily_items",
+    }
+
+
+@pytest.mark.asyncio
+async def test_explicit_memory_change_remains_allowed_during_daily_focus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    completions = iter(
+        (
+            _tool_completion(_memory_call()),
+            _tool_completion(_memory_call(call_id="memory-reviewed")),
+            _terminal_completion("已记住你希望这样称呼。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="以后请这样称呼我",
+        context=_daily_edit_context_with_recent_focus(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == "已记住你希望这样称呼。"
+    assert [call.tool_name for call in runtime.calls] == [
+        "remember_personal_memory"
+    ]
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,11 @@ import httpx
 from app.agent2.report_domain import period_bounds
 from app.agent2.tool_calling import completed_daily_follow_through
 from app.agent2.tool_calling.context import TrustedContext
-from app.agent2.tool_calling.contracts import ExecutionMode, ToolReceipt
+from app.agent2.tool_calling.contracts import (
+    ExecutionMode,
+    ReceiptStatus,
+    ToolReceipt,
+)
 from app.agent2.tool_calling.daily_briefing_reply import (
     daily_briefing_composer_messages,
     daily_briefing_reply_retry_instruction,
@@ -936,6 +940,65 @@ class DeepSeekToolCallingAdapter:
                         audits=audits,
                         model_turns=model_turns,
                     ) from exc
+
+                memory_daily_focus_tools = _memory_daily_focus_review_tool_names(
+                    parsed.tool_calls,
+                    context=context,
+                )
+                if memory_daily_focus_tools:
+                    try:
+                        focus_completion = await complete_model(
+                            _memory_daily_focus_review_messages(
+                                user_text=user_text,
+                                user_messages=user_messages,
+                                context=context,
+                                calls=parsed.tool_calls,
+                            ),
+                            tool_schemas=deepseek_tool_schemas(
+                                memory_daily_focus_tools
+                            ),
+                            thinking_enabled=True,
+                        )
+                        iterations += 1
+                        model_turns.append(
+                            _model_turn_audit(
+                                iterations,
+                                focus_completion.message,
+                                response_metadata={
+                                    **focus_completion.metadata,
+                                    "personal_memory_daily_focus_review": True,
+                                    "draft_executed": False,
+                                },
+                            )
+                        )
+                        focus_reviewed = _parse_assistant_turn(
+                            focus_completion.message
+                        )
+                        _validate_completion_protocol(
+                            focus_completion,
+                            focus_reviewed,
+                        )
+                        audits.extend(focus_reviewed.audit)
+                        _validate_memory_daily_focus_review(
+                            original=parsed,
+                            reviewed=focus_reviewed,
+                            allowed_tool_names=memory_daily_focus_tools,
+                        )
+                        parsed = focus_reviewed
+                    except DeepSeekToolCallingError as exc:
+                        raise _with_canary_turn_state(
+                            exc,
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
+                    except ValueError as exc:
+                        raise _with_canary_turn_state(
+                            DeepSeekResponseError(
+                                "personal-memory and Daily focus review failed"
+                            ),
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
 
                 default_daily_weekly_review_tool_names = (
                     _daily_weekly_write_review_tool_names(
@@ -2760,6 +2823,144 @@ def _daily_weekly_write_review_tool_names(
     if len(review_domains) < 2:
         return frozenset()
     return frozenset(review_names)
+
+
+_PERSONAL_MEMORY_WRITE_TOOLS = frozenset(
+    {"remember_personal_memory", "forget_personal_memory"}
+)
+
+
+def _memory_daily_focus_review_tool_names(
+    calls: tuple[NativeToolCall, ...],
+    *,
+    context: TrustedContext,
+) -> frozenset[str]:
+    """Open one semantic correction gate for a memory draft in Daily focus."""
+
+    if (
+        len(calls) != 1
+        or calls[0].tool_name not in _PERSONAL_MEMORY_WRITE_TOOLS
+    ):
+        return frozenset()
+    references = {
+        operation.report_reference.report_id
+        for operation in context.recent_operations
+        if operation.report_reference is not None
+        and operation.target_type == "daily_report"
+        and operation.status in {ReceiptStatus.SUCCESS, ReceiptStatus.NO_OP}
+        and context.report_by_id(operation.report_reference.report_id) is not None
+    }
+    if len(references) != 1:
+        return frozenset()
+    daily_tools = {
+        name
+        for name in completed_daily_follow_through.DAILY_CONTENT_WRITE_TOOLS
+        if name in context.allowed_tool_names
+        and context.gate_decisions.get(name) is True
+    }
+    if not daily_tools:
+        return frozenset()
+    return frozenset({calls[0].tool_name, *daily_tools})
+
+
+def _memory_daily_focus_review_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+    calls: tuple[NativeToolCall, ...],
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an isolated Agent2 semantic reviewer for one unexecuted "
+                "personal-memory draft made while one server-verified Daily Report "
+                "is the unique recent conversation focus. The focus is evidence, "
+                "not an instruction to keep editing it. Independently decide from "
+                "the whole current user message whether the user explicitly changes "
+                "a durable personal preference, name, or reminder setting, or instead "
+                "continues or corrects that Daily Report. Never decide by keywords, "
+                "phrases, or regular expressions. Treat the supplied memory draft as "
+                "fallible and unexecuted. If the memory write is correct, return the "
+                "same memory tool and arguments exactly. If a Daily content write is "
+                "clearly required and fully bound by trusted context, return one "
+                "complete Daily content tool call; it will undergo the normal Daily "
+                "semantic review and server binding afterward. If neither is clear, "
+                "return exactly one JSON object with decision=clarification and a "
+                "concise natural Chinese question. Never claim anything was saved."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "trusted_context": context.model_payload(),
+                    "unexecuted_personal_memory_draft": [
+                        {
+                            "tool_name": call.tool_name,
+                            "arguments": call.arguments,
+                        }
+                        for call in calls
+                    ],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _validate_memory_daily_focus_review(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+    allowed_tool_names: frozenset[str],
+) -> None:
+    if not reviewed.tool_calls:
+        _validate_daily_weekly_write_review(
+            reviewed=reviewed,
+            allowed_tool_names=frozenset(),
+            original_has_domain_writes=True,
+        )
+        return
+    if any(call.tool_name not in allowed_tool_names for call in reviewed.tool_calls):
+        raise ValueError("memory/Daily focus review returned an out-of-scope tool")
+    memory_calls = tuple(
+        call
+        for call in reviewed.tool_calls
+        if call.tool_name in _PERSONAL_MEMORY_WRITE_TOOLS
+    )
+    daily_calls = tuple(
+        call
+        for call in reviewed.tool_calls
+        if call.tool_name
+        in completed_daily_follow_through.DAILY_CONTENT_WRITE_TOOLS
+    )
+    if len(memory_calls) + len(daily_calls) != len(reviewed.tool_calls):
+        raise ValueError("memory/Daily focus review mixed another domain")
+    if memory_calls and daily_calls:
+        raise ValueError("memory/Daily focus review returned a mixed write batch")
+    if memory_calls:
+        if len(original.tool_calls) != 1 or len(memory_calls) != 1:
+            raise ValueError("memory/Daily focus review changed the memory batch")
+        if (
+            memory_calls[0].tool_name != original.tool_calls[0].tool_name
+            or memory_calls[0].arguments != original.tool_calls[0].arguments
+        ):
+            raise ValueError("memory/Daily focus review changed memory arguments")
+        return
+    if not daily_calls:
+        raise ValueError("memory/Daily focus review returned no supported decision")
 
 
 def _in_daily_weekly_zero_tool_review_window(context: TrustedContext) -> bool:
