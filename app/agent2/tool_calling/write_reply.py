@@ -492,12 +492,28 @@ def write_reply_retry_messages(
     return [
         {
             "role": "system",
-            "content": (
-                "You are an isolated Agent2 final-reply composer. Return exactly "
-                "one JSON object and no other text. Do not call tools. Use only "
-                "the supplied safe receipt facts. Copy every server-required "
-                "field exactly. Write a concise natural reply without internal "
-                "codes, identifiers, hashes, or unsupported claims."
+            "content": json.dumps(
+                {
+                    "canary_turn_protocol": {
+                        "write_batch_closed": True,
+                        "final_response_required": True,
+                        "terminal_response_contract": {
+                            "format": "json_object",
+                        },
+                    },
+                    "isolated_write_reply_composer": {
+                        "required_output": {"reply": "non-empty natural text"},
+                        "instruction": (
+                            "Return exactly one JSON object containing only the "
+                            "reply field. Do not call tools. Use only the supplied "
+                            "safe receipt facts. The server attaches verified "
+                            "execution fields. Do not expose internal codes, "
+                            "identifiers, hashes, or unsupported claims."
+                        ),
+                    },
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
             ),
         },
         {
@@ -515,6 +531,36 @@ def write_reply_retry_messages(
             ),
         },
     ]
+
+
+def complete_write_reply_retry_envelope(
+    content: str,
+    receipts: tuple[ToolReceipt, ...],
+) -> str:
+    """Attach server-owned execution fields to a model-authored retry reply."""
+
+    try:
+        candidate = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if not isinstance(candidate, dict) or set(candidate) != {"reply"}:
+        return content
+    reply = candidate.get("reply")
+    if not isinstance(reply, str) or not reply.strip():
+        return content
+    retry_contract = json.loads(write_reply_retry_instruction((), receipts))[
+        "write_reply_retry"
+    ]
+    envelope = {
+        "reply": reply.strip(),
+        **retry_contract["required_exact_fields"],
+    }
+    return json.dumps(
+        envelope,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _expected_daily_report_state(

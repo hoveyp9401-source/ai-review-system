@@ -1908,8 +1908,6 @@ async def test_pending_write_gets_two_bounded_terminal_json_repairs(
                     "content": json.dumps(
                         {
                             "reply": "已经按你的原话记录到今天的日报。",
-                            "actual_write": True,
-                            "operation_outcome": "changed",
                         },
                         ensure_ascii=False,
                     ),

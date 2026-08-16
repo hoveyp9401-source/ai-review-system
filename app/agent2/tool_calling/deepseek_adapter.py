@@ -50,6 +50,7 @@ from app.agent2.tool_calling.runtime import (
     merge_turn_plans,
 )
 from app.agent2.tool_calling.write_reply import (
+    complete_write_reply_retry_envelope,
     model_safe_user_facts,
     validate_write_reply,
     write_reply_protocol,
@@ -1298,10 +1299,19 @@ class DeepSeekToolCallingAdapter:
                     briefing_validation_errors: tuple[str, ...] = ()
                     briefing_envelope = None
                     if write_batch_seen:
+                        validation_content = (
+                            complete_write_reply_retry_envelope(
+                                content,
+                                tuple(receipts),
+                            )
+                            if write_reply_retry_count
+                            else content
+                        )
                         envelope, write_validation_errors = validate_write_reply(
-                            content, tuple(receipts)
+                            validation_content, tuple(receipts)
                         )
                         if envelope is not None:
+                            content = validation_content
                             reply_for_validation = envelope.reply
                     elif briefing_fact_batch_seen:
                         (
