@@ -260,7 +260,8 @@ class _TwoCompletedReportQueryRuntime(_CompletedReportEditRuntime):
     async def execute(self, calls, **kwargs):
         if len(calls) != 2:
             return await super().execute(calls, **kwargs)
-        results = [await super().execute((call,), **kwargs) for call in calls]
+        parent_execute = super().execute
+        results = [await parent_execute((call,), **kwargs) for call in calls]
         return ProductionRuntimeResult(
             status="success",
             receipts=tuple(
