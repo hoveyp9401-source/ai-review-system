@@ -1288,6 +1288,7 @@ class DeepSeekToolCallingAdapter:
                             allowed_tool_names=daily_weekly_review_tool_names,
                         )
                     )
+                    bounded_daily_review_fallback = False
                     try:
                         review_completion = await complete_model(
                             review_messages,
@@ -1316,15 +1317,20 @@ class DeepSeekToolCallingAdapter:
                             reviewed,
                         )
                         audits.extend(reviewed.audit)
-                        _validate_daily_weekly_write_review(
-                            reviewed=reviewed,
-                            allowed_tool_names=daily_weekly_review_tool_names,
-                            original_has_domain_writes=any(
-                                _daily_weekly_write_domain(call.tool_name)
-                                is not None
-                                for call in parsed.tool_calls
-                            ),
+                        bounded_daily_review_fallback = (
+                            bounded_daily_turn_active
+                            and _is_bounded_daily_not_daily_review(reviewed)
                         )
+                        if not bounded_daily_review_fallback:
+                            _validate_daily_weekly_write_review(
+                                reviewed=reviewed,
+                                allowed_tool_names=daily_weekly_review_tool_names,
+                                original_has_domain_writes=any(
+                                    _daily_weekly_write_domain(call.tool_name)
+                                    is not None
+                                    for call in parsed.tool_calls
+                                ),
+                            )
                     except InvalidNativeToolArgumentsError as exc:
                         invalid_review_tools = {
                             item.tool_name for item in exc.raw_tool_call_audit
@@ -1412,15 +1418,26 @@ class DeepSeekToolCallingAdapter:
                                 reviewed,
                             )
                             audits.extend(reviewed.audit)
-                            _validate_daily_weekly_write_review(
-                                reviewed=reviewed,
-                                allowed_tool_names=daily_weekly_review_tool_names,
-                                original_has_domain_writes=any(
-                                    _daily_weekly_write_domain(call.tool_name)
-                                    is not None
-                                    for call in parsed.tool_calls
-                                ),
+                            bounded_daily_review_fallback = (
+                                bounded_daily_turn_active
+                                and _is_bounded_daily_not_daily_review(
+                                    reviewed
+                                )
                             )
+                            if not bounded_daily_review_fallback:
+                                _validate_daily_weekly_write_review(
+                                    reviewed=reviewed,
+                                    allowed_tool_names=(
+                                        daily_weekly_review_tool_names
+                                    ),
+                                    original_has_domain_writes=any(
+                                        _daily_weekly_write_domain(
+                                            call.tool_name
+                                        )
+                                        is not None
+                                        for call in parsed.tool_calls
+                                    ),
+                                )
                         except (DeepSeekToolCallingError, ValueError) as retry_exc:
                             raise _with_canary_turn_state(
                                 DeepSeekResponseError(
@@ -1499,6 +1516,17 @@ class DeepSeekToolCallingAdapter:
                                 audits=audits,
                                 model_turns=model_turns,
                             ) from exc
+                    if bounded_daily_review_fallback:
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "bounded_daily_review_fell_back": True,
+                                "draft_executed": False,
+                            },
+                        )
+                        bounded_daily_turn_active = False
+                        continue
                     reviewed = await adjudicate_dropped_daily_adds(
                         original=parsed,
                         reviewed=reviewed,
@@ -2881,7 +2909,12 @@ def _bounded_daily_add_review_messages(
             "role": "system",
             "content": (
                 "You are the focused independent Agent2 Daily Report reviewer. "
-                "Nothing has executed. Independently reread every exact current "
+                "Nothing has executed. This bounded path is valid only for a pure "
+                "Daily add. If the same turn also requests any non-Daily action, "
+                "query, edit, deletion, memory change, weekly operation, or other "
+                "business task, return no tools and exactly "
+                "{\"decision\":\"not_daily\"} so the server restores the unchanged "
+                "full Agent2 path. Independently reread every exact current "
                 "user message and trusted context; do not copy or assume any earlier "
                 "draft. If the user clearly authorizes a Daily add and every material "
                 "meaning is clear, return exactly one complete native "
@@ -2896,7 +2929,8 @@ def _bounded_daily_add_review_messages(
                 "not by itself assign the report date. Preserve explicit empty fields, "
                 "retry selection, and same-turn submit intent. Never return a partial "
                 "batch or model-authored content. If a Daily write or any material "
-                "part is unclear, return no tools and exactly one JSON object with "
+                "part of an otherwise pure Daily add is unclear, return no tools and "
+                "exactly one JSON object with "
                 "keys decision and reply, where decision is clarification and reply "
                 "is one concise natural Chinese question. Never claim execution."
             ),
@@ -4009,6 +4043,19 @@ def _dropped_daily_add_adjudication_messages(
             ),
         },
     ]
+
+
+def _is_bounded_daily_not_daily_review(
+    reviewed: _ParsedAssistantTurn,
+) -> bool:
+    if reviewed.tool_calls:
+        return False
+    content = reviewed.assistant_message.get("content")
+    try:
+        payload = json.loads(content) if isinstance(content, str) else None
+    except json.JSONDecodeError:
+        return False
+    return payload == {"decision": "not_daily"}
 
 
 def _validate_daily_weekly_write_review(

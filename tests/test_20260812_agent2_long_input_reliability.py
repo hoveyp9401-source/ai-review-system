@@ -491,6 +491,86 @@ async def test_long_non_daily_probe_falls_back_to_the_unchanged_reasoning_path(
 
 
 @pytest.mark.asyncio
+async def test_long_mixed_turn_review_vetoes_daily_write_and_restores_full_agent2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    requests: list[dict] = []
+    full_reply = "我会按完整流程同时处理日报内容和查询请求。"
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        system_message = str(messages[0]["content"])
+        requests.append(
+            {
+                "system": system_message,
+                "tool_names": tuple(
+                    item["function"]["name"] for item in tool_schemas
+                ),
+                "thinking_enabled": thinking_enabled,
+            }
+        )
+        if "focused Agent2 Daily Report planner" in system_message:
+            return _tool_completion(_compact_long_daily_call("mixed-primary"))
+        if "focused independent Agent2 Daily Report reviewer" in system_message:
+            return _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"decision": "not_daily"},
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            )
+        if system_message == "Agent2 full production prompt":
+            return _CompletionResponse(
+                message={"role": "assistant", "content": full_reply},
+                metadata={"finish_reason": "stop"},
+            )
+        review_facts = json.loads(messages[1]["content"])
+        return _CompletionResponse(
+            message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "decision": "keep",
+                        "classification": "ordinary_reply",
+                        "reviewed_reply_sha256": review_facts[
+                            "reviewed_reply_sha256"
+                        ],
+                        "pending_reference": None,
+                        "replacement_reply": None,
+                    }
+                ),
+            },
+            metadata={"finish_reason": "stop"},
+        )
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=(
+            LONG_DAILY_TEXT
+            + "另外请查询综合管理部本周尚未闭环的事项，并把查询结果一并告诉我。"
+        ),
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == full_reply
+    assert requests[0]["thinking_enabled"] is False
+    assert requests[1]["thinking_enabled"] is False
+    assert requests[2]["system"] == "Agent2 full production prompt"
+    assert requests[2]["thinking_enabled"] is True
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
 async def test_compact_repaired_long_daily_rolls_back_if_terminal_reply_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
