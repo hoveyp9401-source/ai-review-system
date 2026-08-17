@@ -1739,10 +1739,18 @@ async def test_malformed_pre_execution_tool_json_gets_one_model_repair(
         )
     )
     captured_messages = []
+    captured_request_options = []
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
-        del tool_schemas, thinking_enabled
         captured_messages.append(tuple(messages))
+        captured_request_options.append(
+            {
+                "tool_names": tuple(
+                    item["function"]["name"] for item in tool_schemas
+                ),
+                "thinking_enabled": thinking_enabled,
+            }
+        )
         return next(completions)
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
@@ -1760,17 +1768,22 @@ async def test_malformed_pre_execution_tool_json_gets_one_model_repair(
     assert result.iterations == 4
     assert any(
         message.get("role") == "system"
-        and "重新生成一次合法的原生工具调用" in str(message.get("content"))
+        and "isolated Agent2 Daily Report argument repairer"
+        in str(message.get("content"))
         for message in captured_messages[1]
     )
+    assert captured_request_options[1] == {
+        "tool_names": ("add_daily_items",),
+        "thinking_enabled": False,
+    }
     repair_prompt = " ".join(
         str(message.get("content"))
         for message in captured_messages[1]
         if message.get("role") == "system"
     )
-    assert "exact_quote" in repair_prompt
-    assert "连续原文" in repair_prompt
-    assert "不要复制原文" not in repair_prompt
+    assert "complete contiguous verbatim source passage" in repair_prompt
+    assert "model-authored content" in repair_prompt
+    assert captured_messages[1][0]["content"] != "Agent2 test"
 
 
 @pytest.mark.asyncio

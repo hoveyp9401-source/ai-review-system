@@ -86,6 +86,41 @@ class QuoteCase:
 
 CASES = (
     QuoteCase(
+        case_id="long_numbered_six_work_items_with_risk_and_plan",
+        category="long_numbered_complete_report",
+        user_text=(
+            "今日工作：1.复核华东项目补充协议并逐项标注修改意见；"
+            "2.与财务核对海滨项目付款节点和所需审批材料；"
+            "3.参加专项会议并整理会议明确的三项后续安排；"
+            "4.更新案件进展台账并核对本周收到的证据材料；"
+            "5.回复业务部门关于采购模板的法律咨询；"
+            "6.与外部顾问沟通下次会议时间及会前准备文件。"
+            "问题风险：供应商仍未提供盖章版授权文件，若明天中午前不能补齐，"
+            "周一付款审批将无法按原计划发起，需项目负责人决定是否调整节点。"
+            "明日计划：继续催收授权文件；整理诉讼证据目录并同步项目组。"
+        ),
+        expected_items=(
+            ExpectedItem("today_work", "复核华东项目补充协议并逐项标注修改意见"),
+            ExpectedItem("today_work", "与财务核对海滨项目付款节点和所需审批材料"),
+            ExpectedItem("today_work", "参加专项会议并整理会议明确的三项后续安排"),
+            ExpectedItem("today_work", "更新案件进展台账并核对本周收到的证据材料"),
+            ExpectedItem("today_work", "回复业务部门关于采购模板的法律咨询"),
+            ExpectedItem("today_work", "与外部顾问沟通下次会议时间及会前准备文件"),
+            ExpectedItem(
+                "problems",
+                (
+                    "供应商仍未提供盖章版授权文件，若明天中午前不能补齐，"
+                    "周一付款审批将无法按原计划发起，需项目负责人决定是否调整节点"
+                ),
+            ),
+            ExpectedItem("tomorrow_plan", "继续催收授权文件"),
+            ExpectedItem(
+                "tomorrow_plan",
+                "整理诉讼证据目录并同步项目组",
+            ),
+        ),
+    ),
+    QuoteCase(
         case_id="pang_original_sentence",
         category="pang_exact",
         user_text="今天做了日报的基础功能优化",
@@ -479,8 +514,10 @@ def _canonical_arguments(case: QuoteCase) -> dict[str, Any]:
 
 
 def _self_check() -> dict[str, Any]:
-    if len(CASES) != 7 or len({case.category for case in CASES}) != 7:
-        raise AssertionError("source-quote evaluation requires seven distinct categories")
+    if len(CASES) < 7 or len({case.category for case in CASES}) != len(CASES):
+        raise AssertionError(
+            "source-quote evaluation requires at least seven distinct categories"
+        )
     if len(CASES) != len({case.case_id for case in CASES}):
         raise AssertionError("source-quote case IDs must be unique")
 

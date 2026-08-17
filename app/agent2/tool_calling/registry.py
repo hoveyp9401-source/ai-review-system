@@ -40,6 +40,10 @@ from app.agent2.tool_calling.contracts import (
     SubmitNextWeeklyPlanArgs,
     ToolReceipt,
 )
+from app.agent2.tool_calling.daily_add_model_contract import (
+    MODEL_ADD_DAILY_ITEMS_DESCRIPTION,
+    model_add_daily_items_schema,
+)
 from app.agent2.tool_calling.handlers import (
     simulate_add,
     simulate_complete_previous,
@@ -723,8 +727,8 @@ TOOL_REGISTRY = MappingProxyType(
             "whitespace separates it. Exclude report-date lead-ins and section labels only when "
             "doing so cannot change the item's meaning. The server persists that exact "
             "server-owned passage; "
-            "content is only Agent2's semantic interpretation for field selection and review, so "
-            "professional wording cleanup can never introduce text into the stored report. Never "
+            "Do not supply a separate model-authored content value; the field selection and exact "
+            "source passage are the complete model decision. Never "
             "invent, normalize, reorder, or truncate exact_quote. Emit one independently editable "
             "action or object per item; a compound sentence must not hide two separate actions in "
             "one item. The source spans for separate items must not overlap; each span authorizes "
@@ -1050,12 +1054,26 @@ def deepseek_tool_schemas(
         raise UnknownToolError(min(unknown))
     return [
         {"type": "function", "function": {
-            "name": item.tool_name, "description": item.description, "parameters": _thaw_json(item.input_schema),
+            "name": item.tool_name,
+            "description": _model_tool_description(item),
+            "parameters": _model_tool_input_schema(item),
         }}
         for name, item in TOOL_REGISTRY.items()
         if name in selected
         and (mode is None or mode in item.enabled_modes)
     ]
+
+
+def _model_tool_description(definition: ToolDefinition) -> str:
+    if definition.tool_name == "add_daily_items":
+        return MODEL_ADD_DAILY_ITEMS_DESCRIPTION
+    return definition.description
+
+
+def _model_tool_input_schema(definition: ToolDefinition) -> dict[str, Any]:
+    if definition.tool_name == "add_daily_items":
+        return model_add_daily_items_schema()
+    return _thaw_json(definition.input_schema)
 
 
 def validate_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
@@ -1109,6 +1127,8 @@ def registry_contract_digest(
         name: {
             "description": definition.description,
             "input_schema": _thaw_json(definition.input_schema),
+            "model_description": _model_tool_description(definition),
+            "model_input_schema": _model_tool_input_schema(definition),
             "read_or_write": definition.read_or_write,
             "risk_level": definition.risk_level,
             "permission_policy": definition.permission_policy,

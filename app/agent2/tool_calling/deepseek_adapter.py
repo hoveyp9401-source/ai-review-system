@@ -11,6 +11,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import httpx
+from pydantic import ValidationError
 
 from app.agent2.report_domain import period_bounds
 from app.agent2.tool_calling import completed_daily_follow_through
@@ -19,6 +20,9 @@ from app.agent2.tool_calling.contracts import (
     ExecutionMode,
     ReceiptStatus,
     ToolReceipt,
+)
+from app.agent2.tool_calling.daily_add_model_contract import (
+    compile_model_add_daily_items,
 )
 from app.agent2.tool_calling.daily_briefing_reply import (
     daily_briefing_composer_messages,
@@ -68,6 +72,8 @@ _TEXTUAL_TOOL_PROTOCOL_MARKERS = (
     "<｜tool▁call▁begin｜>",
     "<|tool_calls",
 )
+
+_BOUNDED_DAILY_PROBE_MIN_CHARACTERS = 160
 
 
 class DeepSeekToolCallingError(RuntimeError):
@@ -510,6 +516,14 @@ class DeepSeekToolCallingAdapter:
         incomplete_confirm_review_count = 0
         daily_submit_section_review_count = 0
         daily_weekly_write_review_count = 0
+        bounded_daily_probe_pending = _should_run_bounded_daily_probe(
+            user_text=user_text,
+            user_messages=user_messages,
+            context=context,
+            thinking_enabled=thinking_enabled,
+        )
+        bounded_daily_turn_active = False
+        bounded_daily_reply_composer_active = False
         completed_daily_flow = completed_daily_follow_through.CompletedDailyFollowThrough(
             context=context,
             user_text=user_text,
@@ -583,7 +597,7 @@ class DeepSeekToolCallingAdapter:
                         write_domains=write_domains,
                     ),
                     tool_schemas=[],
-                    thinking_enabled=True,
+                    thinking_enabled=not bounded_daily_turn_active,
                 )
                 iterations += 1
                 model_turns.append(
@@ -633,7 +647,7 @@ class DeepSeekToolCallingAdapter:
                         write_domains=write_domains,
                     ),
                     tool_schemas=[],
-                    thinking_enabled=True,
+                    thinking_enabled=not bounded_daily_turn_active,
                 )
                 iterations += 1
                 model_turns.append(
@@ -709,7 +723,7 @@ class DeepSeekToolCallingAdapter:
                         pending_write_review=pending_write_review,
                     ),
                     tool_schemas=[],
-                    thinking_enabled=True,
+                    thinking_enabled=not bounded_daily_turn_active,
                 )
                 iterations += 1
                 model_turns.append(
@@ -794,7 +808,7 @@ class DeepSeekToolCallingAdapter:
                     tool_schemas=deepseek_tool_schemas(
                         frozenset({"add_daily_items"})
                     ),
-                    thinking_enabled=True,
+                    thinking_enabled=not bounded_daily_turn_active,
                 )
                 iterations += 1
                 model_turns.append(
@@ -859,9 +873,21 @@ class DeepSeekToolCallingAdapter:
             while True:
                 iterations += 1
                 try:
-                    completion = await complete_model(
-                        messages,
-                        tool_schemas=completed_daily_flow.prepare_model_tools(
+                    completion_messages = (
+                        _bounded_daily_probe_messages(
+                            user_text=user_text,
+                            user_messages=user_messages,
+                            context=context,
+                        )
+                        if bounded_daily_probe_pending
+                        else messages
+                    )
+                    completion_tool_schemas = (
+                        deepseek_tool_schemas(
+                            frozenset({"add_daily_items"})
+                        )
+                        if bounded_daily_probe_pending
+                        else completed_daily_flow.prepare_model_tools(
                             tool_schemas,
                             tools_disabled=(
                                 write_batch_seen
@@ -870,8 +896,16 @@ class DeepSeekToolCallingAdapter:
                                 or managed_daily_reply_retry_count
                                 or write_reply_retry_count
                             ),
+                        )
+                    )
+                    completion = await complete_model(
+                        completion_messages,
+                        tool_schemas=completion_tool_schemas,
+                        thinking_enabled=(
+                            (thinking_enabled or briefing_fact_batch_seen)
+                            and not bounded_daily_probe_pending
+                            and not bounded_daily_turn_active
                         ),
-                        thinking_enabled=(thinking_enabled or briefing_fact_batch_seen),
                     )
                     model_turns.append(
                         _model_turn_audit(
@@ -880,7 +914,26 @@ class DeepSeekToolCallingAdapter:
                             response_metadata={
                                 **completion.metadata,
                                 "system_prompt_sha256": (
-                                    system_prompt_sha256
+                                    hashlib.sha256(
+                                        str(
+                                            completion_messages[0].get(
+                                                "content",
+                                                "",
+                                            )
+                                        ).encode("utf-8")
+                                    ).hexdigest()
+                                ),
+                                "bounded_daily_probe": (
+                                    bounded_daily_probe_pending
+                                ),
+                                **(
+                                    {
+                                        "production_system_prompt_sha256": (
+                                            system_prompt_sha256
+                                        )
+                                    }
+                                    if bounded_daily_probe_pending
+                                    else {}
                                 ),
                             },
                         )
@@ -911,6 +964,7 @@ class DeepSeekToolCallingAdapter:
                     MalformedToolCallError,
                     InvalidNativeToolArgumentsError,
                 ) as exc:
+                    daily_repair_succeeded = False
                     if (
                         tool_argument_repair_count == 0
                         and not write_batch_seen
@@ -926,20 +980,109 @@ class DeepSeekToolCallingAdapter:
                                 "tool_argument_error_type": type(exc).__name__,
                             },
                         )
-                        messages.append(_pre_execution_tool_argument_repair_message())
-                        tool_argument_repair_count += 1
-                        continue
-                    raise _with_canary_turn_state(
-                        exc,
-                        audits=audits,
-                        model_turns=model_turns,
-                    ) from exc
+                        if _only_daily_add_argument_error(exc):
+                            try:
+                                repair_completion = await complete_model(
+                                    _compact_daily_add_argument_repair_messages(
+                                        user_text=user_text,
+                                        user_messages=user_messages,
+                                        context=context,
+                                    ),
+                                    tool_schemas=deepseek_tool_schemas(
+                                        frozenset({"add_daily_items"})
+                                    ),
+                                    thinking_enabled=False,
+                                )
+                                iterations += 1
+                                model_turns.append(
+                                    _model_turn_audit(
+                                        iterations,
+                                        repair_completion.message,
+                                        response_metadata={
+                                            **repair_completion.metadata,
+                                            "compact_daily_add_argument_repair": True,
+                                            "draft_executed": False,
+                                        },
+                                    )
+                                )
+                                parsed = _parse_assistant_turn(
+                                    repair_completion.message
+                                )
+                                _validate_completion_protocol(
+                                    repair_completion,
+                                    parsed,
+                                )
+                                audits.extend(parsed.audit)
+                                if (
+                                    len(parsed.tool_calls) != 1
+                                    or parsed.tool_calls[0].tool_name
+                                    != "add_daily_items"
+                                ):
+                                    raise ValueError(
+                                        "compact Daily repair requires one complete "
+                                        "add call"
+                                    )
+                            except DeepSeekToolCallingError as repair_exc:
+                                raise _with_canary_turn_state(
+                                    repair_exc,
+                                    audits=audits,
+                                    model_turns=model_turns,
+                                ) from repair_exc
+                            except ValueError as repair_exc:
+                                raise _with_canary_turn_state(
+                                    DeepSeekResponseError(
+                                        "compact Daily argument repair failed"
+                                    ),
+                                    audits=audits,
+                                    model_turns=model_turns,
+                                ) from repair_exc
+                            tool_argument_repair_count += 1
+                            bounded_daily_probe_pending = False
+                            bounded_daily_turn_active = True
+                            daily_repair_succeeded = True
+                        else:
+                            messages.append(
+                                _pre_execution_tool_argument_repair_message()
+                            )
+                            tool_argument_repair_count += 1
+                            bounded_daily_probe_pending = False
+                            continue
+                    if not daily_repair_succeeded:
+                        raise _with_canary_turn_state(
+                            exc,
+                            audits=audits,
+                            model_turns=model_turns,
+                        ) from exc
                 except DeepSeekToolCallingError as exc:
                     raise _with_canary_turn_state(
                         exc,
                         audits=audits,
                         model_turns=model_turns,
                     ) from exc
+
+                if bounded_daily_probe_pending:
+                    bounded_daily_probe_pending = False
+                    if any(
+                        call.tool_name == "add_daily_items"
+                        for call in parsed.tool_calls
+                    ):
+                        bounded_daily_turn_active = True
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "bounded_daily_probe_accepted": True,
+                            },
+                        )
+                    else:
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "bounded_daily_probe_fell_back": True,
+                            },
+                        )
+                        continue
 
                 memory_daily_focus_tools = _memory_daily_focus_review_tool_names(
                     parsed.tool_calls,
@@ -958,7 +1101,7 @@ class DeepSeekToolCallingAdapter:
                             tool_schemas=deepseek_tool_schemas(
                                 memory_daily_focus_tools
                             ),
-                            thinking_enabled=True,
+                            thinking_enabled=not bounded_daily_turn_active,
                         )
                         iterations += 1
                         model_turns.append(
@@ -1025,7 +1168,7 @@ class DeepSeekToolCallingAdapter:
                                 tool_schemas=deepseek_tool_schemas(
                                     recovery_tools
                                 ),
-                                thinking_enabled=True,
+                                thinking_enabled=not bounded_daily_turn_active,
                             )
                             iterations += 1
                             model_turns.append(
@@ -1124,16 +1267,26 @@ class DeepSeekToolCallingAdapter:
                             "draft_executed": False,
                         },
                     )
-                    review_messages = _daily_weekly_write_review_messages(
-                        user_text=user_text,
-                        user_messages=user_messages,
-                        calls=parsed.tool_calls,
-                        context=context,
-                        trusted_completed_daily_query_results=(
-                            completed_daily_tool_inspection.trusted_query_results
-                        ),
-                        selected_targets=trusted_daily_selected_targets,
-                        allowed_tool_names=daily_weekly_review_tool_names,
+                    review_messages = (
+                        _bounded_daily_add_review_messages(
+                            user_text=user_text,
+                            user_messages=user_messages,
+                            context=context,
+                        )
+                        if bounded_daily_turn_active
+                        and daily_weekly_review_tool_names
+                        == frozenset({"add_daily_items"})
+                        else _daily_weekly_write_review_messages(
+                            user_text=user_text,
+                            user_messages=user_messages,
+                            calls=parsed.tool_calls,
+                            context=context,
+                            trusted_completed_daily_query_results=(
+                                completed_daily_tool_inspection.trusted_query_results
+                            ),
+                            selected_targets=trusted_daily_selected_targets,
+                            allowed_tool_names=daily_weekly_review_tool_names,
+                        )
                     )
                     try:
                         review_completion = await complete_model(
@@ -1141,7 +1294,7 @@ class DeepSeekToolCallingAdapter:
                             tool_schemas=deepseek_tool_schemas(
                                 daily_weekly_review_tool_names
                             ),
-                            thinking_enabled=True,
+                            thinking_enabled=not bounded_daily_turn_active,
                         )
                         iterations += 1
                         model_turns.append(
@@ -1237,7 +1390,7 @@ class DeepSeekToolCallingAdapter:
                                 tool_schemas=deepseek_tool_schemas(
                                     daily_weekly_review_tool_names
                                 ),
-                                thinking_enabled=True,
+                                thinking_enabled=not bounded_daily_turn_active,
                             )
                             iterations += 1
                             model_turns.append(
@@ -1295,7 +1448,7 @@ class DeepSeekToolCallingAdapter:
                                         raw_content=review_content,
                                     ),
                                     tool_schemas=[],
-                                    thinking_enabled=True,
+                                    thinking_enabled=not bounded_daily_turn_active,
                                 )
                                 iterations += 1
                                 model_turns.append(
@@ -1382,7 +1535,7 @@ class DeepSeekToolCallingAdapter:
                                 tool_schemas=deepseek_tool_schemas(
                                     daily_weekly_review_tool_names
                                 ),
-                                thinking_enabled=True,
+                                thinking_enabled=not bounded_daily_turn_active,
                             )
                             iterations += 1
                             model_turns.append(
@@ -1437,7 +1590,7 @@ class DeepSeekToolCallingAdapter:
                                         clarification_kind=clarification_kind,
                                     ),
                                     tool_schemas=[],
-                                    thinking_enabled=True,
+                                    thinking_enabled=not bounded_daily_turn_active,
                                 )
                                 iterations += 1
                                 model_turns.append(
@@ -1532,6 +1685,7 @@ class DeepSeekToolCallingAdapter:
                                 tuple(receipts),
                             )
                             if write_reply_retry_count
+                            or bounded_daily_reply_composer_active
                             else content
                         )
                         envelope, write_validation_errors = validate_write_reply(
@@ -1891,7 +2045,7 @@ class DeepSeekToolCallingAdapter:
                                 targets=incomplete_confirm_targets,
                             ),
                             tool_schemas=deepseek_tool_schemas(review_tool_names),
-                            thinking_enabled=True,
+                            thinking_enabled=not bounded_daily_turn_active,
                         )
                         iterations += 1
                         model_turns.append(
@@ -2095,9 +2249,20 @@ class DeepSeekToolCallingAdapter:
                 )
                 messages.extend(tool_results)
                 if current_has_write:
-                    messages.append(
-                        _canary_post_write_protocol_message(tuple(receipts))
-                    )
+                    if bounded_daily_turn_active and all(
+                        call.tool_name == "add_daily_items"
+                        for call in parsed.tool_calls
+                    ):
+                        messages = write_reply_retry_messages(
+                            errors=(),
+                            receipts=tuple(receipts),
+                            retry_number=0,
+                        )
+                        bounded_daily_reply_composer_active = True
+                    else:
+                        messages.append(
+                            _canary_post_write_protocol_message(tuple(receipts))
+                        )
                 current_has_briefing_fact = any(
                     call.tool_name == "query_daily_briefing_facts"
                     for call in parsed.tool_calls
@@ -2436,13 +2601,23 @@ def _parse_native_tool_call(
         decoded = decoded["arguments"]
         parse_status = "validated_review_arguments_envelope"
     try:
+        if name == "add_daily_items":
+            decoded = compile_model_add_daily_items(decoded)
+            parse_status = (
+                "validated_compact_daily_add"
+                if all(
+                    isinstance(item, dict) and "content" not in item
+                    for item in json.loads(raw_arguments).get("items", ())
+                )
+                else parse_status
+            )
         validated = validate_tool_arguments(name, decoded)
     except UnknownToolError as exc:
         raise UnknownNativeToolError(
             "DeepSeek returned an unknown tool",
             raw_tool_call_audit=(audit,),
         ) from exc
-    except ToolArgumentsValidationError as exc:
+    except (ToolArgumentsValidationError, ValidationError) as exc:
         raise InvalidNativeToolArgumentsError(
             "DeepSeek returned invalid tool arguments",
             raw_tool_call_audit=(audit,),
@@ -2559,10 +2734,192 @@ def _pre_execution_tool_argument_repair_message() -> dict[str, str]:
             "source_message_index 和 exact_quote；exact_quote 必须复制当前用户消息中"
             "表达该事项完整含义的一段连续原文，保留否定、条件、期限和引号。"
             "不要把中文弯引号改成英文双引号。"
-            "日报 content 可用冒号保留引述归属，不要把未转义引号放进 JSON 字符串。"
+            "日报事项不要另填 content；服务器会从 exact_quote 复制原文。"
             "不要改用文本描述工具调用，也不要假称已经执行。"
         ),
     }
+
+
+def _should_run_bounded_daily_probe(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+    thinking_enabled: bool,
+) -> bool:
+    """Use one fast model pass for long input, then fall back if it is not Daily add."""
+
+    if not thinking_enabled or "add_daily_items" not in context.allowed_tool_names:
+        return False
+    ordered_messages = user_messages or (user_text,)
+    return sum(len(message) for message in ordered_messages) >= (
+        _BOUNDED_DAILY_PROBE_MIN_CHARACTERS
+    )
+
+
+def _only_daily_add_argument_error(error: DeepSeekToolCallingError) -> bool:
+    audits = error.raw_tool_call_audit
+    return bool(audits) and all(
+        item.tool_name == "add_daily_items" for item in audits
+    )
+
+
+def _compact_daily_add_argument_repair_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the isolated Agent2 Daily Report argument repairer. The "
+                "previous add_daily_items call was not valid JSON and was never "
+                "executed. Independently reread all exact current user messages and "
+                "trusted context. If they clearly authorize a Daily Report write, "
+                "return exactly one complete native add_daily_items call using the "
+                "supplied compact schema. Include every independent asserted matter "
+                "exactly once and preserve its complete contiguous verbatim source "
+                "passage. Use server_default and omit all date/target binding fields "
+                "unless the source explicitly assigns the report date or selects one "
+                "trusted report. Do not return a partial batch, model-authored "
+                "content, a description of a tool call, or any claim that a write "
+                "occurred."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "trusted_context": context.model_payload(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _bounded_daily_probe_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the focused Agent2 Daily Report planner for one long user "
+                "turn. This fast path is only for a pure Daily add. If the same turn "
+                "also requests any non-Daily action, query, edit, deletion, memory "
+                "change, weekly operation, or other business task, return not_daily "
+                "for the unchanged full Agent2 path even when Daily content is also "
+                "present. Decide its meaning semantically from all exact current user "
+                "messages and trusted context. If and only if the turn clearly "
+                "authorizes adding Daily Report content, return exactly one complete "
+                "native add_daily_items call using the supplied compact schema. "
+                "Include every independent asserted matter exactly once, choose its "
+                "Daily field, preserve the complete contiguous verbatim source "
+                "passage, explicit empty fields, report date target, retry target, "
+                "and same-turn submit intent. Never return a partial batch or a "
+                "separate model-authored content value. Do not convert negated, "
+                "conditional, possible, questioned, or attributed material into the "
+                "user's own completed fact. Use server_default and omit "
+                "date_expression, proposed_date, date_evidence, report_id, and "
+                "expected_version unless the user explicitly assigns the report date "
+                "or uniquely selects a trusted report. A heading or content phrase "
+                "such as 今日工作 or 今天完成 does not by itself assign the report "
+                "date. "
+                "If this is not a clear Daily add, return "
+                "no tools and exactly {\"decision\":\"not_daily\"}; the server will "
+                "send the turn through the unchanged full Agent2 path. Never claim "
+                "that anything has been written."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "trusted_context": context.model_payload(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _bounded_daily_add_review_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the focused independent Agent2 Daily Report reviewer. "
+                "Nothing has executed. Independently reread every exact current "
+                "user message and trusted context; do not copy or assume any earlier "
+                "draft. If the user clearly authorizes a Daily add and every material "
+                "meaning is clear, return exactly one complete native "
+                "add_daily_items call using the compact schema. Cover every "
+                "independently editable asserted matter exactly once, with the right "
+                "Daily field and a non-overlapping complete contiguous verbatim "
+                "source passage. Preserve actors, attribution, negation, conditions, "
+                "deadlines, consequences, exceptions, quantities, risks, and plans. "
+                "Use date_selection=server_default unless the user explicitly assigns "
+                "a calendar date to the report itself or uniquely selects a trusted "
+                "report. A heading or content phrase such as 今日工作 or 今天完成 does "
+                "not by itself assign the report date. Preserve explicit empty fields, "
+                "retry selection, and same-turn submit intent. Never return a partial "
+                "batch or model-authored content. If a Daily write or any material "
+                "part is unclear, return no tools and exactly one JSON object with "
+                "keys decision and reply, where decision is clarification and reply "
+                "is one concise natural Chinese question. Never claim execution."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "trusted_context": context.model_payload(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
 
 
 _DAILY_REPORT_TRANSACTION_TARGETS = frozenset(
@@ -3580,7 +3937,18 @@ def _daily_weekly_review_draft_payload(
         return {
             "tool_name": call.tool_name,
             "arguments_without_fallible_date_target": {
-                key: value
+                key: (
+                    [
+                        {
+                            item_key: item_value
+                            for item_key, item_value in item.items()
+                            if item_key != "content"
+                        }
+                        for item in value
+                    ]
+                    if key == "items" and isinstance(value, list)
+                    else value
+                )
                 for key, value in call.arguments.items()
                 if key not in hidden_target_keys
             },
