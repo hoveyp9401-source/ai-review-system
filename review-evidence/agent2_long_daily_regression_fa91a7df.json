@@ -1,0 +1,34 @@
+{
+  "schema_version": "agent2.long-daily.regression-evidence.v1",
+  "created_at": "2026-08-17T22:35:21.8989526+08:00",
+  "candidate_commit": "fa91a7df",
+  "baseline_commit": "49429f98e5735a4a199bed6f6c69f5ae03102811",
+  "targeted_regression": {
+    "command": "python -m pytest -q tests/test_20260812_agent2_long_input_reliability.py tests/test_20260809_write_turn_atomic_reply.py tests/test_agent2_daily_weekly_write_review.py tests/test_20260809_current_turn_source_evidence.py tests/test_20260812_v22_flash_release_bundle.py",
+    "passed": 149,
+    "failed": 0,
+    "elapsed_seconds": 22.11
+  },
+  "full_suite_baseline": {
+    "passed": 3630,
+    "failed": 220,
+    "skipped": 3,
+    "elapsed_seconds": 89.14
+  },
+  "full_suite_candidate": {
+    "passed": 3636,
+    "failed": 220,
+    "skipped": 3,
+    "elapsed_seconds": 68.04,
+    "new_failures_vs_baseline": 0,
+    "additional_passing_tests_vs_baseline": 6
+  },
+  "known_failure_note": "The same 220 failures reproduce on the unmodified production baseline under the same local Python environment; they are not introduced by this candidate.",
+  "live_flash_evidence": "review-evidence/agent2_long_daily_flash_candidate_fa91a7df.json",
+  "production_state": {
+    "deployed": false,
+    "service_restarted": false,
+    "business_database_connected_by_live_eval": false,
+    "messages_sent_by_live_eval": false
+  }
+}
