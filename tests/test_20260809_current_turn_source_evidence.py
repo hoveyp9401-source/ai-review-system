@@ -186,6 +186,28 @@ def test_daily_item_binder_preserves_independently_reviewed_cleanup() -> None:
     )
 
 
+def test_daily_item_binder_removes_only_a_leading_list_marker() -> None:
+    source = CurrentTurnSource(("1. 明天继续跟进签约",))
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        {
+            "items": [
+                {
+                    "field": "tomorrow_plan",
+                    "content": "明天继续跟进签约",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "1. 明天继续跟进签约",
+                    },
+                }
+            ]
+        },
+    )
+
+    assert bound["items"][0]["content"] == "明天继续跟进签约"
+
+
 def test_daily_item_quotes_cannot_overlap_in_one_source_message() -> None:
     source = CurrentTurnSource(
         ("目前对方还没寄回盖章版；明天我去催办并同步项目组",)

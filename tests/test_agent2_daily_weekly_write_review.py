@@ -12,6 +12,7 @@ from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedContext,
     TrustedPrincipal,
+    TrustedRecentMessage,
     TrustedRecentOperation,
     TrustedReportReference,
     TrustedReportItem,
@@ -1825,6 +1826,165 @@ async def test_daily_partial_quote_review_splits_independent_items_before_write(
     assert "shared workstream" in review_system_prompts[0]
     assert "unmistakably identify that failed write" in review_system_prompts[0]
     assert "Broad delegation, general permission" in review_system_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_daily_followup_replaces_one_combined_item_with_supplied_parts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_id = UUID("20000000-0000-4000-8000-000000000009")
+    combined = (
+        "明天计划继续找可以做成网页端的agent技能然后"
+        "被告案件进行通报与未结案案件的签约"
+    )
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="tenant-a",
+        owner_user_id=_USER_ID,
+        report_date=date(2026, 8, 14),
+        version=9,
+        status="pending_confirmation",
+        items=(
+            TrustedReportItem(
+                item_id="tomorrow-combined",
+                field="tomorrow_plan",
+                content=combined,
+                report_id=report_id,
+                report_version=9,
+            ),
+        ),
+    )
+    allowed = frozenset({"add_daily_items", "delete_daily_items"})
+    context = _context().model_copy(
+        update={
+            "today_report": report,
+            "recent_messages": (
+                TrustedRecentMessage(
+                    role="user",
+                    content="明日计划是两条",
+                    source_message_id="previous-correction",
+                ),
+                TrustedRecentMessage(
+                    role="assistant",
+                    content="请把两条明日计划分别发给我，我来调整。",
+                    source_message_id="previous-correction:assistant",
+                ),
+            ),
+            "recent_operations": (
+                TrustedRecentOperation(
+                    tenant_id="tenant-a",
+                    user_id=_USER_ID,
+                    conversation_id="direct-user-a",
+                    source_message_id="original-daily-message",
+                    tool_call_id="original-daily-add",
+                    tool_name="add_daily_items",
+                    status=ReceiptStatus.SUCCESS,
+                    changed=True,
+                    target_type="daily_report",
+                    target_id=str(report_id),
+                    before_version=8,
+                    after_version=9,
+                    affected_item_ids=("tomorrow-combined",),
+                    report_reference=TrustedReportReference(
+                        report_id=report_id,
+                        report_date=report.report_date,
+                        report_version=report.version,
+                        report_status=report.status,
+                        report_state_sha256=report.state_sha256,
+                    ),
+                    occurred_at=_context().now - timedelta(minutes=2),
+                ),
+            ),
+            "allowed_tool_names": allowed,
+            "gate_decisions": {name: True for name in allowed},
+        }
+    )
+    source = (
+        "1. 明天计划继续找可以做成网页端的agent技能\n"
+        "2.被告案件进行通报与未结案案件的签约"
+    )
+    replacements = [
+        {
+            "field": "tomorrow_plan",
+            "content": "明天计划继续找可以做成网页端的agent技能",
+            "source_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "明天计划继续找可以做成网页端的agent技能",
+            },
+        },
+        {
+            "field": "tomorrow_plan",
+            "content": "被告案件进行通报与未结案案件的签约",
+            "source_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "被告案件进行通报与未结案案件的签约",
+            },
+        },
+    ]
+    draft = _daily_items_call(
+        call_id="draft-append",
+        items=replacements,
+        date_selection="trusted_report",
+        report_id=str(report_id),
+        expected_version=9,
+    )
+    reviewed_delete = _daily_delete_call(
+        call_id="reviewed-delete-combined",
+        target_item_ids=["tomorrow-combined"],
+    )
+    reviewed_add = _daily_items_call(
+        call_id="reviewed-add-replacements",
+        items=replacements,
+        date_selection="trusted_report",
+        report_id=str(report_id),
+        expected_version=9,
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(reviewed_delete, reviewed_add),
+            _terminal_completion("已把原来合并的一条调整为两条。"),
+        )
+    )
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    review_prompts: list[str] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del tool_schemas
+        if thinking_enabled:
+            review_prompts.append(messages[0]["content"])
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text=source,
+        context=context,
+        runtime_session=runtime,
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "delete_daily_items",
+        "add_daily_items",
+    ]
+    assert runtime.calls[0].arguments["target_item_ids"] == [
+        "tomorrow-combined"
+    ]
+    assert len(runtime.calls[1].arguments["items"]) == 2
+    assert "possible direct answer to the latest assistant request" in (
+        review_prompts[0]
+    )
+    assert "Never append replacements while retaining the obsolete item" in (
+        review_prompts[0]
+    )
 
 
 @pytest.mark.asyncio

@@ -1688,6 +1688,7 @@ class ProductionDailyExecutor:
             "affected_item_ids": list(affected),
         }
         if report is not None:
+            facts["report_snapshot"] = report.safe_snapshot()
             fields = {
                 field_name: tuple(
                     item.content

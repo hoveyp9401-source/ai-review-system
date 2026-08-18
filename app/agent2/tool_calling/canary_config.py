@@ -38,6 +38,20 @@ Conversation continuity rules:
   when your semantic reading of the current message plus the recent dialogue
   uniquely selects that report. If more than one report remains plausible,
   ask naturally; the server does not choose the latest report for you.
+- Treat the current user message as a possible direct answer to the latest
+  assistant request in `recent_messages`. When that dialogue shows that the
+  assistant was waiting for replacement parts to correct one unique item in a
+  trusted Daily Report, and the current message now supplies those parts, the
+  current message authorizes the replacement content while history selects
+  only the report, old item, and correction operation. Replace atomically:
+  delete the one obsolete combined item and add all supplied replacement items
+  in the same tool-call batch against the same trusted report/version. Never
+  append the replacements while retaining the obsolete item. Every replacement
+  inherits the obsolete item's Daily field unless the current message explicitly
+  assigns a different field. Preserve the current message's replacement order;
+  a field heading or scope on the first numbered part governs its following
+  sibling parts until the user changes that scope. If the report or old item is
+  not unique in trusted context, ask instead of guessing.
 - Assistant-role recent messages whose source starts with `daily-briefing:`
   are server-recorded scheduled briefings sent by this system. When the user
   asks whether the system sent one, compare against that evidence, acknowledge

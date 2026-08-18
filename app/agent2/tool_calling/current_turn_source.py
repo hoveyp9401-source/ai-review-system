@@ -271,7 +271,13 @@ class CurrentTurnSource:
                     "DAILY_ITEM_EXACT_QUOTE_MISMATCH"
                 )
             quote_end = quote_start + len(exact_quote)
-            if not typed.content_reviewed:
+            formatting_only = _strip_leading_list_marker(
+                source_message[quote_start:quote_end]
+            )
+            if (
+                not typed.content_reviewed
+                and item.content != formatting_only
+            ):
                 bound["items"][index]["content"] = source_message[
                     quote_start:quote_end
                 ]
@@ -319,3 +325,23 @@ class CurrentTurnSource:
                 "CURRENT_MESSAGE_EVIDENCE_MISMATCH"
             )
         return self.messages[index]
+
+
+def _strip_leading_list_marker(value: str) -> str:
+    """Remove only an unambiguous leading list marker; never rewrite words."""
+
+    stripped = value.lstrip()
+    if not stripped:
+        return value
+    if stripped[0] in {"-", "•", "·"}:
+        candidate = stripped[1:].lstrip()
+        return candidate or value
+    cursor = 0
+    while cursor < len(stripped) and stripped[cursor].isdigit():
+        cursor += 1
+    if cursor == 0 or cursor >= len(stripped):
+        return value
+    if stripped[cursor] not in {".", "。", "、", ")", "）"}:
+        return value
+    candidate = stripped[cursor + 1 :].lstrip()
+    return candidate or value

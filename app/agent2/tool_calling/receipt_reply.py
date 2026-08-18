@@ -51,8 +51,54 @@ def finalize_canary_content(
         raise ValueError(
             "write reply failed receipt validation: " + "; ".join(errors)
         )
-    del personal_memory
-    return render_write_reply(envelope, receipts), model_hash
+    reply = render_write_reply(envelope, receipts)
+    snapshot = _latest_changed_daily_snapshot(receipts)
+    if snapshot is not None and _toggle_preference(
+        personal_memory,
+        "report.show_updated_snapshot",
+        default=True,
+    ):
+        rendered = _render_report_snapshot(
+            snapshot,
+            show_item_numbers=_toggle_preference(
+                personal_memory,
+                "report.show_item_numbers",
+                default=True,
+            ),
+        )
+        if rendered not in reply:
+            reply = f"{reply}\n\n{rendered}"
+    return reply, model_hash
+
+
+def _toggle_preference(
+    personal_memory: TrustedPersonalMemoryContext | None,
+    memory_key: str,
+    *,
+    default: bool,
+) -> bool:
+    if personal_memory is None:
+        return default
+    for entry in personal_memory.entries:
+        if entry.memory_key != memory_key:
+            continue
+        enabled = getattr(entry.value, "enabled", None)
+        return enabled if isinstance(enabled, bool) else default
+    return default
+
+
+def _latest_changed_daily_snapshot(
+    receipts: tuple[ToolReceipt, ...],
+) -> dict | None:
+    for receipt in reversed(receipts):
+        snapshot = receipt.safe_user_facts.get("report_snapshot")
+        if (
+            receipt.target_type == "daily_report"
+            and receipt.changed
+            and isinstance(snapshot, dict)
+        ):
+            return snapshot
+    return None
 
 
 def _render_report_snapshot(
@@ -75,11 +121,17 @@ def _render_report_snapshot(
     )
     lines = [f"{report_date} 日报"]
     for field_name, title, raw_items in sections:
-        items = (
-            [str(item).strip() for item in raw_items if str(item).strip()]
-            if isinstance(raw_items, list)
-            else []
-        )
+        items = []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                content = (
+                    item.get("content")
+                    if isinstance(item, dict)
+                    else item
+                )
+                normalized = str(content or "").strip()
+                if normalized:
+                    items.append(normalized)
         lines.extend(("", title))
         if items:
             if show_item_numbers:

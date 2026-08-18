@@ -160,3 +160,52 @@ def test_assistant_name_write_has_grounded_acknowledgement() -> None:
     )
 
     assert content == "好，以后我就叫“兼爱”。"
+
+
+def test_changed_daily_write_shows_the_server_updated_report() -> None:
+    receipt = ToolReceipt(
+        status=ReceiptStatus.SUCCESS,
+        tool_name="add_daily_items",
+        changed=True,
+        target_type="daily_report",
+        target_id="report-1",
+        before_version=1,
+        after_version=2,
+        execution_mode=ExecutionMode.CANARY_EXECUTE,
+        safe_user_facts={
+            "actual_write": True,
+            "report_snapshot": {
+                "report_date": "2026-08-18",
+                "status": "pending_confirmation",
+                "fields": {
+                    "today_work": [
+                        {"item_id": "tw-1", "content": "完成合同复核"}
+                    ],
+                    "problems": [],
+                    "tomorrow_plan": [
+                        {"item_id": "tp-1", "content": "继续跟进签约"}
+                    ],
+                },
+                "acknowledged_empty_fields": ["problems"],
+            },
+        },
+    )
+
+    content, _ = finalize_canary_content(
+        json.dumps(
+            {
+                "reply": "已记录。",
+                "actual_write": True,
+                "operation_outcome": "changed",
+            },
+            ensure_ascii=False,
+        ),
+        (receipt,),
+        write_batch_seen=True,
+    )
+
+    assert content.startswith("已记录。\n\n2026-08-18 日报")
+    assert "今日工作\n1. 完成合同复核" in content
+    assert "问题风险\n暂无明显问题" in content
+    assert "明日计划\n1. 继续跟进签约" in content
+    assert content.endswith("状态：待确认")

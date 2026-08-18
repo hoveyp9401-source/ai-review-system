@@ -3400,6 +3400,7 @@ def _should_run_bounded_daily_probe(
     return bool(
         thinking_enabled
         and "add_daily_items" in context.allowed_tool_names
+        and not _has_daily_replacement_followup_context(context)
     )
 
 
@@ -4081,6 +4082,15 @@ def _daily_weekly_write_review_tool_names(
                             and context.gate_decisions.get(name) is True
                         }
                     )
+                if (
+                    "add_daily_items" in source_fidelity_operations
+                    and _has_daily_replacement_followup_context(context)
+                    and "delete_daily_items" in context.allowed_tool_names
+                    and context.gate_decisions.get("delete_daily_items") is True
+                ):
+                    return frozenset(
+                        current_reviewed_operations | {"delete_daily_items"}
+                    )
                 return frozenset(current_reviewed_operations)
             if not calls:
                 return _daily_focus_write_tool_names(context)
@@ -4123,6 +4133,40 @@ def _daily_weekly_write_review_tool_names(
     if len(review_domains) < 2:
         return frozenset()
     return frozenset(review_names)
+
+
+def _has_daily_replacement_followup_context(
+    context: TrustedContext,
+) -> bool:
+    """Expose delete review only for one fresh receipt-bound Daily dialogue."""
+
+    if (
+        context.principal.conversation_kind != "direct"
+        or not context.recent_messages
+        or context.recent_messages[-1].role != "assistant"
+    ):
+        return False
+    for operation in reversed(context.recent_operations):
+        reference = operation.report_reference
+        if (
+            operation.tool_name != "add_daily_items"
+            or operation.status != ReceiptStatus.SUCCESS
+            or not operation.changed
+            or reference is None
+        ):
+            continue
+        report = context.report_by_id(reference.report_id)
+        if (
+            report is None
+            or reference.report_version != report.version
+            or reference.report_state_sha256 != report.state_sha256
+        ):
+            continue
+        current_ids = {item.item_id for item in report.items}
+        return bool(operation.affected_item_ids) and set(
+            operation.affected_item_ids
+        ).issubset(current_ids)
+    return False
 
 
 _PERSONAL_MEMORY_WRITE_TOOLS = frozenset(
@@ -4616,6 +4660,19 @@ def _daily_weekly_write_review_messages(
                 "report and recent conversation; if exactly one correction is clear, "
                 "return the fully bound edit call, otherwise clarify. Do not keep the "
                 "original merely because the follow-up is short. "
+                "Also treat the current message as a possible direct answer to the latest "
+                "assistant request in trusted_context.recent_messages. When that dialogue "
+                "shows the assistant was waiting for replacement parts to correct one unique "
+                "item in a trusted Daily Report, and the current message supplies those parts, "
+                "history may select only the report, obsolete item, and correction operation; "
+                "the current message alone supplies replacement content. Return one atomic "
+                "batch that deletes the obsolete combined item and adds every replacement item "
+                "against the same trusted report/version. Never append replacements while "
+                "retaining the obsolete item. Each replacement inherits the obsolete item's "
+                "Daily field unless the current message explicitly assigns another field. "
+                "Preserve current-message replacement order; a field heading or scope on the "
+                "first numbered part governs following sibling parts until the user changes it. "
+                "If the target is not unique, clarify. "
                 "For targeted_daily_items the "
                 "fallible draft operation name is deliberately omitted: independently "
                 "choose edit, delete, or move from the exact user meaning while copying "
@@ -5080,6 +5137,9 @@ def _merge_daily_weekly_write_review(
     reviewed_tool_names: frozenset[str],
     context: TrustedContext,
 ) -> _ParsedAssistantTurn:
+    if _has_daily_replacement_followup_context(context):
+        original = _normalize_daily_replacement_call_order(original)
+        reviewed = _normalize_daily_replacement_call_order(reviewed)
     original_reviewed_domains = {
         domain
         for call in original.tool_calls
@@ -5183,6 +5243,28 @@ def _merge_daily_weekly_write_review(
         tool_calls=merged_calls,
         audit=(*original.audit, *reviewed.audit),
     )
+
+
+def _normalize_daily_replacement_call_order(
+    parsed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Canonicalize one same-target delete-plus-add batch before comparison."""
+
+    if len(parsed.tool_calls) != 2:
+        return parsed
+    by_name = {call.tool_name: call for call in parsed.tool_calls}
+    if set(by_name) != {"delete_daily_items", "add_daily_items"}:
+        return parsed
+    delete_call = by_name["delete_daily_items"]
+    add_call = by_name["add_daily_items"]
+    if (
+        delete_call.arguments.get("report_id")
+        != add_call.arguments.get("report_id")
+        or delete_call.arguments.get("expected_version")
+        != add_call.arguments.get("expected_version")
+    ):
+        return parsed
+    return replace(parsed, tool_calls=(delete_call, add_call))
 
 
 def _mark_reviewed_daily_content(
