@@ -3,13 +3,11 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-agent2-context-followup-20260818-fe3fe22"
-previous="$releases/ai-review-system-agent2-smart-daily-20260818-3cf5d5c"
+candidate="$releases/ai-review-system-agent2-context-trailing-user-20260818-8cf19a6"
+previous="$releases/ai-review-system-agent2-context-followup-20260818-fe3fe22"
 current="$releases/current"
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
 control_script="$candidate/scripts/manage_unified_daily_480722d_controls.py"
-control_backup=/home/ai_review_tunnel/backups/agent2-context-followup-fe3fe22-controls-20260818T1935/controls.before.json
-control_backup_sha256=4491ca16abba79aa71c122e75d3b88ea3bab7b8dc53847dbd38f0d3bc814631f
 services=(
   ai-review-api.service
   ai-review-stream.service
@@ -114,19 +112,13 @@ wait_healthy() {
   return 1
 }
 
-run_control() {
-  local control_action="$1"
+verify_controls() {
   (
     cd "$candidate"
     set -a
     . /home/ai_review_tunnel/ai-review-system/.env
     set +a
-    if [[ "$control_action" == "verify" ]]; then
-      PYTHONPATH=. "$python" "$control_script" verify
-    else
-      PYTHONPATH=. "$python" "$control_script" "$control_action" \
-        --backup-path "$control_backup"
-    fi
+    PYTHONPATH=. "$python" "$control_script" verify
   )
 }
 
@@ -135,11 +127,8 @@ rollback_code() {
   status="${1:-1}"
   trap - ERR INT TERM
   set +e
-  if [[ "${controls_restore_required:-0}" -eq 1 ]]; then
-    run_control restore
-  fi
   if [[ "${code_restore_required:-0}" -eq 1 ]]; then
-    switch_current "$previous" agent2-context-followup-fe3fe22-rollback
+    switch_current "$previous" agent2-context-trailing-user-8cf19a6-rollback
   fi
   if [[ "$processes_frozen" -eq 1 ]]; then
     terminate_frozen_services
@@ -152,35 +141,23 @@ rollback_code() {
 
 require_release "$candidate"
 require_release "$previous"
-if [[ ! -f "$control_backup" || -L "$control_backup" ]]; then
-  echo "control backup is missing or not a regular file" >&2
-  exit 1
-fi
-if [[ "$(sha256sum "$control_backup" | cut -d' ' -f1)" != "$control_backup_sha256" ]]; then
-  echo "control backup hash mismatch" >&2
-  exit 1
-fi
 
 if [[ "$action" == "deploy" ]]; then
   if [[ "$(readlink -f "$current")" != "$previous" ]]; then
     echo "current release changed before deploy" >&2
     exit 1
   fi
-  controls_restore_required=0
   code_restore_required=0
   trap 'rollback_code "$?"' ERR
   trap 'rollback_code 130' INT
   trap 'rollback_code 143' TERM
   freeze_all_services
   code_restore_required=1
-  switch_current "$candidate" agent2-context-followup-fe3fe22-next
-  controls_restore_required=1
-  run_control update
+  switch_current "$candidate" agent2-context-trailing-user-8cf19a6-next
   terminate_frozen_services
   wait_healthy "$candidate"
-  run_control verify
+  verify_controls
   trap - ERR INT TERM
-  controls_restore_required=0
   code_restore_required=0
   echo "deployed $candidate"
   exit 0
@@ -190,7 +167,6 @@ elif [[ "$action" == "rollback" ]]; then
     exit 1
   fi
   freeze_all_services
-  controls_restore_required=1
   code_restore_required=1
   rollback_code 0
 else
