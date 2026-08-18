@@ -1091,7 +1091,13 @@ def validate_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
             for item in exc.errors()
         )
         raise ToolArgumentsValidationError(tool_name, errors) from exc
-    return validated.model_dump(mode="json")
+    dumped = validated.model_dump(mode="json")
+    if (
+        tool_name == "add_daily_items"
+        and not dumped.get("reviewed_omitted_empty_fields")
+    ):
+        dumped.pop("reviewed_omitted_empty_fields", None)
+    return dumped
 
 
 def dispatcher_tool_names() -> tuple[str, ...]:

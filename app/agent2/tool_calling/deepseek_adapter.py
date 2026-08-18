@@ -3469,7 +3469,12 @@ def _compact_daily_add_argument_repair_messages(
                 "when its latter part only qualifies the status, condition, negation, or "
                 "completion state of the same action. An explicit statement that a field "
                 "has nothing to report belongs only in empty_field_evidence, never as an "
-                "item. Use date_selection=server_default. This tool only repairs the "
+                "item. If any field array remains empty without matching explicit-empty "
+                "evidence and submit_after_write is false, reply must naturally say that "
+                "the available content was saved and place the exact token "
+                "{{daily_missing_section_labels}} once where the missing field names "
+                "belong. Do not name a missing field elsewhere. Otherwise use a short "
+                "success acknowledgement. Use date_selection=server_default. This tool only repairs the "
                 "unexecuted plan and cannot write anything."
             ),
         },
@@ -3539,9 +3544,13 @@ def _bounded_daily_probe_messages(
                 "Set submit_after_write=false unless this same source explicitly asks "
                 "to submit or confirm the report now; merely mentioning that work or a "
                 "Daily Report was done is not submission authorization. Preserve "
-                "explicit empty-field evidence. The reply "
-                "must be a short success acknowledgement with no date, count, section "
-                "state, submission claim, or follow-up question. No markdown."
+                "explicit empty-field evidence. If any field array remains empty without "
+                "matching explicit-empty evidence and submit_after_write is false, reply "
+                "must naturally say that the available content was saved and place the "
+                "exact token {{daily_missing_section_labels}} once where the missing "
+                "field names belong. Do not name a missing field elsewhere. Otherwise "
+                "reply with a short success acknowledgement. Do not claim submission "
+                "unless submit_after_write is true. No markdown."
             ),
         },
         {
@@ -3578,7 +3587,14 @@ def _bounded_daily_add_review_messages(
                 "candidate. Return decision=repair with a concise, specific reason when "
                 "any user-authored matter is missing, invented, in the wrong field, "
                 "arbitrarily merged, arbitrarily split, loses a qualifier, or when an "
-                "explicit empty field or submission intent is wrong. Respect the user's "
+                "explicit empty field or submission intent is wrong. For a self-contained "
+                "Daily source that includes at least one report matter and explicitly asks "
+                "to submit now, candidate.reviewed_omitted_empty_fields lists fields that "
+                "the source omitted and that will therefore be submitted empty. Approve "
+                "those only when the source truly contains no matter for those fields; "
+                "repair if a listed field actually has content or if an omitted field is "
+                "missing from that list. This omission rule never applies to drafts, "
+                "follow-ups, or submit-only messages. Respect the user's "
                 "own grouping: each numbered or bulleted entry is one item unless it has "
                 "explicit subitems; clear list, paragraph, sentence, or semicolon boundaries "
                 "may separate items; one unnumbered natural clause stays intact even when "
@@ -3630,6 +3646,10 @@ def _focused_daily_review_candidate(
         ),
         "empty_field_evidence": arguments.get(
             "empty_field_evidence",
+            [],
+        ),
+        "reviewed_omitted_empty_fields": arguments.get(
+            "reviewed_omitted_empty_fields",
             [],
         ),
         "submit_after_write": bool(
@@ -4850,6 +4870,9 @@ def _daily_add_agreement_signature(call: NativeToolCall) -> dict[str, Any]:
         "acknowledged_empty_fields": sorted(
             arguments.get("acknowledged_empty_fields", ())
         ),
+        "reviewed_omitted_empty_fields": sorted(
+            arguments.get("reviewed_omitted_empty_fields", ())
+        ),
         "empty_field_evidence": empty_evidence,
     }
 
@@ -4919,11 +4942,17 @@ def _constrain_daily_add_call_group(
             raise ValueError("reviewed Daily empty-field evidence must be an array")
         draft_arguments["items"] = reviewed_arguments.get("items", [])
         draft_arguments["empty_field_evidence"] = reviewed_empty_evidence
+        reviewed_omitted_empty_fields = list(
+            reviewed_arguments.get("reviewed_omitted_empty_fields", ())
+        )
+        draft_arguments["reviewed_omitted_empty_fields"] = (
+            reviewed_omitted_empty_fields
+        )
         draft_arguments["acknowledged_empty_fields"] = [
             evidence.get("field")
             for evidence in reviewed_empty_evidence
             if isinstance(evidence, dict)
-        ]
+        ] + reviewed_omitted_empty_fields
         constrained_arguments = validate_tool_arguments(
             "add_daily_items",
             draft_arguments,

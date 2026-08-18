@@ -357,9 +357,18 @@ def validate_write_reply(
     if "{{daily_missing_" in reply_without_tokens:
         errors.append("reply contains an unexpected daily missing-section token")
     if required_tokens:
+        protected_labels = (
+            _all_daily_section_labels(receipts)
+            if expected_daily_states
+            else tuple(
+                label
+                for _token, labels in missing_label_requirements
+                for label in labels
+            )
+        )
         expanded_labels = tuple(
             label
-            for label in _all_daily_section_labels(receipts)
+            for label in protected_labels
             if label in reply_without_tokens
         )
         if expanded_labels:

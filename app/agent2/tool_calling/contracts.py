@@ -636,6 +636,10 @@ class AddDailyItemsArgs(StrictContract):
         default=(),
         max_length=3,
     )
+    reviewed_omitted_empty_fields: tuple[ReportField, ...] = Field(
+        default=(),
+        max_length=3,
+    )
     submit_after_write: bool = False
 
     @model_validator(mode="after")
@@ -724,12 +728,28 @@ class AddDailyItemsArgs(StrictContract):
             set(self.acknowledged_empty_fields)
         ):
             raise ValueError("explicitly empty fields must be unique")
+        if len(self.reviewed_omitted_empty_fields) != len(
+            set(self.reviewed_omitted_empty_fields)
+        ):
+            raise ValueError("reviewed omitted empty fields must be unique")
+        reviewed_omitted = set(self.reviewed_omitted_empty_fields)
+        if reviewed_omitted and not self.submit_after_write:
+            raise ValueError(
+                "reviewed omitted empty fields require explicit submission"
+            )
+        if not reviewed_omitted.issubset(self.acknowledged_empty_fields):
+            raise ValueError(
+                "reviewed omitted empty fields must be acknowledged empty"
+            )
         evidence_fields = tuple(
             item.field for item in self.empty_field_evidence
         )
         if len(evidence_fields) != len(set(evidence_fields)):
             raise ValueError("empty-field evidence must be unique by field")
-        if set(evidence_fields) != set(self.acknowledged_empty_fields):
+        explicitly_empty = (
+            set(self.acknowledged_empty_fields) - reviewed_omitted
+        )
+        if set(evidence_fields) != explicitly_empty:
             raise ValueError(
                 "every explicitly empty field requires matching current-message evidence"
             )

@@ -521,6 +521,36 @@ def test_incomplete_confirmation_reply_cannot_expand_one_missing_section_to_thre
     assert "只缺问题/风险" in final_reply
     assert "{{daily_missing_section_labels}}" not in final_reply
 
+    filled_label_reply = json.dumps(
+        {
+            "reply": (
+                "今日工作和明日计划已经记录，目前只缺"
+                "{{daily_missing_section_labels}}。"
+            ),
+            "actual_write": False,
+            "operation_outcome": "needs_clarification",
+            "daily_report_state": {
+                "section_states": {
+                    "today_work": "filled",
+                    "problems": "missing",
+                    "tomorrow_plan": "filled",
+                },
+                "missing_sections": ["problems"],
+                "confirmation_available": False,
+                "persisted_draft_available": True,
+            },
+        },
+        ensure_ascii=False,
+    )
+    filled_label_final, _ = finalize_canary_content(
+        filled_label_reply,
+        (receipt,),
+        write_batch_seen=True,
+    )
+    assert filled_label_final == (
+        "今日工作和明日计划已经记录，目前只缺问题/风险。"
+    )
+
 
 def test_incomplete_daily_reply_preserves_another_domain_success() -> None:
     daily_receipt = ToolReceipt(

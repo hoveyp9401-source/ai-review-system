@@ -84,6 +84,23 @@ def compile_focused_daily_plan_arguments(
     arguments: Any,
 ) -> tuple[dict[str, Any], str]:
     plan = FocusedDailyPlanArguments.model_validate(arguments)
+    ordered_fields = ("today_work", "problems", "tomorrow_plan")
+    explicit_empty_fields = [
+        evidence.field for evidence in plan.empty_field_evidence
+    ]
+    has_report_content = any(
+        getattr(plan.fields, field) for field in ordered_fields
+    )
+    reviewed_omitted_empty_fields = (
+        [
+            field
+            for field in ordered_fields
+            if not getattr(plan.fields, field)
+            and field not in explicit_empty_fields
+        ]
+        if plan.submit_after_write and has_report_content
+        else []
+    )
     compact_arguments = {
         "date_selection": plan.date_selection,
         "items": [
@@ -91,16 +108,22 @@ def compile_focused_daily_plan_arguments(
                 "field": field,
                 "source_evidence": evidence.model_dump(mode="json"),
             }
-            for field in ("today_work", "problems", "tomorrow_plan")
+            for field in ordered_fields
             for evidence in getattr(plan.fields, field)
         ],
         "acknowledged_empty_fields": [
-            evidence.field for evidence in plan.empty_field_evidence
+            field
+            for field in ordered_fields
+            if field in {
+                *explicit_empty_fields,
+                *reviewed_omitted_empty_fields,
+            }
         ],
         "empty_field_evidence": [
             evidence.model_dump(mode="json")
             for evidence in plan.empty_field_evidence
         ],
+        "reviewed_omitted_empty_fields": reviewed_omitted_empty_fields,
         "submit_after_write": plan.submit_after_write,
     }
     return compile_model_add_daily_items(compact_arguments), plan.reply
@@ -164,14 +187,33 @@ def parse_focused_daily_review_arguments(
 
 
 def model_add_daily_items_schema() -> dict[str, Any]:
-    return ModelAddDailyItemsArgs.model_json_schema()
+    schema = ModelAddDailyItemsArgs.model_json_schema()
+    # Produced only by the server after the focused planner and its independent
+    # reviewer agree on a self-contained explicit submission.
+    schema.get("properties", {}).pop(
+        "reviewed_omitted_empty_fields",
+        None,
+    )
+    required = schema.get("required")
+    if isinstance(required, list):
+        schema["required"] = [
+            name
+            for name in required
+            if name != "reviewed_omitted_empty_fields"
+        ]
+    return schema
 
 
 def compile_model_add_daily_items(arguments: Any) -> dict[str, Any]:
     """Compile a compact model decision into the unchanged execution contract."""
 
     if not isinstance(arguments, dict):
-        return AddDailyItemsArgs.model_validate(arguments).model_dump(mode="json")
+        compiled = AddDailyItemsArgs.model_validate(arguments).model_dump(
+            mode="json"
+        )
+        if not compiled.get("reviewed_omitted_empty_fields"):
+            compiled.pop("reviewed_omitted_empty_fields", None)
+        return compiled
 
     items = arguments.get("items")
     if isinstance(items, (list, tuple)) and any(
@@ -179,13 +221,21 @@ def compile_model_add_daily_items(arguments: Any) -> dict[str, Any]:
     ):
         # Accept already-issued calls during a rolling release. The trusted-source
         # binder still replaces every model-authored content value before writing.
-        return AddDailyItemsArgs.model_validate(arguments).model_dump(mode="json")
+        compiled = AddDailyItemsArgs.model_validate(arguments).model_dump(
+            mode="json"
+        )
+        if not compiled.get("reviewed_omitted_empty_fields"):
+            compiled.pop("reviewed_omitted_empty_fields", None)
+        return compiled
 
     proposal = ModelAddDailyItemsArgs.model_validate(arguments)
     compiled = proposal.model_dump(mode="json")
     for item in compiled["items"]:
         item["content"] = item["source_evidence"]["exact_quote"]
-    return AddDailyItemsArgs.model_validate(compiled).model_dump(mode="json")
+    compiled = AddDailyItemsArgs.model_validate(compiled).model_dump(mode="json")
+    if not compiled.get("reviewed_omitted_empty_fields"):
+        compiled.pop("reviewed_omitted_empty_fields", None)
+    return compiled
 
 
 def parse_focused_daily_add_decision(

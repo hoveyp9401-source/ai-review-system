@@ -25,6 +25,7 @@ from app.agent2.tool_calling.contracts import ExecutionMode, ReceiptStatus, Tool
 from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
 from app.agent2.tool_calling.daily_add_model_contract import (
     compile_focused_daily_plan_arguments,
+    model_add_daily_items_schema,
     parse_focused_daily_add_decision,
 )
 from app.agent2.tool_calling.deepseek_adapter import (
@@ -528,6 +529,66 @@ def test_focused_daily_plan_preserves_explicit_empty_field_evidence() -> None:
     ]
 
 
+def test_focused_daily_submit_marks_reviewed_omitted_sections_empty() -> None:
+    arguments, _ = compile_focused_daily_plan_arguments(
+        {
+            "date_selection": "server_default",
+            "fields": {
+                "today_work": [
+                    {
+                        "source_message_index": 1,
+                        "exact_quote": "今日完成合同复核",
+                    }
+                ],
+                "problems": [],
+                "tomorrow_plan": [
+                    {
+                        "source_message_index": 1,
+                        "exact_quote": "明天继续整理附件",
+                    }
+                ],
+            },
+            "empty_field_evidence": [],
+            "submit_after_write": True,
+            "reply": "已按原文记录并提交。",
+        }
+    )
+
+    assert arguments["acknowledged_empty_fields"] == ["problems"]
+    assert arguments["reviewed_omitted_empty_fields"] == ["problems"]
+    assert arguments["empty_field_evidence"] == []
+
+
+def test_focused_daily_draft_does_not_mark_omitted_sections_empty() -> None:
+    arguments, _ = compile_focused_daily_plan_arguments(
+        {
+            "date_selection": "server_default",
+            "fields": {
+                "today_work": [
+                    {
+                        "source_message_index": 1,
+                        "exact_quote": "今日完成合同复核",
+                    }
+                ],
+                "problems": [],
+                "tomorrow_plan": [],
+            },
+            "empty_field_evidence": [],
+            "submit_after_write": False,
+            "reply": "已记录，尚缺{{daily_missing_section_labels}}。",
+        }
+    )
+
+    assert arguments["acknowledged_empty_fields"] == []
+    assert arguments.get("reviewed_omitted_empty_fields", []) == []
+
+
+def test_ordinary_daily_tool_cannot_author_reviewed_omission() -> None:
+    assert "reviewed_omitted_empty_fields" not in (
+        model_add_daily_items_schema()["properties"]
+    )
+
+
 def test_focused_daily_repair_derives_empty_acknowledgement_from_evidence() -> None:
     decision, arguments, _ = parse_focused_daily_add_decision(
         json.dumps(
@@ -1010,6 +1071,12 @@ async def test_focused_daily_can_submit_without_inventing_a_missing_section(
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.calls[0].arguments["submit_after_write"] is True
+    assert runtime.calls[0].arguments["acknowledged_empty_fields"] == [
+        "problems"
+    ]
+    assert runtime.calls[0].arguments["reviewed_omitted_empty_fields"] == [
+        "problems"
+    ]
     assert {item["field"] for item in runtime.calls[0].arguments["items"]} == {
         "today_work",
         "tomorrow_plan",
