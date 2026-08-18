@@ -108,6 +108,31 @@ async def test_complete_daily_write_survives_one_review_drop_only_after_fresh_ag
 
 
 @pytest.mark.asyncio
+async def test_daily_write_keep_original_review_enters_fresh_adjudication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = shape_harness.COMPLETE_FIVE_NONE_FOUR
+    adjudicated = shape_harness._daily_call(
+        case,
+        call_id="fresh-keep-original-adjudication",
+    )
+
+    outcome, session, http = await _run_public_recovery(
+        monkeypatch,
+        first_review={
+            "role": "assistant",
+            "content": json.dumps({"decision": "keep_original"}),
+        },
+        adjudication=ingress_harness._assistant_tools(adjudicated),
+    )
+
+    assert outcome.actual_write is True
+    assert session.attempted_calls == ["add_daily_items"]
+    assert session.outer_commit_count == 1
+    assert len(http.calls) == 4
+
+
+@pytest.mark.asyncio
 async def test_fresh_adjudication_clarification_keeps_the_whole_batch_unwritten(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

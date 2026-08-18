@@ -1532,7 +1532,17 @@ class DeepSeekToolCallingAdapter:
                             bounded_daily_turn_active
                             and _is_bounded_daily_not_daily_review(reviewed)
                         )
-                        if not bounded_daily_review_fallback:
+                        daily_add_review_drop = (
+                            any(
+                                call.tool_name == "add_daily_items"
+                                for call in parsed.tool_calls
+                            )
+                            and _is_keep_original_review(reviewed)
+                        )
+                        if (
+                            not bounded_daily_review_fallback
+                            and not daily_add_review_drop
+                        ):
                             _validate_daily_weekly_write_review(
                                 reviewed=reviewed,
                                 allowed_tool_names=daily_weekly_review_tool_names,
@@ -4853,6 +4863,19 @@ def _is_bounded_daily_not_daily_review(
     return payload == {"decision": "not_daily"}
 
 
+def _is_keep_original_review(
+    reviewed: _ParsedAssistantTurn,
+) -> bool:
+    if reviewed.tool_calls:
+        return False
+    content = reviewed.assistant_message.get("content")
+    try:
+        payload = json.loads(content) if isinstance(content, str) else None
+    except json.JSONDecodeError:
+        return False
+    return payload == {"decision": "keep_original"}
+
+
 def _validate_daily_weekly_write_review(
     *,
     reviewed: _ParsedAssistantTurn,
@@ -5019,7 +5042,7 @@ def _constrain_daily_add_call_group(
                 or reviewed_arguments.get("date_selection") != "trusted_report"
                 or trusted_report is None
                 or trusted_report.status
-                not in {"collecting", "pending_confirmation"}
+                not in {"collecting", "pending_confirmation", "completed"}
                 or reviewed_arguments.get("expected_version")
                 != trusted_report.version
             ):

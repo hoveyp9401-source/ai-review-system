@@ -1993,7 +1993,7 @@ async def test_daily_followup_replaces_one_combined_item_with_supplied_parts(
 
 
 @pytest.mark.asyncio
-async def test_daily_review_rebinds_server_default_to_exact_trusted_open_report(
+async def test_daily_review_rebinds_server_default_to_exact_trusted_completed_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _RecordingRuntime()
@@ -2019,7 +2019,12 @@ async def test_daily_review_rebinds_server_default_to_exact_trusted_open_report(
     )
     trusted = _daily_edit_only_context().today_report
     assert trusted is not None
-    historical = trusted.model_copy(update={"report_date": date(2026, 8, 13)})
+    historical = trusted.model_copy(
+        update={
+            "report_date": date(2026, 8, 13),
+            "status": "completed",
+        }
+    )
     context = _daily_only_context().model_copy(
         update={"historical_reports": (historical,)}
     )
