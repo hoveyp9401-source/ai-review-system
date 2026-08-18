@@ -158,6 +158,8 @@ async def main() -> None:
                     now=now,
                     accepted=frozenset({"success"}),
                 )
+                await session.refresh(report)
+                status_before_replacement = report.status
                 session.add(
                     WebhookEvent(
                         idempotency_key=f"{RUN_ID}-correction",
@@ -203,8 +205,15 @@ async def main() -> None:
                     )
                 if "完成合同复核" not in list(report.today_work or ()):
                     raise AssertionError({"unexpected_today_work": report.today_work})
-                if report.status != "pending_confirmation":
-                    raise AssertionError({"status_changed": report.status})
+                if report.status != status_before_replacement:
+                    raise AssertionError(
+                        {
+                            "status_before_replacement": (
+                                status_before_replacement
+                            ),
+                            "status_after_replacement": report.status,
+                        }
+                    )
                 rows = list(
                     (
                         await session.scalars(
@@ -229,6 +238,7 @@ async def main() -> None:
                     "tools": tools,
                     "tomorrow_plan": list(report.tomorrow_plan or ()),
                     "report_status": report.status,
+                    "status_before_replacement": status_before_replacement,
                     "seed_result": first.user_visible_result,
                     "correction_result": "trusted_delivered_clarification",
                     "replacement_result": replacement.user_visible_result,
