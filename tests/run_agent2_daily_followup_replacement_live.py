@@ -97,6 +97,11 @@ def _context(round_number: int) -> TrustedContext:
                 content="请把两条明日计划分别发给我，我来调整。",
                 source_message_id="previous-correction:assistant",
             ),
+            TrustedRecentMessage(
+                role="user",
+                content="咋不回复了？",
+                source_message_id="queued-followup",
+            ),
         ),
         recent_operations=(
             TrustedRecentOperation(

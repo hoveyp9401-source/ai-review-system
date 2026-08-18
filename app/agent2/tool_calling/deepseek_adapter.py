@@ -4143,7 +4143,10 @@ def _has_daily_replacement_followup_context(
     if (
         context.principal.conversation_kind != "direct"
         or not context.recent_messages
-        or context.recent_messages[-1].role != "assistant"
+        or not any(
+            message.role == "assistant"
+            for message in context.recent_messages[-6:]
+        )
     ):
         return False
     for operation in reversed(context.recent_operations):
