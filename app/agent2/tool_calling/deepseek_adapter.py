@@ -3435,6 +3435,8 @@ def _should_run_bounded_daily_probe(
     return bool(
         thinking_enabled
         and "add_daily_items" in context.allowed_tool_names
+        and context.today_report is None
+        and not context.historical_reports
         and not _has_daily_replacement_followup_context(context)
     )
 

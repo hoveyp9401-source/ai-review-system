@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -14,7 +14,7 @@ from app.agent2.typed_daily_executor import TYPED_AUDIT_KEY
 from app.config import get_settings
 from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
-from app.models import DailyReport
+from app.models import DailyReport, WebhookEvent
 from scripts.smoke_20260811_overnight_daily_rollback import (
     _turn,
     _user_and_control,
@@ -92,19 +92,44 @@ async def _run_case(
             session.add(report)
             await session.flush()
             source_message_id = f"{RUN_ID}-{name}"
+            conversation_id = f"{RUN_ID}-{name}-conversation"
+            now = datetime.combine(
+                report_date,
+                datetime.min.time().replace(hour=19),
+                tzinfo=ZoneInfo(user.timezone or settings.timezone),
+            )
+            if not completed:
+                session.add(
+                    WebhookEvent(
+                        idempotency_key=f"{RUN_ID}-{name}-previous",
+                        platform="dingtalk",
+                        external_message_id=f"{RUN_ID}-{name}-previous-external",
+                        dingtalk_user_id=user.dingtalk_user_id,
+                        payload={
+                            "conversationId": conversation_id,
+                            "text": {"content": "今天的工作和明日计划先记这些"},
+                        },
+                        response_payload={
+                            "msgtype": "text",
+                            "text": {
+                                "content": "已记录，当前还缺问题风险。"
+                            },
+                        },
+                        status="processed",
+                        received_at=now - timedelta(minutes=1),
+                        processed_at=now - timedelta(minutes=1),
+                    )
+                )
+                await session.flush()
             outcome = await _turn(
                 session,
                 user=user,
                 settings=settings,
                 llm_client=client,
                 text=text,
-                conversation_id=f"{RUN_ID}-{name}-conversation",
+                conversation_id=conversation_id,
                 source_message_id=source_message_id,
-                now=datetime.combine(
-                    report_date,
-                    datetime.min.time().replace(hour=19),
-                    tzinfo=ZoneInfo(user.timezone or settings.timezone),
-                ),
+                now=now,
                 accepted_business_results=frozenset({"success"}),
             )
             await session.flush()
