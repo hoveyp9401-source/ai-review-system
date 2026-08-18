@@ -15,17 +15,24 @@ from app.agent2.tool_calling.contracts import (
 
 MODEL_ADD_DAILY_ITEMS_DESCRIPTION = (
     "Create one complete Daily Report write decision for the authenticated user. "
-    "The model decides every item's Daily field and exact source passage; the server "
-    "copies persisted text from that trusted passage, so do not return a separate "
-    "content value. Include every independently editable asserted matter exactly once "
+    "For every item, return content as concise professional Daily Report wording and "
+    "also return the exact current-message passage that proves it. Conservative cleanup "
+    "may remove oral filler, repetition, and obvious grammatical noise, but must not add, "
+    "remove, generalize, or change any actor, project, action, object, date, number, "
+    "negation, condition, completion state, risk, or plan. Include every independently "
+    "editable asserted matter exactly once "
     "and keep completed work, current problems/risks, and definite future plans in "
     "today_work, problems, and tomorrow_plan respectively. Do not turn a negation, "
     "condition, possibility, quotation, question, or attributed statement into the "
     "user's own completed fact. Each source_evidence.exact_quote must be one complete "
     "contiguous verbatim passage from its one-based current source message, preserving "
     "actors, attribution, negation, conditions, deadlines, consequences, exceptions, "
-    "quantities, and pending decisions. Separate independently editable action-object "
-    "pairs and never overlap their source passages. Use server_default when the report "
+    "quantities, and pending decisions. One item is the smallest coherent work topic or "
+    "outcome the user would update as one report line, not the smallest verb-object pair. "
+    "Split when the source switches to an unrelated goal, project, case group, deliverable, "
+    "or workstream even without punctuation; keep coordinated actions together when the "
+    "user presents them as one coherent topic or shared workstream. Never overlap source "
+    "passages. Use server_default when the report "
     "date is not explicit. A section heading or work-time phrase such as 今日工作 or "
     "今天完成 states report content, not an explicit calendar assignment to the "
     "report. "
@@ -44,24 +51,59 @@ MODEL_ADD_DAILY_ITEMS_DESCRIPTION = (
 
 
 class DailyItemInput(StrictContract):
-    """Small model decision; persisted text always comes from server-owned source."""
+    """Model wording plus the exact source used for independent fact review."""
 
     field: ReportField
+    content: str = Field(min_length=1, max_length=4000)
     source_evidence: DailyItemSourceEvidence
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_pre_content_rolling_calls(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "content" in value:
+            return value
+        evidence = value.get("source_evidence")
+        if isinstance(evidence, dict) and isinstance(
+            evidence.get("exact_quote"), str
+        ):
+            return {**value, "content": evidence["exact_quote"]}
+        return value
 
 
 class ModelAddDailyItemsArgs(AddDailyItemsArgs):
-    """LLM-facing Daily add contract without duplicated model-authored content."""
+    """LLM-facing Daily add contract with separately reviewable wording."""
 
     items: tuple[DailyItemInput, ...] = Field(default=(), max_length=100)
 
 
+class FocusedDailyItemInput(StrictContract):
+    content: str = Field(min_length=1, max_length=4000)
+    source_evidence: DailyItemSourceEvidence
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_pre_content_rolling_calls(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "content" in value:
+            return value
+        evidence = (
+            value.get("source_evidence")
+            if isinstance(value.get("source_evidence"), dict)
+            else value
+        )
+        if isinstance(evidence.get("exact_quote"), str):
+            return {
+                "content": evidence["exact_quote"],
+                "source_evidence": evidence,
+            }
+        return value
+
+
 class FocusedDailyFields(StrictContract):
-    today_work: tuple[DailyItemSourceEvidence, ...] = Field(
+    today_work: tuple[FocusedDailyItemInput, ...] = Field(
         max_length=100
     )
-    problems: tuple[DailyItemSourceEvidence, ...] = Field(max_length=100)
-    tomorrow_plan: tuple[DailyItemSourceEvidence, ...] = Field(
+    problems: tuple[FocusedDailyItemInput, ...] = Field(max_length=100)
+    tomorrow_plan: tuple[FocusedDailyItemInput, ...] = Field(
         max_length=100
     )
 
@@ -106,10 +148,11 @@ def compile_focused_daily_plan_arguments(
         "items": [
             {
                 "field": field,
-                "source_evidence": evidence.model_dump(mode="json"),
+                "content": item.content,
+                "source_evidence": item.source_evidence.model_dump(mode="json"),
             }
             for field in ordered_fields
-            for evidence in getattr(plan.fields, field)
+            for item in getattr(plan.fields, field)
         ],
         "acknowledged_empty_fields": [
             field
@@ -194,12 +237,14 @@ def model_add_daily_items_schema() -> dict[str, Any]:
         "reviewed_omitted_empty_fields",
         None,
     )
+    schema.get("properties", {}).pop("content_reviewed", None)
     required = schema.get("required")
     if isinstance(required, list):
         schema["required"] = [
             name
             for name in required
             if name != "reviewed_omitted_empty_fields"
+            and name != "content_reviewed"
         ]
     return schema
 
@@ -207,6 +252,12 @@ def model_add_daily_items_schema() -> dict[str, Any]:
 def compile_model_add_daily_items(arguments: Any) -> dict[str, Any]:
     """Compile a compact model decision into the unchanged execution contract."""
 
+    if isinstance(arguments, dict):
+        arguments = {
+            key: value
+            for key, value in arguments.items()
+            if key != "content_reviewed"
+        }
     if not isinstance(arguments, dict):
         compiled = AddDailyItemsArgs.model_validate(arguments).model_dump(
             mode="json"
@@ -219,8 +270,8 @@ def compile_model_add_daily_items(arguments: Any) -> dict[str, Any]:
     if isinstance(items, (list, tuple)) and any(
         isinstance(item, dict) and "content" in item for item in items
     ):
-        # Accept already-issued calls during a rolling release. The trusted-source
-        # binder still replaces every model-authored content value before writing.
+        # Accept already-issued calls during a rolling release. The source binder
+        # still replaces wording unless the server later attaches review proof.
         compiled = AddDailyItemsArgs.model_validate(arguments).model_dump(
             mode="json"
         )
@@ -230,8 +281,6 @@ def compile_model_add_daily_items(arguments: Any) -> dict[str, Any]:
 
     proposal = ModelAddDailyItemsArgs.model_validate(arguments)
     compiled = proposal.model_dump(mode="json")
-    for item in compiled["items"]:
-        item["content"] = item["source_evidence"]["exact_quote"]
     compiled = AddDailyItemsArgs.model_validate(compiled).model_dump(mode="json")
     if not compiled.get("reviewed_omitted_empty_fields"):
         compiled.pop("reviewed_omitted_empty_fields", None)
@@ -266,10 +315,11 @@ def parse_focused_daily_add_decision(
         raw_arguments["items"] = [
             {
                 "field": field,
-                "source_evidence": evidence.model_dump(mode="json"),
+                "content": item.content,
+                "source_evidence": item.source_evidence.model_dump(mode="json"),
             }
             for field in ("today_work", "problems", "tomorrow_plan")
-            for evidence in getattr(fields, field)
+            for item in getattr(fields, field)
         ]
         if "acknowledged_empty_fields" not in raw_arguments:
             empty_evidence = raw_arguments.get("empty_field_evidence")

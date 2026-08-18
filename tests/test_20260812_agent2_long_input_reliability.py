@@ -25,6 +25,7 @@ from app.agent2.tool_calling.contracts import ExecutionMode, ReceiptStatus, Tool
 from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
 from app.agent2.tool_calling.daily_add_model_contract import (
     compile_focused_daily_plan_arguments,
+    compile_model_add_daily_items,
     model_add_daily_items_schema,
     parse_focused_daily_add_decision,
 )
@@ -434,14 +435,43 @@ def _adapter() -> DeepSeekToolCallingAdapter:
     )
 
 
-def test_daily_add_model_schema_does_not_request_duplicate_item_content() -> None:
+def test_daily_add_model_schema_requires_reviewable_item_content() -> None:
     schema = deepseek_tool_schemas(frozenset({"add_daily_items"}))[0][
         "function"
     ]["parameters"]
     item_contract = schema["$defs"]["DailyItemInput"]
 
-    assert set(item_contract["properties"]) == {"field", "source_evidence"}
-    assert item_contract["required"] == ["field", "source_evidence"]
+    assert set(item_contract["properties"]) == {
+        "field",
+        "content",
+        "source_evidence",
+    }
+    assert item_contract["required"] == [
+        "field",
+        "content",
+        "source_evidence",
+    ]
+    assert "content_reviewed" not in schema["properties"]
+
+
+def test_model_cannot_self_assert_independent_content_review() -> None:
+    compiled = compile_model_add_daily_items(
+        {
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "改写后的内容",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "用户原话",
+                    },
+                }
+            ],
+            "content_reviewed": True,
+        }
+    )
+
+    assert compiled["content_reviewed"] is False
 
 
 def test_explicit_today_report_display_requires_one_fresh_read() -> None:
@@ -489,6 +519,125 @@ def test_focused_daily_plan_accepts_one_complete_36_item_report() -> None:
 
     assert len(arguments["items"]) == 36
     assert reply == "已按原文完整记录。"
+
+
+@pytest.mark.asyncio
+async def test_focused_daily_plan_preserves_reviewed_conservative_wording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (
+        "今天：1修复了日报agent的bug。"
+        "2.将合同评审技能变成了网页端的网页agent调用速度快了10倍，"
+        "明天计划继续找可以做成网页端的agent技能然后"
+        "被告案件进行通报与为结案案件的签约 没啥别的问题"
+    )
+    plan_arguments = {
+        "date_selection": "server_default",
+        "fields": {
+            "today_work": [
+                {
+                    "content": "修复日报agent的bug",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "修复了日报agent的bug",
+                    },
+                },
+                {
+                    "content": "将合同评审技能改造成网页端agent，调用速度提升10倍",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": (
+                            "将合同评审技能变成了网页端的网页agent调用速度快了10倍"
+                        ),
+                    },
+                },
+            ],
+            "problems": [],
+            "tomorrow_plan": [
+                {
+                    "content": "继续寻找可以做成网页端的agent技能",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "明天计划继续找可以做成网页端的agent技能",
+                    },
+                },
+                {
+                    "content": "进行被告案件通报及为结案案件签约",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "被告案件进行通报与为结案案件的签约",
+                    },
+                },
+            ],
+        },
+        "empty_field_evidence": [
+            {
+                "field": "problems",
+                "source_evidence": {"source_message_index": 1},
+            }
+        ],
+        "submit_after_write": False,
+        "reply": "已整理并记录。",
+    }
+    completions = iter(
+        (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "pang-semantic-split",
+                            "type": "function",
+                            "function": {
+                                "name": "plan_daily_report",
+                                "arguments": json.dumps(
+                                    plan_arguments,
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                },
+                metadata={"finish_reason": "tool_calls"},
+            ),
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    requests: list[list[dict]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del tool_schemas, thinking_enabled
+        requests.append(messages)
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=source,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已整理并记录。"
+    assert [
+        (item["field"], item["content"])
+        for item in runtime.calls[0].arguments["items"]
+    ] == [
+        ("today_work", "修复日报agent的bug"),
+        ("today_work", "将合同评审技能改造成网页端agent，调用速度提升10倍"),
+        ("tomorrow_plan", "继续寻找可以做成网页端的agent技能"),
+        ("tomorrow_plan", "进行被告案件通报及为结案案件签约"),
+    ]
+    review_payload = json.loads(requests[1][1]["content"])
+    assert review_payload["candidate"]["items"][1]["content"] == (
+        "将合同评审技能改造成网页端agent，调用速度提升10倍"
+    )
+    assert "adds, removes, generalizes, or changes" in requests[1][0]["content"]
 
 
 def test_focused_daily_plan_preserves_explicit_empty_field_evidence() -> None:

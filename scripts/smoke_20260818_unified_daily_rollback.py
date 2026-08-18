@@ -95,6 +95,8 @@ async def _run_add_case(
     text: str,
     required: dict[str, tuple[str, ...]],
     expected_status: str,
+    expected_empty_fields: tuple[str, ...] = (),
+    expected_field_counts: dict[str, int] | None = None,
 ) -> dict[str, object]:
     async with AsyncSessionLocal() as session:
         try:
@@ -136,6 +138,30 @@ async def _run_add_case(
                 raise AssertionError(
                     {"expected_status": expected_status, "actual_status": report.status}
                 )
+            for field in expected_empty_fields:
+                if getattr(report, field):
+                    raise AssertionError(
+                        {"expected_empty_field": field, "values": getattr(report, field)}
+                    )
+                if not bool(
+                    (report.section_status or {}).get(
+                        f"{field}_acknowledged_empty"
+                    )
+                ):
+                    raise AssertionError(
+                        {"missing_empty_acknowledgement": field}
+                    )
+            for field, expected_count in (expected_field_counts or {}).items():
+                actual_count = len(getattr(report, field) or ())
+                if actual_count != expected_count:
+                    raise AssertionError(
+                        {
+                            "field": field,
+                            "expected_count": expected_count,
+                            "actual_count": actual_count,
+                            "values": list(getattr(report, field) or ()),
+                        }
+                    )
             receipts = await _receipts(session, source_message_id)
             if [row.tool_name for row in receipts] != ["add_daily_items"]:
                 raise AssertionError(
@@ -150,6 +176,19 @@ async def _run_add_case(
                 "item_count": sum(
                     len(getattr(report, field) or ())
                     for field in ("today_work", "problems", "tomorrow_plan")
+                ),
+                "field_counts": {
+                    field: len(getattr(report, field) or ())
+                    for field in ("today_work", "problems", "tomorrow_plan")
+                },
+                "acknowledged_empty_fields": sorted(
+                    field
+                    for field in ("today_work", "problems", "tomorrow_plan")
+                    if bool(
+                        (report.section_status or {}).get(
+                            f"{field}_acknowledged_empty"
+                        )
+                    )
                 ),
             }
         finally:
@@ -333,6 +372,24 @@ async def main() -> None:
                     "tomorrow_plan": ("整理附件",),
                 },
                 expected_status="completed",
+                expected_empty_fields=("problems",),
+            ),
+        ),
+        (
+            "same_turn_colloquial_no_problem_submit",
+            lambda: _run_add_case(
+                llm_client,
+                name="same_turn_colloquial_no_problem_submit",
+                report_date=BASE_DATE + timedelta(days=11),
+                text=(
+                    "今天完成合同复核，没啥问题，"
+                    "明天继续跟进项目，请提交日报。"
+                ),
+                required={
+                    "today_work": ("合同复核",),
+                    "tomorrow_plan": ("跟进项目",),
+                },
+                expected_status="completed",
             ),
         ),
         (
@@ -415,6 +472,31 @@ async def main() -> None:
                     ),
                 },
                 expected_status="pending_confirmation",
+            ),
+        ),
+        (
+            "pang_initial_semantic_split",
+            lambda: _run_add_case(
+                llm_client,
+                name="pang_initial_semantic_split",
+                report_date=BASE_DATE + timedelta(days=12),
+                text=(
+                    "今天：1修复了日报agent的bug。"
+                    "2.将合同评审技能变成了网页端的网页agent调用速度快了10倍，"
+                    "明天计划继续找可以做成网页端的agent技能"
+                    "然后被告案件进行通报与未结案案件的签约 没啥别的问题"
+                ),
+                required={
+                    "today_work": ("日报agent", "合同评审技能"),
+                    "tomorrow_plan": ("网页端的agent技能", "被告案件"),
+                },
+                expected_status="pending_confirmation",
+                expected_empty_fields=("problems",),
+                expected_field_counts={
+                    "today_work": 2,
+                    "problems": 0,
+                    "tomorrow_plan": 2,
+                },
             ),
         ),
         (

@@ -571,16 +571,16 @@ class DailyItemSourceEvidence(CurrentUserMessageEvidence):
             min_length=1,
             max_length=4000,
             description=(
-                "Contiguous current-message quote authoritative for this one "
-                "persisted Daily Report item, or a quote from the one server-"
+                "Contiguous current-message quote authoritative for every fact in "
+                "this Daily Report item, or a quote from the one server-"
                 "verified immediately preceding failed write selected by "
                 "retry_candidate_id. It must cover the item's complete "
                 "meaning: never omit a negation, condition, deadline, consequence, "
                 "exception, or pending action, even when punctuation or whitespace "
                 "separates it. A date or section lead-in may be omitted only when "
-                "doing so does not change the item's meaning. The server copies this "
-                "quote from its own current-turn source instead of persisting "
-                "model-authored wording."
+                "doing so does not change the item's meaning. The server verifies this "
+                "quote from its own current-turn source before any independently "
+                "reviewed conservative wording may be persisted."
             ),
         ),
     ]
@@ -594,9 +594,9 @@ class DailyItemInput(StrictContract):
             min_length=1,
             max_length=4000,
             description=(
-                "Agent2's semantic interpretation of this item. If it is not "
-                "verbatim current-message text, source_evidence.exact_quote must "
-                "carry the exact authoritative wording to persist."
+                "Agent2's conservatively cleaned wording for this item. The "
+                "independent semantic review must confirm that it adds, removes, "
+                "or changes no fact from source_evidence.exact_quote."
             ),
         ),
     ]
@@ -641,6 +641,13 @@ class AddDailyItemsArgs(StrictContract):
         max_length=3,
     )
     submit_after_write: bool = False
+    content_reviewed: bool = Field(
+        default=False,
+        description=(
+            "Server-only proof that an independent semantic review approved "
+            "the conservative item wording. Models cannot set this field."
+        ),
+    )
 
     @model_validator(mode="after")
     def require_content_or_explicit_empty_acknowledgement(

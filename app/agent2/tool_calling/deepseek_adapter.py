@@ -1873,6 +1873,8 @@ class DeepSeekToolCallingAdapter:
                             ),
                             context=context,
                         )
+                        if bounded_daily_turn_active:
+                            parsed = _mark_reviewed_daily_content(parsed)
                     except ValueError as exc:
                         if not bounded_daily_turn_active:
                             raise
@@ -2748,7 +2750,7 @@ def _focused_daily_plan_tool_schemas() -> list[dict[str, Any]]:
                 "name": _FOCUSED_DAILY_PLAN_TOOL_NAME,
                 "description": (
                     "Read one self-contained Daily Report source completely and "
-                    "return every independently editable matter in the correct "
+                    "return every coherent work topic or outcome in the correct "
                     "section with exact source evidence. Empty sections stay empty."
                 ),
                 "strict": True,
@@ -3377,7 +3379,9 @@ def _pre_execution_tool_argument_repair_message() -> dict[str, str]:
             "source_message_index 和 exact_quote；exact_quote 必须复制当前用户消息中"
             "表达该事项完整含义的一段连续原文，保留否定、条件、期限和引号。"
             "不要把中文弯引号改成英文双引号。"
-            "日报事项不要另填 content；服务器会从 exact_quote 复制原文。"
+            "日报事项还必须填写 content：只可做保守的专业化整理，去掉口语赘词、"
+            "重复和明显语病，不得改变任何人物、项目、动作、对象、日期、数字、"
+            "否定、条件、完成状态、风险或计划；exact_quote 仍保留完整原话。"
             "不要改用文本描述工具调用，也不要假称已经执行。"
         ),
     }
@@ -3449,9 +3453,12 @@ def _compact_daily_add_argument_repair_messages(
                 "use complete non-overlapping sub-passages. Re-read the entire source and "
                 "call plan_daily_report exactly once. Its fields must contain today_work, "
                 "problems, and tomorrow_plan. Each field is an array with one object "
-                "per independently editable matter; every object uses the one-based "
-                "source_message_index of the exact current user message that contains "
-                "its contiguous quote. Use index 1 only when there is one source message. "
+                "per independently editable matter; every object contains content plus "
+                "source_evidence. content is concise professional Daily wording and may "
+                "only remove oral filler, repetition, or obvious grammar noise without "
+                "changing any fact. source_evidence uses the one-based source_message_index "
+                "of the exact current user message that contains its contiguous quote. "
+                "Use index 1 only when there is one source message. "
                 "Use an empty "
                 "array only when the source truly has no matter for that field. "
                 "An operation-level statement that the user has no edits, changes, "
@@ -3461,9 +3468,13 @@ def _compact_daily_add_argument_repair_messages(
                 "call. Do not merge or duplicate matters across fields. Respect the user's own "
                 "grouping. Each numbered or bulleted entry is one item unless it contains "
                 "explicit subitems. Clear user-written list, paragraph, sentence, or "
-                "semicolon boundaries may separate items. Keep one unnumbered natural "
-                "clause intact instead of splitting it merely because it contains several "
-                "verbs, objects, or recipients. Preserve every clause-level modifier and "
+                "semicolon boundaries may separate items. One item is the smallest coherent "
+                "work topic or outcome the user would update as one report line, not the "
+                "smallest verb-object pair. Missing punctuation does not merge a switch to an "
+                "unrelated goal, project, case group, deliverable, or workstream. Keep several "
+                "coordinated actions together when they form one user-described topic or shared "
+                "workstream. "
+                "Preserve every clause-level modifier and "
                 "transition; do not trim it merely because the remaining words still form "
                 "a substring. Keep a clause together "
                 "when its latter part only qualifies the status, condition, negation, or "
@@ -3515,9 +3526,13 @@ def _bounded_daily_probe_messages(
                 "plan_daily_report exactly once. This tool only prepares a plan and "
                 "cannot write anything. Its fields must contain all three keys "
                 "today_work, problems, "
-                "and tomorrow_plan. Each value is an array with one exact "
-                "source_evidence object per independently editable matter. Every "
-                "source_evidence uses the one-based source_message_index of the exact "
+                "and tomorrow_plan. Each value is an array with one object containing "
+                "content and source_evidence per independently editable matter. content "
+                "is concise professional Daily wording: remove only oral filler, repetition, "
+                "or obvious grammar noise, and never add, remove, generalize, or change an "
+                "actor, project, action, object, date, number, negation, condition, completion "
+                "state, risk, or plan. Every source_evidence uses the one-based "
+                "source_message_index of the exact "
                 "current user message containing exact_quote; use index 1 only when there "
                 "is one source message. Use an "
                 "empty array only when the source truly has no matter for that field. "
@@ -3532,8 +3547,12 @@ def _bounded_daily_probe_messages(
                 "separate matters. Treat each user-authored numbered or bulleted list entry "
                 "as one grouping unit; keep its dependent actions, outputs, checks, and "
                 "qualifiers together unless the source itself marks separate subitems. "
-                "For unnumbered prose, keep one natural clause intact instead of splitting "
-                "it merely because it contains several verbs, objects, or recipients. "
+                "For unnumbered prose, one item is the smallest coherent work topic or outcome "
+                "the user would update as one report line, not the smallest verb-object pair. "
+                "Split at a switch to an unrelated goal, project, case group, deliverable, or "
+                "workstream even when punctuation is missing. Keep several coordinated actions "
+                "together when they form one user-described topic or shared workstream, and keep "
+                "qualifiers of that topic together. "
                 "Preserve every clause-level modifier and transition; do not trim it merely "
                 "because the remaining words still form a substring. Keep a clause "
                 "together when its latter part only "
@@ -3586,7 +3605,8 @@ def _bounded_daily_add_review_messages(
                 "self-contained pure Daily add, compare the entire source with the "
                 "candidate. Return decision=repair with a concise, specific reason when "
                 "any user-authored matter is missing, invented, in the wrong field, "
-                "arbitrarily merged, arbitrarily split, loses a qualifier, or when an "
+                "arbitrarily merged, arbitrarily split, loses a qualifier, or when content "
+                "adds, removes, generalizes, or changes any source fact, or when an "
                 "explicit empty field or submission intent is wrong. For a self-contained "
                 "Daily source that includes at least one report matter and explicitly asks "
                 "to submit now, candidate.reviewed_omitted_empty_fields lists fields that "
@@ -3602,8 +3622,13 @@ def _bounded_daily_add_review_messages(
                 "fields are absent. Respect the user's "
                 "own grouping: each numbered or bulleted entry is one item unless it has "
                 "explicit subitems; clear list, paragraph, sentence, or semicolon boundaries "
-                "may separate items; one unnumbered natural clause stays intact even when "
-                "it contains several verbs, objects, or recipients. Exact quotes retain "
+                "may separate items. Judge the user's coherent work topics, not individual verbs: "
+                "split a switch to an unrelated goal, project, case group, deliverable, or "
+                "workstream even without punctuation, while keeping coordinated actions together "
+                "inside one user-described topic or shared workstream. The candidate content may only "
+                "remove oral filler, repetition, and obvious grammar noise while preserving "
+                "all actors, projects, actions, objects, dates, numbers, negation, conditions, "
+                "completion states, risks, and plans. Exact quotes retain "
                 "clause-level modifiers, transitions, conditions, and status qualifiers. Return "
                 "{\"decision\":\"approve\"} only when scope and candidate are both "
                 "fully correct. For approve, reason may be empty. A repair reason "
@@ -3641,6 +3666,7 @@ def _focused_daily_review_candidate(
         "items": [
             {
                 "field": item.get("field"),
+                "content": item.get("content"),
                 "source_evidence": item.get("source_evidence"),
             }
             for item in (arguments.get("items") or [])
@@ -4486,18 +4512,19 @@ def _daily_weekly_write_review_messages(
         "and explicit-empty-field evidence for add_daily_items. Every exact_quote must preserve "
         "the complete meaning of its item, including every negation, condition, "
         "deadline, consequence, exception, and pending action even when separated "
-        "by punctuation. Put each independently editable action-object pair in a "
-        "separate Daily item; never use one quote to hide two separate matters. "
-        "Count the independently editable matters in the current user messages "
-        "before producing calls, then ensure the corrected item count covers each "
-        "one exactly once. Coordinating wording does not merge different actions "
-        "or different objects into one matter. The exact_quote source spans for "
-        "different items must not overlap, and each quote must contain only the "
-        "one matter persisted by that item. A second action with a different "
-        "object is a separate item even when a comma or coordinating word joins "
-        "it to the first action. By contrast, one action about a relationship "
-        "between two objects remains one item. Do not preserve the draft's item "
-        "grouping without independently recounting the source matters. "
+        "by punctuation. One item is the smallest coherent work topic or outcome the "
+        "user would update as one report line, not the smallest verb-object pair. Count "
+        "those topics in the current user messages and cover each exactly once. Split a "
+        "switch to an unrelated goal, project, case group, deliverable, or workstream even "
+        "without punctuation. Keep several coordinated actions together when they form one "
+        "user-described topic or shared workstream. The exact_quote source spans for different "
+        "items must not overlap, and each quote must contain only its coherent topic. Do not "
+        "preserve the draft's item "
+        "grouping without independently recounting the source matters. Each item's "
+        "content must be concise professional wording grounded by exact_quote. It may "
+        "remove oral filler, repetition, or obvious grammar noise, but must preserve "
+        "every actor, project, action, object, date, number, attribution, negation, "
+        "condition, completion state, risk, and plan. "
         if allowed_domains == {"daily"}
         and any(call.tool_name == "add_daily_items" for call in calls)
         else ""
@@ -4678,20 +4705,9 @@ def _daily_weekly_review_draft_payload(
         return {
             "tool_name": call.tool_name,
             "arguments_without_fallible_date_target": {
-                key: (
-                    [
-                        {
-                            item_key: item_value
-                            for item_key, item_value in item.items()
-                            if item_key != "content"
-                        }
-                        for item in value
-                    ]
-                    if key == "items" and isinstance(value, list)
-                    else value
-                )
+                key: value
                 for key, value in call.arguments.items()
-                if key not in hidden_target_keys
+                if key not in hidden_target_keys and key != "content_reviewed"
             },
         }
     return {"tool_name": call.tool_name, "arguments": call.arguments}
@@ -4726,7 +4742,9 @@ def _dropped_daily_add_adjudication_messages(
                 "every explicit empty field and its evidence, the requested report date, "
                 "trusted target/version or retry candidate, and submit intent. The server "
                 "will compare this fresh decision with the other independently grounded "
-                "decision and copy persisted content from its own current-message text. "
+                "decision. Return conservative professional content plus exact source evidence "
+                "for each item; content may remove oral filler, repetition, and obvious grammar "
+                "noise but must preserve every source fact. "
                 "Do not reproduce only a partial items array. If a Daily write or any material "
                 "part remains unclear, return no tool calls and exactly one JSON object "
                 "with keys decision and reply, where decision is clarification and reply "
@@ -4834,7 +4852,7 @@ def _daily_weekly_review_envelope_repair_messages(
 
 
 def _daily_add_agreement_signature(call: NativeToolCall) -> dict[str, Any]:
-    """Compare model decisions without trusting model-authored item prose."""
+    """Compare independently grounded field, wording, and source decisions."""
 
     if call.tool_name != "add_daily_items":
         raise ValueError("Daily add agreement requires add_daily_items")
@@ -4858,6 +4876,7 @@ def _daily_add_agreement_signature(call: NativeToolCall) -> dict[str, Any]:
         items.append(
             {
                 "field": item.get("field"),
+                "content": item.get("content"),
                 "source_message_index": evidence.get("source_message_index"),
                 "exact_quote": evidence.get("exact_quote"),
             }
@@ -5153,6 +5172,50 @@ def _merge_daily_weekly_write_review(
         assistant_message=merged_message,
         tool_calls=merged_calls,
         audit=(*original.audit, *reviewed.audit),
+    )
+
+
+def _mark_reviewed_daily_content(
+    parsed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Attach server-only proof after the independent semantic review passes."""
+
+    reviewed_calls = tuple(
+        NativeToolCall(
+            call.tool_call_id,
+            call.tool_name,
+            validate_tool_arguments(
+                "add_daily_items",
+                {**call.arguments, "content_reviewed": True},
+            ),
+        )
+        if call.tool_name == "add_daily_items"
+        else call
+        for call in parsed.tool_calls
+    )
+    if reviewed_calls == parsed.tool_calls:
+        return parsed
+    assistant_message = dict(parsed.assistant_message)
+    assistant_message["tool_calls"] = [
+        {
+            "id": call.tool_call_id,
+            "type": "function",
+            "function": {
+                "name": call.tool_name,
+                "arguments": json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        for call in reviewed_calls
+    ]
+    return replace(
+        parsed,
+        assistant_message=assistant_message,
+        tool_calls=reviewed_calls,
     )
 
 

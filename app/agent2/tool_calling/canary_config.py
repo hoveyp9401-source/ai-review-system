@@ -311,9 +311,11 @@ Current-turn daily-report source fidelity:
   `trusted_failed_write` mode only, the index instead addresses the trusted
   candidate's `source_messages`. The server binds that index to its original
   text. Also provide
-  `exact_quote` as one complete contiguous passage for that item. The server
-  copies this user-authored passage into the report; model-authored `content`
-  is only a semantic interpretation and must never replace the quote.
+  `exact_quote` as one complete contiguous passage for that item. Provide
+  `content` as conservative professional wording. It may remove oral filler,
+  repetition, and obvious grammar noise, but an independent semantic review
+  must confirm that every fact remains grounded by the exact quote before the
+  wording can enter the report.
 - exact_quote must be contiguous user-authored text and cover the complete
   meaning of that one item. Never drop a negation, condition, deadline,
   consequence, exception, qualifier, or required decision, even when source
@@ -321,18 +323,17 @@ Current-turn daily-report source fidelity:
   excluded only when removing it does not change the item's meaning.
 - Never shorten exact_quote into a summary. A risk item's exact_quote must
   include all attached conditions, deadlines, consequences, exceptions, and
-  required decisions through that item's boundary. Independent matters with
-  different actions or objects must remain separate items and separate
-  quotes. Emit one independently editable action or object per item. A
-  compound sentence must not hide two actions in one item merely because they
-  are conversationally connected. Keep conditions and consequences attached
-  to their governing item instead of splitting a single risk chain. One quote
+  required decisions through that item's boundary. One item is the smallest
+  coherent work topic or outcome the user would update as one report line,
+  not the smallest verb-object pair. Split when the source switches to an
+  unrelated goal, project, case group, deliverable, or workstream even without
+  punctuation. Keep several coordinated actions together when the user presents
+  them as one coherent topic or shared workstream. Keep conditions and
+  consequences attached to their governing item instead of splitting a single
+  risk chain. One quote
   must not cross into another matter merely to make the wording smoother. The
   source spans for separate items must not overlap; each span authorizes only
-  its own persisted item. A second action with a different object is a separate
-  item even when a comma or coordinating word joins it to the first action. By
-  contrast, one action about a relationship between two objects remains one
-  item.
+  its own persisted item.
   Preserve the user's actors and qualifiers. A harmless
   source-language lead-in may remain when it is genuinely part of the matter;
   completeness and faithful separation take priority over cosmetic trimming.
@@ -343,7 +344,8 @@ Current-turn daily-report source fidelity:
   content, preserve attribution with wording such as a colon when necessary;
   never emit an unescaped quote character inside JSON tool arguments.
 - Wording cleanup may improve readability but must preserve actors, dates,
-  deadlines, quantities, alternatives, attribution, and named subjects. If
+  deadlines, quantities, alternatives, attribution, actions, objects,
+  completion states, risks, plans, and named subjects. If
   the meaning or split is uncertain, ask the user naturally without writing.
 """.strip()
 

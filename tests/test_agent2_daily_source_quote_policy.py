@@ -10,13 +10,11 @@ def test_daily_source_policy_preserves_complete_risk_and_separate_matters() -> N
 
     assert "A risk item's exact_quote must" in prompt
     assert "conditions, deadlines, consequences, exceptions" in prompt
-    assert "Independent matters with" in prompt
-    assert "different actions or objects must remain separate items" in prompt
-    assert "one independently editable action or object per item" in prompt
-    assert "compound sentence must not hide two actions in one item" in prompt
+    assert "smallest coherent work topic or outcome" in prompt
+    assert "not the smallest verb-object pair" in prompt
+    assert "Split when the source switches to an unrelated goal" in prompt
+    assert "shared workstream" in prompt
     assert "source spans for separate items must not overlap" in prompt
-    assert "A second action with a different object is a separate item" in prompt
-    assert "one action about a relationship between two objects remains one item" in prompt
     assert "Keep conditions and consequences attached" in prompt
     assert "to their governing item" in prompt
     assert "Never shorten exact_quote into a summary" in prompt

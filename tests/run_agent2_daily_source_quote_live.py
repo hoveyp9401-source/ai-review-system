@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -72,6 +73,7 @@ ReportField = Literal["today_work", "problems", "tomorrow_plan"]
 class ExpectedItem:
     field: ReportField
     exact_quote: str
+    content_facts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,39 @@ CASES = (
             ExpectedItem("today_work", "做了日报的基础功能优化"),
         ),
         allowed_tool_names=_DAILY_AND_WEEKLY_TOOLS,
+    ),
+    QuoteCase(
+        case_id="pang_aug18_semantic_split",
+        category="pang_aug18_exact",
+        user_text=(
+            "今天：1修复了日报agent的bug。"
+            "2.将合同评审技能变成了网页端的网页agent调用速度快了10倍，"
+            "明天计划继续找可以做成网页端的agent技能然后"
+            "被告案件进行通报与为结案案件的签约 没啥别的问题"
+        ),
+        expected_items=(
+            ExpectedItem(
+                "today_work",
+                "修复了日报agent的bug",
+                ("日报", "bug"),
+            ),
+            ExpectedItem(
+                "today_work",
+                "将合同评审技能变成了网页端的网页agent调用速度快了10倍",
+                ("合同评审", "网页端", "10倍"),
+            ),
+            ExpectedItem(
+                "tomorrow_plan",
+                "继续找可以做成网页端的agent技能",
+                ("网页端", "技能"),
+            ),
+            ExpectedItem(
+                "tomorrow_plan",
+                "被告案件进行通报与为结案案件的签约",
+                ("被告案件", "通报", "结案案件", "签约"),
+            ),
+        ),
+        expected_empty_fields=frozenset({"problems"}),
     ),
     QuoteCase(
         case_id="complete_three_sections_five_empty_four",
@@ -357,7 +392,7 @@ def _score_proposed_call(
     if not isinstance(items, list):
         return False, ("add_daily_items.items must be an array",)
 
-    actual_items: list[tuple[str, str]] = []
+    actual_items: list[tuple[str, str, str]] = []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             errors.append(f"items[{index}] is not an object")
@@ -375,16 +410,20 @@ def _score_proposed_call(
             continue
         if exact_quote not in case.user_text:
             errors.append(f"items[{index}] exact_quote is not contiguous source text")
-        actual_items.append((str(field), exact_quote))
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            errors.append(f"items[{index}] has no conservative content")
+            content = ""
+        actual_items.append((str(field), exact_quote, content))
 
     expected_items = tuple(
         (item.field, item.exact_quote) for item in case.expected_items
     )
     matched_actual_indexes: list[int] = []
-    for field, core_quote in expected_items:
+    for expected_index, (field, core_quote) in enumerate(expected_items):
         matches = [
             index
-            for index, (actual_field, actual_quote) in enumerate(actual_items)
+            for index, (actual_field, actual_quote, _) in enumerate(actual_items)
             if actual_field == field and core_quote in actual_quote
         ]
         if len(matches) != 1:
@@ -394,6 +433,18 @@ def _score_proposed_call(
             )
         else:
             matched_actual_indexes.append(matches[0])
+            actual_content = actual_items[matches[0]][2]
+            normalized_content = re.sub(r"\s+", "", actual_content).casefold()
+            missing_facts = [
+                fact
+                for fact in case.expected_items[expected_index].content_facts
+                if re.sub(r"\s+", "", fact).casefold() not in normalized_content
+            ]
+            if missing_facts:
+                errors.append(
+                    "conservative content lost required facts: "
+                    f"{field}={core_quote!r}, missing={missing_facts}"
+                )
     if (
         not case.allow_combined_expected_matters
         and len(set(matched_actual_indexes)) != len(matched_actual_indexes)
@@ -407,7 +458,7 @@ def _score_proposed_call(
             "daily item count differs: expected "
             f"{len(expected_items)}, got {len(actual_items)}"
         )
-    for index, (field, actual_quote) in enumerate(actual_items):
+    for index, (field, actual_quote, _) in enumerate(actual_items):
         if not any(
             expected_field == field and core_quote in actual_quote
             for expected_field, core_quote in expected_items
@@ -460,6 +511,9 @@ def _score_bound_call(
     arguments = calls[0].get("arguments")
     if not isinstance(arguments, dict):
         return False, ("server-bound add_daily_items arguments are invalid",)
+    reviewed = arguments.get("content_reviewed") is True
+    if not reviewed:
+        errors.append("server-bound conservative content lacks review proof")
     for index, item in enumerate(arguments.get("items") or []):
             if not isinstance(item, dict):
                 errors.append(f"bound items[{index}] is not an object")
@@ -467,16 +521,14 @@ def _score_bound_call(
             evidence = item.get("source_evidence") or {}
             exact_quote = evidence.get("exact_quote")
             content = item.get("content")
-            if isinstance(exact_quote, str) and content != exact_quote:
-                errors.append(
-                    f"bound items[{index}].content was not copied from exact_quote"
-                )
+            if not isinstance(content, str) or not content.strip():
+                errors.append(f"bound items[{index}].content is empty")
             if isinstance(exact_quote, str) and exact_quote in case.user_text:
                 start = case.user_text.index(exact_quote)
                 server_slice = case.user_text[start : start + len(exact_quote)]
-                if content != server_slice:
+                if exact_quote != server_slice:
                     errors.append(
-                        f"bound items[{index}].content contains model-authored text"
+                        f"bound items[{index}].exact_quote changed after source binding"
                     )
     return not errors, tuple(errors)
 
@@ -502,13 +554,13 @@ def _canonical_arguments(case: QuoteCase) -> dict[str, Any]:
         "items": [
             {
                 "field": item.field,
-                "content": f"模型语义解释{index}",
+                "content": item.exact_quote,
                 "source_evidence": {
                     "source_message_index": 1,
                     "exact_quote": item.exact_quote,
                 },
             }
-            for index, item in enumerate(case.expected_items, start=1)
+            for item in case.expected_items
         ],
         "acknowledged_empty_fields": sorted(case.expected_empty_fields),
         "empty_field_evidence": [
@@ -548,7 +600,10 @@ def _self_check() -> dict[str, Any]:
         source = CurrentTurnSource((case.user_text,))
         bound_arguments = source.bind_tool_arguments(
             "add_daily_items",
-            proposed[0]["arguments"],
+            {
+                **proposed[0]["arguments"],
+                "content_reviewed": True,
+            },
         )
         bound_ok, bound_errors = _score_bound_call(
             case,
@@ -656,7 +711,7 @@ async def _evaluate_one(
         "final_proposal_errors": list(proposed_errors),
         "server_binding_pass": bound_ok,
         "server_binding_errors": list(bound_errors),
-        "server_bound_no_model_added_text": bound_ok,
+        "server_bound_content_has_review_proof": bound_ok,
         "model_rephrased_item_count": _model_rephrase_count(proposed_calls),
         "semantic_review_count": semantic_review_count,
         "binding_errors": runtime.binding_errors,
@@ -802,8 +857,8 @@ async def _run(args: argparse.Namespace) -> int:
         "all_final_items_cover_every_matter_without_merging": all(
             item.get("final_proposal_pass") is True for item in results
         ),
-        "all_bound_content_is_server_owned": all(
-            item.get("server_bound_no_model_added_text") is True
+        "all_bound_content_has_independent_review_proof": all(
+            item.get("server_bound_content_has_review_proof") is True
             for item in results
         ),
         "all_daily_only_writes_semantically_reviewed_once": all(

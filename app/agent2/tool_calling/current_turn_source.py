@@ -242,7 +242,7 @@ class CurrentTurnSource:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
-        """Return validated arguments with writes materialized from server text."""
+        """Return arguments grounded in server text and approved review evidence."""
 
         self.validate_tool_arguments(tool_name, arguments)
         if tool_name not in {"add_daily_items", "edit_daily_items"}:
@@ -271,9 +271,10 @@ class CurrentTurnSource:
                     "DAILY_ITEM_EXACT_QUOTE_MISMATCH"
                 )
             quote_end = quote_start + len(exact_quote)
-            bound["items"][index]["content"] = source_message[
-                quote_start:quote_end
-            ]
+            if not typed.content_reviewed:
+                bound["items"][index]["content"] = source_message[
+                    quote_start:quote_end
+                ]
         return bound
 
     def _validate_daily_item_spans(self, typed: AddDailyItemsArgs) -> None:

@@ -160,6 +160,32 @@ def test_daily_item_quote_accepts_the_complete_joined_sentence() -> None:
     assert bound["items"][0]["content"] == source_message
 
 
+def test_daily_item_binder_preserves_independently_reviewed_cleanup() -> None:
+    source_message = "将合同评审技能变成了网页端的网页agent调用速度快了10倍"
+    source = CurrentTurnSource((source_message,))
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        {
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "将合同评审技能改造成网页端agent，调用速度提升10倍",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": source_message,
+                    },
+                }
+            ],
+            "content_reviewed": True,
+        },
+    )
+
+    assert bound["items"][0]["content"] == (
+        "将合同评审技能改造成网页端agent，调用速度提升10倍"
+    )
+
+
 def test_daily_item_quotes_cannot_overlap_in_one_source_message() -> None:
     source = CurrentTurnSource(
         ("目前对方还没寄回盖章版；明天我去催办并同步项目组",)

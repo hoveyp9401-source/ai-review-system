@@ -726,16 +726,17 @@ TOOL_REGISTRY = MappingProxyType(
             "the complete meaning of that item. Never drop a negation, condition, deadline, "
             "consequence, exception, qualifier, or required decision even when punctuation or "
             "whitespace separates it. Exclude report-date lead-ins and section labels only when "
-            "doing so cannot change the item's meaning. The server persists that exact "
-            "server-owned passage; "
-            "Do not supply a separate model-authored content value; the field selection and exact "
-            "source passage are the complete model decision. Never "
-            "invent, normalize, reorder, or truncate exact_quote. Emit one independently editable "
-            "action or object per item; a compound sentence must not hide two separate actions in "
-            "one item. The source spans for separate items must not overlap; each span authorizes "
-            "only its own persisted item. A second action with a different object is a separate item "
-            "even when a comma or coordinating word joins it to the first action. By contrast, one "
-            "action about a relationship between two objects remains one item. Keep all conditions, "
+            "doing so cannot change the item's meaning. Supply content as concise professional "
+            "Daily Report wording and keep exact_quote as the complete authoritative source. "
+            "Content may remove oral filler, repetition, and obvious grammar noise, but it must "
+            "not add, remove, generalize, or change any actor, project, action, object, date, "
+            "number, attribution, negation, condition, completion state, risk, or plan. Never "
+            "invent, normalize, reorder, or truncate exact_quote. One item is the smallest coherent "
+            "work topic or outcome the user would update as one report line, not the smallest "
+            "verb-object pair. Split a switch to an unrelated goal, project, case group, deliverable, "
+            "or workstream even without punctuation. Keep several coordinated actions together when "
+            "the user presents them as one coherent topic or shared workstream. Source spans for "
+            "separate items must not overlap. Keep all conditions, "
             "deadlines, consequences, exceptions, and pending "
             "decisions attached to their governing risk item. Every acknowledged empty field "
             "must also "
@@ -1097,6 +1098,8 @@ def validate_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
         and not dumped.get("reviewed_omitted_empty_fields")
     ):
         dumped.pop("reviewed_omitted_empty_fields", None)
+    if tool_name == "add_daily_items" and not dumped.get("content_reviewed"):
+        dumped.pop("content_reviewed", None)
     return dumped
 
 
