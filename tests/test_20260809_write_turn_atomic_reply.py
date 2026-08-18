@@ -25,6 +25,8 @@ from app.agent2.tool_calling.deepseek_adapter import (
     MalformedToolCallError,
     _canary_post_write_protocol_message,
     _CompletionResponse,
+    _focused_daily_plan_tool_schemas,
+    _focused_daily_review_tool_schemas,
 )
 from app.agent2.tool_calling.production_contracts import (
     ProductionRuntimeResult,
@@ -430,6 +432,185 @@ async def test_flash_thinking_request_is_explicitly_enabled_at_high_effort() -> 
 
 
 @pytest.mark.asyncio
+async def test_flash_non_thinking_request_is_explicitly_disabled() -> None:
+    class CapturingHttpClient:
+        def __init__(self) -> None:
+            self.payload = None
+
+        async def post(self, url, **kwargs):
+            self.payload = kwargs["json"]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "response-no-thinking",
+                    "model": "deepseek-v4-flash",
+                    "created": 1,
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": "好的。",
+                            },
+                        }
+                    ],
+                    "usage": {},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    client = CapturingHttpClient()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=client,
+        model="deepseek-v4-flash",
+        timeout_seconds=3.0,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+
+    await adapter._complete(
+        messages=[{"role": "user", "content": "测试"}],
+        tool_schemas=[],
+        thinking_enabled=False,
+    )
+
+    assert client.payload["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in client.payload
+
+
+@pytest.mark.asyncio
+async def test_focused_daily_plan_uses_one_strict_model_only_tool() -> None:
+    class CapturingHttpClient:
+        def __init__(self) -> None:
+            self.payload = None
+
+        async def post(self, url, **kwargs):
+            self.payload = kwargs["json"]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "response-focused-daily",
+                    "model": "deepseek-v4-flash",
+                    "created": 1,
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {"decision": "not_daily"}
+                                ),
+                            },
+                        }
+                    ],
+                    "usage": {},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    client = CapturingHttpClient()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=client,
+        model="deepseek-v4-flash",
+        timeout_seconds=3.0,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+
+    await adapter._complete(
+        messages=[
+            {"role": "system", "content": "focused Daily planner"},
+            {"role": "user", "content": "一份较长日报"},
+        ],
+        tool_schemas=_focused_daily_plan_tool_schemas(),
+        thinking_enabled=True,
+    )
+
+    assert "response_format" not in client.payload
+    assert client.payload["thinking"] == {"type": "enabled"}
+    assert client.payload["max_tokens"] == 16384
+    assert [
+        tool["function"]["name"] for tool in client.payload["tools"]
+    ] == ["plan_daily_report"]
+    assert client.payload["tools"][0]["function"]["strict"] is True
+    assert "add_daily_items" not in json.dumps(
+        client.payload["tools"],
+        ensure_ascii=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_focused_daily_review_uses_one_strict_verdict_tool() -> None:
+    class CapturingHttpClient:
+        def __init__(self) -> None:
+            self.payload = None
+
+        async def post(self, url, **kwargs):
+            self.payload = kwargs["json"]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "response-focused-review",
+                    "model": "deepseek-v4-flash",
+                    "created": 1,
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "review-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "review_daily_plan",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "decision": "approve",
+                                                    "reason": "",
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    client = CapturingHttpClient()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=client,
+        model="deepseek-v4-flash",
+        timeout_seconds=3.0,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+
+    await adapter._complete(
+        messages=[
+            {"role": "system", "content": "focused Daily review"},
+            {"role": "user", "content": "{}"},
+        ],
+        tool_schemas=_focused_daily_review_tool_schemas(),
+        thinking_enabled=True,
+    )
+
+    assert "response_format" not in client.payload
+    assert client.payload["max_tokens"] == 8192
+    assert client.payload["thinking"] == {"type": "enabled"}
+    assert client.payload["reasoning_effort"] == "low"
+    assert client.payload["tools"][0]["function"]["name"] == (
+        "review_daily_plan"
+    )
+    assert client.payload["tools"][0]["function"]["strict"] is True
+
+
+@pytest.mark.asyncio
 async def test_provider_model_mismatch_fails_closed_before_any_tool_execution() -> None:
     class WrongModelHttpClient:
         async def post(self, url, **kwargs):
@@ -498,6 +679,64 @@ def _tool_call_completion(
                                     }
                                 ],
                             },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
+def _focused_tool_call_completion(
+    call_id: str = "focused-call-1",
+) -> _CompletionResponse:
+    del call_id
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": json.dumps({"decision": "approve"}),
+        },
+        metadata={"finish_reason": "stop"},
+    )
+
+
+def _focused_daily_add_completion(
+    call_id: str = "focused-add-1",
+) -> _CompletionResponse:
+    native = _tool_call_completion(call_id)
+    raw_arguments = native.message["tool_calls"][0]["function"][
+        "arguments"
+    ]
+    native_arguments = json.loads(raw_arguments)
+    items = native_arguments.get("items", [])
+    arguments = {
+        "date_selection": "server_default",
+        "fields": {
+        field: [
+            item["source_evidence"]
+            for item in items
+            if item["field"] == field
+        ]
+        for field in ("today_work", "problems", "tomorrow_plan")
+        },
+        "empty_field_evidence": [],
+        "submit_after_write": False,
+        "reply": "已经按你的原话记录。",
+    }
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "plan_daily_report",
+                        "arguments": json.dumps(
+                            arguments,
                             ensure_ascii=False,
                         ),
                     },
@@ -1632,6 +1871,13 @@ async def test_section_reviewer_replacement_keeps_main_reasoning_in_tool_loop(
     )
     completions = iter(
         (
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps({"decision": "not_daily"}),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
             main,
             review,
             _CompletionResponse(
@@ -1667,8 +1913,8 @@ async def test_section_reviewer_replacement_keeps_main_reasoning_in_tool_loop(
         thinking_enabled=True,
     )
 
-    assert result.iterations == 3
-    tool_loop_messages = captured_messages[2]
+    assert result.iterations == 4
+    tool_loop_messages = captured_messages[3]
     assistant_tool_message = next(
         message
         for message in reversed(tool_loop_messages)
@@ -1720,7 +1966,7 @@ async def test_malformed_pre_execution_tool_json_gets_one_model_repair(
     completions = iter(
         (
             _malformed_tool_call_completion(),
-            _tool_call_completion(),
+            _tool_call_completion("repaired-call-1"),
             _tool_call_completion("reviewed-call-1"),
             _CompletionResponse(
                 message={
@@ -1768,7 +2014,7 @@ async def test_malformed_pre_execution_tool_json_gets_one_model_repair(
     assert result.iterations == 4
     assert any(
         message.get("role") == "system"
-        and "isolated Agent2 Daily Report argument repairer"
+        and "上一条原生工具调用尚未执行"
         in str(message.get("content"))
         for message in captured_messages[1]
     )
@@ -1781,9 +2027,9 @@ async def test_malformed_pre_execution_tool_json_gets_one_model_repair(
         for message in captured_messages[1]
         if message.get("role") == "system"
     )
-    assert "complete contiguous verbatim source passage" in repair_prompt
-    assert "model-authored content" in repair_prompt
-    assert captured_messages[1][0]["content"] != "Agent2 test"
+    assert "source_evidence" in repair_prompt
+    assert "不要把中文弯引号改成英文双引号" in repair_prompt
+    assert captured_messages[1][0]["content"] == "Agent2 test"
 
 
 @pytest.mark.asyncio

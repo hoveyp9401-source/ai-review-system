@@ -21,8 +21,18 @@ from app.agent2.tool_calling.contracts import (
     ReceiptStatus,
     ToolReceipt,
 )
+from app.agent2.tool_calling.current_turn_source import (
+    CurrentTurnSource,
+    CurrentTurnSourceEvidenceError,
+)
 from app.agent2.tool_calling.daily_add_model_contract import (
+    compile_focused_daily_plan_arguments,
     compile_model_add_daily_items,
+    focused_daily_plan_parameters_schema,
+    focused_daily_review_parameters_schema,
+    parse_focused_daily_add_decision,
+    parse_focused_daily_review_arguments,
+    parse_focused_daily_review_decision,
 )
 from app.agent2.tool_calling.daily_briefing_reply import (
     daily_briefing_composer_messages,
@@ -73,7 +83,8 @@ _TEXTUAL_TOOL_PROTOCOL_MARKERS = (
     "<|tool_calls",
 )
 
-_BOUNDED_DAILY_PROBE_MIN_CHARACTERS = 160
+_FOCUSED_DAILY_PLAN_TOOL_NAME = "plan_daily_report"
+_FOCUSED_DAILY_REVIEW_TOOL_NAME = "review_daily_plan"
 
 
 class DeepSeekToolCallingError(RuntimeError):
@@ -207,6 +218,7 @@ class _ParsedAssistantTurn:
     assistant_message: dict[str, Any]
     tool_calls: tuple[NativeToolCall, ...]
     audit: tuple[RawToolCallAudit, ...]
+    focused_success_reply: str | None = None
 
 
 @dataclass(frozen=True)
@@ -524,6 +536,8 @@ class DeepSeekToolCallingAdapter:
         )
         bounded_daily_turn_active = False
         bounded_daily_reply_composer_active = False
+        bounded_daily_success_reply: str | None = None
+        prefetched_terminal_completion: _CompletionResponse | None = None
         completed_daily_flow = completed_daily_follow_through.CompletedDailyFollowThrough(
             context=context,
             user_text=user_text,
@@ -883,9 +897,7 @@ class DeepSeekToolCallingAdapter:
                         else messages
                     )
                     completion_tool_schemas = (
-                        deepseek_tool_schemas(
-                            frozenset({"add_daily_items"})
-                        )
+                        _focused_daily_plan_tool_schemas()
                         if bounded_daily_probe_pending
                         else completed_daily_flow.prepare_model_tools(
                             tool_schemas,
@@ -898,15 +910,23 @@ class DeepSeekToolCallingAdapter:
                             ),
                         )
                     )
-                    completion = await complete_model(
-                        completion_messages,
-                        tool_schemas=completion_tool_schemas,
-                        thinking_enabled=(
-                            (thinking_enabled or briefing_fact_batch_seen)
-                            and not bounded_daily_probe_pending
-                            and not bounded_daily_turn_active
-                        ),
-                    )
+                    if prefetched_terminal_completion is not None:
+                        completion = prefetched_terminal_completion
+                        prefetched_terminal_completion = None
+                    else:
+                        completion = await complete_model(
+                            completion_messages,
+                            tool_schemas=completion_tool_schemas,
+                            thinking_enabled=(
+                                thinking_enabled
+                                if bounded_daily_probe_pending
+                                else (
+                                    thinking_enabled
+                                    or briefing_fact_batch_seen
+                                )
+                                and not bounded_daily_turn_active
+                            ),
+                        )
                     model_turns.append(
                         _model_turn_audit(
                             iterations,
@@ -938,20 +958,46 @@ class DeepSeekToolCallingAdapter:
                             },
                         )
                     )
-                    parsed = _parse_assistant_turn(completion.message)
-                    audits.extend(parsed.audit)
-                    protocol_warning = _validate_completion_protocol(
-                        completion,
-                        parsed,
-                        allow_usable_direct_text=True,
-                        allow_empty_terminal_for_retry=(
-                            (
-                                briefing_fact_batch_seen
-                                and daily_briefing_reply_retry_count == 0
-                            )
-                            or (write_batch_seen and write_reply_retry_count < 2)
-                        ),
+                    parsed = (
+                        _parse_focused_daily_completion(
+                            completion.message,
+                            call_scope="probe",
+                        )
+                        if bounded_daily_probe_pending
+                        else _parse_assistant_turn(completion.message)
                     )
+                    audits.extend(parsed.audit)
+                    if bounded_daily_probe_pending:
+                        bounded_daily_success_reply = (
+                            parsed.focused_success_reply
+                        )
+                    protocol_warning = (
+                        _validate_focused_daily_completion_protocol(
+                            completion
+                        )
+                        if bounded_daily_probe_pending
+                        else _validate_completion_protocol(
+                            completion,
+                            parsed,
+                            allow_usable_direct_text=True,
+                            allow_empty_terminal_for_retry=(
+                                (
+                                    briefing_fact_batch_seen
+                                    and daily_briefing_reply_retry_count == 0
+                                )
+                                or (
+                                    write_batch_seen
+                                    and write_reply_retry_count < 2
+                                )
+                            ),
+                        )
+                    )
+                    if bounded_daily_probe_pending:
+                        _validate_focused_daily_source(
+                            parsed,
+                            user_text=user_text,
+                            user_messages=user_messages,
+                        )
                     if protocol_warning is not None:
                         model_turns[-1] = replace(
                             model_turns[-1],
@@ -980,18 +1026,25 @@ class DeepSeekToolCallingAdapter:
                                 "tool_argument_error_type": type(exc).__name__,
                             },
                         )
-                        if _only_daily_add_argument_error(exc):
+                        if (
+                            bounded_daily_probe_pending
+                            and _only_daily_add_argument_error(exc)
+                        ):
                             try:
                                 repair_completion = await complete_model(
                                     _compact_daily_add_argument_repair_messages(
                                         user_text=user_text,
                                         user_messages=user_messages,
                                         context=context,
+                                        previous_decision=(
+                                            exc.raw_tool_call_audit[-1].raw_arguments
+                                            if exc.raw_tool_call_audit
+                                            else ""
+                                        ),
+                                        validation_error=str(exc),
                                     ),
-                                    tool_schemas=deepseek_tool_schemas(
-                                        frozenset({"add_daily_items"})
-                                    ),
-                                    thinking_enabled=False,
+                                    tool_schemas=_focused_daily_plan_tool_schemas(),
+                                    thinking_enabled=True,
                                 )
                                 iterations += 1
                                 model_turns.append(
@@ -1005,14 +1058,22 @@ class DeepSeekToolCallingAdapter:
                                         },
                                     )
                                 )
-                                parsed = _parse_assistant_turn(
-                                    repair_completion.message
+                                parsed = _parse_focused_daily_completion(
+                                    repair_completion.message,
+                                    call_scope="repair",
                                 )
-                                _validate_completion_protocol(
-                                    repair_completion,
+                                _validate_focused_daily_completion_protocol(
+                                    repair_completion
+                                )
+                                _validate_focused_daily_source(
                                     parsed,
+                                    user_text=user_text,
+                                    user_messages=user_messages,
                                 )
                                 audits.extend(parsed.audit)
+                                bounded_daily_success_reply = (
+                                    parsed.focused_success_reply
+                                )
                                 if (
                                     len(parsed.tool_calls) != 1
                                     or parsed.tool_calls[0].tool_name
@@ -1075,6 +1136,7 @@ class DeepSeekToolCallingAdapter:
                             },
                         )
                     else:
+                        bounded_daily_success_reply = None
                         model_turns[-1] = replace(
                             model_turns[-1],
                             response_metadata={
@@ -1267,15 +1329,19 @@ class DeepSeekToolCallingAdapter:
                             "draft_executed": False,
                         },
                     )
+                    focused_daily_review = (
+                        bounded_daily_turn_active
+                        and daily_weekly_review_tool_names
+                        == frozenset({"add_daily_items"})
+                    )
                     review_messages = (
                         _bounded_daily_add_review_messages(
                             user_text=user_text,
                             user_messages=user_messages,
                             context=context,
+                            calls=parsed.tool_calls,
                         )
-                        if bounded_daily_turn_active
-                        and daily_weekly_review_tool_names
-                        == frozenset({"add_daily_items"})
+                        if focused_daily_review
                         else _daily_weekly_write_review_messages(
                             user_text=user_text,
                             user_messages=user_messages,
@@ -1292,10 +1358,18 @@ class DeepSeekToolCallingAdapter:
                     try:
                         review_completion = await complete_model(
                             review_messages,
-                            tool_schemas=deepseek_tool_schemas(
-                                daily_weekly_review_tool_names
+                            tool_schemas=(
+                                _focused_daily_review_tool_schemas()
+                                if focused_daily_review
+                                else deepseek_tool_schemas(
+                                    daily_weekly_review_tool_names
+                                )
                             ),
-                            thinking_enabled=not bounded_daily_turn_active,
+                            thinking_enabled=(
+                                True
+                                if focused_daily_review
+                                else not bounded_daily_turn_active
+                            ),
                         )
                         iterations += 1
                         model_turns.append(
@@ -1308,15 +1382,152 @@ class DeepSeekToolCallingAdapter:
                                 },
                             )
                         )
-                        reviewed = _parse_assistant_turn(
-                            review_completion.message,
-                            allow_review_arguments_envelope=True,
-                        )
-                        _validate_completion_protocol(
-                            review_completion,
-                            reviewed,
-                        )
-                        audits.extend(reviewed.audit)
+                        if focused_daily_review:
+                            focused_review_decision, focused_review_reason = (
+                                _parse_focused_daily_review_completion(
+                                    review_completion
+                                )
+                            )
+                            if focused_review_decision == "approve":
+                                reviewed = parsed
+                            elif focused_review_decision == "repair":
+                                if tool_argument_repair_count != 0:
+                                    raise DeepSeekResponseError(
+                                        "focused Daily repair budget exhausted"
+                                    )
+                                try:
+                                    semantic_repair_completion = await complete_model(
+                                        _compact_daily_add_argument_repair_messages(
+                                            user_text=user_text,
+                                            user_messages=user_messages,
+                                            context=context,
+                                            previous_decision=json.dumps(
+                                                {
+                                                    "candidate": (
+                                                        _focused_daily_review_candidate(
+                                                            parsed.tool_calls
+                                                        )
+                                                    ),
+                                                    "reply": (
+                                                        bounded_daily_success_reply
+                                                    ),
+                                                },
+                                                ensure_ascii=False,
+                                                sort_keys=True,
+                                                separators=(",", ":"),
+                                            ),
+                                            validation_error=(
+                                                "focused semantic review: "
+                                                + str(focused_review_reason or "repair")
+                                            ),
+                                        ),
+                                        tool_schemas=(
+                                            _focused_daily_plan_tool_schemas()
+                                        ),
+                                        thinking_enabled=True,
+                                    )
+                                    iterations += 1
+                                    model_turns.append(
+                                        _model_turn_audit(
+                                            iterations,
+                                            semantic_repair_completion.message,
+                                            response_metadata={
+                                                **semantic_repair_completion.metadata,
+                                                "focused_daily_semantic_repair": True,
+                                                "draft_executed": False,
+                                            },
+                                        )
+                                    )
+                                    reviewed = _parse_focused_daily_completion(
+                                        semantic_repair_completion.message,
+                                        call_scope="semantic-repair",
+                                    )
+                                    _validate_focused_daily_completion_protocol(
+                                        semantic_repair_completion
+                                    )
+                                    _validate_focused_daily_source(
+                                        reviewed,
+                                        user_text=user_text,
+                                        user_messages=user_messages,
+                                    )
+                                    audits.extend(reviewed.audit)
+                                    if (
+                                        len(reviewed.tool_calls) != 1
+                                        or reviewed.tool_calls[0].tool_name
+                                        != "add_daily_items"
+                                    ):
+                                        raise ValueError(
+                                            "focused semantic repair requires one "
+                                            "complete Daily add"
+                                        )
+                                    bounded_daily_success_reply = (
+                                        reviewed.focused_success_reply
+                                    )
+                                    tool_argument_repair_count += 1
+                                    repair_review_completion = await complete_model(
+                                        _bounded_daily_add_review_messages(
+                                            user_text=user_text,
+                                            user_messages=user_messages,
+                                            context=context,
+                                            calls=reviewed.tool_calls,
+                                        ),
+                                        tool_schemas=(
+                                            _focused_daily_review_tool_schemas()
+                                        ),
+                                        thinking_enabled=True,
+                                    )
+                                    iterations += 1
+                                    model_turns.append(
+                                        _model_turn_audit(
+                                            iterations,
+                                            repair_review_completion.message,
+                                            response_metadata={
+                                                **repair_review_completion.metadata,
+                                                "focused_daily_semantic_repair_review": True,
+                                                "draft_executed": False,
+                                            },
+                                        )
+                                    )
+                                    repair_review_decision, _ = (
+                                        _parse_focused_daily_review_completion(
+                                            repair_review_completion
+                                        )
+                                    )
+                                    if repair_review_decision != "approve":
+                                        raise ValueError(
+                                            "focused semantic repair did not pass "
+                                            "independent review"
+                                        )
+                                except DeepSeekToolCallingError as repair_exc:
+                                    audits.extend(repair_exc.raw_tool_call_audit)
+                                    raise DeepSeekResponseError(
+                                        "focused Daily semantic repair failed"
+                                    ) from repair_exc
+                                except ValueError as repair_exc:
+                                    raise DeepSeekResponseError(
+                                        "focused Daily semantic repair failed"
+                                    ) from repair_exc
+                            else:
+                                reviewed = _ParsedAssistantTurn(
+                                    assistant_message={
+                                        "role": "assistant",
+                                        "content": json.dumps(
+                                            {"decision": "not_daily"}
+                                        ),
+                                    },
+                                    tool_calls=(),
+                                    audit=(),
+                                )
+                        else:
+                            reviewed = _parse_assistant_turn(
+                                review_completion.message,
+                                allow_review_arguments_envelope=True,
+                            )
+                            _validate_completion_protocol(
+                                review_completion,
+                                reviewed,
+                            )
+                            audits.extend(reviewed.audit)
                         bounded_daily_review_fallback = (
                             bounded_daily_turn_active
                             and _is_bounded_daily_not_daily_review(reviewed)
@@ -1526,6 +1737,7 @@ class DeepSeekToolCallingAdapter:
                             },
                         )
                         bounded_daily_turn_active = False
+                        bounded_daily_success_reply = None
                         continue
                     reviewed = await adjudicate_dropped_daily_adds(
                         original=parsed,
@@ -1652,12 +1864,39 @@ class DeepSeekToolCallingAdapter:
                                     audits=audits,
                                     model_turns=model_turns,
                                 ) from clarify_exc
-                    parsed = _merge_daily_weekly_write_review(
-                        original=parsed,
-                        reviewed=reviewed,
-                        reviewed_tool_names=daily_weekly_review_tool_names,
-                        context=context,
-                    )
+                    try:
+                        parsed = _merge_daily_weekly_write_review(
+                            original=parsed,
+                            reviewed=reviewed,
+                            reviewed_tool_names=(
+                                daily_weekly_review_tool_names
+                            ),
+                            context=context,
+                        )
+                    except ValueError as exc:
+                        if not bounded_daily_turn_active:
+                            raise
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "bounded_daily_review_merge_fell_back": True,
+                                "bounded_daily_review_merge_error": str(exc),
+                                "draft_executed": False,
+                            },
+                        )
+                        bounded_daily_turn_active = False
+                        bounded_daily_success_reply = None
+                        daily_weekly_write_review_count = 0
+                        tool_argument_repair_count = 0
+                        completed_daily_flow = (
+                            completed_daily_follow_through.CompletedDailyFollowThrough(
+                                context=context,
+                                user_text=user_text,
+                                user_messages=user_messages,
+                            )
+                        )
+                        continue
 
                 completed_daily_tool_turn_error = (
                     completed_daily_flow.reviewed_tool_turn_error(
@@ -2130,6 +2369,7 @@ class DeepSeekToolCallingAdapter:
                     )
                 if (
                     daily_submit_section_review_count == 0
+                    and not bounded_daily_turn_active
                     and _needs_daily_submit_section_review(
                         parsed.tool_calls,
                         context=context,
@@ -2287,6 +2527,44 @@ class DeepSeekToolCallingAdapter:
                             retry_number=0,
                         )
                         bounded_daily_reply_composer_active = True
+                        if (
+                            bounded_daily_success_reply is not None
+                            and any(
+                                receipt.changed
+                                for receipt in runtime_result.receipts
+                            )
+                        ):
+                            prefetched_content = (
+                                complete_write_reply_retry_envelope(
+                                    json.dumps(
+                                        {
+                                            "reply": (
+                                                bounded_daily_success_reply
+                                            )
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    tuple(receipts),
+                                )
+                            )
+                            prefetched_terminal_completion = (
+                                _CompletionResponse(
+                                    message={
+                                        "role": "assistant",
+                                        "content": prefetched_content,
+                                    },
+                                    metadata={
+                                        "finish_reason": "stop",
+                                        "request_attempt_count": 0,
+                                        "transport_retry_count": 0,
+                                        "transport_errors": [],
+                                        "elapsed_seconds": 0.0,
+                                        "model_call_performed": False,
+                                        "reused_focused_daily_reply": True,
+                                    },
+                                )
+                            )
+                            bounded_daily_success_reply = None
                     else:
                         messages.append(
                             _canary_post_write_protocol_message(tuple(receipts))
@@ -2333,7 +2611,17 @@ class DeepSeekToolCallingAdapter:
             # DeepSeek maps lower labels to this same supported low-cost
             # thinking tier. Send it explicitly so model comparisons and
             # production behavior cannot silently depend on provider defaults.
-            payload["reasoning_effort"] = "high"
+            payload["reasoning_effort"] = (
+                "low"
+                if _has_focused_daily_review_tool(tool_schemas)
+                else "high"
+            )
+        else:
+            payload["thinking"] = {"type": "disabled"}
+        if _has_focused_daily_plan_tool(tool_schemas):
+            payload["max_tokens"] = 16384
+        elif _has_focused_daily_review_tool(tool_schemas):
+            payload["max_tokens"] = 8192
         if _server_requests_json_object(messages):
             payload["response_format"] = {"type": "json_object"}
         transport_errors: list[dict[str, Any]] = []
@@ -2452,6 +2740,63 @@ class DeepSeekToolCallingAdapter:
         )
 
 
+def _focused_daily_plan_tool_schemas() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": _FOCUSED_DAILY_PLAN_TOOL_NAME,
+                "description": (
+                    "Read one self-contained Daily Report source completely and "
+                    "return every independently editable matter in the correct "
+                    "section with exact source evidence. Empty sections stay empty."
+                ),
+                "strict": True,
+                "parameters": focused_daily_plan_parameters_schema(),
+            },
+        }
+    ]
+
+
+def _has_focused_daily_plan_tool(
+    tool_schemas: list[dict[str, Any]],
+) -> bool:
+    return any(
+        isinstance(tool, dict)
+        and isinstance(tool.get("function"), dict)
+        and tool["function"].get("name") == _FOCUSED_DAILY_PLAN_TOOL_NAME
+        for tool in tool_schemas
+    )
+
+
+def _focused_daily_review_tool_schemas() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": _FOCUSED_DAILY_REVIEW_TOOL_NAME,
+                "description": (
+                    "Return only a verdict on one Daily Report plan: approve it, "
+                    "request one focused repair, or return it to the full Agent2 path."
+                ),
+                "strict": True,
+                "parameters": focused_daily_review_parameters_schema(),
+            },
+        }
+    ]
+
+
+def _has_focused_daily_review_tool(
+    tool_schemas: list[dict[str, Any]],
+) -> bool:
+    return any(
+        isinstance(tool, dict)
+        and isinstance(tool.get("function"), dict)
+        and tool["function"].get("name") == _FOCUSED_DAILY_REVIEW_TOOL_NAME
+        for tool in tool_schemas
+    )
+
+
 def _server_requests_json_object(messages: list[dict[str, Any]]) -> bool:
     """Recognize only the server-owned terminal write protocol."""
 
@@ -2483,6 +2828,276 @@ def _server_requests_json_object(messages: list[dict[str, Any]]) -> bool:
         ):
             return True
     return False
+
+
+def _validate_focused_daily_completion_protocol(
+    completion: _CompletionResponse,
+) -> None:
+    raw_calls = completion.message.get("tool_calls")
+    if raw_calls:
+        if completion.metadata.get("finish_reason") != "tool_calls":
+            raise DeepSeekResponseError(
+                "focused Daily tool response did not finish as a tool call"
+            )
+        return
+    if completion.metadata.get("finish_reason") != "stop":
+        raise DeepSeekResponseError(
+            "focused Daily response did not reach complete JSON termination"
+        )
+    content = completion.message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise DeepSeekResponseError("focused Daily response returned empty JSON")
+
+
+def _parse_focused_daily_completion(
+    message: dict[str, Any],
+    *,
+    call_scope: str,
+) -> _ParsedAssistantTurn:
+    raw_calls = message.get("tool_calls") or ()
+    if raw_calls:
+        if not isinstance(raw_calls, (list, tuple)) or len(raw_calls) != 1:
+            raise InvalidNativeToolArgumentsError(
+                "focused Daily plan requires exactly one tool call"
+            )
+        raw_call = raw_calls[0]
+        function = raw_call.get("function") if isinstance(raw_call, dict) else None
+        raw_arguments = (
+            function.get("arguments") if isinstance(function, dict) else None
+        )
+        raw_name = function.get("name") if isinstance(function, dict) else None
+        call_id = (
+            str(raw_call.get("id") or "").strip()
+            if isinstance(raw_call, dict)
+            else ""
+        )
+        raw_text = raw_arguments if isinstance(raw_arguments, str) else ""
+        digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        audit = RawToolCallAudit(
+            tool_call_id=call_id or f"focused-daily-{call_scope}-{digest[:20]}",
+            tool_name="add_daily_items",
+            raw_arguments=raw_text,
+            arguments_sha256=digest,
+            parse_status="received_focused_daily_tool",
+        )
+        if raw_name != _FOCUSED_DAILY_PLAN_TOOL_NAME or not raw_text:
+            raise InvalidNativeToolArgumentsError(
+                "DeepSeek returned an invalid focused Daily planning tool",
+                raw_tool_call_audit=(audit,),
+            )
+        try:
+            decoder = json.JSONDecoder()
+            cursor = len(raw_text) - len(raw_text.lstrip())
+            decoded, cursor = decoder.raw_decode(raw_text, cursor)
+            salvaged_duplicate = False
+            while raw_text[cursor:].strip():
+                cursor += len(raw_text[cursor:]) - len(
+                    raw_text[cursor:].lstrip()
+                )
+                _, cursor = decoder.raw_decode(raw_text, cursor)
+                salvaged_duplicate = True
+            arguments, reply = compile_focused_daily_plan_arguments(decoded)
+        except (TypeError, ValueError) as exc:
+            raise InvalidNativeToolArgumentsError(
+                "DeepSeek returned invalid focused Daily planning arguments",
+                raw_tool_call_audit=(audit,),
+            ) from exc
+        if (
+            not arguments.get("items")
+            and not arguments.get("acknowledged_empty_fields")
+        ):
+            return _ParsedAssistantTurn(
+                assistant_message={
+                    "role": "assistant",
+                    "content": json.dumps({"decision": "not_daily"}),
+                },
+                tool_calls=(),
+                audit=(
+                    replace(
+                        audit,
+                        parse_status="focused_submit_only_fallback",
+                    ),
+                ),
+            )
+        execution_call_id = audit.tool_call_id
+        canonical_arguments = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return _ParsedAssistantTurn(
+            assistant_message={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": execution_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "add_daily_items",
+                            "arguments": canonical_arguments,
+                        },
+                    }
+                ],
+            },
+            tool_calls=(
+                NativeToolCall(
+                    tool_call_id=execution_call_id,
+                    tool_name="add_daily_items",
+                    arguments=arguments,
+                ),
+            ),
+            audit=(
+                replace(
+                    audit,
+                    parse_status=(
+                        "salvaged_focused_daily_tool"
+                        if salvaged_duplicate
+                        else "validated_focused_daily_tool"
+                    ),
+                ),
+            ),
+            focused_success_reply=reply,
+        )
+
+    content = message.get("content")
+    raw_content = content if isinstance(content, str) else ""
+    digest = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
+    call_id = f"focused-daily-{call_scope}-{digest[:20]}"
+    audit = RawToolCallAudit(
+        tool_call_id=call_id,
+        tool_name="add_daily_items",
+        raw_arguments=raw_content,
+        arguments_sha256=digest,
+        parse_status="received_focused_daily_json",
+    )
+    try:
+        decision, arguments, reply = parse_focused_daily_add_decision(
+            raw_content
+        )
+    except (TypeError, ValueError) as exc:
+        raise InvalidNativeToolArgumentsError(
+            "DeepSeek returned an invalid focused Daily decision",
+            raw_tool_call_audit=(audit,),
+        ) from exc
+    if decision != "daily_add":
+        return _ParsedAssistantTurn(
+            assistant_message={
+                "role": "assistant",
+                "content": raw_content,
+            },
+            tool_calls=(),
+            audit=(),
+        )
+    if arguments is None:
+        raise InvalidNativeToolArgumentsError(
+            "focused Daily add omitted arguments",
+            raw_tool_call_audit=(audit,),
+        )
+    raw_arguments = json.dumps(
+        arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    call = NativeToolCall(
+        tool_call_id=call_id,
+        tool_name="add_daily_items",
+        arguments=arguments,
+    )
+    assistant_message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "add_daily_items",
+                    "arguments": raw_arguments,
+                },
+            }
+        ],
+    }
+    return _ParsedAssistantTurn(
+        assistant_message=assistant_message,
+        tool_calls=(call,),
+        audit=(
+            replace(
+                audit,
+                parse_status="validated_focused_daily_json",
+            ),
+        ),
+        focused_success_reply=reply,
+    )
+
+
+def _validate_focused_daily_source(
+    parsed: _ParsedAssistantTurn,
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+) -> None:
+    if not parsed.tool_calls:
+        return
+    source = CurrentTurnSource(user_messages or (user_text,))
+    try:
+        for call in parsed.tool_calls:
+            source.validate_tool_arguments(
+                call.tool_name,
+                call.arguments,
+            )
+    except CurrentTurnSourceEvidenceError as exc:
+        raise InvalidNativeToolArgumentsError(
+            f"focused Daily source validation failed: {exc.code}",
+            raw_tool_call_audit=parsed.audit,
+        ) from exc
+
+
+def _parse_focused_daily_review_completion(
+    completion: _CompletionResponse,
+) -> tuple[str, str | None]:
+    _validate_focused_daily_completion_protocol(completion)
+    raw_calls = completion.message.get("tool_calls") or ()
+    if raw_calls:
+        try:
+            if not isinstance(raw_calls, (list, tuple)) or len(raw_calls) != 1:
+                raise ValueError("focused Daily review requires one tool call")
+            function = raw_calls[0]["function"]
+            if function.get("name") != _FOCUSED_DAILY_REVIEW_TOOL_NAME:
+                raise ValueError("focused Daily review used the wrong tool")
+            raw_arguments = function.get("arguments")
+            if not isinstance(raw_arguments, str) or not raw_arguments.strip():
+                raise ValueError("focused Daily review omitted arguments")
+            decoder = json.JSONDecoder()
+            cursor = len(raw_arguments) - len(raw_arguments.lstrip())
+            decoded, cursor = decoder.raw_decode(raw_arguments, cursor)
+            while raw_arguments[cursor:].strip():
+                cursor += len(raw_arguments[cursor:]) - len(
+                    raw_arguments[cursor:].lstrip()
+                )
+                duplicate, cursor = decoder.raw_decode(raw_arguments, cursor)
+                if duplicate != decoded:
+                    raise ValueError(
+                        "focused Daily review returned conflicting arguments"
+                    )
+            return parse_focused_daily_review_arguments(decoded)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InvalidNativeToolArgumentsError(
+                "focused Daily review returned an invalid tool verdict"
+            ) from exc
+    content = completion.message.get("content")
+    if not isinstance(content, str):
+        raise InvalidNativeToolArgumentsError(
+            "focused Daily review returned no JSON"
+        )
+    try:
+        return parse_focused_daily_review_decision(content)
+    except (TypeError, ValueError) as exc:
+        raise InvalidNativeToolArgumentsError(
+            "focused Daily review returned an invalid verdict"
+        ) from exc
 
 
 def _parse_assistant_turn(
@@ -2775,13 +3390,12 @@ def _should_run_bounded_daily_probe(
     context: TrustedContext,
     thinking_enabled: bool,
 ) -> bool:
-    """Use one fast model pass for long input, then fall back if it is not Daily add."""
+    """Let one semantic planner admit every pure Daily add, regardless of length."""
 
-    if not thinking_enabled or "add_daily_items" not in context.allowed_tool_names:
-        return False
-    ordered_messages = user_messages or (user_text,)
-    return sum(len(message) for message in ordered_messages) >= (
-        _BOUNDED_DAILY_PROBE_MIN_CHARACTERS
+    del user_text, user_messages
+    return bool(
+        thinking_enabled
+        and "add_daily_items" in context.allowed_tool_names
     )
 
 
@@ -2792,43 +3406,82 @@ def _only_daily_add_argument_error(error: DeepSeekToolCallingError) -> bool:
     )
 
 
+def _focused_daily_user_content(
+    ordered_messages: tuple[str, ...],
+) -> str:
+    if len(ordered_messages) == 1:
+        return ordered_messages[0]
+    return json.dumps(
+        {
+            "ordered_current_user_messages": [
+                {"sequence": index, "content": content}
+                for index, content in enumerate(
+                    ordered_messages,
+                    start=1,
+                )
+            ]
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _compact_daily_add_argument_repair_messages(
     *,
     user_text: str,
     user_messages: tuple[str, ...],
     context: TrustedContext,
+    previous_decision: str,
+    validation_error: str,
 ) -> list[dict[str, str]]:
     ordered_messages = user_messages or (user_text,)
     return [
         {
             "role": "system",
             "content": (
-                "You are the isolated Agent2 Daily Report argument repairer. The "
-                "previous add_daily_items call was not valid JSON and was never "
-                "executed. Independently reread all exact current user messages and "
-                "trusted context. If they clearly authorize a Daily Report write, "
-                "return exactly one complete native add_daily_items call using the "
-                "supplied compact schema. Include every independent asserted matter "
-                "exactly once and preserve its complete contiguous verbatim source "
-                "passage. Use server_default and omit all date/target binding fields "
-                "unless the source explicitly assigns the report date or selects one "
-                "trusted report. Do not return a partial batch, model-authored "
-                "content, a description of a tool call, or any claim that a write "
-                "occurred."
+                "The previous focused Daily plan was missing, structurally invalid, "
+                "or failed exact-source validation, and nothing executed. The user "
+                "payload supplies the exact source, "
+                "previous decision, and validation error. Correct that error without "
+                "dropping valid matters. When source spans overlap, never reuse the "
+                "same passage in two fields: choose the semantically correct field or "
+                "use complete non-overlapping sub-passages. Re-read the entire source and "
+                "call plan_daily_report exactly once. Its fields must contain today_work, "
+                "problems, and tomorrow_plan. Each field is an array with one object "
+                "per independently editable matter; every object uses the one-based "
+                "source_message_index of the exact current user message that contains "
+                "its contiguous quote. Use index 1 only when there is one source message. "
+                "Use an empty "
+                "array only when the source truly has no matter for that field. "
+                "An operation-level statement that the user has no edits, changes, "
+                "additions, deletions, or moves is not evidence that any Daily Report "
+                "content field is empty. If the source supplies no report content and "
+                "only asks to submit an existing report, return not_daily without a tool "
+                "call. Do not merge or duplicate matters across fields. Respect the user's own "
+                "grouping. Each numbered or bulleted entry is one item unless it contains "
+                "explicit subitems. Clear user-written list, paragraph, sentence, or "
+                "semicolon boundaries may separate items. Keep one unnumbered natural "
+                "clause intact instead of splitting it merely because it contains several "
+                "verbs, objects, or recipients. Preserve every clause-level modifier and "
+                "transition; do not trim it merely because the remaining words still form "
+                "a substring. Keep a clause together "
+                "when its latter part only qualifies the status, condition, negation, or "
+                "completion state of the same action. An explicit statement that a field "
+                "has nothing to report belongs only in empty_field_evidence, never as an "
+                "item. Use date_selection=server_default. This tool only repairs the "
+                "unexecuted plan and cannot write anything."
             ),
         },
         {
             "role": "user",
             "content": json.dumps(
                 {
-                    "ordered_current_user_messages": [
-                        {"sequence": index, "content": content}
-                        for index, content in enumerate(
-                            ordered_messages,
-                            start=1,
-                        )
-                    ],
-                    "trusted_context": context.model_payload(),
+                    "source": _focused_daily_user_content(
+                        ordered_messages
+                    ),
+                    "previous_decision": previous_decision,
+                    "validation_error": validation_error,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -2849,50 +3502,51 @@ def _bounded_daily_probe_messages(
         {
             "role": "system",
             "content": (
-                "You are the focused Agent2 Daily Report planner for one long user "
-                "turn. This fast path is only for a pure Daily add. If the same turn "
-                "also requests any non-Daily action, query, edit, deletion, memory "
-                "change, weekly operation, or other business task, return not_daily "
-                "for the unchanged full Agent2 path even when Daily content is also "
-                "present. Decide its meaning semantically from all exact current user "
-                "messages and trusted context. If and only if the turn clearly "
-                "authorizes adding Daily Report content, return exactly one complete "
-                "native add_daily_items call using the supplied compact schema. "
-                "Include every independent asserted matter exactly once, choose its "
-                "Daily field, preserve the complete contiguous verbatim source "
-                "passage, explicit empty fields, report date target, retry target, "
-                "and same-turn submit intent. Never return a partial batch or a "
-                "separate model-authored content value. Do not convert negated, "
-                "conditional, possible, questioned, or attributed material into the "
-                "user's own completed fact. Use server_default and omit "
-                "date_expression, proposed_date, date_evidence, report_id, and "
-                "expected_version unless the user explicitly assigns the report date "
-                "or uniquely selects a trusted report. A heading or content phrase "
-                "such as 今日工作 or 今天完成 does not by itself assign the report "
-                "date. "
-                "If this is not a clear Daily add, return "
-                "no tools and exactly {\"decision\":\"not_daily\"}; the server will "
-                "send the turn through the unchanged full Agent2 path. Never claim "
-                "that anything has been written."
+                "You are Agent2's fast planner for one self-contained pure Daily "
+                "Report add. If the message also asks another task, depends on "
+                "history, retries an earlier write, targets an existing report, or "
+                "assigns a non-default report date, return exactly "
+                "{\"decision\":\"not_daily\"} without a tool call. Otherwise call "
+                "plan_daily_report exactly once. This tool only prepares a plan and "
+                "cannot write anything. Its fields must contain all three keys "
+                "today_work, problems, "
+                "and tomorrow_plan. Each value is an array with one exact "
+                "source_evidence object per independently editable matter. Every "
+                "source_evidence uses the one-based source_message_index of the exact "
+                "current user message containing exact_quote; use index 1 only when there "
+                "is one source message. Use an "
+                "empty array only when the source truly has no matter for that field. "
+                "empty_field_evidence must contain one field plus its current source "
+                "message index only when the user explicitly says that field is empty, such as "
+                "no new risks or none; do not treat that empty statement as a report item. "
+                "A statement that there are no edits, changes, additions, deletions, or "
+                "moves describes operation state, not an empty report field. If the source "
+                "contains no report content and only asks to submit an existing report, "
+                "return not_daily without calling the planning tool. "
+                "Read the entire source after any numbered work list; do not merge "
+                "separate matters. Treat each user-authored numbered or bulleted list entry "
+                "as one grouping unit; keep its dependent actions, outputs, checks, and "
+                "qualifiers together unless the source itself marks separate subitems. "
+                "For unnumbered prose, keep one natural clause intact instead of splitting "
+                "it merely because it contains several verbs, objects, or recipients. "
+                "Preserve every clause-level modifier and transition; do not trim it merely "
+                "because the remaining words still form a substring. Keep a clause "
+                "together when its latter part only "
+                "qualifies the status, condition, negation, or completion state of the "
+                "same action. Preserve complete actors, attribution, negation, "
+                "conditions, deadlines, consequences, exceptions, risks, and plans "
+                "inside contiguous exact quotes. Use date_selection=server_default. "
+                "Set submit_after_write=false unless this same source explicitly asks "
+                "to submit or confirm the report now; merely mentioning that work or a "
+                "Daily Report was done is not submission authorization. Preserve "
+                "explicit empty-field evidence. The reply "
+                "must be a short success acknowledgement with no date, count, section "
+                "state, submission claim, or follow-up question. No markdown."
             ),
         },
         {
             "role": "user",
-            "content": json.dumps(
-                {
-                    "ordered_current_user_messages": [
-                        {"sequence": index, "content": content}
-                        for index, content in enumerate(
-                            ordered_messages,
-                            start=1,
-                        )
-                    ],
-                    "trusted_context": context.model_payload(),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
+            "content": _focused_daily_user_content(ordered_messages),
         },
     ]
 
@@ -2902,51 +3556,47 @@ def _bounded_daily_add_review_messages(
     user_text: str,
     user_messages: tuple[str, ...],
     context: TrustedContext,
+    calls: tuple[NativeToolCall, ...],
 ) -> list[dict[str, str]]:
+    del context
     ordered_messages = user_messages or (user_text,)
     return [
         {
             "role": "system",
             "content": (
-                "You are the focused independent Agent2 Daily Report reviewer. "
-                "Nothing has executed. This bounded path is valid only for a pure "
-                "Daily add. If the same turn also requests any non-Daily action, "
-                "query, edit, deletion, memory change, weekly operation, or other "
-                "business task, return no tools and exactly "
-                "{\"decision\":\"not_daily\"} so the server restores the unchanged "
-                "full Agent2 path. Independently reread every exact current "
-                "user message and trusted context; do not copy or assume any earlier "
-                "draft. If the user clearly authorizes a Daily add and every material "
-                "meaning is clear, return exactly one complete native "
-                "add_daily_items call using the compact schema. Cover every "
-                "independently editable asserted matter exactly once, with the right "
-                "Daily field and a non-overlapping complete contiguous verbatim "
-                "source passage. Preserve actors, attribution, negation, conditions, "
-                "deadlines, consequences, exceptions, quantities, risks, and plans. "
-                "Use date_selection=server_default unless the user explicitly assigns "
-                "a calendar date to the report itself or uniquely selects a trusted "
-                "report. A heading or content phrase such as 今日工作 or 今天完成 does "
-                "not by itself assign the report date. Preserve explicit empty fields, "
-                "retry selection, and same-turn submit intent. Never return a partial "
-                "batch or model-authored content. If a Daily write or any material "
-                "part of an otherwise pure Daily add is unclear, return no tools and "
-                "exactly one JSON object with "
-                "keys decision and reply, where decision is clarification and reply "
-                "is one concise natural Chinese question. Never claim execution."
+                "You are an independent Agent2 Daily plan verifier. Never rewrite the "
+                "candidate. Call review_daily_plan exactly once. First judge scope. "
+                "Use decision=fallback with a concise "
+                "reason only when the source also asks a non-Daily task, depends on "
+                "conversation history, retries an earlier failed write, targets an "
+                "existing report, or assigns a non-default report date. For a "
+                "source that supplies no report content and only asks to submit an "
+                "existing report, also use fallback; a statement that there are no edits, "
+                "changes, additions, deletions, or moves is operation state, not empty-field "
+                "evidence. For a "
+                "self-contained pure Daily add, compare the entire source with the "
+                "candidate. Return decision=repair with a concise, specific reason when "
+                "any user-authored matter is missing, invented, in the wrong field, "
+                "arbitrarily merged, arbitrarily split, loses a qualifier, or when an "
+                "explicit empty field or submission intent is wrong. Respect the user's "
+                "own grouping: each numbered or bulleted entry is one item unless it has "
+                "explicit subitems; clear list, paragraph, sentence, or semicolon boundaries "
+                "may separate items; one unnumbered natural clause stays intact even when "
+                "it contains several verbs, objects, or recipients. Exact quotes retain "
+                "clause-level modifiers, transitions, conditions, and status qualifiers. Return "
+                "{\"decision\":\"approve\"} only when scope and candidate are both "
+                "fully correct. For approve, reason may be empty. A repair reason "
+                "identifies the defect but must not supply a rewritten candidate."
             ),
         },
         {
             "role": "user",
             "content": json.dumps(
                 {
-                    "ordered_current_user_messages": [
-                        {"sequence": index, "content": content}
-                        for index, content in enumerate(
-                            ordered_messages,
-                            start=1,
-                        )
-                    ],
-                    "trusted_context": context.model_payload(),
+                    "source": _focused_daily_user_content(
+                        ordered_messages
+                    ),
+                    "candidate": _focused_daily_review_candidate(calls),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -2954,6 +3604,38 @@ def _bounded_daily_add_review_messages(
             ),
         },
     ]
+
+
+def _focused_daily_review_candidate(
+    calls: tuple[NativeToolCall, ...],
+) -> dict[str, Any]:
+    daily_calls = tuple(
+        call for call in calls if call.tool_name == "add_daily_items"
+    )
+    if len(daily_calls) != 1:
+        raise ValueError("focused Daily review requires one add candidate")
+    arguments = daily_calls[0].arguments
+    return {
+        "date_selection": arguments.get("date_selection"),
+        "items": [
+            {
+                "field": item.get("field"),
+                "source_evidence": item.get("source_evidence"),
+            }
+            for item in (arguments.get("items") or [])
+        ],
+        "acknowledged_empty_fields": arguments.get(
+            "acknowledged_empty_fields",
+            [],
+        ),
+        "empty_field_evidence": arguments.get(
+            "empty_field_evidence",
+            [],
+        ),
+        "submit_after_write": bool(
+            arguments.get("submit_after_write")
+        ),
+    }
 
 
 _DAILY_REPORT_TRANSACTION_TARGETS = frozenset(

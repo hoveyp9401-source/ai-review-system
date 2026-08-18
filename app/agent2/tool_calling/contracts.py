@@ -627,7 +627,7 @@ class AddDailyItemsArgs(StrictContract):
         pattern=r"^[0-9a-f]{64}$",
     )
     date_evidence: DailyReportDateEvidence | None = None
-    items: tuple[DailyItemInput, ...] = Field(default=(), max_length=30)
+    items: tuple[DailyItemInput, ...] = Field(default=(), max_length=100)
     acknowledged_empty_fields: tuple[ReportField, ...] = Field(
         default=(),
         max_length=3,

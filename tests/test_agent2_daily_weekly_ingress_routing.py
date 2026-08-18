@@ -29,6 +29,10 @@ from app.agent2.tool_calling.production_runtime import (
 )
 from app.agent2.tool_calling.registry import runtime_registry_contract_digest
 from app.agent2.weekly_plan_domain import _stable_id
+from tests.focused_daily_test_support import (
+    focused_daily_fallback_completion,
+    is_focused_daily_plan_request,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 8, 14, 18, 0, tzinfo=SHANGHAI)
@@ -125,11 +129,19 @@ class _ScriptedHttpClient:
     def __init__(self, messages: list[dict]) -> None:
         self._messages = iter(messages)
         self.calls: list[dict] = []
+        self.focused_daily_calls: list[dict] = []
 
     async def post(self, _endpoint, *, json, timeout):
         del timeout
+        if is_focused_daily_plan_request(json.get("tools") or []):
+            self.focused_daily_calls.append(json)
+            return _HttpResponse(
+                focused_daily_fallback_completion().message,
+                len(self.calls) + 1,
+            )
         self.calls.append(json)
-        return _HttpResponse(next(self._messages), len(self.calls))
+        message = next(self._messages)
+        return _HttpResponse(message, len(self.calls))
 
 
 class _PendingLedgerRuntime:
@@ -634,6 +646,10 @@ async def test_production_prompt_is_built_from_this_users_allowed_tools(
 
     first_request_tools = frozenset(
         item["function"]["name"] for item in http.calls[0]["tools"]
+    )
+    assert len(http.focused_daily_calls) == 1
+    assert is_focused_daily_plan_request(
+        http.focused_daily_calls[0]["tools"]
     )
     assert captured_allowed_tools == [first_request_tools]
     assert "apply_next_weekly_plan" in first_request_tools

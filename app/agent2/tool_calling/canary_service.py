@@ -64,10 +64,6 @@ from app.agent2.tool_calling.production_contracts import (
 )
 from app.agent2.tool_calling.production_runtime import ProductionRuntime
 from app.agent2.tool_calling.production_store import ProductionContextStore
-from app.agent2.tool_calling.reply_delivery import (
-    REPLY_DELIVERY_KEY,
-    cached_reply_is_retry_safe,
-)
 from app.agent2.tool_calling.receipt_reply import (
     canary_block_message,
 )
@@ -75,6 +71,10 @@ from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     runtime_registry_contract_digest,
     runtime_registry_tool_names,
+)
+from app.agent2.tool_calling.reply_delivery import (
+    REPLY_DELIVERY_KEY,
+    cached_reply_is_retry_safe,
 )
 from app.agent2.tool_calling.salutation_onboarding import (
     PersonalMemoryOnboarding,
@@ -967,7 +967,11 @@ async def process_tool_call_canary_ingress(
             messages_enabled=bool(
                 resolution.control.messages_enabled
             ),
-            model_call_count=len(result.model_turns),
+            model_call_count=sum(
+                turn.response_metadata.get("model_call_performed")
+                is not False
+                for turn in result.model_turns
+            ),
             model_request_attempt_count=(
                 result.request_attempt_count
             ),

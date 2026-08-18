@@ -21,7 +21,6 @@ from app.agent2.tool_calling.contracts import (
     ReceiptStatus,
     ToolReceipt,
 )
-from app.agent2.tool_calling.registry import TOOL_REGISTRY
 from app.agent2.tool_calling.production_contracts import (
     ProductionExecutionCapability,
 )
@@ -30,8 +29,15 @@ from app.agent2.tool_calling.production_daily_executor import (
     ProductionHandlerOutcome,
 )
 from app.agent2.tool_calling.production_store import ProductionStateSnapshot
-from app.agent2.tool_calling.registry import runtime_registry_contract_digest
+from app.agent2.tool_calling.registry import (
+    TOOL_REGISTRY,
+    runtime_registry_contract_digest,
+)
 from app.agent2.weekly_plan_domain import _stable_id
+from tests.focused_daily_test_support import (
+    focused_daily_fallback_completion,
+    is_focused_daily_plan_request,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 8, 14, 18, 0, tzinfo=SHANGHAI)
@@ -165,11 +171,19 @@ class _ScriptedHttpClient:
     def __init__(self, messages: list[dict]) -> None:
         self._messages = iter(messages)
         self.calls: list[dict] = []
+        self.focused_daily_calls: list[dict] = []
 
     async def post(self, _endpoint, *, json, timeout):
         del timeout
+        if is_focused_daily_plan_request(json.get("tools") or []):
+            self.focused_daily_calls.append(json)
+            return _HttpResponse(
+                focused_daily_fallback_completion().message,
+                len(self.calls) + 1,
+            )
         self.calls.append(json)
-        return _HttpResponse(next(self._messages), len(self.calls))
+        message = next(self._messages)
+        return _HttpResponse(message, len(self.calls))
 
 
 class _ObservableDailyExecutor:
@@ -774,6 +788,7 @@ async def test_pure_weekly_report_uses_real_tool_call_core_ingress(
     supplied_tools = {
         item["function"]["name"] for item in http.calls[0]["tools"]
     }
+    assert len(http.focused_daily_calls) == 1
     assert {
         "query_current_weekly_report",
         "apply_current_weekly_report",

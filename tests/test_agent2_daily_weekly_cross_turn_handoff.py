@@ -38,6 +38,10 @@ from app.agent2.weekly_plan_models import (
     WeeklyPlanItem,
     WeeklyPlanRosterMember,
 )
+from tests.focused_daily_test_support import (
+    focused_daily_fallback_completion,
+    is_focused_daily_plan_request,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 8, 14, 16, 0, tzinfo=SHANGHAI)
@@ -279,6 +283,11 @@ class _ScriptedModel:
 
     async def post(self, _endpoint, *, json, timeout):
         del timeout
+        if is_focused_daily_plan_request(json.get("tools") or []):
+            return _HttpResponse(
+                focused_daily_fallback_completion().message,
+                len(self.calls) + 1,
+            )
         self.calls.append(json)
         return _HttpResponse(next(self._messages), len(self.calls))
 
@@ -830,6 +839,11 @@ class _RetrySelectingModel:
 
     async def post(self, _endpoint, *, json, timeout):
         del timeout
+        if is_focused_daily_plan_request(json.get("tools") or []):
+            return _HttpResponse(
+                focused_daily_fallback_completion().message,
+                len(self.calls) + 1,
+            )
         self.calls.append(json)
         sequence = len(self.calls)
         if sequence == 1:

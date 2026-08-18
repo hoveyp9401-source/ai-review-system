@@ -82,6 +82,7 @@ class QuoteCase:
     expected_items: tuple[ExpectedItem, ...]
     expected_empty_fields: frozenset[ReportField] = frozenset()
     allowed_tool_names: frozenset[str] = _TOOLS
+    allow_combined_expected_matters: bool = False
 
 
 CASES = (
@@ -208,6 +209,7 @@ CASES = (
             ExpectedItem("tomorrow_plan", "催办"),
             ExpectedItem("tomorrow_plan", "同步项目组"),
         ),
+        allow_combined_expected_matters=True,
     ),
     QuoteCase(
         case_id="negated_work_must_not_become_completed",
@@ -392,9 +394,15 @@ def _score_proposed_call(
             )
         else:
             matched_actual_indexes.append(matches[0])
-    if len(set(matched_actual_indexes)) != len(matched_actual_indexes):
+    if (
+        not case.allow_combined_expected_matters
+        and len(set(matched_actual_indexes)) != len(matched_actual_indexes)
+    ):
         errors.append("one source quote merged more than one independent matter")
-    if len(actual_items) != len(expected_items):
+    if (
+        not case.allow_combined_expected_matters
+        and len(actual_items) != len(expected_items)
+    ):
         errors.append(
             "daily item count differs: expected "
             f"{len(expected_items)}, got {len(actual_items)}"

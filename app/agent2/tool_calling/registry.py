@@ -281,9 +281,10 @@ TOOL_REGISTRY = MappingProxyType(
             "Return today's trusted report snapshot with stable item IDs. Use only when the "
             "current user_message explicitly requests retrieval or display of a report or "
             "record. This is not a default confirmation, truth-checking, or wording-review "
-            "tool. Do not call merely "
-            "to interpret an ambiguous current user_message, and do not duplicate a trusted "
-            "snapshot already injected. Never use this as a preparatory call before "
+            "tool. For an explicit request to retrieve, view, or display the current Daily "
+            "Report, call this tool once even when a snapshot is already injected, because "
+            "the current mutable state must be read freshly. Do not call merely "
+            "to interpret an ambiguous current user_message. Never use this as a preparatory call before "
             "clarification or current-report confirmation when that snapshot is already present.",
             QueryTodayReportArgs, "read", "low", _OWNER_READ, "server_today_owner_report",
             "server_today_in_user_timezone",

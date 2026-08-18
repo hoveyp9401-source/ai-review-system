@@ -23,11 +23,16 @@ from app.agent2.tool_calling.context import (
 )
 from app.agent2.tool_calling.contracts import ExecutionMode, ReceiptStatus, ToolReceipt
 from app.agent2.tool_calling.current_turn_source import CurrentTurnSource
+from app.agent2.tool_calling.daily_add_model_contract import (
+    compile_focused_daily_plan_arguments,
+    parse_focused_daily_add_decision,
+)
 from app.agent2.tool_calling.deepseek_adapter import (
     DeepSeekResponseError,
     DeepSeekTimeoutError,
     DeepSeekToolCallingAdapter,
     _CompletionResponse,
+    _parse_focused_daily_completion,
 )
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
 from app.agent2.tool_calling.production_runtime import _prepare_call
@@ -67,6 +72,9 @@ def _context(
     report: TrustedReportSnapshot | None = None,
     recent_messages: tuple[TrustedRecentMessage, ...] = (),
     recent_operations: tuple[TrustedRecentOperation, ...] = (),
+    allowed_tool_names: frozenset[str] = frozenset(
+        {"add_daily_items", "confirm_report"}
+    ),
 ) -> TrustedContext:
     return TrustedContext(
         namespace=CANARY_STATE_NAMESPACE,
@@ -82,8 +90,8 @@ def _context(
         historical_reports=(report,) if report is not None else (),
         recent_messages=recent_messages,
         recent_operations=recent_operations,
-        allowed_tool_names=frozenset({"add_daily_items", "confirm_report"}),
-        gate_decisions={"add_daily_items": True, "confirm_report": True},
+        allowed_tool_names=allowed_tool_names,
+        gate_decisions={name: True for name in allowed_tool_names},
     )
 
 
@@ -190,7 +198,7 @@ class _DeferredRuntime:
         self.rollback_count = 0
         self.calls: tuple[NativeToolCall, ...] = ()
 
-    async def execute(self, calls, *, defer_finalization):
+    async def execute(self, calls, *, defer_finalization=False):
         assert defer_finalization is True
         self.execute_count += 1
         self.calls = calls
@@ -216,6 +224,41 @@ class _DeferredRuntime:
 
     async def rollback_pending(self):
         self.rollback_count += 1
+
+
+class _QueryRuntime:
+    mode = ExecutionMode.CANARY_EXECUTE
+
+    def __init__(self) -> None:
+        self.calls: tuple[NativeToolCall, ...] = ()
+
+    async def execute(self, calls, *, defer_finalization=False):
+        assert defer_finalization is False
+        self.calls = calls
+        assert [call.tool_name for call in calls] == ["query_today_report"]
+        return ProductionRuntimeResult(
+            status="success",
+            receipts=(
+                ToolReceipt(
+                    status=ReceiptStatus.SUCCESS,
+                    tool_name="query_today_report",
+                    changed=False,
+                    target_type="daily_report",
+                    target_id=str(REPORT_ID),
+                    safe_user_facts={
+                        "today_report": {
+                            "report_date": "2026-08-12",
+                            "status": "collecting",
+                            "today_work": ["完成合同复核"],
+                            "problems": [],
+                            "tomorrow_plan": [],
+                        }
+                    },
+                    execution_mode=ExecutionMode.CANARY_EXECUTE,
+                ),
+            ),
+            handler_call_count=1,
+        )
 
 
 def _tool_completion(call: NativeToolCall) -> _CompletionResponse:
@@ -248,8 +291,130 @@ def _malformed_daily_completion() -> _CompletionResponse:
                     "id": "malformed-long-daily-1",
                     "type": "function",
                     "function": {
-                        "name": "add_daily_items",
-                        "arguments": '{"date_selection":"server_default","items":[',
+                        "name": "plan_daily_report",
+                        "arguments": '{"date_selection":"server_default","fields":{',
+                    },
+                }
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
+def _focused_daily_completion(call: NativeToolCall) -> _CompletionResponse:
+    arguments = {
+        key: value
+        for key, value in call.arguments.items()
+        if key != "items"
+    }
+    arguments["fields"] = {
+        field: [
+            item["source_evidence"]
+            for item in call.arguments.get("items", [])
+            if item["field"] == field
+        ]
+        for field in ("today_work", "problems", "tomorrow_plan")
+    }
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "decision": "daily_add",
+                    "arguments": arguments,
+                    "reply": "已按原文完整记录。",
+                },
+                ensure_ascii=False,
+            ),
+        },
+        metadata={"finish_reason": "stop"},
+    )
+
+
+def _focused_daily_plan_completion(call: NativeToolCall) -> _CompletionResponse:
+    fields = {
+        field: [
+            item["source_evidence"]
+            for item in call.arguments.get("items", [])
+            if item["field"] == field
+        ]
+        for field in ("today_work", "problems", "tomorrow_plan")
+    }
+    arguments = {
+        "date_selection": "server_default",
+        "fields": fields,
+        "empty_field_evidence": [],
+        "submit_after_write": bool(
+            call.arguments.get("submit_after_write", False)
+        ),
+        "reply": "已按原文完整记录。",
+    }
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call.tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "plan_daily_report",
+                        "arguments": json.dumps(
+                            arguments,
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
+def _focused_daily_review_completion(
+    *,
+    approved: bool,
+    reason: str = "candidate is incomplete",
+) -> _CompletionResponse:
+    payload = (
+        {"decision": "approve", "reason": ""}
+        if approved
+        else {"decision": "fallback", "reason": reason}
+    )
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "focused-daily-review",
+                    "type": "function",
+                    "function": {
+                        "name": "review_daily_plan",
+                        "arguments": json.dumps(payload, ensure_ascii=False),
+                    },
+                }
+            ],
+        },
+        metadata={"finish_reason": "tool_calls"},
+    )
+
+
+def _focused_daily_repair_review_completion(reason: str) -> _CompletionResponse:
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "focused-daily-repair-review",
+                    "type": "function",
+                    "function": {
+                        "name": "review_daily_plan",
+                        "arguments": json.dumps(
+                            {"decision": "repair", "reason": reason},
+                            ensure_ascii=False,
+                        ),
                     },
                 }
             ],
@@ -276,6 +441,211 @@ def test_daily_add_model_schema_does_not_request_duplicate_item_content() -> Non
 
     assert set(item_contract["properties"]) == {"field", "source_evidence"}
     assert item_contract["required"] == ["field", "source_evidence"]
+
+
+def test_explicit_today_report_display_requires_one_fresh_read() -> None:
+    description = deepseek_tool_schemas(
+        frozenset({"query_today_report"})
+    )[0]["function"]["description"]
+
+    assert "call this tool once even when a snapshot is already injected" in (
+        description
+    )
+
+
+def test_focused_daily_plan_accepts_one_complete_36_item_report() -> None:
+    arguments, reply = compile_focused_daily_plan_arguments(
+        {
+            "date_selection": "server_default",
+            "fields": {
+                "today_work": [
+                    {
+                        "source_message_index": 1,
+                        "exact_quote": f"今日工作第{index}项",
+                    }
+                    for index in range(1, 26)
+                ],
+                "problems": [
+                    {
+                        "source_message_index": 1,
+                        "exact_quote": f"问题风险第{index}项",
+                    }
+                    for index in range(1, 6)
+                ],
+                "tomorrow_plan": [
+                    {
+                        "source_message_index": 1,
+                        "exact_quote": f"明日计划第{index}项",
+                    }
+                    for index in range(1, 7)
+                ],
+            },
+            "empty_field_evidence": [],
+            "submit_after_write": False,
+            "reply": "已按原文完整记录。",
+        }
+    )
+
+    assert len(arguments["items"]) == 36
+    assert reply == "已按原文完整记录。"
+
+
+def test_focused_daily_plan_preserves_explicit_empty_field_evidence() -> None:
+    arguments, _ = compile_focused_daily_plan_arguments(
+        {
+            "date_selection": "server_default",
+            "fields": {
+                "today_work": [
+                    {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同复核",
+                    }
+                ],
+                "problems": [],
+                "tomorrow_plan": [],
+            },
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                    },
+                }
+            ],
+            "submit_after_write": False,
+            "reply": "已按原文完整记录。",
+        }
+    )
+
+    assert arguments["acknowledged_empty_fields"] == ["problems"]
+    assert arguments["empty_field_evidence"] == [
+        {
+            "field": "problems",
+            "source_evidence": {
+                "source_message_index": 1,
+            },
+        }
+    ]
+
+
+def test_focused_daily_repair_derives_empty_acknowledgement_from_evidence() -> None:
+    decision, arguments, _ = parse_focused_daily_add_decision(
+        json.dumps(
+            {
+                "decision": "daily_add",
+                "arguments": {
+                    "date_selection": "server_default",
+                    "fields": {
+                        "today_work": [
+                            {
+                                "source_message_index": 1,
+                                "exact_quote": "完成合同复核",
+                            }
+                        ],
+                        "problems": [],
+                        "tomorrow_plan": [],
+                    },
+                    "empty_field_evidence": [
+                        {
+                            "field": "problems",
+                            "source_evidence": {
+                                "source_message_index": 1,
+                            },
+                        }
+                    ],
+                },
+                "reply": "已按原文记录。",
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    assert decision == "daily_add"
+    assert arguments is not None
+    assert arguments["acknowledged_empty_fields"] == ["problems"]
+
+
+def test_submit_only_focused_plan_falls_back_to_full_agent2() -> None:
+    submit_only = NativeToolCall(
+        tool_call_id="submit-only-plan",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [],
+            "submit_after_write": True,
+        },
+    )
+
+    parsed = _parse_focused_daily_completion(
+        _focused_daily_plan_completion(submit_only).message,
+        call_scope="submit-only",
+    )
+
+    assert parsed.tool_calls == ()
+    assert json.loads(parsed.assistant_message["content"]) == {
+        "decision": "not_daily"
+    }
+
+
+def test_focused_daily_fields_accept_equivalent_source_evidence_wrapper() -> None:
+    decision, arguments, reply = parse_focused_daily_add_decision(
+        json.dumps(
+            {
+                "decision": "daily_add",
+                "arguments": {
+                    "date_selection": "server_default",
+                    "fields": {
+                        "today_work": [
+                            {
+                                "source_evidence": {
+                                    "source_message_index": 1,
+                                    "exact_quote": "完成合同复核",
+                                }
+                            }
+                        ],
+                        "problems": [],
+                        "tomorrow_plan": [],
+                    },
+                },
+                "reply": "已按原文记录。",
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    assert decision == "daily_add"
+    assert reply == "已按原文记录。"
+    assert arguments is not None
+    assert arguments["items"][0]["content"] == "完成合同复核"
+
+
+def test_focused_daily_repair_accepts_quote_alias_without_reply_draft() -> None:
+    decision, arguments, reply = parse_focused_daily_add_decision(
+        json.dumps(
+            {
+                "decision": "daily_add",
+                "arguments": {
+                    "date_selection": "server_default",
+                    "fields": {
+                        "today_work": [
+                            {
+                                "source_message_index": 1,
+                                "quote": "完成合同复核",
+                            }
+                        ],
+                        "problems": [],
+                        "tomorrow_plan": [],
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    assert decision == "daily_add"
+    assert reply is None
+    assert arguments is not None
+    assert arguments["items"][0]["content"] == "完成合同复核"
 
 
 @pytest.mark.asyncio
@@ -343,8 +713,10 @@ async def test_malformed_long_daily_uses_bounded_compact_repair_without_full_rep
     completions = iter(
         (
             _malformed_daily_completion(),
-            _tool_completion(_compact_long_daily_call("compact-repair-1")),
-            _tool_completion(_compact_long_daily_call("compact-review-1")),
+            _focused_daily_plan_completion(
+                _compact_long_daily_call("compact-repair-1")
+            ),
+            _focused_daily_review_completion(approved=True),
             _CompletionResponse(
                 message={
                     "role": "assistant",
@@ -359,6 +731,67 @@ async def test_malformed_long_daily_uses_bounded_compact_repair_without_full_rep
                 },
                 metadata={"finish_reason": "stop"},
             ),
+        )
+    )
+    requests: list[dict] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        requests.append(
+            {
+                "system": messages[0]["content"],
+                "tool_names": tuple(
+                    item["function"]["name"] for item in tool_schemas
+                ),
+                "thinking_enabled": thinking_enabled,
+                "user_content": messages[-1]["content"],
+            }
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=LONG_DAILY_TEXT,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+    assert len(requests) == 3
+    assert requests[0]["tool_names"] == ("plan_daily_report",)
+    assert requests[0]["thinking_enabled"] is True
+    assert requests[0]["user_content"] == LONG_DAILY_TEXT
+    assert requests[0]["system"] != "Agent2 full production prompt"
+    assert "self-contained pure Daily" in requests[0]["system"]
+    assert "all three keys" in requests[0]["system"]
+    assert requests[1]["tool_names"] == ("plan_daily_report",)
+    assert requests[1]["thinking_enabled"] is True
+    assert requests[1]["system"] != "Agent2 full production prompt"
+    assert "previous focused Daily plan" in requests[1]["system"]
+    assert requests[2]["tool_names"] == ("review_daily_plan",)
+    assert requests[2]["thinking_enabled"] is True
+    assert "independent Agent2 Daily plan verifier" in requests[2][
+        "system"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_long_daily_probe_uses_strict_plan_before_scope_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    completions = iter(
+        (
+            _focused_daily_plan_completion(
+                _compact_long_daily_call("focused-json-primary")
+            ),
+            _focused_daily_review_completion(approved=True),
         )
     )
     requests: list[dict] = []
@@ -386,26 +819,378 @@ async def test_malformed_long_daily_uses_bounded_compact_repair_without_full_rep
     )
 
     assert result.final_content == "已按原文完整记录。"
+    assert requests[0]["tool_names"] == ("plan_daily_report",)
+    assert requests[0]["thinking_enabled"] is True
+    assert requests[1]["tool_names"] == ("review_daily_plan",)
+    assert len(requests) == 2
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.rollback_count == 0
-    assert len(requests) == 4
-    assert requests[0]["tool_names"] == ("add_daily_items",)
-    assert requests[0]["thinking_enabled"] is False
-    assert requests[0]["system"] != "Agent2 full production prompt"
-    assert "only for a pure Daily add" in requests[0]["system"]
-    assert requests[1]["tool_names"] == ("add_daily_items",)
-    assert requests[1]["thinking_enabled"] is False
-    assert requests[1]["system"] != "Agent2 full production prompt"
-    assert "isolated Agent2 Daily Report argument repairer" in requests[1]["system"]
-    assert requests[2]["tool_names"] == ("add_daily_items",)
-    assert requests[2]["thinking_enabled"] is False
-    assert "focused independent Agent2 Daily Report reviewer" in requests[2][
-        "system"
-    ]
-    assert requests[3]["tool_names"] == ()
-    assert requests[3]["thinking_enabled"] is False
-    assert requests[3]["system"] != "Agent2 full production prompt"
+
+
+@pytest.mark.asyncio
+async def test_short_daily_add_uses_the_same_strict_plan_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "完成合同复核但尚未提交系统。"
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    call = NativeToolCall(
+        tool_call_id="short-daily-plan",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": source,
+                    },
+                }
+            ],
+        },
+    )
+    completions = iter(
+        (
+            _focused_daily_plan_completion(call),
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+    requests: list[tuple[str, ...]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, thinking_enabled
+        requests.append(
+            tuple(item["function"]["name"] for item in tool_schemas)
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=source,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert requests[0] == ("plan_daily_report",)
+    assert result.final_content == "已按原文完整记录。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.calls[0].arguments["items"][0]["content"] == source
+
+
+@pytest.mark.asyncio
+async def test_batched_daily_sources_keep_each_message_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_messages = (
+        "今日工作：完成甲合同复核。",
+        "明日计划：继续跟进乙项目。",
+    )
+    call = NativeToolCall(
+        tool_call_id="batched-daily-plan",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成甲合同复核",
+                    },
+                },
+                {
+                    "field": "tomorrow_plan",
+                    "source_evidence": {
+                        "source_message_index": 2,
+                        "exact_quote": "继续跟进乙项目",
+                    },
+                },
+            ],
+        },
+    )
+    completions = iter(
+        (
+            _focused_daily_plan_completion(call),
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+    requests: list[list[dict]] = []
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del tool_schemas, thinking_enabled
+        requests.append(messages)
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text="\n".join(user_messages),
+        user_messages=user_messages,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert [
+        item["source_evidence"]["source_message_index"]
+        for item in runtime.calls[0].arguments["items"]
+    ] == [1, 2]
+    planner_prompt = requests[0][0]["content"]
+    assert "one-based source_message_index" in planner_prompt
+    assert "use index 1 only when there is one source message" in planner_prompt
+
+
+@pytest.mark.asyncio
+async def test_focused_daily_can_submit_without_inventing_a_missing_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "今日完成合同复核，明天继续跟进，请立即提交。"
+    call = NativeToolCall(
+        tool_call_id="focused-incomplete-submit",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今日完成合同复核",
+                    },
+                },
+                {
+                    "field": "tomorrow_plan",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "明天继续跟进",
+                    },
+                },
+            ],
+            "submit_after_write": True,
+        },
+    )
+    completions = iter(
+        (
+            _focused_daily_plan_completion(call),
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+    request_count = 0
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        nonlocal request_count
+        del messages, tool_schemas, thinking_enabled
+        request_count += 1
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=source,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert request_count == 2
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.calls[0].arguments["submit_after_write"] is True
+    assert {item["field"] for item in runtime.calls[0].arguments["items"]} == {
+        "today_work",
+        "tomorrow_plan",
+    }
+
+
+@pytest.mark.asyncio
+async def test_long_daily_accepts_first_valid_plan_before_trailing_alternative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    plan_completion = _focused_daily_plan_completion(
+        _compact_long_daily_call("focused-plan-trailing-duplicate")
+    )
+    function = plan_completion.message["tool_calls"][0]["function"]
+    complete_arguments = function["arguments"]
+    function["arguments"] = complete_arguments + json.dumps(
+        {"alternative": "must not replace the first validated plan"}
+    )
+    completions = iter(
+        (
+            plan_completion,
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=LONG_DAILY_TEXT,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
+    assert any(
+        audit.parse_status == "salvaged_focused_daily_tool"
+        for audit in result.raw_tool_call_audit
+    )
+
+
+@pytest.mark.asyncio
+async def test_focused_review_repairs_over_split_daily_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "今天参加专项会议并整理会议纪要。"
+    over_split = NativeToolCall(
+        tool_call_id="over-split-plan",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "参加专项会议",
+                    },
+                },
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "整理会议纪要",
+                    },
+                },
+            ],
+        },
+    )
+    repaired = NativeToolCall(
+        tool_call_id="repaired-plan",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "参加专项会议并整理会议纪要",
+                    },
+                }
+            ],
+        },
+    )
+    completions = iter(
+        (
+            _focused_daily_plan_completion(over_split),
+            _focused_daily_repair_review_completion(
+                "Two quotes over-split one dependent action chain."
+            ),
+            _focused_daily_plan_completion(repaired),
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+    requests: list[dict[str, object]] = []
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        requests.append(
+            {
+                "system": messages[0]["content"],
+                "tool_names": tuple(
+                    item["function"]["name"] for item in tool_schemas
+                ),
+                "thinking_enabled": thinking_enabled,
+            }
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=source,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+    assert len(runtime.calls[0].arguments["items"]) == 1
+    assert runtime.calls[0].arguments["items"][0]["content"] == (
+        "参加专项会议并整理会议纪要"
+    )
+    assert requests[1]["thinking_enabled"] is True
+    assert requests[2]["tool_names"] == ("plan_daily_report",)
+    assert requests[2]["thinking_enabled"] is True
+    assert requests[3]["tool_names"] == ("review_daily_plan",)
+    assert requests[3]["thinking_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_focused_daily_allows_only_one_repair_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    completions = iter(
+        (
+            _malformed_daily_completion(),
+            _focused_daily_plan_completion(
+                _compact_long_daily_call("first-and-only-repair")
+            ),
+            _focused_daily_repair_review_completion(
+                "candidate would require another repair"
+            ),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    with pytest.raises(DeepSeekResponseError, match="repair budget exhausted"):
+        await adapter.run_canary_turn(
+            system_prompt="Agent2 full production prompt",
+            user_text=LONG_DAILY_TEXT,
+            context=_context(),
+            runtime_session=runtime,
+            thinking_enabled=True,
+        )
+
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
 
 
 @pytest.mark.asyncio
@@ -424,24 +1209,18 @@ async def test_long_non_daily_probe_falls_back_to_the_unchanged_reasoning_path(
         completion_count += 1
         thinking_modes.append(thinking_enabled)
         system_message = str(messages[0]["content"])
-        if "focused Agent2 Daily Report planner" in system_message:
-            return _CompletionResponse(
-                message={"role": "assistant", "content": "快速探测：不是日报新增。"},
-                metadata={"finish_reason": "stop"},
-            )
-        if "focused independent Agent2 Daily Report reviewer" in system_message:
+        if "Agent2's fast planner" in system_message:
             return _CompletionResponse(
                 message={
                     "role": "assistant",
-                    "content": json.dumps(
-                        {
-                            "decision": "clarification",
-                            "reply": "请问你希望我处理哪一项？",
-                        },
-                        ensure_ascii=False,
-                    ),
+                    "content": json.dumps({"decision": "not_daily"}),
                 },
                 metadata={"finish_reason": "stop"},
+            )
+        if "independent Agent2 Daily plan verifier" in system_message:
+            return _focused_daily_review_completion(
+                approved=False,
+                reason="not a pure Daily add",
             )
         if system_message == "Agent2 full production prompt":
             return _CompletionResponse(
@@ -484,10 +1263,92 @@ async def test_long_non_daily_probe_falls_back_to_the_unchanged_reasoning_path(
     )
 
     assert result.final_content == final_reply
-    assert thinking_modes[:2] == [False, True]
+    assert thinking_modes[:2] == [True, True]
     assert runtime.execute_count == 0
     assert runtime.commit_count == 0
     assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_today_report_display_falls_back_and_calls_fresh_read_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _QueryRuntime()
+    adapter = _adapter()
+    query_issued = False
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        nonlocal query_issued
+        del tool_schemas, thinking_enabled
+        system_message = str(messages[0]["content"])
+        if "Agent2's fast planner" in system_message:
+            return _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps({"decision": "not_daily"}),
+                },
+                metadata={"finish_reason": "stop"},
+            )
+        if system_message == "Agent2 full production prompt":
+            if not query_issued:
+                query_issued = True
+                return _CompletionResponse(
+                    message={
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "fresh-today-query",
+                                "type": "function",
+                                "function": {
+                                    "name": "query_today_report",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    metadata={"finish_reason": "tool_calls"},
+                )
+            return _CompletionResponse(
+                message={"role": "assistant", "content": "今天完成了合同复核。"},
+                metadata={"finish_reason": "stop"},
+            )
+        review_facts = json.loads(messages[1]["content"])
+        return _CompletionResponse(
+            message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "decision": "keep",
+                        "classification": "ordinary_reply",
+                        "reviewed_reply_sha256": review_facts[
+                            "reviewed_reply_sha256"
+                        ],
+                        "pending_reference": None,
+                        "replacement_reply": None,
+                    }
+                ),
+            },
+            metadata={"finish_reason": "stop"},
+        )
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text="查看我今天的日报内容",
+        context=_context(
+            allowed_tool_names=frozenset(
+                {"add_daily_items", "query_today_report"}
+            )
+        ),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "今天完成了合同复核。"
+    assert query_issued is True
+    assert [call.tool_name for call in runtime.calls] == ["query_today_report"]
 
 
 @pytest.mark.asyncio
@@ -510,18 +1371,14 @@ async def test_long_mixed_turn_review_vetoes_daily_write_and_restores_full_agent
                 "thinking_enabled": thinking_enabled,
             }
         )
-        if "focused Agent2 Daily Report planner" in system_message:
-            return _tool_completion(_compact_long_daily_call("mixed-primary"))
-        if "focused independent Agent2 Daily Report reviewer" in system_message:
-            return _CompletionResponse(
-                message={
-                    "role": "assistant",
-                    "content": json.dumps(
-                        {"decision": "not_daily"},
-                        ensure_ascii=False,
-                    ),
-                },
-                metadata={"finish_reason": "stop"},
+        if "Agent2's fast planner" in system_message:
+            return _focused_daily_completion(
+                _compact_long_daily_call("mixed-primary")
+            )
+        if "independent Agent2 Daily plan verifier" in system_message:
+            return _focused_daily_review_completion(
+                approved=False,
+                reason="mixed task",
             )
         if system_message == "Agent2 full production prompt":
             return _CompletionResponse(
@@ -561,8 +1418,8 @@ async def test_long_mixed_turn_review_vetoes_daily_write_and_restores_full_agent
     )
 
     assert result.final_content == full_reply
-    assert requests[0]["thinking_enabled"] is False
-    assert requests[1]["thinking_enabled"] is False
+    assert requests[0]["thinking_enabled"] is True
+    assert requests[1]["thinking_enabled"] is True
     assert requests[2]["system"] == "Agent2 full production prompt"
     assert requests[2]["thinking_enabled"] is True
     assert runtime.execute_count == 0
@@ -571,7 +1428,81 @@ async def test_long_mixed_turn_review_vetoes_daily_write_and_restores_full_agent
 
 
 @pytest.mark.asyncio
-async def test_compact_repaired_long_daily_rolls_back_if_terminal_reply_fails(
+async def test_long_daily_date_disagreement_falls_back_without_executing_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _candidate_report()
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    full_reply = "日期判断不一致，已回到完整流程重新处理。"
+    trusted_call = _compact_long_daily_call("date-disagreement-primary")
+    trusted_call = NativeToolCall(
+        tool_call_id=trusted_call.tool_call_id,
+        tool_name=trusted_call.tool_name,
+        arguments={
+            **trusted_call.arguments,
+            "date_selection": "trusted_report",
+            "report_id": str(report.report_id),
+            "expected_version": report.version,
+        },
+    )
+    full_path_seen = False
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        nonlocal full_path_seen
+        del tool_schemas, thinking_enabled
+        system_message = str(messages[0]["content"])
+        if "Agent2's fast planner" in system_message:
+            return _focused_daily_completion(trusted_call)
+        if "independent Agent2 Daily plan verifier" in system_message:
+            return _focused_daily_review_completion(
+                approved=False,
+                reason="non-default report target",
+            )
+        if system_message == "Agent2 full production prompt":
+            full_path_seen = True
+            return _CompletionResponse(
+                message={"role": "assistant", "content": full_reply},
+                metadata={"finish_reason": "stop"},
+            )
+        review_facts = json.loads(messages[1]["content"])
+        return _CompletionResponse(
+            message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "decision": "keep",
+                        "classification": "ordinary_reply",
+                        "reviewed_reply_sha256": review_facts[
+                            "reviewed_reply_sha256"
+                        ],
+                        "pending_reference": None,
+                        "replacement_reply": None,
+                    }
+                ),
+            },
+            metadata={"finish_reason": "stop"},
+        )
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=LONG_DAILY_TEXT,
+        context=_context(report=report),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == full_reply
+    assert full_path_seen is True
+    assert runtime.execute_count == 0
+    assert runtime.commit_count == 0
+    assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_compact_repaired_long_daily_reuses_model_reply_without_third_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _DeferredRuntime()
@@ -579,8 +1510,10 @@ async def test_compact_repaired_long_daily_rolls_back_if_terminal_reply_fails(
     completions = iter(
         (
             _malformed_daily_completion(),
-            _tool_completion(_compact_long_daily_call("compact-repair-rollback")),
-            _tool_completion(_compact_long_daily_call("compact-review-rollback")),
+            _focused_daily_plan_completion(
+                _compact_long_daily_call("compact-repair-rollback")
+            ),
+            _focused_daily_review_completion(approved=True),
         )
     )
 
@@ -593,18 +1526,18 @@ async def test_compact_repaired_long_daily_rolls_back_if_terminal_reply_fails(
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
 
-    with pytest.raises(DeepSeekTimeoutError):
-        await adapter.run_canary_turn(
-            system_prompt="Agent2 full production prompt",
-            user_text=LONG_DAILY_TEXT,
-            context=_context(),
-            runtime_session=runtime,
-            thinking_enabled=True,
-        )
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=LONG_DAILY_TEXT,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
 
+    assert result.final_content == "已按原文完整记录。"
     assert runtime.execute_count == 1
-    assert runtime.commit_count == 0
-    assert runtime.rollback_count == 1
+    assert runtime.commit_count == 1
+    assert runtime.rollback_count == 0
 
 
 @pytest.mark.asyncio
