@@ -274,13 +274,8 @@ class CurrentTurnSource:
             formatting_only = _strip_leading_list_marker(
                 source_message[quote_start:quote_end]
             )
-            if (
-                not typed.content_reviewed
-                and item.content != formatting_only
-            ):
-                bound["items"][index]["content"] = source_message[
-                    quote_start:quote_end
-                ]
+            if not typed.content_reviewed:
+                bound["items"][index]["content"] = formatting_only
         return bound
 
     def _validate_daily_item_spans(self, typed: AddDailyItemsArgs) -> None:

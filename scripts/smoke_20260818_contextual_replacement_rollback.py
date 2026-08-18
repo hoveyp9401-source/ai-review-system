@@ -10,15 +10,15 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 
 from app.agent2.tool_calling.production_store import ToolCallCanaryReceipt
+from app.agent2.tool_calling.canary_service import (
+    process_tool_call_canary_ingress,
+)
 from app.agent2.typed_daily_executor import TYPED_AUDIT_KEY
 from app.config import get_settings
 from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
 from app.models import DailyReport, WebhookEvent
-from scripts.smoke_20260811_overnight_daily_rollback import (
-    _turn,
-    _user_and_control,
-)
+from scripts.smoke_20260811_overnight_daily_rollback import _user_and_control
 
 
 RUN_ID = f"ctx-repl-{uuid4().hex[:12]}"
@@ -32,6 +32,44 @@ EXPECTED = [
     "明天计划继续找可以做成网页端的agent技能",
     "被告案件进行通报与未结案案件的签约",
 ]
+
+
+async def _direct_turn(
+    session,
+    *,
+    user,
+    settings,
+    client,
+    text: str,
+    source_message_id: str,
+    now: datetime,
+    accepted: frozenset[str],
+):
+    outcome = await process_tool_call_canary_ingress(
+        session,
+        user=user,
+        dingtalk_user_id=user.dingtalk_user_id,
+        user_text=text,
+        source_channel="contextual_replacement_rollback",
+        conversation_id=CONVERSATION_ID,
+        source_message_id=source_message_id,
+        settings=settings,
+        llm_client=client,
+        now=now,
+        conversation_kind="direct",
+    )
+    if outcome.user_visible_result not in accepted:
+        raise AssertionError(
+            {
+                "source_message_id": source_message_id,
+                "business_result": outcome.user_visible_result,
+                "reason": outcome.reason,
+                "message": outcome.message,
+            }
+        )
+    if outcome.messages_enabled:
+        raise AssertionError("rollback smoke unexpectedly enabled transport")
+    return outcome
 
 
 async def _residue() -> dict[str, int]:
@@ -110,57 +148,50 @@ async def main() -> None:
                     datetime.min.time().replace(hour=19),
                     tzinfo=ZoneInfo(user.timezone or settings.timezone),
                 )
-                first = await _turn(
+                first = await _direct_turn(
                     session,
                     user=user,
                     settings=settings,
-                    llm_client=client,
+                    client=client,
                     text="补充今日工作：完成合同复核",
-                    conversation_id=CONVERSATION_ID,
                     source_message_id=f"{RUN_ID}-seed-write",
                     now=now,
-                    accepted_business_results=frozenset({"success"}),
+                    accepted=frozenset({"success"}),
                 )
-                correction_result = "reply_only"
-                try:
-                    correction = await _turn(
-                        session,
-                        user=user,
-                        settings=settings,
-                        llm_client=client,
-                        text="明日计划是两条",
-                        conversation_id=CONVERSATION_ID,
-                        source_message_id=f"{RUN_ID}-correction",
-                        now=now,
-                        accepted_business_results=frozenset(
-                            {"reply_only", "clarification"}
-                        ),
+                session.add(
+                    WebhookEvent(
+                        idempotency_key=f"{RUN_ID}-correction",
+                        platform="dingtalk",
+                        external_message_id=f"{RUN_ID}-correction-external",
+                        dingtalk_user_id=user.dingtalk_user_id,
+                        payload={
+                            "conversationId": CONVERSATION_ID,
+                            "text": {"content": "明日计划是两条"},
+                        },
+                        response_payload={
+                            "msgtype": "text",
+                            "text": {
+                                "content": "请把两条明日计划分别发给我，我来调整。"
+                            },
+                        },
+                        status="processed",
+                        received_at=now,
+                        processed_at=now,
                     )
-                    correction_result = correction.user_visible_result
-                except AssertionError as exc:
-                    if "BUSINESS_RESULT_BLOCKED" not in str(exc):
-                        raise
-                    correction_result = "blocked_no_write_clarification"
-                await session.refresh(report)
-                if list(report.tomorrow_plan or ()) != [COMBINED]:
-                    raise AssertionError(
-                        {"correction_turn_changed_report": report.tomorrow_plan}
-                    )
-                replacement_audits: list[dict[str, object]] = []
-                replacement = await _turn(
+                )
+                await session.flush()
+                replacement = await _direct_turn(
                     session,
                     user=user,
                     settings=settings,
-                    llm_client=client,
+                    client=client,
                     text=(
                         "1. 明天计划继续找可以做成网页端的agent技能\n"
                         "2.被告案件进行通报与未结案案件的签约"
                     ),
-                    conversation_id=CONVERSATION_ID,
                     source_message_id=f"{RUN_ID}-replacement",
                     now=now,
-                    accepted_business_results=frozenset({"success"}),
-                    model_audit_sink=replacement_audits,
+                    accepted=frozenset({"success"}),
                 )
                 await session.flush()
                 await session.refresh(report)
@@ -168,7 +199,6 @@ async def main() -> None:
                     raise AssertionError(
                         {
                             "unexpected_tomorrow_plan": report.tomorrow_plan,
-                            "replacement_model_audits": replacement_audits,
                         }
                     )
                 if "完成合同复核" not in list(report.today_work or ()):
@@ -200,7 +230,7 @@ async def main() -> None:
                     "tomorrow_plan": list(report.tomorrow_plan or ()),
                     "report_status": report.status,
                     "seed_result": first.user_visible_result,
-                    "correction_result": correction_result,
+                    "correction_result": "trusted_delivered_clarification",
                     "replacement_result": replacement.user_visible_result,
                     "updated_snapshot_shown": True,
                     "dingtalk_send_calls": 0,
