@@ -726,6 +726,14 @@
       "unique_inputs": 19,
       "verification_sha256": "c2849929b9d4f9f10f6073684cd9556926c8fee96ad13295e8620673ffbbf774"
     },
+    "runtime_control_alignment_incident": {
+      "blocked_event_sha256": "e2bcd60ba3b5bbeb0c60755e0cc4cb4f6422c9e7a5a7ff23aa281c757e71f068",
+      "blocked_model_call_count": 0,
+      "control_backup_sha256": "c5767f4c2327ecd0ee33701aad43473300884a32f677d8b2db1cb4e51ec6670c",
+      "final_control_alignment": "74/74 enabled; 74/74 messages enabled; zero contract mismatches",
+      "final_release": "480722d",
+      "unmodified_control_question_smoke": "3/3 entered deepseek-v4-flash; three model calls per case; zero writes, sends, mutations, or residue"
+    },
     "regression": {
       "local": "3658 passed, 220 baseline failures, 3 skipped; new failures 0",
       "server": "candidate has no failures beyond current-release environment baseline"

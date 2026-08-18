@@ -4,9 +4,12 @@ set -euo pipefail
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
 candidate="$releases/ai-review-system-unified-daily-20260818-480722d"
-previous="$releases/ai-review-system-unified-daily-20260818-5d23c6c"
+previous="$releases/ai-review-system-historical-dialogue-fix-20260817-49429f9-final"
 current="$releases/current"
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
+control_script="$candidate/scripts/manage_unified_daily_480722d_controls.py"
+control_backup=/home/ai_review_tunnel/backups/agent2-unified-daily-480722d-controls-20260818T1350/controls.before.json
+control_backup_sha256=c5767f4c2327ecd0ee33701aad43473300884a32f677d8b2db1cb4e51ec6670c
 services=(
   ai-review-api.service
   ai-review-stream.service
@@ -75,8 +78,39 @@ wait_healthy() {
   return 1
 }
 
+run_control() {
+  local control_action="$1"
+  (
+    cd "$candidate"
+    set -a
+    . /home/ai_review_tunnel/ai-review-system/.env
+    set +a
+    if [[ "$control_action" == "verify" ]]; then
+      PYTHONPATH=. "$python" "$control_script" verify
+    else
+      PYTHONPATH=. "$python" "$control_script" "$control_action" \
+        --backup-path "$control_backup"
+    fi
+  )
+}
+
+rollback_code_and_controls() {
+  run_control restore
+  switch_current "$previous" unified-daily-480722d-control-rollback
+  restart_by_owner_signal
+  wait_healthy "$previous"
+}
+
 require_release "$candidate"
 require_release "$previous"
+if [[ ! -f "$control_backup" || -L "$control_backup" ]]; then
+  echo "control backup is missing or not a regular file" >&2
+  exit 1
+fi
+if [[ "$(sha256sum "$control_backup" | cut -d' ' -f1)" != "$control_backup_sha256" ]]; then
+  echo "control backup hash mismatch" >&2
+  exit 1
+fi
 
 if [[ "$action" == "deploy" ]]; then
   if [[ "$(readlink -f "$current")" != "$previous" ]]; then
@@ -85,23 +119,24 @@ if [[ "$action" == "deploy" ]]; then
   fi
   switch_current "$candidate" unified-daily-480722d-next
   restart_by_owner_signal
-  if wait_healthy "$candidate"; then
+  if ! run_control update; then
+    echo "control update failed; rolling back" >&2
+    rollback_code_and_controls
+    exit 1
+  fi
+  if wait_healthy "$candidate" && run_control verify; then
     echo "deployed $candidate"
     exit 0
   fi
   echo "candidate health check failed; rolling back" >&2
-  switch_current "$previous" unified-daily-480722d-rollback
-  restart_by_owner_signal
-  wait_healthy "$previous"
+  rollback_code_and_controls
   exit 1
 elif [[ "$action" == "rollback" ]]; then
   if [[ "$(readlink -f "$current")" != "$candidate" ]]; then
     echo "current release is not the candidate" >&2
     exit 1
   fi
-  switch_current "$previous" unified-daily-480722d-manual-rollback
-  restart_by_owner_signal
-  wait_healthy "$previous"
+  rollback_code_and_controls
   echo "rolled back to $previous"
 else
   echo "usage: $0 deploy|rollback" >&2
