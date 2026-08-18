@@ -3,8 +3,8 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-unified-daily-20260818-5d23c6c"
-previous="$releases/ai-review-system-unified-daily-20260818-8eab022"
+candidate="$releases/ai-review-system-unified-daily-20260818-480722d"
+previous="$releases/ai-review-system-unified-daily-20260818-5d23c6c"
 current="$releases/current"
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
 services=(
@@ -83,14 +83,14 @@ if [[ "$action" == "deploy" ]]; then
     echo "current release changed before deploy" >&2
     exit 1
   fi
-  switch_current "$candidate" unified-daily-5d23c6c-next
+  switch_current "$candidate" unified-daily-480722d-next
   restart_by_owner_signal
   if wait_healthy "$candidate"; then
     echo "deployed $candidate"
     exit 0
   fi
   echo "candidate health check failed; rolling back" >&2
-  switch_current "$previous" unified-daily-5d23c6c-rollback
+  switch_current "$previous" unified-daily-480722d-rollback
   restart_by_owner_signal
   wait_healthy "$previous"
   exit 1
@@ -99,7 +99,7 @@ elif [[ "$action" == "rollback" ]]; then
     echo "current release is not the candidate" >&2
     exit 1
   fi
-  switch_current "$previous" unified-daily-5d23c6c-manual-rollback
+  switch_current "$previous" unified-daily-480722d-manual-rollback
   restart_by_owner_signal
   wait_healthy "$previous"
   echo "rolled back to $previous"

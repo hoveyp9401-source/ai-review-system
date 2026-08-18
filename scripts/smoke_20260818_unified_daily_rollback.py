@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
@@ -357,6 +358,66 @@ async def main() -> None:
             ),
         ),
         (
+            "morning_long_redictation",
+            lambda: _run_add_case(
+                llm_client,
+                name="morning_long_redictation",
+                report_date=BASE_DATE + timedelta(days=9),
+                text=(
+                    "今天主要做以下几件事情，第一个是评估一下岳阳广济医院项目的诉讼项目，跟进一下流转单。"
+                    "第二个是郑州高投的项目，因需要进行行政的报批报报批备案，以及需要总包进行配合盖章资料。"
+                    "总包要求我们集团公司出一个承诺书以及盖章的说明，实质是要求集团公司进行背书和担保。"
+                    "需要给对方进行写一个函，明确说明一下，拒绝对方。"
+                    "第三个是张家港永卓永煤项目的硬盘材料涨价调查的这个补充协议，跟进一下对方的盖章情况。"
+                    "第四个是继续配合梳理一下这个南京园博园项目，一诉评估以及这个后续资料的收收集。"
+                    "第五个事情是还有两个项目的标前的风控评审，进行一诉，进行那个风控提报。"
+                    "明天的主要工作是完成新疆那拉提酒店项目的民宿评估以及提报，"
+                    "然后跟一下悦榕庄酒店项目对方二审上诉的进展。"
+                    "第三个是梳理月底前工期没有闭环的工期项目，根据工期手续的闭环以及上下游履约资料的梳理"
+                ),
+                required={
+                    "today_work": (
+                        "岳阳广济医院",
+                        "郑州高投",
+                        "张家港永卓永煤",
+                        "南京园博园",
+                        "标前的风控评审",
+                    ),
+                    "tomorrow_plan": (
+                        "新疆那拉提",
+                        "悦榕庄酒店",
+                        "月底前工期",
+                    ),
+                },
+                expected_status="collecting",
+            ),
+        ),
+        (
+            "morning_explicit_dated_complete",
+            lambda: _run_add_case(
+                llm_client,
+                name="morning_explicit_dated_complete",
+                report_date=BASE_DATE + timedelta(days=10),
+                text=(
+                    "2026年4月16日 日报（已完成）\n\n"
+                    "今日工作\n1. 今日请假\n\n"
+                    "问题风险\n（无）\n\n"
+                    "明日计划\n1. 日常用印审核\n2. 未归档协议跟盯\n"
+                    "3. 未归档施工合同跟盯\n4. 项目章审计"
+                ),
+                required={
+                    "today_work": ("今日请假",),
+                    "tomorrow_plan": (
+                        "日常用印审核",
+                        "未归档协议跟盯",
+                        "未归档施工合同跟盯",
+                        "项目章审计",
+                    ),
+                },
+                expected_status="pending_confirmation",
+            ),
+        ),
+        (
             "submit_only",
             lambda: _run_existing_case(
                 llm_client,
@@ -412,8 +473,20 @@ async def main() -> None:
             ),
         ),
     ]
+    selected = {
+        value.strip()
+        for value in os.getenv("SMOKE_CASE_NAMES", "").split(",")
+        if value.strip()
+    }
+    available = {name for name, _run in cases}
+    if selected - available:
+        raise RuntimeError(
+            f"unknown smoke cases: {sorted(selected - available)}"
+        )
     try:
         for name, run in cases:
+            if selected and name not in selected:
+                continue
             try:
                 results.append(await run())
             except Exception as exc:

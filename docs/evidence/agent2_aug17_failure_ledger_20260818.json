@@ -700,7 +700,7 @@
       "result": "1/1 exact 109-character late failure; four items; pending confirmation; transaction rolled back; zero residue and zero messages"
     },
     "postdeploy_online_rollback": {
-      "result": "9/9 short, long, exact late failure, incomplete direct submit, submit-only, query, edit, delete, and clear-request cases; zero residue and zero messages"
+      "result": "11/11 short, long, exact late failure, morning long redictation, explicit dated report, incomplete direct submit, submit-only, query, edit, delete, and clear-request cases; zero residue and zero messages; one long-list case additionally passed 3/3 consecutive rounds"
     },
     "production_repair": {
       "affected_users": 14,
@@ -712,6 +712,19 @@
       "plan_sha256": "f2ea57d1e65de70efa3061f061201f248e42ce6b45e85f69ee579229800f2da9",
       "updated_reports": 5,
       "verification_sha256": "f9617ad7fea0f437db99ae59bf1e1121c6c85a7116466a6c3280ee639859e3fe"
+    },
+    "production_repair_aug18_morning": {
+      "affected_users": 9,
+      "backup_sha256": "634c908b6d2ad77cf714fa4b2661d5d102c104cd7c2101e62d9c4d3d0e3beaa0",
+      "content_plan_sha256": "39371293c0d4086b2713f3413ddbffea367a99b88c32d1f05c9ce061be36541e",
+      "content_repairs": 3,
+      "created_reports": 2,
+      "failure_events": 21,
+      "independently_reviewed_no_change": 5,
+      "submission_metadata_repairs": 1,
+      "submission_plan_sha256": "2c4e80c416db53bd8fc28381c644c2c72b81b07d048852c1fb3795e17e692306",
+      "unique_inputs": 19,
+      "verification_sha256": "c2849929b9d4f9f10f6073684cd9556926c8fee96ad13295e8620673ffbbf774"
     },
     "regression": {
       "local": "3658 passed, 220 baseline failures, 3 skipped; new failures 0",

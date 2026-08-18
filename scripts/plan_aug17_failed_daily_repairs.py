@@ -43,7 +43,10 @@ def _read_verified_backup(path: Path, expected_sha256: str) -> dict[str, Any]:
             f"backup hash mismatch: expected {expected_sha256}, got {actual}"
         )
     value = json.loads(encoded.decode("utf-8"))
-    if value.get("schema_version") != "agent2.aug17.daily-repair-backup.v1":
+    if value.get("schema_version") not in {
+        "agent2.aug17.daily-repair-backup.v1",
+        "agent2.aug18-morning.daily-repair-backup.v1",
+    }:
         raise RuntimeError("unsupported backup schema")
     return value
 
@@ -445,6 +448,7 @@ async def main() -> None:
     parser.add_argument("--only", default="")
     parser.add_argument("--resume-plan", type=Path)
     parser.add_argument("--concurrency", type=int, default=MAX_CONCURRENCY)
+    parser.add_argument("--alias-prefix", default="affected")
     args = parser.parse_args()
     backup = _read_verified_backup(args.backup, args.backup_sha256)
     users = sorted(backup["users"], key=lambda row: row["id"])
@@ -452,11 +456,11 @@ async def main() -> None:
         value.strip() for value in args.only.split(",") if value.strip()
     }
     task_specs = [
-        (f"affected-{index:02d}", user)
+        (f"{args.alias_prefix}-{index:02d}", user)
         for index, user in enumerate(users, start=1)
-        if not requested or f"affected-{index:02d}" in requested
+        if not requested or f"{args.alias_prefix}-{index:02d}" in requested
     ]
-    if requested != {alias for alias, _user in task_specs}:
+    if requested and requested != {alias for alias, _user in task_specs}:
         raise RuntimeError("--only contains an unknown affected-user alias")
     resumed_results: list[dict[str, Any]] = []
     resumed_failures: list[dict[str, str]] = []

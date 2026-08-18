@@ -71,6 +71,27 @@ def _read_verified_plan(path: Path, expected_sha256: str) -> dict[str, Any]:
     return value
 
 
+def _read_verified_submission_plan(
+    path: Path,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    encoded = path.read_bytes()
+    actual = _sha256_bytes(encoded)
+    if actual != expected_sha256:
+        raise RuntimeError(
+            f"submission plan hash mismatch: expected {expected_sha256}, got {actual}"
+        )
+    value = json.loads(encoded.decode("utf-8"))
+    if (
+        value.get("schema_version")
+        != "agent2.aug18-morning.submission-repair-plan.v1"
+    ):
+        raise RuntimeError("unsupported submission repair plan schema")
+    if value.get("review", {}).get("decision") != "approve":
+        raise RuntimeError("submission repair plan lacks independent approval")
+    return value
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -155,6 +176,11 @@ def _backup_guard_snapshot(report: dict[str, Any]) -> dict[str, Any]:
 def _validate_plan(
     backup: dict[str, Any],
     plan: dict[str, Any],
+    *,
+    expected_users: int = EXPECTED_USERS,
+    expected_changed: int = EXPECTED_CHANGED,
+    expected_created: int = EXPECTED_CREATED,
+    alias_prefix: str = "affected",
 ) -> list[dict[str, Any]]:
     if not str(plan.get("backup_sha256") or ""):
         raise RuntimeError("repair plan has no backup binding")
@@ -163,11 +189,11 @@ def _validate_plan(
     if plan.get("failures") or plan.get("non_approved"):
         raise RuntimeError("repair plan contains failed or unapproved users")
     results = list(plan.get("results") or ())
-    if len(results) != EXPECTED_USERS:
-        raise RuntimeError(f"expected {EXPECTED_USERS} approved users")
+    if len(results) != expected_users:
+        raise RuntimeError(f"expected {expected_users} approved users")
     users = sorted(backup["users"], key=lambda row: row["id"])
     aliases = {
-        f"affected-{index:02d}": user["id"]
+        f"{alias_prefix}-{index:02d}": user["id"]
         for index, user in enumerate(users, start=1)
     }
     if {row.get("anonymous_user") for row in results} != set(aliases):
@@ -211,7 +237,7 @@ def _validate_plan(
         )
     changed = [row for row in validated if row["plan"]["decision"] == "change"]
     created = [row for row in changed if row["backup_report"] is None]
-    if len(changed) != EXPECTED_CHANGED or len(created) != EXPECTED_CREATED:
+    if len(changed) != expected_changed or len(created) != expected_created:
         raise RuntimeError(
             f"unexpected repair scope: changed={len(changed)}, created={len(created)}"
         )
@@ -408,6 +434,8 @@ def _interaction_event(
     row: dict[str, Any],
     backup_sha256: str,
     plan_sha256: str,
+    submission_decision: dict[str, Any] | None = None,
+    submission_plan_sha256: str | None = None,
 ) -> ReportInteractionEvent:
     changed = before != after
     return ReportInteractionEvent(
@@ -423,6 +451,8 @@ def _interaction_event(
             "user_review_sha256": row["review_sha256"],
             "independent_review": row["review"],
             "source_message_indexes": _source_indexes(row),
+            "submission_decision": submission_decision,
+            "submission_plan_sha256": submission_plan_sha256,
             "changed": changed,
         },
         backend_action=(
@@ -449,12 +479,24 @@ async def _preview_or_apply(
     backup_sha256: str,
     plan_sha256: str,
     apply: bool,
+    submission_decisions: dict[str, dict[str, Any]] | None = None,
+    submission_plan_sha256: str | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
     manifest_rows: list[dict[str, Any]] = []
     async with AsyncSessionLocal() as session:
         async with session.begin():
             for row in rows:
+                alias = row["anonymous_user"]
+                submission_decision = (submission_decisions or {}).get(
+                    alias,
+                    {
+                        "anonymous_user": alias,
+                        "decision": "preserve",
+                        "source_message_index": None,
+                        "reason": "no separate submission repair plan",
+                    },
+                )
                 user_id = row["user_id"]
                 user = await session.get(User, user_id)
                 if user is None:
@@ -476,6 +518,7 @@ async def _preview_or_apply(
                     )
                 )
                 backup_report = row["backup_report"]
+                original_metadata = None
                 if backup_report is None:
                     if report is not None:
                         raise RuntimeError(
@@ -505,6 +548,14 @@ async def _preview_or_apply(
                             f"{row['anonymous_user']} report changed after backup"
                         )
                     before_content = _content_snapshot(report)
+                    original_metadata = (
+                        report.status,
+                        report.confirmation_type,
+                        report.confirmed_by_user,
+                        report.submitted_at,
+                        report.pending_confirmation_at,
+                        report.auto_submit_at,
+                    )
                 decision = row["plan"]["decision"]
                 if decision == "change":
                     if report is None:
@@ -518,14 +569,6 @@ async def _preview_or_apply(
                         session.add(report)
                         await session.flush()
                     else:
-                        original_metadata = (
-                            report.status,
-                            report.confirmation_type,
-                            report.confirmed_by_user,
-                            report.submitted_at,
-                            report.pending_confirmation_at,
-                            report.auto_submit_at,
-                        )
                         _apply_existing(
                             report,
                             row=row,
@@ -533,25 +576,51 @@ async def _preview_or_apply(
                             backup_sha256=backup_sha256,
                             plan_sha256=plan_sha256,
                         )
-                        if (
-                            report.status,
-                            report.confirmation_type,
-                            report.confirmed_by_user,
-                            report.submitted_at,
-                            report.pending_confirmation_at,
-                            report.auto_submit_at,
-                        ) != original_metadata:
-                            raise RuntimeError(
-                                f"{row['anonymous_user']} submission metadata changed"
-                            )
                         await session.flush()
                 if report is None:
                     raise RuntimeError("repair review has no report target")
-                after_content = (
-                    _content_snapshot(report)
-                    if decision == "change"
-                    else before_content
-                )
+                if submission_decision["decision"] == "mark_user_confirmed":
+                    if (
+                        original_metadata is not None
+                        and original_metadata[1] == "user_confirmed"
+                        and original_metadata[2] is True
+                    ):
+                        raise RuntimeError(
+                            f"{alias} was already user-confirmed before repair"
+                        )
+                    source_index = submission_decision["source_message_index"]
+                    source = next(
+                        (
+                            item
+                            for item in row["timeline"]
+                            if item["source_message_index"] == source_index
+                        ),
+                        None,
+                    )
+                    if source is None:
+                        raise RuntimeError(
+                            f"{alias} submission evidence is missing"
+                        )
+                    submitted_at = datetime.fromisoformat(source["received_at"])
+                    report.status = "completed"
+                    report.confirmation_type = "user_confirmed"
+                    report.confirmed_by_user = True
+                    report.submitted_at = submitted_at
+                    report.pending_confirmation_at = None
+                    report.auto_submit_at = None
+                    await session.flush()
+                elif original_metadata is not None and (
+                    report.status,
+                    report.confirmation_type,
+                    report.confirmed_by_user,
+                    report.submitted_at,
+                    report.pending_confirmation_at,
+                    report.auto_submit_at,
+                ) != original_metadata:
+                    raise RuntimeError(
+                        f"{alias} submission metadata changed without approval"
+                    )
+                after_content = _content_snapshot(report)
                 expected_fields = row["plan"]["materialized_fields"]
                 if any(
                     after_content[field] != expected_fields[field]
@@ -570,12 +639,26 @@ async def _preview_or_apply(
                             row=row,
                             backup_sha256=backup_sha256,
                             plan_sha256=plan_sha256,
+                            submission_decision=submission_decision,
+                            submission_plan_sha256=submission_plan_sha256,
                         )
                     )
                 manifest_rows.append(
                     {
                         "anonymous_user": row["anonymous_user"],
                         "decision": decision,
+                        "submission_decision": submission_decision["decision"],
+                        "metadata_changed": backup_report is not None
+                        and any(
+                            before_content[key] != after_content[key]
+                            for key in (
+                                "status",
+                                "confirmation_type",
+                                "confirmed_by_user",
+                                "submitted_at",
+                            )
+                        ),
+                        "overall_changed": before_content != after_content,
                         "created": backup_report is None and decision == "change",
                         "before_sha256": _sha256_json(before_content),
                         "after_sha256": _sha256_json(after_content),
@@ -596,6 +679,7 @@ async def _preview_or_apply(
         "applied_at": now.isoformat() if apply else None,
         "backup_sha256": backup_sha256,
         "repair_plan_sha256": plan_sha256,
+        "submission_plan_sha256": submission_plan_sha256,
         "dingtalk_send_calls": 0,
         "rows": manifest_rows,
     }
@@ -626,26 +710,96 @@ async def main() -> None:
     parser.add_argument("--plan-sha256", required=True)
     parser.add_argument("--mode", choices=("preview", "apply"), required=True)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--expected-users", type=int, default=EXPECTED_USERS)
+    parser.add_argument("--expected-changed", type=int, default=EXPECTED_CHANGED)
+    parser.add_argument("--expected-created", type=int, default=EXPECTED_CREATED)
+    parser.add_argument("--expected-metadata-changed", type=int, default=0)
+    parser.add_argument("--alias-prefix", default="affected")
+    parser.add_argument("--submission-plan", type=Path)
+    parser.add_argument("--submission-plan-sha256")
     args = parser.parse_args()
     backup = _read_verified_backup(args.backup, args.backup_sha256)
     plan = _read_verified_plan(args.plan, args.plan_sha256)
     if plan.get("backup_sha256") != args.backup_sha256:
         raise RuntimeError("repair plan is not bound to this backup")
-    rows = _validate_plan(backup, plan)
+    rows = _validate_plan(
+        backup,
+        plan,
+        expected_users=args.expected_users,
+        expected_changed=args.expected_changed,
+        expected_created=args.expected_created,
+        alias_prefix=args.alias_prefix,
+    )
+    submission_decisions: dict[str, dict[str, Any]] = {}
+    submission_plan_sha256 = None
+    if (args.submission_plan is None) != (
+        args.submission_plan_sha256 is None
+    ):
+        raise RuntimeError(
+            "submission plan path and hash must be supplied together"
+        )
+    if args.submission_plan is not None:
+        submission_plan = _read_verified_submission_plan(
+            args.submission_plan,
+            str(args.submission_plan_sha256),
+        )
+        if (
+            submission_plan.get("backup_sha256") != args.backup_sha256
+            or submission_plan.get("content_plan_sha256")
+            != args.plan_sha256
+            or submission_plan.get("model") != CANARY_MODEL_NAME
+            or submission_plan.get("thinking_enabled") is not True
+        ):
+            raise RuntimeError("submission plan artifact binding mismatch")
+        submission_decisions = {
+            row["anonymous_user"]: row
+            for row in submission_plan.get("users", [])
+            if isinstance(row, dict)
+        }
+        if set(submission_decisions) != {
+            row["anonymous_user"] for row in rows
+        }:
+            raise RuntimeError("submission plan does not cover every repair user")
+        for row in rows:
+            submission = submission_decisions[row["anonymous_user"]]
+            decision = submission.get("decision")
+            source_index = submission.get("source_message_index")
+            if decision not in {"preserve", "mark_user_confirmed"}:
+                raise RuntimeError("invalid submission repair decision")
+            if decision == "preserve" and source_index is not None:
+                raise RuntimeError("preserve decision cannot cite submission evidence")
+            if decision == "mark_user_confirmed" and source_index not in {
+                item["source_message_index"] for item in row["timeline"]
+            }:
+                raise RuntimeError("submission evidence is outside the timeline")
+        submission_plan_sha256 = str(args.submission_plan_sha256)
     manifest = await _preview_or_apply(
         backup=backup,
         rows=rows,
         backup_sha256=args.backup_sha256,
         plan_sha256=args.plan_sha256,
         apply=args.mode == "apply",
+        submission_decisions=submission_decisions,
+        submission_plan_sha256=submission_plan_sha256,
     )
     created = sum(row["created"] for row in manifest["rows"])
-    changed = sum(row["decision"] == "change" for row in manifest["rows"])
+    content_changed = sum(
+        row["decision"] == "change" for row in manifest["rows"]
+    )
+    metadata_changed = sum(row["metadata_changed"] for row in manifest["rows"])
+    changed = sum(row["overall_changed"] for row in manifest["rows"])
+    if metadata_changed != args.expected_metadata_changed:
+        raise RuntimeError(
+            "unexpected submission-metadata repair scope: "
+            f"{metadata_changed}"
+        )
     summary: dict[str, Any] = {
         "status": "pass",
         "mode": args.mode,
         "users_reviewed": len(manifest["rows"]),
         "reports_changed": changed,
+        "content_repairs": content_changed,
+        "submission_metadata_repairs": metadata_changed,
         "reports_created": created,
         "reports_updated": changed - created,
         "reports_unchanged": len(manifest["rows"]) - changed,
