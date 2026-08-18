@@ -1419,7 +1419,7 @@ async def test_focused_review_repairs_over_split_daily_before_execution(
 
 
 @pytest.mark.asyncio
-async def test_focused_daily_allows_only_one_repair_before_execution(
+async def test_focused_daily_allows_one_format_and_one_semantic_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _DeferredRuntime()
@@ -1430,10 +1430,14 @@ async def test_focused_daily_allows_only_one_repair_before_execution(
             _focused_daily_plan_completion(
                 _compact_long_daily_call("first-and-only-repair")
             ),
-            _focused_daily_repair_review_completion(
-                "candidate would require another repair"
-            ),
-        )
+                _focused_daily_repair_review_completion(
+                    "candidate would require another repair"
+                ),
+                _focused_daily_plan_completion(
+                    _compact_long_daily_call("semantic-repair")
+                ),
+                _focused_daily_review_completion(approved=True),
+            )
     )
 
     async def fake_complete(messages, *, tool_schemas, thinking_enabled):
@@ -1442,17 +1446,17 @@ async def test_focused_daily_allows_only_one_repair_before_execution(
 
     monkeypatch.setattr(adapter, "_complete", fake_complete)
 
-    with pytest.raises(DeepSeekResponseError, match="repair budget exhausted"):
-        await adapter.run_canary_turn(
-            system_prompt="Agent2 full production prompt",
-            user_text=LONG_DAILY_TEXT,
-            context=_context(),
-            runtime_session=runtime,
-            thinking_enabled=True,
-        )
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=LONG_DAILY_TEXT,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
 
-    assert runtime.execute_count == 0
-    assert runtime.commit_count == 0
+    assert result.final_content == "已按原文完整记录。"
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
     assert runtime.rollback_count == 0
 
 

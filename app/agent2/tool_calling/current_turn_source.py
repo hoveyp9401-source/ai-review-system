@@ -315,7 +315,10 @@ class CurrentTurnSource:
                 )
             occurrence_queues[(source_index, exact_quote)] = occurrences
 
-        spans_by_message: dict[int, list[tuple[int, int]]] = {}
+        spans_by_message: dict[
+            int,
+            list[tuple[int, int, str]],
+        ] = {}
         for item in typed.items:
             evidence = item.source_evidence
             source_message = self._validate_evidence(evidence)
@@ -328,13 +331,15 @@ class CurrentTurnSource:
                 [],
             )
             if any(
-                start < existing_end and existing_start < end
-                for existing_start, existing_end in message_spans
+                item.field == existing_field
+                and start < existing_end
+                and existing_start < end
+                for existing_start, existing_end, existing_field in message_spans
             ):
                 raise CurrentTurnSourceEvidenceError(
                     "DAILY_ITEM_SOURCE_SPAN_OVERLAP"
                 )
-            message_spans.append((start, end))
+            message_spans.append((start, end, item.field))
 
     def _validate_evidence(
         self,

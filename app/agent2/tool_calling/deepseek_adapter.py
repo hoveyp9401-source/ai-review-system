@@ -525,6 +525,7 @@ class DeepSeekToolCallingAdapter:
         managed_daily_reply_retry_count = 0
         write_reply_retry_count = 0
         tool_argument_repair_count = 0
+        focused_semantic_repair_count = 0
         incomplete_confirm_review_count = 0
         daily_submit_section_review_count = 0
         daily_weekly_write_review_count = 0
@@ -1389,9 +1390,26 @@ class DeepSeekToolCallingAdapter:
                                 )
                             )
                             if focused_review_decision == "approve":
+                                missing_numbered_entries = (
+                                    _focused_daily_missing_numbered_entries(
+                                        user_text=user_text,
+                                        user_messages=user_messages,
+                                        calls=parsed.tool_calls,
+                                    )
+                                )
+                                if missing_numbered_entries:
+                                    focused_review_decision = "repair"
+                                    focused_review_reason = (
+                                        "numbered source entries are missing: "
+                                        + json.dumps(
+                                            missing_numbered_entries,
+                                            ensure_ascii=False,
+                                        )
+                                    )
+                            if focused_review_decision == "approve":
                                 reviewed = parsed
                             elif focused_review_decision == "repair":
-                                if tool_argument_repair_count != 0:
+                                if focused_semantic_repair_count != 0:
                                     raise DeepSeekResponseError(
                                         "focused Daily repair budget exhausted"
                                     )
@@ -1463,7 +1481,7 @@ class DeepSeekToolCallingAdapter:
                                     bounded_daily_success_reply = (
                                         reviewed.focused_success_reply
                                     )
-                                    tool_argument_repair_count += 1
+                                    focused_semantic_repair_count += 1
                                     repair_review_completion = await complete_model(
                                         _bounded_daily_add_review_messages(
                                             user_text=user_text,
@@ -1493,7 +1511,14 @@ class DeepSeekToolCallingAdapter:
                                             repair_review_completion
                                         )
                                     )
-                                    if repair_review_decision != "approve":
+                                    if (
+                                        repair_review_decision != "approve"
+                                        or _focused_daily_missing_numbered_entries(
+                                            user_text=user_text,
+                                            user_messages=user_messages,
+                                            calls=reviewed.tool_calls,
+                                        )
+                                    ):
                                         raise ValueError(
                                             "focused semantic repair did not pass "
                                             "independent review"
@@ -3560,7 +3585,9 @@ def _bounded_daily_probe_messages(
                 "Read the entire source after any numbered work list; do not merge "
                 "separate matters. Treat each user-authored numbered or bulleted list entry "
                 "as one grouping unit; keep its dependent actions, outputs, checks, and "
-                "qualifiers together unless the source itself marks separate subitems. "
+                "qualifiers together unless the source itself marks separate subitems. Every "
+                "numbered entry remains a report matter even when it is terse, fragmentary, or "
+                "ends with an ellipsis; preserve it verbatim when safe polishing is unclear. "
                 "For unnumbered prose, one item is the smallest coherent work topic or outcome "
                 "the user would update as one report line, not the smallest verb-object pair. "
                 "Split at a switch to an unrelated goal, project, case group, deliverable, or "
@@ -3708,6 +3735,49 @@ def _focused_daily_review_candidate(
             arguments.get("submit_after_write")
         ),
     }
+
+
+def _focused_daily_missing_numbered_entries(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    calls: tuple[NativeToolCall, ...],
+) -> list[str]:
+    ordered_messages = user_messages or (user_text,)
+    covered_quotes: dict[int, list[str]] = {}
+    for call in calls:
+        if call.tool_name != "add_daily_items":
+            continue
+        for item in call.arguments.get("items", ()):
+            evidence = item.get("source_evidence") or {}
+            source_index = evidence.get("source_message_index")
+            exact_quote = evidence.get("exact_quote")
+            if isinstance(source_index, int) and isinstance(exact_quote, str):
+                covered_quotes.setdefault(source_index, []).append(exact_quote)
+    missing: list[str] = []
+    for source_index, message in enumerate(ordered_messages, start=1):
+        segments = message.splitlines()
+        for segment in segments:
+            normalized = segment.strip()
+            cursor = 0
+            while cursor < len(normalized) and normalized[cursor].isdigit():
+                cursor += 1
+            if (
+                cursor == 0
+                or cursor >= len(normalized)
+                or normalized[cursor] not in {".", "。", "、", ")", "）"}
+            ):
+                continue
+            content = normalized[cursor + 1 :].strip()
+            if not content:
+                continue
+            content_core = content.rstrip("。；; ")
+            if not any(
+                content_core in quote or quote in content_core
+                for quote in covered_quotes.get(source_index, ())
+            ):
+                missing.append(content)
+    return missing
 
 
 _DAILY_REPORT_TRANSACTION_TARGETS = frozenset(

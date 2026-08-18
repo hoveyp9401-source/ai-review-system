@@ -242,6 +242,41 @@ def test_daily_item_quotes_cannot_overlap_in_one_source_message() -> None:
         )
 
 
+def test_daily_item_quotes_may_overlap_across_distinct_fields() -> None:
+    source = CurrentTurnSource(
+        ("联合体协议内容已完善，明日发宏富确认",)
+    )
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        {
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "联合体协议内容已完善",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "联合体协议内容已完善，明日发宏富确认",
+                    },
+                },
+                {
+                    "field": "tomorrow_plan",
+                    "content": "明日发宏富确认",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "明日发宏富确认",
+                    },
+                },
+            ]
+        },
+    )
+
+    assert [item["field"] for item in bound["items"]] == [
+        "today_work",
+        "tomorrow_plan",
+    ]
+
+
 def test_daily_item_quote_must_identify_one_source_occurrence() -> None:
     source = CurrentTurnSource(("完成核对；完成核对",))
 
