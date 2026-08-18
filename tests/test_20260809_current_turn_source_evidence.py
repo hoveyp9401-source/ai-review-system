@@ -266,6 +266,44 @@ def test_daily_item_quote_must_identify_one_source_occurrence() -> None:
         )
 
 
+def test_daily_item_binder_accepts_all_repeated_list_occurrences() -> None:
+    source = CurrentTurnSource(
+        (
+            "今日工作：1. 日常用印的审核\n"
+            "明日计划：1. 日常用印的审核",
+        )
+    )
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        {
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "日常用印的审核",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "日常用印的审核",
+                    },
+                },
+                {
+                    "field": "tomorrow_plan",
+                    "content": "日常用印的审核",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "日常用印的审核",
+                    },
+                },
+            ]
+        },
+    )
+
+    assert [item["content"] for item in bound["items"]] == [
+        "日常用印的审核",
+        "日常用印的审核",
+    ]
+
+
 def test_daily_edit_replacement_is_copied_from_the_current_message() -> None:
     source = CurrentTurnSource(("第9条旧内容改为每周一记录",))
 

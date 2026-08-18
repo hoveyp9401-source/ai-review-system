@@ -125,6 +125,7 @@ def focused_daily_plan_parameters_schema() -> dict[str, Any]:
 def compile_focused_daily_plan_arguments(
     arguments: Any,
 ) -> tuple[dict[str, Any], str]:
+    arguments = _normalize_focused_empty_field_evidence(arguments)
     plan = FocusedDailyPlanArguments.model_validate(arguments)
     ordered_fields = ("today_work", "problems", "tomorrow_plan")
     explicit_empty_fields = [
@@ -170,6 +171,45 @@ def compile_focused_daily_plan_arguments(
         "submit_after_write": plan.submit_after_write,
     }
     return compile_model_add_daily_items(compact_arguments), plan.reply
+
+
+def _normalize_focused_empty_field_evidence(arguments: Any) -> Any:
+    """Accept a model's redundant exact empty quote without widening execution."""
+
+    if not isinstance(arguments, dict):
+        return arguments
+    raw_items = arguments.get("empty_field_evidence")
+    if not isinstance(raw_items, (list, tuple)):
+        return arguments
+    normalized_items = []
+    changed = False
+    for item in raw_items:
+        if not isinstance(item, dict):
+            normalized_items.append(item)
+            continue
+        evidence = item.get("source_evidence")
+        exact_quote = (
+            evidence.get("exact_quote")
+            if isinstance(evidence, dict)
+            else None
+        )
+        if not isinstance(exact_quote, str) or not exact_quote.strip():
+            normalized_items.append(item)
+            continue
+        normalized_items.append(
+            {
+                **item,
+                "source_evidence": {
+                    key: value
+                    for key, value in evidence.items()
+                    if key != "exact_quote"
+                },
+            }
+        )
+        changed = True
+    if not changed:
+        return arguments
+    return {**arguments, "empty_field_evidence": normalized_items}
 
 
 class FocusedDailyAddDecision(StrictContract):

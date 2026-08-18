@@ -12,6 +12,7 @@ from app.agent2.tool_calling.contracts import (
     ApplyNextWeeklyPlanArgs,
     CorrectDailyReportDateArgs,
     CurrentUserMessageEvidence,
+    DailyItemSourceEvidence,
     EditDailyItemsArgs,
     RecordWeeklyPlanItemsAsTodayWorkArgs,
     RememberPersonalMemoryArgs,
@@ -279,24 +280,49 @@ class CurrentTurnSource:
         return bound
 
     def _validate_daily_item_spans(self, typed: AddDailyItemsArgs) -> None:
+        item_counts: dict[tuple[int, str], int] = {}
+        occurrence_queues: dict[
+            tuple[int, str],
+            list[tuple[int, int]],
+        ] = {}
+        quote_is_content: set[tuple[int, str]] = set()
+        for item in typed.items:
+            evidence = item.source_evidence
+            key = (evidence.source_message_index, evidence.exact_quote)
+            item_counts[key] = item_counts.get(key, 0) + 1
+            if evidence.exact_quote == item.content:
+                quote_is_content.add(key)
+        for (source_index, exact_quote), item_count in item_counts.items():
+            source_message = self._validate_evidence(
+                DailyItemSourceEvidence(
+                    source_message_index=source_index,
+                    exact_quote=exact_quote,
+                )
+            )
+            occurrences = _non_overlapping_quote_spans(
+                source_message,
+                exact_quote,
+            )
+            if not occurrences:
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_ITEM_CONTENT_NOT_GROUNDED"
+                    if (source_index, exact_quote) in quote_is_content
+                    else "DAILY_ITEM_EXACT_QUOTE_MISMATCH"
+                )
+            if len(occurrences) != item_count:
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_ITEM_SOURCE_SPAN_AMBIGUOUS"
+                )
+            occurrence_queues[(source_index, exact_quote)] = occurrences
+
         spans_by_message: dict[int, list[tuple[int, int]]] = {}
         for item in typed.items:
             evidence = item.source_evidence
             source_message = self._validate_evidence(evidence)
             exact_quote = evidence.exact_quote
-            occurrence_count = source_message.count(exact_quote)
-            if occurrence_count == 0:
-                raise CurrentTurnSourceEvidenceError(
-                    "DAILY_ITEM_CONTENT_NOT_GROUNDED"
-                    if exact_quote == item.content
-                    else "DAILY_ITEM_EXACT_QUOTE_MISMATCH"
-                )
-            if occurrence_count != 1:
-                raise CurrentTurnSourceEvidenceError(
-                    "DAILY_ITEM_SOURCE_SPAN_AMBIGUOUS"
-                )
-            start = source_message.find(exact_quote)
-            end = start + len(exact_quote)
+            start, end = occurrence_queues[
+                (evidence.source_message_index, exact_quote)
+            ].pop(0)
             message_spans = spans_by_message.setdefault(
                 evidence.source_message_index,
                 [],
@@ -340,3 +366,19 @@ def _strip_leading_list_marker(value: str) -> str:
         return value
     candidate = stripped[cursor + 1 :].lstrip()
     return candidate or value
+
+
+def _non_overlapping_quote_spans(
+    source_message: str,
+    exact_quote: str,
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor <= len(source_message) - len(exact_quote):
+        start = source_message.find(exact_quote, cursor)
+        if start < 0:
+            break
+        end = start + len(exact_quote)
+        spans.append((start, end))
+        cursor = end
+    return spans

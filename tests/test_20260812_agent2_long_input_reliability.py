@@ -680,6 +680,45 @@ def test_focused_daily_plan_preserves_explicit_empty_field_evidence() -> None:
     ]
 
 
+def test_focused_daily_plan_accepts_extra_exact_empty_quote() -> None:
+    arguments, _ = compile_focused_daily_plan_arguments(
+        {
+            "date_selection": "server_default",
+            "fields": {
+                "today_work": [
+                    {
+                        "content": "完成合同复核",
+                        "source_evidence": {
+                            "source_message_index": 1,
+                            "exact_quote": "完成合同复核",
+                        },
+                    }
+                ],
+                "problems": [],
+                "tomorrow_plan": [],
+            },
+            "empty_field_evidence": [
+                {
+                    "field": "problems",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "问题风险：暂无",
+                    },
+                }
+            ],
+            "submit_after_write": False,
+            "reply": "已记录。",
+        }
+    )
+
+    assert arguments["empty_field_evidence"] == [
+        {
+            "field": "problems",
+            "source_evidence": {"source_message_index": 1},
+        }
+    ]
+
+
 def test_focused_daily_submit_marks_reviewed_omitted_sections_empty() -> None:
     arguments, _ = compile_focused_daily_plan_arguments(
         {
