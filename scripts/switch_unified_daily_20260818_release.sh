@@ -36,29 +36,52 @@ switch_current() {
   mv -Tf "$temp" "$current"
 }
 
-stop_all_services() {
-  local attempt service pid all_stopped
-  systemctl stop "${services[@]}"
-  for attempt in $(seq 1 30); do
-    all_stopped=true
-    for service in "${services[@]}"; do
-      pid="$(systemctl show "$service" -p MainPID --value)"
-      if [[ "$(systemctl is-active "$service" 2>/dev/null || true)" != "inactive" \
-        || ! "$pid" =~ ^[0-9]+$ || "$pid" -ne 0 ]]; then
-        all_stopped=false
-        break
-      fi
-    done
-    if [[ "$all_stopped" == true ]]; then
-      return 0
+frozen_pids=()
+processes_frozen=0
+
+freeze_all_services() {
+  local service pid state
+  frozen_pids=()
+  for service in "${services[@]}"; do
+    pid="$(systemctl show "$service" -p MainPID --value)"
+    if [[ ! "$pid" =~ ^[0-9]+$ || "$pid" -le 1 ]]; then
+      echo "invalid MainPID for $service: $pid" >&2
+      return 1
     fi
-    sleep 1
+    frozen_pids+=("$pid")
+    processes_frozen=1
+    kill -STOP "$pid"
   done
-  return 1
+  sleep 0.2
+  for pid in "${frozen_pids[@]}"; do
+    state="$(awk '/^State:/{print $2}' "/proc/$pid/status")"
+    if [[ "$state" != "T" ]]; then
+      echo "service process did not freeze: $pid:$state" >&2
+      return 1
+    fi
+  done
 }
 
-start_all_services() {
-  systemctl start "${services[@]}"
+terminate_frozen_services() {
+  local pid
+  for pid in "${frozen_pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "${frozen_pids[@]}"; do
+    kill -CONT "$pid" 2>/dev/null || true
+  done
+  processes_frozen=0
+  frozen_pids=()
+}
+
+restart_by_owner_signal() {
+  local service pid
+  for service in "${services[@]}"; do
+    pid="$(systemctl show "$service" -p MainPID --value)"
+    if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]]; then
+      kill -TERM "$pid"
+    fi
+  done
 }
 
 wait_healthy() {
@@ -112,14 +135,17 @@ rollback_code_and_controls() {
   status="${1:-1}"
   trap - ERR INT TERM
   set +e
-  stop_all_services >/dev/null 2>&1
   if [[ "${controls_restore_required:-0}" -eq 1 ]]; then
     run_control restore
   fi
   if [[ "${code_restore_required:-0}" -eq 1 ]]; then
     switch_current "$previous" agent2-smart-daily-2350ec2-rollback
   fi
-  start_all_services
+  if [[ "$processes_frozen" -eq 1 ]]; then
+    terminate_frozen_services
+  else
+    restart_by_owner_signal
+  fi
   wait_healthy "$previous"
   exit "$status"
 }
@@ -145,12 +171,12 @@ if [[ "$action" == "deploy" ]]; then
   trap 'rollback_code_and_controls "$?"' ERR
   trap 'rollback_code_and_controls 130' INT
   trap 'rollback_code_and_controls 143' TERM
-  stop_all_services
+  freeze_all_services
   code_restore_required=1
   switch_current "$candidate" agent2-smart-daily-2350ec2-next
   controls_restore_required=1
   run_control update
-  start_all_services
+  terminate_frozen_services
   wait_healthy "$candidate"
   run_control verify
   trap - ERR INT TERM
@@ -163,6 +189,7 @@ elif [[ "$action" == "rollback" ]]; then
     echo "current release is not the candidate" >&2
     exit 1
   fi
+  freeze_all_services
   controls_restore_required=1
   code_restore_required=1
   rollback_code_and_controls 0
