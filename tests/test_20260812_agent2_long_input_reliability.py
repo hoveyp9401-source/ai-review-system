@@ -839,6 +839,12 @@ async def test_malformed_long_daily_uses_bounded_compact_repair_without_full_rep
     assert "independent Agent2 Daily plan verifier" in requests[2][
         "system"
     ]
+    assert "asking to fill, write, record, draft, or save" in requests[2][
+        "system"
+    ]
+    assert "Never reject or repair a non-submitting draft" in requests[2][
+        "system"
+    ]
 
 
 @pytest.mark.asyncio
