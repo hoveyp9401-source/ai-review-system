@@ -1,10 +1,10 @@
 {
   "category_counts": {
-    "context_or_submit_followup": 37,
+    "context_or_submit_followup": 38,
     "long_daily_content": 15,
-    "standalone_short_daily": 7
+    "standalone_short_daily": 8
   },
-  "event_count": 59,
+  "event_count": 61,
   "events": [
     {
       "candidate_result": "pass_with_trusted_context_or_safe_no_write_without_context",
@@ -654,6 +654,28 @@
       "original_model_result": "failed",
       "received_at": "2026-08-17T22:42:09.437418+08:00",
       "replay_case": "verified_report_followup_and_context_guard_zero_write"
+    },
+    {
+      "candidate_result": "pass_write",
+      "category": "standalone_short_daily",
+      "event_sha256": "3555a8305bc3c1cfac56a9d6801ea20f05628d86d5bc8efe3860b416c1f4c232",
+      "input_characters": 109,
+      "input_sha256": "75ddafa1df48d8b9a6fd93f60486fe212733f58931fd6b59026aabc9320377c5",
+      "original_model_call_count": 3,
+      "original_model_result": "failed",
+      "received_at": "2026-08-17T22:53:06.283812+08:00",
+      "replay_case": "late_aug17_short_report_online_rollback"
+    },
+    {
+      "candidate_result": "pass_with_trusted_context",
+      "category": "context_or_submit_followup",
+      "event_sha256": "41a017ac009fb45bee976eb8941b3a73c6090eec6a47d6ca4db80ed99b578b82",
+      "input_characters": 2,
+      "input_sha256": "08a85f4ab4bab9cac9adb34251164b48c783698f43a1978166000d48015fa2ca",
+      "original_model_call_count": 1,
+      "original_model_result": "failed",
+      "received_at": "2026-08-17T22:55:29.706298+08:00",
+      "replay_case": "verified_report_followup_and_context_guard_zero_write"
     }
   ],
   "identity_in_artifact": false,
@@ -674,8 +696,25 @@
       ],
       "result": "6/6 standalone short Daily inputs; zero writes"
     },
+    "late_aug17_short_report_online_rollback": {
+      "result": "1/1 exact 109-character late failure; four items; pending confirmation; transaction rolled back; zero residue and zero messages"
+    },
+    "postdeploy_online_rollback": {
+      "result": "9/9 short, long, exact late failure, incomplete direct submit, submit-only, query, edit, delete, and clear-request cases; zero residue and zero messages"
+    },
+    "production_repair": {
+      "affected_users": 14,
+      "approved_changes": 8,
+      "audit_events_verified": 14,
+      "backup_sha256": "995352c092e19b52588965d6db71584a5eb86754d4af08b250bd9860cf6da6f8",
+      "created_reports": 3,
+      "independently_reviewed_no_change": 6,
+      "plan_sha256": "f2ea57d1e65de70efa3061f061201f248e42ce6b45e85f69ee579229800f2da9",
+      "updated_reports": 5,
+      "verification_sha256": "f9617ad7fea0f437db99ae59bf1e1121c6c85a7116466a6c3280ee639859e3fe"
+    },
     "regression": {
-      "local": "3655 passed, 220 baseline failures, 3 skipped; new failures 0",
+      "local": "3658 passed, 220 baseline failures, 3 skipped; new failures 0",
       "server": "candidate has no failures beyond current-release environment baseline"
     },
     "strict_shape_gate": {
@@ -688,8 +727,8 @@
   },
   "schema_version": "agent2.aug17-failure-ledger.v1",
   "source_window": {
-    "end": "2026-08-17T22:45:00+08:00",
+    "end": "2026-08-17T22:55:29.706298+08:00",
     "start": "2026-08-17T00:00:00+08:00"
   },
-  "unique_input_count": 39
+  "unique_input_count": 40
 }

@@ -335,6 +335,28 @@ async def main() -> None:
             ),
         ),
         (
+            "late_aug17_short_report",
+            lambda: _run_add_case(
+                llm_client,
+                name="late_aug17_short_report",
+                report_date=BASE_DATE + timedelta(days=8),
+                text=(
+                    "今日工作：\n"
+                    "1. 蓝海风案信托材料报审待确认\n"
+                    "2. 继续诉讼评估谢忠柏、王伟两个班组超付案件，核对原件等材料\n"
+                    "3. 中天系列债权联系管理人\n\n"
+                    "明日计划：\n"
+                    "1. 不夜城案和分公司沟通下一步计划\n\n"
+                    "问题风险已按要求记为无。"
+                ),
+                required={
+                    "today_work": ("蓝海风", "谢忠柏", "中天系列"),
+                    "tomorrow_plan": ("不夜城",),
+                },
+                expected_status="pending_confirmation",
+            ),
+        ),
+        (
             "submit_only",
             lambda: _run_existing_case(
                 llm_client,
