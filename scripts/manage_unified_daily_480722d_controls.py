@@ -24,9 +24,9 @@ from app.config import get_settings
 from app.db import AsyncSessionLocal, engine
 
 
-ACTOR = "codex-unified-daily-480722d"
+ACTOR = "codex-agent2-smart-daily-2350ec2"
 UPDATE_REASON = (
-    "Deploy unified Daily fill-versus-submit review fix 480722d on 2026-08-18"
+    "Deploy reviewed Daily splitting and conservative wording fix 2350ec2 on 2026-08-18"
 )
 EXPECTED_CONTROLS = 74
 
@@ -94,7 +94,7 @@ async def backup(path: Path) -> None:
     if len(rows) != EXPECTED_CONTROLS:
         raise RuntimeError(f"expected 74 controls, got {len(rows)}")
     payload = {
-        "schema_version": "agent2.unified-daily-480722d.controls-backup.v1",
+        "schema_version": "agent2.smart-daily-2350ec2.controls-backup.v1",
         "controls": [_snapshot(row) for row in rows],
         "count": len(rows),
     }
@@ -153,7 +153,7 @@ async def update(path: Path) -> None:
                 before=before,
                 actor_user_id=ACTOR,
                 source_change_id=(
-                    f"unified-daily-480722d:{row.control_id}:{uuid4()}"
+                    f"agent2-smart-daily-2350ec2:{row.control_id}:{uuid4()}"
                 ),
                 reason=UPDATE_REASON,
             )
@@ -190,14 +190,14 @@ async def restore(path: Path) -> None:
             row.model_name = str(target["model_name"])
             row.version += 1
             row.changed_by = ACTOR
-            row.change_reason = "Rollback unified Daily 480722d control alignment"
+            row.change_reason = "Rollback Agent2 smart Daily 2350ec2 control alignment"
             await session.flush()
             repository._add_audit(
                 control=row,
                 before=before,
                 actor_user_id=ACTOR,
                 source_change_id=(
-                    f"unified-daily-480722d-rollback:{row.control_id}:{uuid4()}"
+                    f"agent2-smart-daily-2350ec2-rollback:{row.control_id}:{uuid4()}"
                 ),
                 reason=row.change_reason,
             )
