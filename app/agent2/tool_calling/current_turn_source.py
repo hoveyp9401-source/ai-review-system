@@ -89,6 +89,7 @@ class CurrentTurnSource:
         arguments: dict[str, Any],
     ) -> None:
         if tool_name == "add_daily_items":
+            arguments = self._normalize_daily_source_quotes(arguments)
             typed = AddDailyItemsArgs.model_validate(arguments)
             self._validate_daily_item_spans(typed)
             for item in typed.empty_field_evidence:
@@ -245,6 +246,8 @@ class CurrentTurnSource:
     ) -> dict[str, Any]:
         """Return arguments grounded in server text and approved review evidence."""
 
+        if tool_name == "add_daily_items":
+            arguments = self._normalize_daily_source_quotes(arguments)
         self.validate_tool_arguments(tool_name, arguments)
         if tool_name not in {"add_daily_items", "edit_daily_items"}:
             return arguments
@@ -278,6 +281,55 @@ class CurrentTurnSource:
             if not typed.content_reviewed:
                 bound["items"][index]["content"] = formatting_only
         return bound
+
+    def _normalize_daily_source_quotes(
+        self,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_items = arguments.get("items")
+        if not isinstance(raw_items, (list, tuple)):
+            return arguments
+        normalized_items = []
+        changed = False
+        for item in raw_items:
+            if not isinstance(item, dict):
+                normalized_items.append(item)
+                continue
+            evidence = item.get("source_evidence")
+            if not isinstance(evidence, dict):
+                normalized_items.append(item)
+                continue
+            source_index = evidence.get("source_message_index")
+            exact_quote = evidence.get("exact_quote")
+            if (
+                not isinstance(source_index, int)
+                or not isinstance(exact_quote, str)
+                or source_index < 1
+                or source_index > len(self.messages)
+                or exact_quote in self.messages[source_index - 1]
+            ):
+                normalized_items.append(item)
+                continue
+            candidate = _strip_leading_source_separator(exact_quote)
+            if (
+                candidate == exact_quote
+                or candidate not in self.messages[source_index - 1]
+            ):
+                normalized_items.append(item)
+                continue
+            normalized_items.append(
+                {
+                    **item,
+                    "source_evidence": {
+                        **evidence,
+                        "exact_quote": candidate,
+                    },
+                }
+            )
+            changed = True
+        if not changed:
+            return arguments
+        return {**arguments, "items": normalized_items}
 
     def _validate_daily_item_spans(self, typed: AddDailyItemsArgs) -> None:
         item_counts: dict[tuple[int, str], int] = {}
@@ -371,6 +423,24 @@ def _strip_leading_list_marker(value: str) -> str:
         return value
     candidate = stripped[cursor + 1 :].lstrip()
     return candidate or value
+
+
+def _strip_leading_source_separator(value: str) -> str:
+    stripped = value.lstrip()
+    cursor = 0
+    while cursor < len(stripped) and stripped[cursor] in {
+        "、",
+        ",",
+        "，",
+        ":",
+        "：",
+        ";",
+        "；",
+    }:
+        cursor += 1
+        while cursor < len(stripped) and stripped[cursor].isspace():
+            cursor += 1
+    return stripped[cursor:] or value
 
 
 def _non_overlapping_quote_spans(

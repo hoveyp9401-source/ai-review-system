@@ -137,6 +137,31 @@ def test_daily_item_quote_accepts_punctuation_or_whitespace_boundaries(
     assert bound["items"][0]["content"] == "完成合同复核"
 
 
+def test_daily_item_quote_tolerates_a_model_added_leading_separator() -> None:
+    source = CurrentTurnSource(("明日计划：常州续封跟盯",))
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        {
+            "items": [
+                {
+                    "field": "tomorrow_plan",
+                    "content": "常州续封跟盯",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "、常州续封跟盯",
+                    },
+                }
+            ]
+        },
+    )
+
+    assert bound["items"][0]["content"] == "常州续封跟盯"
+    assert bound["items"][0]["source_evidence"]["exact_quote"] == (
+        "常州续封跟盯"
+    )
+
+
 def test_daily_item_quote_accepts_the_complete_joined_sentence() -> None:
     source_message = "今天做了日报的基础功能优化"
     source = CurrentTurnSource((source_message,))
