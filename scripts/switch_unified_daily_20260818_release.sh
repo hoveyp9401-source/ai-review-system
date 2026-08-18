@@ -3,8 +3,8 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-agent2-context-trailing-user-20260818-8cf19a6"
-previous="$releases/ai-review-system-agent2-context-followup-20260818-fe3fe22"
+candidate="$releases/ai-review-system-agent2-context-final-20260818-be6b575"
+previous="$releases/ai-review-system-agent2-context-trailing-user-20260818-8cf19a6"
 current="$releases/current"
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
 control_script="$candidate/scripts/manage_unified_daily_480722d_controls.py"
@@ -128,7 +128,7 @@ rollback_code() {
   trap - ERR INT TERM
   set +e
   if [[ "${code_restore_required:-0}" -eq 1 ]]; then
-    switch_current "$previous" agent2-context-trailing-user-8cf19a6-rollback
+    switch_current "$previous" agent2-context-final-be6b575-rollback
   fi
   if [[ "$processes_frozen" -eq 1 ]]; then
     terminate_frozen_services
@@ -153,7 +153,7 @@ if [[ "$action" == "deploy" ]]; then
   trap 'rollback_code 143' TERM
   freeze_all_services
   code_restore_required=1
-  switch_current "$candidate" agent2-context-trailing-user-8cf19a6-next
+  switch_current "$candidate" agent2-context-final-be6b575-next
   terminate_frozen_services
   wait_healthy "$candidate"
   verify_controls
