@@ -3,13 +3,13 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-unified-daily-20260818-480722d"
-previous="$releases/ai-review-system-historical-dialogue-fix-20260817-49429f9-final"
+candidate="$releases/ai-review-system-agent2-smart-daily-20260818-2350ec2"
+previous="$releases/ai-review-system-unified-daily-20260818-480722d"
 current="$releases/current"
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
 control_script="$candidate/scripts/manage_unified_daily_480722d_controls.py"
-control_backup=/home/ai_review_tunnel/backups/agent2-unified-daily-480722d-controls-20260818T1350/controls.before.json
-control_backup_sha256=c5767f4c2327ecd0ee33701aad43473300884a32f677d8b2db1cb4e51ec6670c
+control_backup=/home/ai_review_tunnel/backups/agent2-smart-daily-2350ec2-controls-20260818T1850/controls.before.json
+control_backup_sha256=7092f8a3921f02bfba46b595460871a480cca8ddfd0380eb4f77239a4d81838c
 services=(
   ai-review-api.service
   ai-review-stream.service
@@ -36,16 +36,29 @@ switch_current() {
   mv -Tf "$temp" "$current"
 }
 
-restart_by_owner_signal() {
-  local service pid
-  for service in "${services[@]}"; do
-    pid="$(systemctl show "$service" -p MainPID --value)"
-    if [[ ! "$pid" =~ ^[0-9]+$ || "$pid" -le 1 ]]; then
-      echo "invalid MainPID for $service: $pid" >&2
-      exit 1
+stop_all_services() {
+  local attempt service pid all_stopped
+  systemctl stop "${services[@]}"
+  for attempt in $(seq 1 30); do
+    all_stopped=true
+    for service in "${services[@]}"; do
+      pid="$(systemctl show "$service" -p MainPID --value)"
+      if [[ "$(systemctl is-active "$service" 2>/dev/null || true)" != "inactive" \
+        || ! "$pid" =~ ^[0-9]+$ || "$pid" -ne 0 ]]; then
+        all_stopped=false
+        break
+      fi
+    done
+    if [[ "$all_stopped" == true ]]; then
+      return 0
     fi
-    kill -TERM "$pid"
+    sleep 1
   done
+  return 1
+}
+
+start_all_services() {
+  systemctl start "${services[@]}"
 }
 
 wait_healthy() {
@@ -95,10 +108,20 @@ run_control() {
 }
 
 rollback_code_and_controls() {
-  run_control restore
-  switch_current "$previous" unified-daily-480722d-control-rollback
-  restart_by_owner_signal
+  local status
+  status="${1:-1}"
+  trap - ERR INT TERM
+  set +e
+  stop_all_services >/dev/null 2>&1
+  if [[ "${controls_restore_required:-0}" -eq 1 ]]; then
+    run_control restore
+  fi
+  if [[ "${code_restore_required:-0}" -eq 1 ]]; then
+    switch_current "$previous" agent2-smart-daily-2350ec2-rollback
+  fi
+  start_all_services
   wait_healthy "$previous"
+  exit "$status"
 }
 
 require_release "$candidate"
@@ -117,27 +140,32 @@ if [[ "$action" == "deploy" ]]; then
     echo "current release changed before deploy" >&2
     exit 1
   fi
-  switch_current "$candidate" unified-daily-480722d-next
-  restart_by_owner_signal
-  if ! run_control update; then
-    echo "control update failed; rolling back" >&2
-    rollback_code_and_controls
-    exit 1
-  fi
-  if wait_healthy "$candidate" && run_control verify; then
-    echo "deployed $candidate"
-    exit 0
-  fi
-  echo "candidate health check failed; rolling back" >&2
-  rollback_code_and_controls
-  exit 1
+  controls_restore_required=0
+  code_restore_required=0
+  trap 'rollback_code_and_controls "$?"' ERR
+  trap 'rollback_code_and_controls 130' INT
+  trap 'rollback_code_and_controls 143' TERM
+  stop_all_services
+  code_restore_required=1
+  switch_current "$candidate" agent2-smart-daily-2350ec2-next
+  controls_restore_required=1
+  run_control update
+  start_all_services
+  wait_healthy "$candidate"
+  run_control verify
+  trap - ERR INT TERM
+  controls_restore_required=0
+  code_restore_required=0
+  echo "deployed $candidate"
+  exit 0
 elif [[ "$action" == "rollback" ]]; then
   if [[ "$(readlink -f "$current")" != "$candidate" ]]; then
     echo "current release is not the candidate" >&2
     exit 1
   fi
-  rollback_code_and_controls
-  echo "rolled back to $previous"
+  controls_restore_required=1
+  code_restore_required=1
+  rollback_code_and_controls 0
 else
   echo "usage: $0 deploy|rollback" >&2
   exit 2
