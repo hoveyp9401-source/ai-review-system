@@ -638,6 +638,8 @@ async def test_focused_daily_plan_preserves_reviewed_conservative_wording(
         "将合同评审技能改造成网页端agent，调用速度提升10倍"
     )
     assert "adds, removes, generalizes, or changes" in requests[1][0]["content"]
+    assert "Audit in two passes" in requests[1][0]["content"]
+    assert "one item spans two unrelated work domains" in requests[1][0]["content"]
 
 
 def test_focused_daily_plan_preserves_explicit_empty_field_evidence() -> None:
