@@ -54,6 +54,7 @@ from app.agent2.tool_calling.receipt_reply import (
     finalize_canary_content,
     finalize_shadow_content,
 )
+from app.agent2.tool_calling.reporting_date import default_daily_write_date
 from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     ToolArgumentsValidationError,
@@ -5100,6 +5101,14 @@ def _constrain_daily_add_call_group(
             key: reviewed_arguments.get(key) for key in date_target_keys
         }
         if reviewed_target != draft_target:
+            draft_date = _daily_add_target_date(
+                draft_arguments,
+                context=context,
+            )
+            reviewed_date = _daily_add_target_date(
+                reviewed_arguments,
+                context=context,
+            )
             reviewed_report_id = reviewed_arguments.get("report_id")
             try:
                 trusted_report = (
@@ -5109,20 +5118,33 @@ def _constrain_daily_add_call_group(
                 )
             except ValueError:
                 trusted_report = None
-            if (
-                draft_arguments.get("date_selection") != "server_default"
-                or reviewed_arguments.get("date_selection") != "trusted_report"
-                or trusted_report is None
-                or trusted_report.status
-                not in {"collecting", "pending_confirmation", "completed"}
-                or reviewed_arguments.get("expected_version")
-                != trusted_report.version
+            same_resolved_date = (
+                draft_date is not None
+                and reviewed_date is not None
+                and draft_date == reviewed_date
+            )
+            reviewed_trusted_valid = (
+                reviewed_arguments.get("date_selection") == "trusted_report"
+                and trusted_report is not None
+                and trusted_report.status
+                in {"collecting", "pending_confirmation", "completed"}
+                and reviewed_arguments.get("expected_version")
+                == trusted_report.version
+            )
+            if not same_resolved_date and not (
+                draft_arguments.get("date_selection") == "server_default"
+                and reviewed_trusted_valid
             ):
                 raise ValueError(
                     "Daily review cannot change an untrusted report-date binding"
                 )
-            for key in date_target_keys:
-                draft_arguments[key] = reviewed_arguments.get(key)
+            if reviewed_arguments.get("date_selection") == "trusted_report":
+                if not reviewed_trusted_valid:
+                    raise ValueError(
+                        "Daily review cannot change an untrusted report-date binding"
+                    )
+                for key in date_target_keys:
+                    draft_arguments[key] = reviewed_arguments.get(key)
         reviewed_empty_evidence = reviewed_arguments.get(
             "empty_field_evidence",
             [],
@@ -5154,6 +5176,36 @@ def _constrain_daily_add_call_group(
             )
         )
     return tuple(constrained)
+
+
+def _daily_add_target_date(
+    arguments: dict[str, Any],
+    *,
+    context: TrustedContext | None,
+) -> date | None:
+    selection = arguments.get("date_selection")
+    if selection == "server_default" and context is not None:
+        return default_daily_write_date(
+            now=context.now,
+            timezone=context.principal.timezone,
+        )
+    if selection in {"agent2_semantic", "user_explicit"}:
+        raw = arguments.get("proposed_date")
+        try:
+            return raw if isinstance(raw, date) else date.fromisoformat(str(raw))
+        except ValueError:
+            return None
+    if selection == "trusted_report" and context is not None:
+        raw_id = arguments.get("report_id")
+        try:
+            report = context.report_by_id(UUID(str(raw_id)))
+        except ValueError:
+            return None
+        return report.report_date if report is not None else None
+    if selection == "trusted_failed_write" and context is not None:
+        candidate = context.retryable_daily_write
+        return candidate.target_date if candidate is not None else None
+    return None
 
 
 def _restore_dropped_daily_adds(
