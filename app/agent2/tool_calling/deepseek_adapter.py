@@ -3281,6 +3281,18 @@ def _parse_native_tool_call(
     ):
         decoded = decoded["arguments"]
         parse_status = "validated_review_arguments_envelope"
+    elif (
+        allow_review_arguments_envelope
+        and name == "add_daily_items"
+        and isinstance(decoded, dict)
+        and set(decoded) == {"arguments_without_fallible_date_target"}
+        and isinstance(
+            decoded.get("arguments_without_fallible_date_target"),
+            dict,
+        )
+    ):
+        decoded = decoded["arguments_without_fallible_date_target"]
+        parse_status = "validated_review_date_target_envelope"
     try:
         if name == "add_daily_items":
             decoded = compile_model_add_daily_items(decoded)
