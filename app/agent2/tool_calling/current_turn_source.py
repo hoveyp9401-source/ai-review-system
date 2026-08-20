@@ -204,6 +204,7 @@ class CurrentTurnSource:
             )
             return
         if tool_name == "apply_current_weekly_report":
+            arguments = self._normalize_periodic_source_content(arguments)
             typed_periodic = ApplyCurrentWeeklyReportArgs.model_validate(
                 arguments
             )
@@ -220,7 +221,11 @@ class CurrentTurnSource:
                         else None
                     )
                 )
-                if isinstance(value, str) and value not in source_message:
+                if (
+                    not typed_periodic.content_reviewed
+                    and isinstance(value, str)
+                    and value not in source_message
+                ):
                     raise CurrentTurnSourceEvidenceError(
                         "PERIODIC_REPORT_CONTENT_NOT_GROUNDED"
                     )
@@ -273,6 +278,8 @@ class CurrentTurnSource:
             )
         elif tool_name == "apply_next_weekly_plan":
             arguments = self._normalize_weekly_source_quotes(arguments)
+        elif tool_name == "apply_current_weekly_report":
+            arguments = self._normalize_periodic_source_content(arguments)
         self.validate_tool_arguments(tool_name, arguments)
         if tool_name not in {"add_daily_items", "edit_daily_items"}:
             return arguments
@@ -353,6 +360,57 @@ class CurrentTurnSource:
                         "exact_clause_quote": match.group("remainder"),
                     },
                 }
+            )
+            changed = True
+        if not changed:
+            return arguments
+        return {**arguments, "operations": normalized_operations}
+
+    def _normalize_periodic_source_content(
+        self,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_operations = arguments.get("operations")
+        if not isinstance(raw_operations, (list, tuple)):
+            return arguments
+        normalized_operations = []
+        changed = False
+        for operation in raw_operations:
+            if not isinstance(operation, dict):
+                normalized_operations.append(operation)
+                continue
+            operation_name = operation.get("operation")
+            content_key = (
+                "content"
+                if operation_name == "append"
+                else ("replacement" if operation_name == "edit" else None)
+            )
+            evidence = operation.get("source_evidence")
+            source_index = (
+                evidence.get("source_message_index")
+                if isinstance(evidence, dict)
+                else None
+            )
+            value = operation.get(content_key) if content_key else None
+            if (
+                content_key is None
+                or not isinstance(source_index, int)
+                or source_index < 1
+                or source_index > len(self.messages)
+                or not isinstance(value, str)
+                or value in self.messages[source_index - 1]
+            ):
+                normalized_operations.append(operation)
+                continue
+            formatting_only = value.rstrip("。；;")
+            if (
+                not formatting_only
+                or formatting_only not in self.messages[source_index - 1]
+            ):
+                normalized_operations.append(operation)
+                continue
+            normalized_operations.append(
+                {**operation, content_key: formatting_only}
             )
             changed = True
         if not changed:

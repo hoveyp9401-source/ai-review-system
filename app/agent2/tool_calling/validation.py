@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+import re
 from typing import Any, Protocol
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -92,6 +93,34 @@ class BoundCall:
 
 class _UntrustedReadSnapshotError(ValueError):
     pass
+
+
+_WEEKLY_SOURCE_COVERAGE_IGNORABLE = re.compile(
+    r"[\s，,。；;：:、！？!?（）()]*"
+)
+
+
+def _weekly_source_fully_covered_by_operation_quotes(
+    source_message: str,
+    exact_clauses: tuple[str, ...],
+) -> bool:
+    source = str(source_message)
+    unique_quotes = tuple(dict.fromkeys(exact_clauses))
+    if not source or not unique_quotes:
+        return False
+    covered = [False] * len(source)
+    for quote in unique_quotes:
+        if not quote or source.count(quote) != 1:
+            return False
+        start = source.index(quote)
+        for index in range(start, start + len(quote)):
+            covered[index] = True
+    residual = "".join(
+        character
+        for index, character in enumerate(source)
+        if not covered[index]
+    )
+    return _WEEKLY_SOURCE_COVERAGE_IGNORABLE.fullmatch(residual) is not None
 
 
 class ShadowCallBinder:
@@ -884,6 +913,16 @@ def _validate_weekly_plan_binding(
     recurrent_add_groups: dict[
         tuple[int, str, str, str], list[tuple[int, dict[str, Any]]]
     ] = {}
+    all_exact_clauses = tuple(
+        str(evidence.get("exact_clause_quote") or "")
+        for operation in operations
+        if isinstance(operation, dict)
+        and isinstance(
+            (evidence := operation.get("source_evidence")),
+            dict,
+        )
+        and evidence.get("exact_clause_quote")
+    )
     for operation_index, operation in enumerate(operations):
         if str(operation.get("operation") or "") != "add":
             continue
@@ -943,6 +982,12 @@ def _validate_weekly_plan_binding(
                 business_timezone=context.principal.timezone,
                 target_week_start=plan.target_week_start,
                 proposed_dates=proposed_dates,
+                complete_source_coverage=(
+                    _weekly_source_fully_covered_by_operation_quotes(
+                        source_message,
+                        all_exact_clauses,
+                    )
+                ),
                 require_explicit_week_scope=len(
                     {
                         candidate.target_week_start

@@ -11,7 +11,10 @@ from app.agent2.tool_calling.assembly import (
     TrustedContextRequest,
 )
 from app.agent2.tool_calling.context import CANARY_STATE_NAMESPACE
-from app.agent2.tool_calling.contracts import ExecutionMode
+from app.agent2.tool_calling.contracts import (
+    ApplyCurrentWeeklyReportArgs,
+    ExecutionMode,
+)
 from app.agent2.tool_calling.registry import deepseek_tool_schemas
 
 
@@ -91,3 +94,16 @@ async def test_real_canary_schema_can_reach_current_weekly_report_intent(
         f"{user_message!r} has no executable Weekly Report route; "
         f"missing {required_tool}"
     )
+
+
+def test_periodic_content_review_proof_is_server_only() -> None:
+    schema = next(
+        item["function"]["parameters"]
+        for item in deepseek_tool_schemas(
+            frozenset({"apply_current_weekly_report"})
+        )
+        if item["function"]["name"] == "apply_current_weekly_report"
+    )
+
+    assert "content_reviewed" in ApplyCurrentWeeklyReportArgs.model_fields
+    assert "content_reviewed" not in schema["properties"]

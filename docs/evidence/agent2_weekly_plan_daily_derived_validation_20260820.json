@@ -18,16 +18,14 @@
       "rounds": 2,
       "passed": 28,
       "failed": 0,
-      "artifact_sha256": "11d7e83c1b29e37e28e1381a4466027ab7ac5c63f2e57cc520e0c8ee4b9246cf"
+      "artifact_sha256": "3f854548e28c89d1a9fb2b9ef0e8e81f4e062429c2d8d72b74d99a14d018f5c0"
     },
     "daily_weekly_periodic_collision_matrix": {
       "unique_cases": 7,
-      "initial_passed": 13,
-      "initial_failed_transport_timeout": 1,
-      "timed_out_case_retry_passed": 2,
-      "timed_out_case_retry_failed": 0,
-      "matrix_artifact_sha256": "24f3d7aad4cad6495334ccb1a7979b0a7c04d46f18f16db96a10bc1b07fb4608",
-      "retry_artifact_sha256": "6442868a4c5bff374c353951eb6959bf1ab10154e3e35e2002b839d35089ace8"
+      "rounds": 2,
+      "passed": 14,
+      "failed": 0,
+      "artifact_sha256": "ec43ecc7856e1d165f3d11148a41fe53571ad309ccb2cafefaf4d13672318f2d"
     },
     "recurrence_focus": {
       "passed": 6,
@@ -39,12 +37,32 @@
       "failed": 0,
       "artifact_sha256": "3e9d2500505f37fe4260a98b70407525f03bc13afb61af3818b5df722cd0bbbb"
     },
+    "recurrence_plus_oneoff_focus": {
+      "passed": 5,
+      "failed": 0,
+      "artifact_sha256": "7e803092500aee4c4a93774668384fae899eafdebc9ee7c715c963edf32fea62"
+    },
+    "explicit_daily_review_envelope_focus": {
+      "passed": 5,
+      "failed": 0,
+      "artifact_sha256": "df50374b2a0b3b702213475984830325316fd6ddc755fe7eb21b802c982ef9bd"
+    },
+    "periodic_next_plan_wording_focus": {
+      "passed": 5,
+      "failed": 0,
+      "artifact_sha256": "739535ac8a99e8ecfb152f1f01e9d6b110c002e17c34b950cee21936e2a2d974"
+    },
+    "ambiguous_no_write_quorum_focus": {
+      "passed": 3,
+      "failed": 0,
+      "artifact_sha256": "0d71f0b53a90f8a7f4c308036a2c6d3012958539ccc1492260e0932859fda05f"
+    },
     "business_database_connected": false,
     "business_writes": 0,
     "messages_sent": 0
   },
   "daily_report_non_regression": {
-    "targeted_tests_passed": 455,
+    "targeted_tests_passed": 457,
     "targeted_tests_failed": 0,
     "production_database_outer_rollback_cases_passed": 13,
     "production_database_outer_rollback_cases_failed": 0,
@@ -54,8 +72,28 @@
     "rollback_receipt_residue": 0,
     "messages_sent": 0
   },
+  "production_database_outer_rollback": {
+    "real_agent2_and_flash": true,
+    "target_week_start": "2026-08-24",
+    "cases_passed": 6,
+    "cases_failed": 0,
+    "temporary_final_plan_status": "submitted",
+    "temporary_final_plan_version": 6,
+    "baseline_restored": true,
+    "canary_receipt_residue": 0,
+    "weekly_command_receipt_residue": 0,
+    "weekly_audit_residue": 0,
+    "temporary_daily_report_residue": 0,
+    "messages_sent": 0
+  },
+  "supporting_gates": {
+    "progress_gate_passed": 12,
+    "progress_gate_failed": 0,
+    "legacy_product_quick_gate_status": "legacy-gap",
+    "legacy_product_quick_gate_reason": "The old gate references test files absent from the current Agent2 release; the complete current repository suite was used instead."
+  },
   "full_repository_regression": {
-    "passed": 3699,
+    "passed": 3711,
     "failed": 219,
     "skipped": 3,
     "baseline_failed": 219,

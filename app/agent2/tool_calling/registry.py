@@ -1080,7 +1080,10 @@ def _model_tool_input_schema(definition: ToolDefinition) -> dict[str, Any]:
     if definition.tool_name == "add_daily_items":
         return model_add_daily_items_schema()
     schema = _thaw_json(definition.input_schema)
-    if definition.tool_name == "apply_next_weekly_plan":
+    if definition.tool_name in {
+        "apply_current_weekly_report",
+        "apply_next_weekly_plan",
+    }:
         schema.get("properties", {}).pop("content_reviewed", None)
         required = schema.get("required")
         if isinstance(required, list):
@@ -1114,6 +1117,11 @@ def validate_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
         dumped.pop("content_reviewed", None)
     if (
         tool_name == "apply_next_weekly_plan"
+        and not dumped.get("content_reviewed")
+    ):
+        dumped.pop("content_reviewed", None)
+    if (
+        tool_name == "apply_current_weekly_report"
         and not dumped.get("content_reviewed")
     ):
         dumped.pop("content_reviewed", None)

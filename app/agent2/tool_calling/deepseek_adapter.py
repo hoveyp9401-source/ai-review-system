@@ -790,7 +790,7 @@ class DeepSeekToolCallingAdapter:
             original: _ParsedAssistantTurn,
             reviewed: _ParsedAssistantTurn,
         ) -> _ParsedAssistantTurn:
-            """Resolve only a full Daily-add deletion without replaying the draft."""
+            """Optionally restore a dropped Daily add without invalidating reviewed work."""
 
             nonlocal iterations
             original_daily_adds = tuple(
@@ -854,12 +854,32 @@ class DeepSeekToolCallingAdapter:
                     original_has_domain_writes=True,
                 )
             except DeepSeekToolCallingError as exc:
+                if reviewed.tool_calls and model_turns:
+                    model_turns[-1] = replace(
+                        model_turns[-1],
+                        response_metadata={
+                            **model_turns[-1].response_metadata,
+                            "dropped_daily_add_adjudication_fell_back": True,
+                            "dropped_daily_add_adjudication_error": type(exc).__name__,
+                        },
+                    )
+                    return reviewed
                 raise _with_canary_turn_state(
                     exc,
                     audits=audits,
                     model_turns=model_turns,
                 ) from exc
             except ValueError as exc:
+                if reviewed.tool_calls and model_turns:
+                    model_turns[-1] = replace(
+                        model_turns[-1],
+                        response_metadata={
+                            **model_turns[-1].response_metadata,
+                            "dropped_daily_add_adjudication_fell_back": True,
+                            "dropped_daily_add_adjudication_error": type(exc).__name__,
+                        },
+                    )
+                    return reviewed
                 raise _with_canary_turn_state(
                     DeepSeekResponseError(
                         "dropped Daily add adjudication returned an invalid decision"
@@ -869,7 +889,7 @@ class DeepSeekToolCallingAdapter:
                 ) from exc
 
             if not adjudicated.tool_calls:
-                return adjudicated
+                return reviewed if reviewed.tool_calls else adjudicated
             try:
                 return _restore_dropped_daily_adds(
                     original=original,
@@ -877,15 +897,118 @@ class DeepSeekToolCallingAdapter:
                     adjudicated=adjudicated,
                 )
             except ValueError as exc:
-                if not reviewed.tool_calls:
-                    return reviewed
-                raise _with_canary_turn_state(
-                    DeepSeekResponseError(
-                        "dropped Daily add reviewers did not independently agree"
-                    ),
-                    audits=audits,
-                    model_turns=model_turns,
-                ) from exc
+                if model_turns:
+                    model_turns[-1] = replace(
+                        model_turns[-1],
+                        response_metadata={
+                            **model_turns[-1].response_metadata,
+                            "dropped_daily_add_adjudication_fell_back": True,
+                            "dropped_daily_add_adjudication_error": type(exc).__name__,
+                        },
+                    )
+                return reviewed
+
+        async def review_weekly_reclassification(
+            *,
+            original: _ParsedAssistantTurn,
+            reviewed: _ParsedAssistantTurn,
+            allowed_tool_names: frozenset[str],
+        ) -> _ParsedAssistantTurn:
+            """Focus once when a fallible Daily draft was reclassified as Weekly."""
+
+            nonlocal iterations
+            original_domains = {
+                domain
+                for call in original.tool_calls
+                if (domain := _daily_weekly_write_domain(call.tool_name))
+                is not None
+            }
+            reviewed_domains = {
+                domain
+                for call in reviewed.tool_calls
+                if (domain := _daily_weekly_write_domain(call.tool_name))
+                is not None
+            }
+            if original_domains != {"daily"} or reviewed_domains != {"weekly"}:
+                return reviewed
+            weekly_tool_names = frozenset(
+                name
+                for name in allowed_tool_names
+                if _daily_weekly_review_domain(name) == "weekly"
+            )
+            if not weekly_tool_names:
+                return reviewed
+            review_messages = _daily_weekly_write_review_messages(
+                user_text=user_text,
+                user_messages=user_messages,
+                calls=reviewed.tool_calls,
+                context=context,
+                trusted_completed_daily_query_results=[],
+                selected_targets=[],
+                allowed_tool_names=weekly_tool_names,
+            )
+            for attempt in range(1, 3):
+                try:
+                    completion = await complete_model(
+                        review_messages,
+                        tool_schemas=deepseek_tool_schemas(
+                            weekly_tool_names
+                        ),
+                        thinking_enabled=False,
+                    )
+                    iterations += 1
+                    model_turns.append(
+                        _model_turn_audit(
+                            iterations,
+                            completion.message,
+                            response_metadata={
+                                **completion.metadata,
+                                "weekly_reclassification_focused_review": True,
+                                "weekly_reclassification_review_attempt": attempt,
+                                "draft_executed": False,
+                            },
+                        )
+                    )
+                    focused = _parse_assistant_turn(completion.message)
+                    _validate_completion_protocol(completion, focused)
+                    audits.extend(focused.audit)
+                    _validate_daily_weekly_write_review(
+                        reviewed=focused,
+                        allowed_tool_names=weekly_tool_names,
+                        original_has_domain_writes=True,
+                    )
+                    if not any(
+                        call.tool_name == "apply_next_weekly_plan"
+                        for call in focused.tool_calls
+                    ):
+                        raise ValueError(
+                            "weekly reclassification review dropped the apply call"
+                        )
+                    return _constrain_weekly_plan_review_submission(
+                        original=reviewed,
+                        reviewed=focused,
+                    )
+                except (DeepSeekToolCallingError, ValueError) as exc:
+                    if model_turns:
+                        model_turns[-1] = replace(
+                            model_turns[-1],
+                            response_metadata={
+                                **model_turns[-1].response_metadata,
+                                "weekly_reclassification_review_retry": attempt == 1,
+                                "weekly_reclassification_review_error": type(exc).__name__,
+                            },
+                        )
+                    if attempt == 1:
+                        continue
+            if model_turns:
+                model_turns[-1] = replace(
+                    model_turns[-1],
+                    response_metadata={
+                        **model_turns[-1].response_metadata,
+                        "weekly_reclassification_review_fell_back": True,
+                    },
+                )
+            return reviewed
 
         try:
             while True:
@@ -1817,6 +1940,11 @@ class DeepSeekToolCallingAdapter:
                         original=parsed,
                         reviewed=reviewed,
                     )
+                    reviewed = await review_weekly_reclassification(
+                        original=parsed,
+                        reviewed=reviewed,
+                        allowed_tool_names=daily_weekly_review_tool_names,
+                    )
                     completed_daily_flow.record_write_review(
                         reviewed,
                         receipts=tuple(receipts),
@@ -1882,62 +2010,78 @@ class DeepSeekToolCallingAdapter:
                                 model_turns=model_turns,
                             ) from exc
                         except ValueError as exc:
-                            clarification_kind = _zero_draft_disagreement_kind(
-                                first=reviewed.tool_calls,
-                                second=confirmed.tool_calls,
-                                context=context,
+                            no_write_quorum = bool(
+                                not parsed.tool_calls
+                                and reviewed.tool_calls
+                                and not confirmed.tool_calls
                             )
-                            if clarification_kind is None:
-                                raise _with_canary_turn_state(
-                                    DeepSeekResponseError(
-                                        "daily and weekly zero-draft reviewers did not independently agree"
-                                    ),
-                                    audits=audits,
-                                    model_turns=model_turns,
-                                ) from exc
-                            try:
-                                clarification_completion = await complete_model(
-                                    _weekly_target_disagreement_clarification_messages(
-                                        user_text=user_text,
-                                        user_messages=user_messages,
-                                        context=context,
-                                        clarification_kind=clarification_kind,
-                                    ),
-                                    tool_schemas=[],
-                                    thinking_enabled=not bounded_daily_turn_active,
+                            if no_write_quorum:
+                                reviewed = confirmed
+                                model_turns[-1] = replace(
+                                    model_turns[-1],
+                                    response_metadata={
+                                        **model_turns[-1].response_metadata,
+                                        "daily_weekly_zero_draft_no_write_quorum": True,
+                                        "draft_executed": False,
+                                    },
                                 )
-                                iterations += 1
-                                model_turns.append(
-                                    _model_turn_audit(
-                                        iterations,
-                                        clarification_completion.message,
-                                        response_metadata={
-                                            **clarification_completion.metadata,
-                                            "daily_weekly_zero_draft_disagreement_clarification": True,
-                                        },
+                            else:
+                                clarification_kind = _zero_draft_disagreement_kind(
+                                    first=reviewed.tool_calls,
+                                    second=confirmed.tool_calls,
+                                    context=context,
+                                )
+                                if clarification_kind is None:
+                                    raise _with_canary_turn_state(
+                                        DeepSeekResponseError(
+                                            "daily and weekly zero-draft reviewers did not independently agree"
+                                        ),
+                                        audits=audits,
+                                        model_turns=model_turns,
+                                    ) from exc
+                                try:
+                                    clarification_completion = await complete_model(
+                                        _weekly_target_disagreement_clarification_messages(
+                                            user_text=user_text,
+                                            user_messages=user_messages,
+                                            context=context,
+                                            clarification_kind=clarification_kind,
+                                        ),
+                                        tool_schemas=[],
+                                        thinking_enabled=not bounded_daily_turn_active,
                                     )
-                                )
-                                clarified = _parse_assistant_turn(
-                                    clarification_completion.message
-                                )
-                                _validate_completion_protocol(
-                                    clarification_completion,
-                                    clarified,
-                                )
-                                audits.extend(clarified.audit)
-                                _validate_week_target_disagreement_clarification(
-                                    clarified,
-                                    clarification_kind=clarification_kind,
-                                )
-                                reviewed = clarified
-                            except (DeepSeekToolCallingError, ValueError) as clarify_exc:
-                                raise _with_canary_turn_state(
-                                    DeepSeekResponseError(
-                                        "daily and weekly zero-draft reviewers did not independently agree"
-                                    ),
-                                    audits=audits,
-                                    model_turns=model_turns,
-                                ) from clarify_exc
+                                    iterations += 1
+                                    model_turns.append(
+                                        _model_turn_audit(
+                                            iterations,
+                                            clarification_completion.message,
+                                            response_metadata={
+                                                **clarification_completion.metadata,
+                                                "daily_weekly_zero_draft_disagreement_clarification": True,
+                                            },
+                                        )
+                                    )
+                                    clarified = _parse_assistant_turn(
+                                        clarification_completion.message
+                                    )
+                                    _validate_completion_protocol(
+                                        clarification_completion,
+                                        clarified,
+                                    )
+                                    audits.extend(clarified.audit)
+                                    _validate_week_target_disagreement_clarification(
+                                        clarified,
+                                        clarification_kind=clarification_kind,
+                                    )
+                                    reviewed = clarified
+                                except (DeepSeekToolCallingError, ValueError) as clarify_exc:
+                                    raise _with_canary_turn_state(
+                                        DeepSeekResponseError(
+                                            "daily and weekly zero-draft reviewers did not independently agree"
+                                        ),
+                                        audits=audits,
+                                        model_turns=model_turns,
+                                    ) from clarify_exc
                     try:
                         parsed = _merge_daily_weekly_write_review(
                             original=parsed,
@@ -1947,6 +2091,7 @@ class DeepSeekToolCallingAdapter:
                             ),
                             context=context,
                         )
+                        parsed = _mark_reviewed_periodic_report_content(parsed)
                         parsed = _mark_reviewed_weekly_plan_content(parsed)
                         if bounded_daily_turn_active:
                             parsed = _mark_reviewed_daily_content(parsed)
@@ -3390,6 +3535,13 @@ def _parse_native_tool_call(
         outer_target_keys = set(decoded) - {
             "arguments_without_fallible_date_target"
         }
+        if "tool_name" in outer_target_keys:
+            if decoded.get("tool_name") != name:
+                raise InvalidNativeToolArgumentsError(
+                    "DeepSeek returned invalid tool arguments",
+                    raw_tool_call_audit=(audit,),
+                )
+            outer_target_keys.remove("tool_name")
         if (
             not outer_target_keys.issubset(date_target_keys)
             or outer_target_keys.intersection(content_arguments)
@@ -3417,7 +3569,10 @@ def _parse_native_tool_call(
                 )
                 else parse_status
             )
-        elif name == "apply_next_weekly_plan" and isinstance(decoded, dict):
+        elif name in {
+            "apply_current_weekly_report",
+            "apply_next_weekly_plan",
+        } and isinstance(decoded, dict):
             decoded = {
                 key: value
                 for key, value in decoded.items()
@@ -5627,8 +5782,24 @@ def _merge_daily_weekly_write_review(
         for call in reviewed.tool_calls
         if (domain := _daily_weekly_write_domain(call.tool_name)) is not None
     }
-    if reviewed.tool_calls and not original_reviewed_domains.issubset(
-        reviewed_domains
+    original_daily_writes = tuple(
+        call
+        for call in original.tool_calls
+        if _daily_weekly_write_domain(call.tool_name) == "daily"
+    )
+    adjudicated_daily_add_reclassification = bool(
+        original_daily_writes
+        and all(
+            call.tool_name == "add_daily_items"
+            for call in original_daily_writes
+        )
+        and "daily" not in reviewed_domains
+        and reviewed_domains
+    )
+    if (
+        reviewed.tool_calls
+        and not original_reviewed_domains.issubset(reviewed_domains)
+        and not adjudicated_daily_add_reclassification
     ):
         raise ValueError(
             "review must preserve every reviewed write domain; "
@@ -5821,6 +5992,50 @@ def _mark_reviewed_daily_content(
             ),
         )
         if call.tool_name == "add_daily_items"
+        else call
+        for call in parsed.tool_calls
+    )
+    if reviewed_calls == parsed.tool_calls:
+        return parsed
+    assistant_message = dict(parsed.assistant_message)
+    assistant_message["tool_calls"] = [
+        {
+            "id": call.tool_call_id,
+            "type": "function",
+            "function": {
+                "name": call.tool_name,
+                "arguments": json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        for call in reviewed_calls
+    ]
+    return replace(
+        parsed,
+        assistant_message=assistant_message,
+        tool_calls=reviewed_calls,
+    )
+
+
+def _mark_reviewed_periodic_report_content(
+    parsed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Attach server-only proof after Weekly Report semantic review passes."""
+
+    reviewed_calls = tuple(
+        NativeToolCall(
+            call.tool_call_id,
+            call.tool_name,
+            validate_tool_arguments(
+                "apply_current_weekly_report",
+                {**call.arguments, "content_reviewed": True},
+            ),
+        )
+        if call.tool_name == "apply_current_weekly_report"
         else call
         for call in parsed.tool_calls
     )

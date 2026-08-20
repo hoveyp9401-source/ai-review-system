@@ -16,6 +16,7 @@ from app.agent2.tool_calling.validation import (
     DateResolution,
     NativeToolCall,
     ShadowCallBinder,
+    _weekly_source_fully_covered_by_operation_quotes,
 )
 from app.agent2.weekly_plan_context import (
     TrustedWeeklyPlanContext,
@@ -28,6 +29,30 @@ TENANT_ID = "test-tenant"
 USER_ID = UUID("10000000-0000-4000-8000-000000000001")
 PLAN_ID = UUID("20000000-0000-4000-8000-000000000001")
 START = date(2026, 8, 17)
+
+
+def test_weekly_operation_quotes_may_collectively_cover_one_complete_message():
+    source = "下周每天做日常用印审核，另外周四准备甲案件开庭材料。"
+
+    assert _weekly_source_fully_covered_by_operation_quotes(
+        source,
+        (
+            "下周每天做日常用印审核",
+            "另外周四准备甲案件开庭材料",
+        ),
+    )
+
+
+def test_weekly_operation_quotes_cannot_hide_an_uncovered_qualifier():
+    source = "下周每天做日常用印审核，仅工作日除外，另外周四准备材料。"
+
+    assert not _weekly_source_fully_covered_by_operation_quotes(
+        source,
+        (
+            "下周每天做日常用印审核",
+            "另外周四准备材料",
+        ),
+    )
 
 
 class _DateResolver:

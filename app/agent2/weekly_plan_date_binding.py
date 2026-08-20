@@ -232,6 +232,7 @@ def validate_weekly_plan_date_set_binding(
     target_week_start: date,
     proposed_dates: tuple[date, ...],
     require_explicit_week_scope: bool = False,
+    complete_source_coverage: bool = False,
 ) -> WeeklyPlanDateSetResolution:
     """Validate one matter repeated on every day of the selected plan.
 
@@ -279,7 +280,7 @@ def validate_weekly_plan_date_set_binding(
     # message, not a model-selected subclause.  This prevents a draft from
     # hiding a later qualifier after punctuation.  Agent2's independent
     # reviewers still own the semantic decision across Daily/Weekly matters.
-    if clause != source:
+    if clause != source and not complete_source_coverage:
         raise WeeklyPlanDateBindingError(
             "WEEKLY_PLAN_RECURRENCE_SOURCE_EVIDENCE_INCOMPLETE"
         )

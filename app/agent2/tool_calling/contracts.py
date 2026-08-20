@@ -215,6 +215,13 @@ class ApplyCurrentWeeklyReportArgs(StrictContract):
         min_length=1,
         max_length=50,
     )
+    content_reviewed: bool = Field(
+        default=False,
+        description=(
+            "Server-only proof that an independent semantic review approved "
+            "the conservative Weekly Report wording. Models cannot set this field."
+        ),
+    )
 
     @field_validator("operations")
     @classmethod

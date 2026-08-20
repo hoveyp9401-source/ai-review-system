@@ -273,3 +273,25 @@ def test_adjacent_daily_word_is_recovered_from_the_complete_source_clause():
         date(2026, 8, 17) + timedelta(days=offset)
         for offset in range(5)
     )
+
+
+def test_collectively_covered_recurrence_clause_may_be_shorter_than_message():
+    result = validate_weekly_plan_date_set_binding(
+        source_message="下周每天做日常用印审核，另外周四准备甲案件开庭材料。",
+        exact_clause_quote="下周每天做日常用印审核",
+        recurrence_scope_quote="下周每天",
+        matter_text="日常用印审核",
+        source_occurred_at=datetime(2026, 8, 14, 17, 30, tzinfo=SHANGHAI),
+        business_timezone="Asia/Shanghai",
+        target_week_start=date(2026, 8, 17),
+        proposed_dates=tuple(
+            date(2026, 8, 17) + timedelta(days=offset)
+            for offset in range(6)
+        ),
+        complete_source_coverage=True,
+    )
+
+    assert result.resolved_dates == tuple(
+        date(2026, 8, 17) + timedelta(days=offset)
+        for offset in range(6)
+    )

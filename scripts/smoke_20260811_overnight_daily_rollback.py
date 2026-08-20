@@ -330,6 +330,8 @@ async def _turn(
     now: datetime,
     accepted_business_results: frozenset[str] = frozenset({"success"}),
     model_audit_sink: list[dict[str, object]] | None = None,
+    conversation_kind: str = "unknown",
+    message_occurred_at: datetime | None = None,
 ):
     model_audits = model_audit_sink if model_audit_sink is not None else []
     original_audit_recorder = canary_service._record_model_audit_safely
@@ -397,6 +399,8 @@ async def _turn(
             settings=settings,
             llm_client=llm_client,
             now=now,
+            conversation_kind=conversation_kind,
+            message_occurred_at=message_occurred_at,
         )
     except Exception as exc:
         raise AssertionError(
@@ -427,6 +431,7 @@ async def _turn(
                 "release_blockers": assessment.blockers,
                 "daily_date_votes": _compact_daily_date_votes(model_audits),
                 "model_flow": _compact_model_flow(model_audits),
+                "result_receipts": _compact_result_receipts(model_audits),
             }
         )
     if outcome.messages_enabled:

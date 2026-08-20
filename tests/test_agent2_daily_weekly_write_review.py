@@ -616,6 +616,8 @@ async def _run_scripted_write_review(
     draft_calls: tuple[dict, ...],
     reviewed_calls: tuple[dict, ...],
     adjudicated_calls: tuple[dict, ...] | None = None,
+    adjudication_completion: _CompletionResponse | None = None,
+    weekly_reclassification_completion: _CompletionResponse | None = None,
     captured_review_payloads: list[dict] | None = None,
 ):
     adapter = DeepSeekToolCallingAdapter(
@@ -629,8 +631,14 @@ async def _run_scripted_write_review(
         _tool_completion(*draft_calls),
         _tool_completion(*reviewed_calls),
     ]
+    if adjudicated_calls is not None and adjudication_completion is not None:
+        raise ValueError("choose adjudicated_calls or adjudication_completion")
     if adjudicated_calls is not None:
         scripted.append(_tool_completion(*adjudicated_calls))
+    elif adjudication_completion is not None:
+        scripted.append(adjudication_completion)
+    if weekly_reclassification_completion is not None:
+        scripted.append(weekly_reclassification_completion)
     scripted.append(_terminal_completion("日报已按原话处理。"))
     completions = iter(scripted)
 
@@ -1509,6 +1517,107 @@ async def test_daily_edit_review_restores_a_dropped_sibling_add_only_after_adjud
     assert runtime.commit_count == 1
     assert result.model_turns[2].response_metadata[
         "dropped_daily_add_independent_adjudication"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_daily_adjudicator_cannot_replace_a_reviewed_weekly_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+
+    await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=_context(),
+        user_text="下周三整理案件材料",
+        draft_calls=(_daily_add_call(call_id="wrong-daily-draft"),),
+        reviewed_calls=(_weekly_call(call_id="reviewed-weekly"),),
+        adjudication_completion=_clarification_completion(
+            "这不是日报内容。"
+        ),
+        weekly_reclassification_completion=_tool_completion(
+            _weekly_call(call_id="focused-weekly")
+        ),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "apply_next_weekly_plan"
+    ]
+    assert runtime.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_daily_adjudication_falls_back_to_reviewed_weekly_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+
+    result = await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=_context(),
+        user_text="下周三整理案件材料",
+        draft_calls=(_daily_add_call(call_id="wrong-daily-draft"),),
+        reviewed_calls=(_weekly_call(call_id="reviewed-weekly"),),
+        adjudication_completion=_direct_completion(
+            "This message is not a Daily Report write."
+        ),
+        weekly_reclassification_completion=_tool_completion(
+            _weekly_call(call_id="focused-weekly")
+        ),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "apply_next_weekly_plan"
+    ]
+    assert runtime.commit_count == 1
+    assert result.model_turns[2].response_metadata[
+        "dropped_daily_add_adjudication_fell_back"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_daily_to_weekly_reclassification_gets_one_focused_weekly_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    wrong_weekly = _weekly_call(call_id="reviewed-weekly")
+    wrong_arguments = json.loads(wrong_weekly["function"]["arguments"])
+    wrong_arguments["operations"][0]["content"] = (
+        "整理案件材料，先别提交"
+    )
+    wrong_arguments["operations"][0]["source_evidence"][
+        "exact_clause_quote"
+    ] = "下周三整理案件材料，先别提交"
+    wrong_weekly["function"]["arguments"] = json.dumps(
+        wrong_arguments,
+        ensure_ascii=False,
+    )
+
+    result = await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=_context(),
+        user_text="下周三整理案件材料，先别提交",
+        draft_calls=(_daily_add_call(call_id="wrong-daily-draft"),),
+        reviewed_calls=(wrong_weekly,),
+        adjudication_completion=_clarification_completion(
+            "这不是日报内容。"
+        ),
+        weekly_reclassification_completion=_tool_completion(
+            _weekly_call(call_id="focused-weekly")
+        ),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "apply_next_weekly_plan"
+    ]
+    assert runtime.calls[0].arguments["operations"][0]["content"] == (
+        "整理案件材料"
+    )
+    assert result.model_turns[3].response_metadata[
+        "weekly_reclassification_focused_review"
     ] is True
 
 
@@ -2470,6 +2579,42 @@ async def test_daily_review_accepts_content_envelope_with_trusted_target(
     ]
 
 
+def test_daily_review_accepts_matching_tool_name_around_content_envelope() -> None:
+    call = _daily_items_call(
+        call_id="reviewed-daily",
+        items=[
+            {
+                "field": "today_work",
+                "content": "周五完成A项目材料整理",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "周五完成A项目材料整理。",
+                },
+            }
+        ],
+    )
+    arguments = json.loads(call["function"]["arguments"])
+    call["function"]["arguments"] = json.dumps(
+        {
+            "tool_name": "add_daily_items",
+            "arguments_without_fallible_date_target": arguments,
+        },
+        ensure_ascii=False,
+    )
+
+    parsed = _parse_assistant_turn(
+        _tool_completion(call).message,
+        allow_review_arguments_envelope=True,
+    )
+
+    assert parsed.tool_calls[0].arguments["date_selection"] == (
+        "server_default"
+    )
+    assert parsed.tool_calls[0].arguments["items"][0]["content"] == (
+        "周五完成A项目材料整理"
+    )
+
+
 @pytest.mark.asyncio
 async def test_independent_review_restores_a_weekly_write_omitted_from_daily_draft(
     monkeypatch: pytest.MonkeyPatch,
@@ -3243,6 +3388,48 @@ async def test_zero_tool_write_confirmation_cannot_drop_one_domain(
         )
 
     assert runtime.execute_count == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_tool_no_write_quorum_keeps_the_confirmed_clarification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    reply = "你是要记入今日日报，还是安排到下周工作计划？"
+    completions = iter(
+        (
+            _clarification_completion(reply),
+            _tool_completion(_weekly_call(call_id="reviewed-weekly")),
+            _clarification_completion(reply),
+            _zero_tool_keep_completion(reply),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text="周五整理A项目材料。",
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == reply
+    assert runtime.execute_count == 0
+    assert result.model_turns[2].response_metadata[
+        "daily_weekly_zero_draft_no_write_quorum"
+    ] is True
 
 
 @pytest.mark.asyncio
