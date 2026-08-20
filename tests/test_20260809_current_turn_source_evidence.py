@@ -162,6 +162,68 @@ def test_daily_item_quote_tolerates_a_model_added_leading_separator() -> None:
     )
 
 
+def test_daily_item_quote_reanchors_asr_cleanup_to_one_exact_source_span() -> None:
+    source_message = (
+        "现在因为现在我们这个整体的这个违约损失这部分没有定嘛，呃，"
+        "所以现在去我们去主张跟人家这个到期的这个3万块钱的应付款去抵消呢，"
+        "可能是有一点问题的。"
+    )
+    approximate_quote = (
+        "现在因为这个整体的违约损失没有定，所以主张跟人家到期的3万块钱"
+        "应付款抵消可能有一点问题"
+    )
+    source = CurrentTurnSource((source_message,))
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        {
+            "items": [
+                {
+                    "field": "problems",
+                    "content": "整体违约损失未定，抵消存在问题",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": approximate_quote,
+                    },
+                }
+            ],
+            "content_reviewed": True,
+        },
+    )
+
+    exact_quote = bound["items"][0]["source_evidence"]["exact_quote"]
+    assert exact_quote in source_message
+    assert "没有定嘛" in exact_quote
+    assert "3万块钱" in exact_quote
+    assert bound["items"][0]["content"] == (
+        "整体违约损失未定，抵消存在问题"
+    )
+
+
+def test_daily_item_quote_does_not_reanchor_an_unrelated_claim() -> None:
+    source = CurrentTurnSource(("今天完成合同复核并向业务反馈。",))
+
+    with pytest.raises(
+        CurrentTurnSourceEvidenceError,
+        match="DAILY_ITEM_CONTENT_NOT_GROUNDED",
+    ):
+        source.bind_tool_arguments(
+            "add_daily_items",
+            {
+                "items": [
+                    {
+                        "field": "today_work",
+                        "content": "完成法院开庭材料准备",
+                        "source_evidence": {
+                            "source_message_index": 1,
+                            "exact_quote": "完成法院开庭材料准备",
+                        },
+                    }
+                ]
+            },
+        )
+
+
 def test_daily_item_quote_accepts_the_complete_joined_sentence() -> None:
     source_message = "今天做了日报的基础功能优化"
     source = CurrentTurnSource((source_message,))

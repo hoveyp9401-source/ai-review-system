@@ -30,6 +30,7 @@ from app.agent2.tool_calling.daily_add_model_contract import (
     compile_model_add_daily_items,
     focused_daily_plan_parameters_schema,
     focused_daily_review_parameters_schema,
+    focused_daily_submission_evidence,
     parse_focused_daily_add_decision,
     parse_focused_daily_review_arguments,
     parse_focused_daily_review_decision,
@@ -220,6 +221,7 @@ class _ParsedAssistantTurn:
     tool_calls: tuple[NativeToolCall, ...]
     audit: tuple[RawToolCallAudit, ...]
     focused_success_reply: str | None = None
+    focused_submission_evidence: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1046,7 +1048,14 @@ class DeepSeekToolCallingAdapter:
                                         validation_error=str(exc),
                                     ),
                                     tool_schemas=_focused_daily_plan_tool_schemas(),
-                                    thinking_enabled=True,
+                                    thinking_enabled=(
+                                        "focused Daily source validation failed"
+                                        not in str(exc)
+                                        and completion.metadata.get(
+                                            "finish_reason"
+                                        )
+                                        != "length"
+                                    ),
                                 )
                                 iterations += 1
                                 model_turns.append(
@@ -1342,6 +1351,9 @@ class DeepSeekToolCallingAdapter:
                             user_messages=user_messages,
                             context=context,
                             calls=parsed.tool_calls,
+                            submission_evidence=(
+                                parsed.focused_submission_evidence
+                            ),
                         )
                         if focused_daily_review
                         else _daily_weekly_write_review_messages(
@@ -1384,6 +1396,31 @@ class DeepSeekToolCallingAdapter:
                                 },
                             )
                         )
+                        if (
+                            focused_daily_review
+                            and _focused_daily_review_needs_fast_retry(
+                                review_completion
+                            )
+                        ):
+                            review_completion = await complete_model(
+                                review_messages,
+                                tool_schemas=(
+                                    _focused_daily_review_tool_schemas()
+                                ),
+                                thinking_enabled=False,
+                            )
+                            iterations += 1
+                            model_turns.append(
+                                _model_turn_audit(
+                                    iterations,
+                                    review_completion.message,
+                                    response_metadata={
+                                        **review_completion.metadata,
+                                        "focused_daily_review_fast_retry": True,
+                                        "draft_executed": False,
+                                    },
+                                )
+                            )
                         if focused_daily_review:
                             focused_review_decision, focused_review_reason = (
                                 _parse_focused_daily_review_completion(
@@ -1407,6 +1444,73 @@ class DeepSeekToolCallingAdapter:
                                             ensure_ascii=False,
                                         )
                                     )
+                            if (
+                                focused_review_decision == "approve"
+                                and _focused_daily_needs_completeness_challenge(
+                                    user_text=user_text,
+                                    user_messages=user_messages,
+                                    calls=parsed.tool_calls,
+                                )
+                            ):
+                                challenge_messages = (
+                                    _bounded_daily_add_review_messages(
+                                        user_text=user_text,
+                                        user_messages=user_messages,
+                                        context=context,
+                                        calls=parsed.tool_calls,
+                                        submission_evidence=(
+                                            parsed.focused_submission_evidence
+                                        ),
+                                        challenge_approval=True,
+                                    )
+                                )
+                                challenge_completion = await complete_model(
+                                    challenge_messages,
+                                    tool_schemas=(
+                                        _focused_daily_review_tool_schemas()
+                                    ),
+                                    thinking_enabled=True,
+                                )
+                                iterations += 1
+                                model_turns.append(
+                                    _model_turn_audit(
+                                        iterations,
+                                        challenge_completion.message,
+                                        response_metadata={
+                                            **challenge_completion.metadata,
+                                            "focused_daily_completeness_challenge": True,
+                                            "draft_executed": False,
+                                        },
+                                    )
+                                )
+                                if _focused_daily_review_needs_fast_retry(
+                                    challenge_completion
+                                ):
+                                    challenge_completion = await complete_model(
+                                        challenge_messages,
+                                        tool_schemas=(
+                                            _focused_daily_review_tool_schemas()
+                                        ),
+                                        thinking_enabled=False,
+                                    )
+                                    iterations += 1
+                                    model_turns.append(
+                                        _model_turn_audit(
+                                            iterations,
+                                            challenge_completion.message,
+                                            response_metadata={
+                                                **challenge_completion.metadata,
+                                                "focused_daily_challenge_fast_retry": True,
+                                                "draft_executed": False,
+                                            },
+                                        )
+                                    )
+                                (
+                                    focused_review_decision,
+                                    focused_review_reason,
+                                ) = _parse_focused_daily_review_completion(
+                                    challenge_completion
+                                )
                             if focused_review_decision == "approve":
                                 reviewed = parsed
                             elif focused_review_decision == "repair":
@@ -1424,7 +1528,10 @@ class DeepSeekToolCallingAdapter:
                                                 {
                                                     "candidate": (
                                                         _focused_daily_review_candidate(
-                                                            parsed.tool_calls
+                                                            parsed.tool_calls,
+                                                            submission_evidence=(
+                                                                parsed.focused_submission_evidence
+                                                            ),
                                                         )
                                                     ),
                                                     "reply": (
@@ -1489,11 +1596,14 @@ class DeepSeekToolCallingAdapter:
                                             user_messages=user_messages,
                                             context=context,
                                             calls=reviewed.tool_calls,
+                                            submission_evidence=(
+                                                reviewed.focused_submission_evidence
+                                            ),
                                         ),
                                         tool_schemas=(
                                             _focused_daily_review_tool_schemas()
                                         ),
-                                        thinking_enabled=True,
+                                        thinking_enabled=False,
                                     )
                                     iterations += 1
                                     model_turns.append(
@@ -2650,9 +2760,13 @@ class DeepSeekToolCallingAdapter:
             # thinking tier. Send it explicitly so model comparisons and
             # production behavior cannot silently depend on provider defaults.
             payload["reasoning_effort"] = (
-                "low"
+                "medium"
                 if _has_focused_daily_review_tool(tool_schemas)
-                else "high"
+                else (
+                    "low"
+                    if _has_focused_daily_plan_tool(tool_schemas)
+                    else "high"
+                )
             )
         else:
             payload["thinking"] = {"type": "disabled"}
@@ -2935,6 +3049,9 @@ def _parse_focused_daily_completion(
                 _, cursor = decoder.raw_decode(raw_text, cursor)
                 salvaged_duplicate = True
             arguments, reply = compile_focused_daily_plan_arguments(decoded)
+            submission_evidence = focused_daily_submission_evidence(
+                decoded
+            )
         except (TypeError, ValueError) as exc:
             raise InvalidNativeToolArgumentsError(
                 "DeepSeek returned invalid focused Daily planning arguments",
@@ -2997,6 +3114,7 @@ def _parse_focused_daily_completion(
                 ),
             ),
             focused_success_reply=reply,
+            focused_submission_evidence=submission_evidence,
         )
 
     content = message.get("content")
@@ -3013,6 +3131,17 @@ def _parse_focused_daily_completion(
     try:
         decision, arguments, reply = parse_focused_daily_add_decision(
             raw_content
+        )
+        decoded_content = json.loads(raw_content)
+        raw_decision_arguments = (
+            decoded_content.get("arguments")
+            if isinstance(decoded_content, dict)
+            else None
+        )
+        submission_evidence = (
+            raw_decision_arguments.get("submission_evidence")
+            if isinstance(raw_decision_arguments, dict)
+            else None
         )
     except (TypeError, ValueError) as exc:
         raise InvalidNativeToolArgumentsError(
@@ -3068,6 +3197,7 @@ def _parse_focused_daily_completion(
             ),
         ),
         focused_success_reply=reply,
+        focused_submission_evidence=submission_evidence,
     )
 
 
@@ -3082,9 +3212,34 @@ def _validate_focused_daily_source(
     source = CurrentTurnSource(user_messages or (user_text,))
     try:
         for call in parsed.tool_calls:
+            submit_after_write = bool(
+                call.arguments.get("submit_after_write")
+            )
+            submission_evidence = parsed.focused_submission_evidence
+            if submit_after_write != (submission_evidence is not None):
+                raise CurrentTurnSourceEvidenceError(
+                    "DAILY_SUBMISSION_EVIDENCE_REQUIRED"
+                )
+            if submission_evidence is not None:
+                source_index = submission_evidence.get(
+                    "source_message_index"
+                )
+                exact_quote = submission_evidence.get("exact_quote")
+                if (
+                    not isinstance(source_index, int)
+                    or source_index < 1
+                    or source_index > len(source.messages)
+                    or not isinstance(exact_quote, str)
+                    or not exact_quote.strip()
+                    or exact_quote not in source.messages[source_index - 1]
+                ):
+                    raise CurrentTurnSourceEvidenceError(
+                        "DAILY_SUBMISSION_EVIDENCE_MISMATCH"
+                    )
             source.validate_tool_arguments(
                 call.tool_name,
                 call.arguments,
+                allow_approximate_daily_quotes=True,
             )
     except CurrentTurnSourceEvidenceError as exc:
         raise InvalidNativeToolArgumentsError(
@@ -3285,13 +3440,42 @@ def _parse_native_tool_call(
         allow_review_arguments_envelope
         and name == "add_daily_items"
         and isinstance(decoded, dict)
-        and set(decoded) == {"arguments_without_fallible_date_target"}
+        and "arguments_without_fallible_date_target" in decoded
         and isinstance(
             decoded.get("arguments_without_fallible_date_target"),
             dict,
         )
     ):
-        decoded = decoded["arguments_without_fallible_date_target"]
+        content_arguments = decoded[
+            "arguments_without_fallible_date_target"
+        ]
+        date_target_keys = {
+            "date_selection",
+            "date_expression",
+            "proposed_date",
+            "report_id",
+            "expected_version",
+            "retry_candidate_id",
+            "date_evidence",
+        }
+        outer_target_keys = set(decoded) - {
+            "arguments_without_fallible_date_target"
+        }
+        if (
+            not outer_target_keys.issubset(date_target_keys)
+            or outer_target_keys.intersection(content_arguments)
+        ):
+            raise InvalidNativeToolArgumentsError(
+                "DeepSeek returned invalid tool arguments",
+                raw_tool_call_audit=(audit,),
+            )
+        decoded = {
+            **content_arguments,
+            **{
+                key: decoded[key]
+                for key in outer_target_keys
+            },
+        }
         parse_status = "validated_review_date_target_envelope"
     try:
         if name == "add_daily_items":
@@ -3534,7 +3718,11 @@ def _compact_daily_add_argument_repair_messages(
                 "when its latter part only qualifies the status, condition, negation, or "
                 "completion state of the same action. An explicit statement that a field "
                 "has nothing to report belongs only in empty_field_evidence, never as an "
-                "item. If any field array remains empty without matching explicit-empty "
+                "item. Set submit_after_write=true only when this source explicitly asks "
+                "to submit or confirm this report now, and then submission_evidence must "
+                "copy that exact contiguous authorization quote. Otherwise set it false "
+                "and omit submission_evidence. If any field array remains empty without "
+                "matching explicit-empty "
                 "evidence and submit_after_write is false, reply must naturally say that "
                 "the available content was saved and place the exact token "
                 "{{daily_missing_section_labels}} once where the missing field names "
@@ -3622,8 +3810,11 @@ def _bounded_daily_probe_messages(
                 "inside contiguous exact quotes. Use date_selection=server_default. "
                 "Set submit_after_write=false unless this same source explicitly asks "
                 "to submit or confirm the report now; merely mentioning that work or a "
-                "Daily Report was done is not submission authorization. Preserve "
-                "explicit empty-field evidence. If any field array remains empty without "
+                "Daily Report was done is not submission authorization. "
+                "When submit_after_write is true, submission_evidence must copy one "
+                "exact contiguous current-message quote that explicitly authorizes "
+                "submission now. When it is false, omit submission_evidence. "
+                "Preserve explicit empty-field evidence. If any field array remains empty without "
                 "matching explicit-empty evidence and submit_after_write is false, reply "
                 "must naturally say that the available content was saved and place the "
                 "exact token {{daily_missing_section_labels}} once where the missing "
@@ -3645,6 +3836,8 @@ def _bounded_daily_add_review_messages(
     user_messages: tuple[str, ...],
     context: TrustedContext,
     calls: tuple[NativeToolCall, ...],
+    submission_evidence: dict[str, Any] | None = None,
+    challenge_approval: bool = False,
 ) -> list[dict[str, str]]:
     del context
     ordered_messages = user_messages or (user_text,)
@@ -3652,6 +3845,15 @@ def _bounded_daily_add_review_messages(
         {
             "role": "system",
             "content": (
+                (
+                    "Act as the final independent completeness challenger. A prior "
+                    "review approved the candidate, but you must ignore that verdict "
+                    "and actively try to find any omitted, merged, or misfielded source "
+                    "matter before approving. "
+                    if challenge_approval
+                    else ""
+                )
+                +
                 "You are an independent Agent2 Daily plan verifier. Never rewrite the "
                 "candidate. Call review_daily_plan exactly once. First judge scope. "
                 "Use decision=fallback with a concise "
@@ -3679,7 +3881,12 @@ def _bounded_daily_add_review_messages(
                 "record, draft, or save a Daily Report is not a request to submit it now, "
                 "and omitted fields remain missing rather than acknowledged empty. Never "
                 "reject or repair a non-submitting draft merely because one or more Daily "
-                "fields are absent. Respect the user's "
+                "fields are absent. "
+                "approve submit_after_write unless submission_evidence is an exact source "
+                "quote that explicitly authorizes submitting or confirming this report "
+                "now; recommendations, conclusions, and requests to save/fill do not. "
+                "When submit_after_write is false, submission_evidence must be absent. "
+                "Respect the user's "
                 "own grouping: each numbered or bulleted entry is one item unless it has "
                 "explicit subitems; clear list, paragraph, sentence, or semicolon boundaries "
                 "may separate items. Judge the user's coherent work topics, not individual verbs: "
@@ -3687,7 +3894,12 @@ def _bounded_daily_add_review_messages(
                 "workstream even without punctuation, while keeping coordinated actions together "
                 "inside one user-described topic or shared workstream. Audit in two passes: first "
                 "count and partition every top-level topic or workstream, then check grouping within "
-                "each partition. Repair whenever one item spans two unrelated work domains merely "
+                "each partition. Then perform a third item-level entailment pass: for every "
+                "candidate item, compare its exact_quote clause by clause with content and repair "
+                "if content drops any actor, condition, status, qualification, consequence, "
+                "exception, date, number, or pending action from that quote. Do not assume an "
+                "omitted clause is covered merely because another item overlaps the same source "
+                "region. Repair whenever one item spans two unrelated work domains merely "
                 "because punctuation is missing or a transition connects them. The candidate content may only "
                 "remove oral filler, repetition, and obvious grammar noise while preserving "
                 "all actors, projects, actions, objects, dates, numbers, negation, conditions, "
@@ -3705,7 +3917,10 @@ def _bounded_daily_add_review_messages(
                     "source": _focused_daily_user_content(
                         ordered_messages
                     ),
-                    "candidate": _focused_daily_review_candidate(calls),
+                    "candidate": _focused_daily_review_candidate(
+                        calls,
+                        submission_evidence=submission_evidence,
+                    ),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -3715,8 +3930,38 @@ def _bounded_daily_add_review_messages(
     ]
 
 
+def _focused_daily_needs_completeness_challenge(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    calls: tuple[NativeToolCall, ...],
+) -> bool:
+    source_length = sum(
+        len(message) for message in (user_messages or (user_text,))
+    )
+    item_count = sum(
+        len(call.arguments.get("items") or ())
+        for call in calls
+        if call.tool_name == "add_daily_items"
+    )
+    return source_length >= 1000 or item_count >= 8
+
+
+def _focused_daily_review_needs_fast_retry(
+    completion: _CompletionResponse,
+) -> bool:
+    raw_calls = completion.message.get("tool_calls")
+    return (
+        completion.metadata.get("finish_reason") != "tool_calls"
+        or not isinstance(raw_calls, (list, tuple))
+        or len(raw_calls) != 1
+    )
+
+
 def _focused_daily_review_candidate(
     calls: tuple[NativeToolCall, ...],
+    *,
+    submission_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     daily_calls = tuple(
         call for call in calls if call.tool_name == "add_daily_items"
@@ -3749,6 +3994,7 @@ def _focused_daily_review_candidate(
         "submit_after_write": bool(
             arguments.get("submit_after_write")
         ),
+        "submission_evidence": submission_evidence,
     }
 
 

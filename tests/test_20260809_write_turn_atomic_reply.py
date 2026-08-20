@@ -528,6 +528,7 @@ async def test_focused_daily_plan_uses_one_strict_model_only_tool() -> None:
 
     assert "response_format" not in client.payload
     assert client.payload["thinking"] == {"type": "enabled"}
+    assert client.payload["reasoning_effort"] == "low"
     assert client.payload["max_tokens"] == 16384
     assert [
         tool["function"]["name"] for tool in client.payload["tools"]
@@ -603,7 +604,7 @@ async def test_focused_daily_review_uses_one_strict_verdict_tool() -> None:
     assert "response_format" not in client.payload
     assert client.payload["max_tokens"] == 8192
     assert client.payload["thinking"] == {"type": "enabled"}
-    assert client.payload["reasoning_effort"] == "low"
+    assert client.payload["reasoning_effort"] == "medium"
     assert client.payload["tools"][0]["function"]["name"] == (
         "review_daily_plan"
     )

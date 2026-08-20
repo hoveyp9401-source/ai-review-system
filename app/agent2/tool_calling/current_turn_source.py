@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any
 
 from app.agent2.tool_calling.contracts import (
@@ -87,9 +89,14 @@ class CurrentTurnSource:
         self,
         tool_name: str,
         arguments: dict[str, Any],
+        *,
+        allow_approximate_daily_quotes: bool = False,
     ) -> None:
         if tool_name == "add_daily_items":
-            arguments = self._normalize_daily_source_quotes(arguments)
+            arguments = self._normalize_daily_source_quotes(
+                arguments,
+                allow_approximate=allow_approximate_daily_quotes,
+            )
             typed = AddDailyItemsArgs.model_validate(arguments)
             self._validate_daily_item_spans(typed)
             for item in typed.empty_field_evidence:
@@ -247,7 +254,12 @@ class CurrentTurnSource:
         """Return arguments grounded in server text and approved review evidence."""
 
         if tool_name == "add_daily_items":
-            arguments = self._normalize_daily_source_quotes(arguments)
+            arguments = self._normalize_daily_source_quotes(
+                arguments,
+                allow_approximate=bool(
+                    arguments.get("content_reviewed")
+                ),
+            )
         self.validate_tool_arguments(tool_name, arguments)
         if tool_name not in {"add_daily_items", "edit_daily_items"}:
             return arguments
@@ -285,6 +297,8 @@ class CurrentTurnSource:
     def _normalize_daily_source_quotes(
         self,
         arguments: dict[str, Any],
+        *,
+        allow_approximate: bool = False,
     ) -> dict[str, Any]:
         raw_items = arguments.get("items")
         if not isinstance(raw_items, (list, tuple)):
@@ -311,10 +325,15 @@ class CurrentTurnSource:
                 normalized_items.append(item)
                 continue
             candidate = _strip_leading_source_separator(exact_quote)
-            if (
-                candidate == exact_quote
-                or candidate not in self.messages[source_index - 1]
-            ):
+            source_message = self.messages[source_index - 1]
+            if allow_approximate and candidate not in source_message:
+                aligned = _align_approximate_source_quote(
+                    source_message,
+                    candidate,
+                )
+                if aligned is not None:
+                    candidate = aligned
+            if candidate not in source_message:
                 normalized_items.append(item)
                 continue
             normalized_items.append(
@@ -441,6 +460,101 @@ def _strip_leading_source_separator(value: str) -> str:
         while cursor < len(stripped) and stripped[cursor].isspace():
             cursor += 1
     return stripped[cursor:] or value
+
+
+def _align_approximate_source_quote(
+    source_message: str,
+    approximate_quote: str,
+) -> str | None:
+    """Recover one high-confidence contiguous source span without rewriting it."""
+
+    quote, _ = _alignment_text(approximate_quote)
+    source, source_positions = _alignment_text(source_message)
+    if len(quote) < 12 or not source or len(source_positions) != len(source):
+        return None
+
+    blocks = [
+        block
+        for block in SequenceMatcher(
+            None,
+            quote,
+            source,
+            autojunk=False,
+        ).get_matching_blocks()
+        if block.size
+    ]
+    if not blocks:
+        return None
+
+    max_source_span = min(
+        len(source),
+        max(len(quote) + 80, int(len(quote) * 1.8)),
+    )
+    best: tuple[float, int, int, int, int, int] | None = None
+    for start_index, first in enumerate(blocks):
+        matched = 0
+        for block in blocks[start_index:]:
+            source_span = block.b + block.size - first.b
+            if source_span > max_source_span:
+                break
+            matched += block.size
+            query_end = block.a + block.size
+            query_span = query_end - first.a
+            coverage = matched / len(quote)
+            density = matched / max(source_span, query_span, 1)
+            score = coverage * 2 + density
+            candidate = (
+                score,
+                matched,
+                first.a,
+                first.b,
+                query_end,
+                block.b + block.size,
+            )
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+    if best is None:
+        return None
+
+    _, matched, query_start, source_start, query_end, source_end = best
+    coverage = matched / len(quote)
+    if coverage < 0.8:
+        return None
+    source_start = max(0, source_start - query_start)
+    source_end = min(
+        len(source),
+        source_end + (len(quote) - query_end),
+    )
+    if source_start >= source_end:
+        return None
+    candidate = source[source_start:source_end]
+    similarity = SequenceMatcher(
+        None,
+        quote,
+        candidate,
+        autojunk=False,
+    ).ratio()
+    if similarity < 0.76:
+        return None
+
+    original_start = source_positions[source_start]
+    original_end = source_positions[source_end - 1] + 1
+    aligned = source_message[original_start:original_end].strip()
+    if not aligned or len(aligned) > len(approximate_quote) * 2 + 160:
+        return None
+    return aligned
+
+
+def _alignment_text(value: str) -> tuple[str, list[int]]:
+    characters: list[str] = []
+    positions: list[int] = []
+    for index, character in enumerate(value):
+        category = unicodedata.category(character)
+        if character.isspace() or category.startswith(("P", "Z")):
+            continue
+        characters.append(character.casefold())
+        positions.append(index)
+    return "".join(characters), positions
 
 
 def _non_overlapping_quote_spans(

@@ -66,9 +66,47 @@ def finalize_canary_content(
                 default=True,
             ),
         )
+        reply = _strip_embedded_report_snapshot(reply, snapshot)
         if rendered not in reply:
             reply = f"{reply}\n\n{rendered}"
     return reply, model_hash
+
+
+def _strip_embedded_report_snapshot(reply: str, snapshot: dict) -> str:
+    """Drop a model-rendered duplicate before appending the trusted snapshot."""
+
+    fields = snapshot.get("fields")
+    fields = fields if isinstance(fields, dict) else {}
+    expected_items = [
+        str(content or "").strip()
+        for field_name in ("today_work", "problems", "tomorrow_plan")
+        for raw_item in (
+            fields.get(field_name)
+            if isinstance(fields.get(field_name), list)
+            else ()
+        )
+        for content in (
+            raw_item.get("content")
+            if isinstance(raw_item, dict)
+            else raw_item,
+        )
+        if str(content or "").strip()
+    ]
+    if not expected_items:
+        return reply
+    lines = reply.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "今日工作":
+            continue
+        embedded = "\n".join(lines[index:])
+        if not all(content in embedded for content in expected_items):
+            continue
+        prefix = "\n".join(lines[:index]).strip()
+        canonical_header = f"{str(snapshot.get('report_date') or '')} 日报"
+        if prefix == canonical_header:
+            return ""
+        return prefix or reply
+    return reply
 
 
 def _toggle_preference(

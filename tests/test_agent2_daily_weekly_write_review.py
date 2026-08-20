@@ -2309,6 +2309,96 @@ async def test_daily_write_review_accepts_exact_arguments_envelope(
 
 
 @pytest.mark.asyncio
+async def test_daily_review_accepts_content_envelope_with_trusted_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    context = _daily_context_with_tools("add_daily_items")
+    report = context.today_report
+    assert report is not None
+    message = (
+        "计划，跟进苏宁38家债权，优先债权部分的确认情况，"
+        "齐河智慧产业园上诉状答辩资料准备"
+    )
+    items = [
+        {
+            "field": "tomorrow_plan",
+            "content": "跟进苏宁38家债权，优先债权部分的确认情况",
+            "source_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "跟进苏宁38家债权，优先债权部分的确认情况",
+            },
+        },
+        {
+            "field": "tomorrow_plan",
+            "content": "齐河智慧产业园上诉状答辩资料准备",
+            "source_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "齐河智慧产业园上诉状答辩资料准备",
+            },
+        },
+    ]
+    draft = _daily_items_call(
+        call_id="draft-daily",
+        date_selection="trusted_report",
+        report_id=str(report.report_id),
+        expected_version=report.version,
+        items=items,
+    )
+    reviewed = _daily_items_call(call_id="reviewed-daily", items=items)
+    reviewed_arguments = json.loads(reviewed["function"]["arguments"])
+    reviewed["function"]["arguments"] = json.dumps(
+        {
+            "arguments_without_fallible_date_target": {
+                "items": reviewed_arguments["items"],
+                "submit_after_write": False,
+                "acknowledged_empty_fields": [],
+                "empty_field_evidence": [],
+            },
+            "date_selection": "trusted_report",
+            "report_id": str(report.report_id),
+            "expected_version": report.version,
+        },
+        ensure_ascii=False,
+    )
+    completions = iter(
+        (
+            _tool_completion(draft),
+            _tool_completion(reviewed),
+            _terminal_completion("两项计划已记入日报。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text=message,
+        context=context,
+        runtime_session=runtime,
+    )
+
+    assert result.final_content == "两项计划已记入日报。"
+    assert runtime.execute_count == 1
+    assert runtime.calls[0].arguments["date_selection"] == "trusted_report"
+    assert runtime.calls[0].arguments["report_id"] == str(report.report_id)
+    assert [item["content"] for item in runtime.calls[0].arguments["items"]] == [
+        item["content"] for item in items
+    ]
+
+
+@pytest.mark.asyncio
 async def test_independent_review_restores_a_weekly_write_omitted_from_daily_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

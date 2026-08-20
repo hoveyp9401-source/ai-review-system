@@ -213,6 +213,30 @@ def test_completed_owner_content_edits_are_not_locked_after_historical_cutoff(
     )
 
 
+def test_completed_historical_confirmation_is_a_read_only_noop_not_a_lock() -> None:
+    report = _trusted_completed_report()
+    context = SimpleNamespace(
+        now=datetime(2026, 8, 12, 2, 0, tzinfo=UTC),
+        principal=SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+    definition = SimpleNamespace(
+        tool_name="confirm_report",
+        read_or_write="write",
+        permission_policy="authenticated_report_owner_write",
+        object_binding_policy="trusted_report_version",
+    )
+
+    assert (
+        _locked_historical_report_date(
+            context=context,
+            definition=definition,
+            report=report,
+            date_facts={},
+        )
+        is None
+    )
+
+
 def test_historical_cutoff_still_blocks_non_completed_or_broad_operations() -> None:
     completed = _trusted_completed_report()
     collecting = completed.model_copy(update={"status": "collecting"})

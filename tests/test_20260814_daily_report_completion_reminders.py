@@ -327,6 +327,98 @@ def test_completed_report_receipt_does_not_offer_confirmation_or_a_draft() -> No
 
 
 @pytest.mark.asyncio
+async def test_confirming_an_already_completed_report_returns_a_noop_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_id = uuid5(NAMESPACE_URL, "already-completed-report")
+    user_id = uuid5(NAMESPACE_URL, "already-completed-user")
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="tenant-test",
+        owner_user_id=user_id,
+        report_date=date(2026, 8, 19),
+        version=7,
+        status="completed",
+        items=(
+            TrustedReportItem(
+                item_id="completed-work",
+                field="today_work",
+                content="完成合同审核",
+                report_id=report_id,
+                report_version=7,
+            ),
+            TrustedReportItem(
+                item_id="completed-plan",
+                field="tomorrow_plan",
+                content="继续跟进项目",
+                report_id=report_id,
+                report_version=7,
+            ),
+        ),
+        acknowledged_empty_fields=frozenset({"problems"}),
+    )
+    executor = ProductionDailyExecutor.__new__(ProductionDailyExecutor)
+    executor._context = SimpleNamespace(
+        principal=SimpleNamespace(
+            tenant_id="tenant-test",
+            user_id=user_id,
+            conversation_id="conversation-test",
+            source_message_id="message-test",
+            timezone="Asia/Shanghai",
+        ),
+        now=datetime(2026, 8, 20, 9, 8, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    executor._settings = SimpleNamespace()
+    executor._arguments = lambda request, _expected_type: request.arguments
+    executor._bound = lambda _request: SimpleNamespace(report=report)
+    executor._required_bound_report = lambda _bound: report
+    executor._require_same_report = lambda _trusted, _live_id: None
+    executor._tool_idempotency_key = lambda _request: "daily:already-completed"
+
+    async def snapshot(_report_date):
+        return report
+
+    async def typed_snapshot(_report_date):
+        return SimpleNamespace(
+            report_id=report_id,
+            version=7,
+            status="completed",
+            today_work=("完成合同审核",),
+            problems=(),
+            tomorrow_plan=("继续跟进项目",),
+            acknowledged_empty_fields=frozenset({"problems"}),
+        )
+
+    async def must_not_execute(*_args, **_kwargs):
+        raise AssertionError("completed confirmation must not write again")
+
+    monkeypatch.setattr(executor, "_snapshot", snapshot)
+    monkeypatch.setattr(executor, "_typed_snapshot", typed_snapshot)
+    monkeypatch.setattr(executor, "_execute_typed", must_not_execute)
+    request = ProductionHandlerRequest(
+        tool_call_id="confirm-completed",
+        tool_name="confirm_report",
+        arguments=ConfirmReportArgs(
+            report_id=report_id,
+            expected_version=7,
+        ),
+        executor=executor,
+        memory_executor=executor,
+    )
+
+    outcome = await executor.confirm_report(request)
+
+    assert outcome.status_if_unchanged == ReceiptStatus.NO_OP
+    assert outcome.before_report == report
+    assert outcome.after_report == report
+    assert outcome.safe_user_facts is not None
+    assert outcome.safe_user_facts["actual_write"] is False
+    assert outcome.safe_user_facts["report_status"] == "completed"
+    assert outcome.safe_user_facts["confirmation_available"] is False
+    assert outcome.safe_user_facts["persisted_draft_available"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("missing_field", "expected_missing"),
     (

@@ -1079,6 +1079,13 @@ class ProductionDailyExecutor:
             report_status=live.status,
             persisted_report_available=before is not None,
         )
+        if live.status == "completed":
+            return self._outcome(
+                request,
+                before=before,
+                after=before,
+                typed_receipt_ids=(),
+            )
         if completion_facts["missing_sections"]:
             return ProductionHandlerOutcome(
                 target_type="daily_report",

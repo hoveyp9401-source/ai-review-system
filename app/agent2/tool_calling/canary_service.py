@@ -190,6 +190,7 @@ class CanaryIngressExecutionError(RuntimeError):
         model_transport_retry_count: int = 0,
         model_elapsed_seconds: float = 0.0,
         daily_write_retry_continuation: dict[str, Any] | None = None,
+        user_message: str | None = None,
     ) -> None:
         self.reason = reason or self.reason
         super().__init__(self.reason)
@@ -213,12 +214,16 @@ class CanaryIngressExecutionError(RuntimeError):
                 daily_write_retry_continuation
             )
         )
+        self.user_message = str(user_message or "").strip()
 
     def outcome(self) -> CanaryIngressOutcome:
         return CanaryIngressOutcome(
             owner="blocked",
             reason=self.reason,
-            message=canary_block_message(self.reason),
+            message=(
+                self.user_message
+                or canary_block_message(self.reason)
+            ),
             handled=True,
             actual_write=False,
             messages_enabled=self.messages_enabled,
@@ -251,6 +256,7 @@ def _record_canary_execution_failure(
     conversation_id: str = "",
     system_prompt_sha256: str | None = None,
     daily_write_retry_continuation: dict[str, Any] | None = None,
+    user_message: str | None = None,
 ) -> CanaryIngressExecutionError:
     model_turns = tuple(getattr(error, "model_turns", ()) or ())
     model_call_count = max(
@@ -320,6 +326,7 @@ def _record_canary_execution_failure(
         daily_write_retry_continuation=(
             daily_write_retry_continuation
         ),
+        user_message=user_message,
     )
 
 
@@ -1004,6 +1011,18 @@ async def process_tool_call_canary_ingress(
     except Exception as exc:
         if turn_transaction.is_active:
             await turn_transaction.rollback()
+        daily_retry_continuation = _selected_daily_retry_continuation(
+            error=exc,
+            context=context,
+        )
+        failure_facts = _failure_explanation_facts(
+            exc,
+            retry_available=daily_retry_continuation is not None,
+        )
+        user_failure_message = await _compose_failure_explanation(
+            llm_client,
+            facts=failure_facts,
+        )
         failure = _record_canary_execution_failure(
             error=exc,
             messages_enabled=bool(
@@ -1015,18 +1034,181 @@ async def process_tool_call_canary_ingress(
             user_id=str(getattr(user, "id", "") or ""),
             conversation_id=canonical_conversation_id,
             system_prompt_sha256=rendered_prompt_sha256,
-            daily_write_retry_continuation=(
-                _selected_daily_retry_continuation(
-                    error=exc,
-                    context=context,
-                )
-            ),
+            daily_write_retry_continuation=daily_retry_continuation,
+            user_message=user_failure_message,
         )
         if failure.messages_enabled:
             return failure.outcome()
         raise failure from exc
     _record_canary_metric_safely(**metric_fields)
     return outcome
+
+
+def _failure_explanation_facts(
+    error: Exception,
+    *,
+    retry_available: bool,
+) -> dict[str, Any]:
+    message = str(error or "")
+    model_turns = tuple(getattr(error, "model_turns", ()) or ())
+    finish_reasons = {
+        str(metadata.get("finish_reason") or "")
+        for turn in model_turns
+        if isinstance(
+            (metadata := getattr(turn, "response_metadata", None)),
+            Mapping,
+        )
+    }
+    upper = message.upper()
+    lower = message.lower()
+    if "source validation failed" in lower or any(
+        code in upper
+        for code in (
+            "DAILY_ITEM_",
+            "CURRENT_MESSAGE_EVIDENCE",
+        )
+    ):
+        failure_kind = "source_mismatch"
+        plain_cause = (
+            "拆分后的某条内容与用户原话没有完全对应，为避免写错而停止保存"
+        )
+    elif "review" in lower or "semantic repair" in lower:
+        failure_kind = "review_incomplete"
+        plain_cause = (
+            "内容已经整理出来，但保存前的最终检查没有给出完整结论"
+        )
+    elif "length" in finish_reasons or "timeout" in lower:
+        failure_kind = "response_incomplete"
+        plain_cause = "整理过程在返回完整结果前中断"
+    elif any(
+        marker in upper
+        for marker in (
+            "INVALID_REPORT_STATE",
+            "VERSION_CONFLICT",
+            "STALE_REPORT_VERSION",
+            "HISTORICAL_REPORT_LOCKED",
+        )
+    ):
+        failure_kind = "report_state_changed"
+        plain_cause = (
+            "处理期间日报状态发生了变化，为避免覆盖较新的内容而停止操作"
+        )
+    else:
+        failure_kind = "processing_interrupted"
+        plain_cause = "本次处理在完成保存前意外中断"
+    next_step_kind = (
+        "continue_retry"
+        if retry_available
+        else (
+            "reload_then_continue"
+            if failure_kind == "report_state_changed"
+            else "resend_or_split"
+        )
+    )
+    return {
+        "message_received": True,
+        "actual_write": False,
+        "failure_kind": failure_kind,
+        "plain_cause": plain_cause,
+        "retry_available": retry_available,
+        "next_step_kind": next_step_kind,
+    }
+
+
+async def _compose_failure_explanation(
+    llm_client: Any,
+    *,
+    facts: Mapping[str, Any],
+) -> str:
+    no_write = "本次没有写入任何内容。"
+    next_steps = {
+        "continue_retry": "你不用重新发送，直接回复“继续重试”即可。",
+        "reload_then_continue": (
+            "请回复“按当前内容继续”，我会先重新读取这份日报再处理。"
+        ),
+        "resend_or_split": (
+            "请把刚才那条消息再发一次；如果内容很长，可以分成两三段连续发，"
+            "我会合并处理。"
+        ),
+    }
+    next_step = next_steps[str(facts.get("next_step_kind") or "")]
+    fallback = (
+        f"抱歉，我已经收到你的消息，但{facts['plain_cause']}。"
+        f"{no_write}{next_step}"
+    )
+    try:
+        raw = await llm_client.complete_json(
+            system_prompt=(
+                "你是面向普通用户的Agent2故障说明助手。只根据给定安全事实，"
+                "用自然、简短、易懂的中文生成两段：acknowledgement只确认消息已经"
+                "收到；explanation只解释为什么这次处理没能完成。不得在这两段里"
+                "说明是否写入，也不得指导用户下一步；这些会由服务器根据真实状态"
+                "另行补充一次。不得出现架构、参数、JSON、schema、工具调用、错误码"
+                "等技术词；不得声称已保存、已写入或已提交。返回且只返回JSON对象："
+                "{\"acknowledgement\":\"...\",\"explanation\":\"...\"}。"
+            ),
+            user_prompt=json.dumps(
+                dict(facts),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            model=CANARY_MODEL_NAME,
+            thinking_enabled=False,
+            timeout_seconds=min(20.0, CANARY_TIMEOUT_SECONDS),
+            max_retries=0,
+            max_tokens=600,
+        )
+        payload = json.loads(raw)
+        acknowledgement = (
+            payload.get("acknowledgement")
+            if isinstance(payload, dict)
+            else None
+        )
+        explanation = (
+            payload.get("explanation")
+            if isinstance(payload, dict)
+            else None
+        )
+        combined = f"{acknowledgement or ''}{explanation or ''}"
+        if (
+            not isinstance(acknowledgement, str)
+            or not acknowledgement.strip()
+            or len(acknowledgement) > 200
+            or not isinstance(explanation, str)
+            or not explanation.strip()
+            or len(explanation) > 300
+            or any(
+                claim in combined
+                for claim in (
+                    "已经保存",
+                    "已保存",
+                    "已经写入",
+                    "已写入",
+                    "已经提交",
+                    "已提交",
+                    "没有保存",
+                    "没有写入",
+                    "未写入",
+                    "重新发送",
+                    "再发一次",
+                    "继续重试",
+                    "下一步",
+                    "JSON",
+                    "schema",
+                    "tool_call",
+                    "错误码",
+                )
+            )
+        ):
+            return fallback
+        return (
+            f"{acknowledgement.strip()}"
+            f"{explanation.strip()}"
+            f"{no_write}{next_step}"
+        )
+    except Exception:
+        return fallback
 
 
 def _receipt_status_counts(receipts: tuple[Any, ...]) -> dict[str, int]:

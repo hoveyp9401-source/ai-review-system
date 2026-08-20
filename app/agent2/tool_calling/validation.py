@@ -1201,6 +1201,7 @@ def _locked_historical_report_date(
             "edit_daily_items",
             "delete_daily_items",
             "move_daily_items",
+            "confirm_report",
         }
     ):
         return None

@@ -11,7 +11,10 @@ import pytest
 
 from app.agent2.tool_calling.contracts import AddDailyItemsArgs
 from app.agent2.tool_calling.production_store import _text_content
-from app.agent2.tool_calling.receipt_reply import _render_report_snapshot
+from app.agent2.tool_calling.receipt_reply import (
+    _render_report_snapshot,
+    _strip_embedded_report_snapshot,
+)
 from app.agent2.typed_daily_commands import (
     DailyReportMutationSnapshot,
     TypedDailyCommand,
@@ -188,6 +191,32 @@ def test_unacknowledged_empty_problem_renders_as_unfilled_not_no_problem() -> No
 
     assert "问题风险\n（未填写）" in rendered
     assert "问题风险\n暂无明显问题" not in rendered
+
+
+def test_duplicate_model_report_snapshot_is_removed_before_trusted_render() -> None:
+    snapshot = {
+        "report_date": "2026-08-20",
+        "status": "pending_confirmation",
+        "acknowledged_empty_fields": ["problems"],
+        "fields": {
+            "today_work": [{"content": "完成合同复核"}],
+            "problems": [{"content": "暂无明显问题"}],
+            "tomorrow_plan": [{"content": "继续跟进项目"}],
+        },
+    }
+    model_reply = (
+        "2026-08-20 日报已按昨天内容填写完整，当前为待确认状态。\n\n"
+        "今日工作\n1. 完成合同复核\n\n"
+        "问题风险\n1. 暂无明显问题\n\n"
+        "明日计划\n1. 继续跟进项目\n\n"
+        "如需继续修改可以告诉我。"
+    )
+
+    stripped = _strip_embedded_report_snapshot(model_reply, snapshot)
+
+    assert stripped == (
+        "2026-08-20 日报已按昨天内容填写完整，当前为待确认状态。"
+    )
 
 
 def test_voice_recent_context_contains_only_recognition_text() -> None:

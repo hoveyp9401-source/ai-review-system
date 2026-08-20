@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import ValidationError
 
 from app.agent2.tool_calling.assembly import TrustedContextRequest
 from app.agent2.tool_calling.context import (
@@ -348,6 +349,9 @@ def _focused_daily_plan_completion(call: NativeToolCall) -> _CompletionResponse:
         "empty_field_evidence": [],
         "submit_after_write": bool(
             call.arguments.get("submit_after_write", False)
+        ),
+        "submission_evidence": call.arguments.get(
+            "submission_evidence"
         ),
         "reply": "已按原文完整记录。",
     }
@@ -740,6 +744,10 @@ def test_focused_daily_submit_marks_reviewed_omitted_sections_empty() -> None:
             },
             "empty_field_evidence": [],
             "submit_after_write": True,
+            "submission_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "请立即提交",
+            },
             "reply": "已按原文记录并提交。",
         }
     )
@@ -747,6 +755,28 @@ def test_focused_daily_submit_marks_reviewed_omitted_sections_empty() -> None:
     assert arguments["acknowledged_empty_fields"] == ["problems"]
     assert arguments["reviewed_omitted_empty_fields"] == ["problems"]
     assert arguments["empty_field_evidence"] == []
+
+
+def test_focused_daily_submit_requires_exact_current_authorization() -> None:
+    with pytest.raises(ValidationError):
+        compile_focused_daily_plan_arguments(
+            {
+                "date_selection": "server_default",
+                "fields": {
+                    "today_work": [
+                        {
+                            "source_message_index": 1,
+                            "exact_quote": "今日完成合同复核",
+                        }
+                    ],
+                    "problems": [],
+                    "tomorrow_plan": [],
+                },
+                "empty_field_evidence": [],
+                "submit_after_write": True,
+                "reply": "已提交。",
+            }
+        )
 
 
 def test_focused_daily_draft_does_not_mark_omitted_sections_empty() -> None:
@@ -824,6 +854,10 @@ def test_submit_only_focused_plan_falls_back_to_full_agent2() -> None:
             "date_selection": "server_default",
             "items": [],
             "submit_after_write": True,
+            "submission_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "确认提交",
+            },
         },
     )
 
@@ -1038,6 +1072,86 @@ async def test_malformed_long_daily_uses_bounded_compact_repair_without_full_rep
 
 
 @pytest.mark.asyncio
+async def test_exact_quote_mismatch_uses_fast_source_repair_then_full_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "完成合同复核。"
+    invalid = NativeToolCall(
+        tool_call_id="invalid-source-quote",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成合同审核",
+                    },
+                }
+            ],
+        },
+    )
+    repaired = NativeToolCall(
+        tool_call_id="repaired-source-quote",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": source,
+                    },
+                }
+            ],
+        },
+    )
+    completions = iter(
+        (
+            _focused_daily_plan_completion(invalid),
+            _focused_daily_plan_completion(repaired),
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+    requests: list[dict[str, object]] = []
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        requests.append(
+            {
+                "system": messages[0]["content"],
+                "tool_names": tuple(
+                    item["function"]["name"] for item in tool_schemas
+                ),
+                "thinking_enabled": thinking_enabled,
+            }
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=source,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert requests[1]["tool_names"] == ("plan_daily_report",)
+    assert requests[1]["thinking_enabled"] is False
+    assert "previous focused Daily plan" in requests[1]["system"]
+    assert requests[2]["tool_names"] == ("review_daily_plan",)
+    assert requests[2]["thinking_enabled"] is True
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+
+
+@pytest.mark.asyncio
 async def test_long_daily_probe_uses_strict_plan_before_scope_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1083,6 +1197,124 @@ async def test_long_daily_probe_uses_strict_plan_before_scope_review(
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert runtime.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_focused_review_length_without_verdict_gets_one_fast_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    completions = iter(
+        (
+            _focused_daily_plan_completion(
+                _compact_long_daily_call("focused-review-retry")
+            ),
+            _CompletionResponse(
+                message={"role": "assistant", "content": ""},
+                metadata={"finish_reason": "length"},
+            ),
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+    requests: list[dict[str, object]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        requests.append(
+            {
+                "tool_names": tuple(
+                    item["function"]["name"] for item in tool_schemas
+                ),
+                "thinking_enabled": thinking_enabled,
+            }
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=(
+            "今天完成A合同复核并向业务反馈两项修改意见；"
+            "随后与财务核对B项目付款节点。"
+            "明天继续跟进C案件证据清单。"
+        ),
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert requests[1]["tool_names"] == ("review_daily_plan",)
+    assert requests[1]["thinking_enabled"] is True
+    assert requests[2]["tool_names"] == ("review_daily_plan",)
+    assert requests[2]["thinking_enabled"] is False
+    assert result.model_turns[2].response_metadata[
+        "focused_daily_review_fast_retry"
+    ] is True
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_complex_daily_requires_a_second_independent_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matters = [f"完成第{index}项合同复核" for index in range(1, 9)]
+    source = "今日工作：" + "；".join(matters)
+    call = NativeToolCall(
+        tool_call_id="complex-daily-plan",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": matter,
+                    },
+                }
+                for matter in matters
+            ],
+        },
+    )
+    completions = iter(
+        (
+            _focused_daily_plan_completion(call),
+            _focused_daily_review_completion(approved=True),
+            _focused_daily_review_completion(approved=True),
+        )
+    )
+    requests: list[list[dict]] = []
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del tool_schemas, thinking_enabled
+        requests.append(messages)
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=source,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert len(requests) == 3
+    assert "final independent completeness challenger" in requests[2][0][
+        "content"
+    ]
+    assert result.model_turns[2].response_metadata[
+        "focused_daily_completeness_challenge"
+    ] is True
+    assert runtime.execute_count == 1
+    assert runtime.commit_count == 1
 
 
 @pytest.mark.asyncio
@@ -1234,6 +1466,10 @@ async def test_focused_daily_can_submit_without_inventing_a_missing_section(
                 },
             ],
             "submit_after_write": True,
+            "submission_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "请立即提交",
+            },
         },
     )
     completions = iter(
@@ -1415,7 +1651,7 @@ async def test_focused_review_repairs_over_split_daily_before_execution(
     assert requests[2]["tool_names"] == ("plan_daily_report",)
     assert requests[2]["thinking_enabled"] is True
     assert requests[3]["tool_names"] == ("review_daily_plan",)
-    assert requests[3]["thinking_enabled"] is True
+    assert requests[3]["thinking_enabled"] is False
 
 
 @pytest.mark.asyncio

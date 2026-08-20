@@ -7,6 +7,7 @@ from pydantic import Field, model_validator
 
 from app.agent2.tool_calling.contracts import (
     AddDailyItemsArgs,
+    CurrentUserMessageEvidence,
     DailyEmptyFieldEvidence,
     DailyItemSourceEvidence,
     ReportField,
@@ -108,6 +109,18 @@ class FocusedDailyFields(StrictContract):
     )
 
 
+class FocusedDailySubmissionEvidence(CurrentUserMessageEvidence):
+    exact_quote: str = Field(
+        min_length=1,
+        max_length=1000,
+        description=(
+            "Exact contiguous current-message text that explicitly authorizes "
+            "submitting or confirming this Daily Report now. A recommendation, "
+            "work conclusion, or request to save/fill the report is not submission."
+        ),
+    )
+
+
 class FocusedDailyPlanArguments(StrictContract):
     date_selection: Literal["server_default"]
     fields: FocusedDailyFields
@@ -115,11 +128,35 @@ class FocusedDailyPlanArguments(StrictContract):
         max_length=3
     )
     submit_after_write: bool
+    submission_evidence: FocusedDailySubmissionEvidence | None = None
     reply: str = Field(min_length=1, max_length=8000)
+
+    @model_validator(mode="after")
+    def require_exact_submission_authorization(
+        self,
+    ) -> "FocusedDailyPlanArguments":
+        if self.submit_after_write != (self.submission_evidence is not None):
+            raise ValueError(
+                "submission evidence is required exactly when submitting"
+            )
+        return self
 
 
 def focused_daily_plan_parameters_schema() -> dict[str, Any]:
     return FocusedDailyPlanArguments.model_json_schema()
+
+
+def focused_daily_submission_evidence(
+    arguments: Any,
+) -> dict[str, Any] | None:
+    plan = FocusedDailyPlanArguments.model_validate(
+        _normalize_focused_empty_field_evidence(arguments)
+    )
+    return (
+        plan.submission_evidence.model_dump(mode="json")
+        if plan.submission_evidence is not None
+        else None
+    )
 
 
 def compile_focused_daily_plan_arguments(
@@ -335,6 +372,23 @@ def parse_focused_daily_add_decision(
     compiled = None
     if decision.arguments is not None:
         raw_arguments = dict(decision.arguments)
+        submission_evidence = raw_arguments.pop(
+            "submission_evidence",
+            None,
+        )
+        validated_submission_evidence = (
+            FocusedDailySubmissionEvidence.model_validate(
+                submission_evidence
+            )
+            if submission_evidence is not None
+            else None
+        )
+        if bool(raw_arguments.get("submit_after_write")) != (
+            validated_submission_evidence is not None
+        ):
+            raise ValueError(
+                "submission evidence is required exactly when submitting"
+            )
         raw_fields = raw_arguments.pop("fields", None)
         if isinstance(raw_fields, dict):
             raw_fields = {
