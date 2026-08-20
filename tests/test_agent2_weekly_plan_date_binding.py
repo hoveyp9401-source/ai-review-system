@@ -54,6 +54,42 @@ def test_explicit_next_weekday_is_bound_to_the_model_proposed_calendar_date():
 @pytest.mark.parametrize(
     ("clause", "proposed"),
     (
+        ("今天整理立案材料", date(2026, 8, 17)),
+        ("明天准备甲案件开庭材料", date(2026, 8, 18)),
+        ("后天跟进乙项目付款", date(2026, 8, 19)),
+    ),
+)
+def test_relative_calendar_day_binds_inside_the_selected_week(
+    clause,
+    proposed,
+):
+    result = _validate(
+        clause,
+        clause,
+        proposed,
+        occurred_at=datetime(2026, 8, 17, 8, 30, tzinfo=SHANGHAI),
+        week=date(2026, 8, 17),
+    )
+
+    assert result.resolved_date == proposed
+    assert result.basis == "relative_calendar_day"
+
+
+def test_consistent_month_day_and_weekday_are_not_treated_as_ambiguous():
+    result = _validate(
+        "8月18日周二整理案件卷宗",
+        "8月18日周二整理案件卷宗",
+        date(2026, 8, 18),
+        occurred_at=datetime(2026, 8, 17, 8, 30, tzinfo=SHANGHAI),
+        week=date(2026, 8, 17),
+    )
+
+    assert result.resolved_date == date(2026, 8, 18)
+
+
+@pytest.mark.parametrize(
+    ("clause", "proposed"),
+    (
         ("补本周三做案件复盘", date(2026, 8, 19)),
         ("补本周周三做案件复盘", date(2026, 8, 19)),
         ("下周三整理证据", date(2026, 8, 26)),
@@ -215,4 +251,25 @@ def test_explicit_monday_to_friday_daily_scope_binds_exactly_five_plan_days():
 
     assert result.resolved_dates == tuple(
         date(2026, 8, 17) + timedelta(days=offset) for offset in range(5)
+    )
+
+
+def test_adjacent_daily_word_is_recovered_from_the_complete_source_clause():
+    result = validate_weekly_plan_date_set_binding(
+        source_message="下周一到周五每天做档案催收和日常用印审核。",
+        exact_clause_quote="下周一到周五每天做档案催收和日常用印审核。",
+        recurrence_scope_quote="下周一到周五",
+        matter_text="档案催收",
+        source_occurred_at=datetime(2026, 8, 14, 17, 30, tzinfo=SHANGHAI),
+        business_timezone="Asia/Shanghai",
+        target_week_start=date(2026, 8, 17),
+        proposed_dates=tuple(
+            date(2026, 8, 17) + timedelta(days=offset)
+            for offset in range(5)
+        ),
+    )
+
+    assert result.resolved_dates == tuple(
+        date(2026, 8, 17) + timedelta(days=offset)
+        for offset in range(5)
     )

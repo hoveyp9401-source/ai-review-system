@@ -36,6 +36,20 @@ class StrictContract(BaseModel):
 
 
 NonEmptyText = Annotated[str, Field(min_length=1, max_length=4000)]
+WeeklyPlanMatterText = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=4000,
+        description=(
+            "Only the user's planned work matter, in conservative natural wording. "
+            "Exclude every instruction addressed to the assistant about adding, editing, "
+            "moving, deleting, saving, previewing, confirming, submitting, or deliberately "
+            "not submitting the plan. Preserve every work-related condition, amount, "
+            "negation, dependency, and deadline."
+        ),
+    ),
+]
 DateExpression = Annotated[str, Field(min_length=1, max_length=128)]
 ItemId = Annotated[str, Field(min_length=1, max_length=256)]
 WeeklyPlanOperationId = Annotated[str, Field(min_length=1, max_length=128)]
@@ -117,13 +131,32 @@ class WeeklyPlanExplicitDateEvidence(CurrentUserMessageEvidence):
             max_length=500,
             description=(
                 "For one matter expanded to multiple exact plan dates, copy the "
-                "complete contiguous date-scope text, such as 下周每天 or "
-                "周一到周五每天. Include every qualifier or exclusion attached "
-                "to that scope; never truncate a restricted phrase to just 每天. "
-                "Omit it for a single-date operation."
+                "complete contiguous date-scope text only, such as 下周每天 or "
+                "周一到周五每天. Stop before the work action and matter: for "
+                "下周每天做日常用印审核, quote 下周每天, not the whole phrase. "
+                "Include every date qualifier or exclusion attached to that scope; "
+                "never truncate a restricted phrase to just 每天. Omit it for a "
+                "single-date operation."
             ),
         ),
     ] | None = None
+
+
+class WeeklyPlanContentEvidence(CurrentUserMessageEvidence):
+    """One complete current-message clause grounding replacement wording."""
+
+    exact_clause_quote: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=2000,
+            description=(
+                "Exact complete current-message clause that supplies the new or "
+                "replacement weekly-plan content. Preserve every attached condition, "
+                "amount, negation, dependency, and deadline."
+            ),
+        ),
+    ]
 
 
 class PersonalMemorySourceEvidence(CurrentUserMessageEvidence):
@@ -223,13 +256,14 @@ class WeeklyPlanAddOperation(_WeeklyPlanOperation):
     source_evidence: WeeklyPlanExplicitDateEvidence
     operation: Literal["add"]
     plan_date: date
-    content: NonEmptyText
+    content: WeeklyPlanMatterText
 
 
 class WeeklyPlanEditOperation(_WeeklyPlanOperation):
+    source_evidence: WeeklyPlanContentEvidence
     operation: Literal["edit"]
     item_id: ItemId
-    content: NonEmptyText
+    content: WeeklyPlanMatterText
 
 
 class WeeklyPlanMoveOperation(_WeeklyPlanOperation):
@@ -290,6 +324,13 @@ class ApplyNextWeeklyPlanArgs(StrictContract):
     operations: tuple[WeeklyPlanOperation, ...] = Field(
         min_length=1,
         max_length=50,
+    )
+    content_reviewed: bool = Field(
+        default=False,
+        description=(
+            "Server-only proof that an independent semantic review approved "
+            "the weekly-plan wording. Models cannot set this field."
+        ),
     )
 
     @field_validator("operations")

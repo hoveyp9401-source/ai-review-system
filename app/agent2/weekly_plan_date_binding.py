@@ -44,6 +44,9 @@ _RELATIVE_DAY = re.compile(
     r"(?P<prefix>下周周|本周周|这周周|下周|下星期|本周|本星期|这周|这星期|周|星期|礼拜)"
     r"(?P<day>[一二三四五六日天])"
 )
+_RELATIVE_CALENDAR_DAY = re.compile(
+    r"(?P<day>今天|明天|后天)"
+)
 _ISO_DATE = re.compile(r"(?<!\d)(?P<year>20\d{2})[-/.年](?P<month>\d{1,2})[-/.月](?P<day>\d{1,2})(?:日|号)?(?!\d)")
 _MONTH_DAY = re.compile(r"(?<!\d)(?P<month>\d{1,2})月(?P<day>\d{1,2})(?:日|号)?(?!\d)")
 _UNSAFE_RELATION = re.compile(r"(?:之前|以前|前完成|前交|左右|附近|前后|~|～|或者|或是|或)")
@@ -146,12 +149,34 @@ def resolve_explicit_weekly_plan_date(
                 prefix not in {"周", "星期", "礼拜"},
             )
         )
+    for match in _RELATIVE_CALENDAR_DAY.finditer(clause):
+        offset = {
+            "今天": 0,
+            "明天": 1,
+            "后天": 2,
+        }[match.group("day")]
+        candidates.append(
+            (
+                local_date + timedelta(days=offset),
+                "relative_calendar_day",
+                True,
+            )
+        )
 
     unique_dates = {candidate for candidate, _, _ in candidates}
     if not candidates:
         raise WeeklyPlanDateBindingError("WEEKLY_PLAN_DAY_NOT_EXPLICIT")
-    if len(candidates) == 1 and len(unique_dates) == 1:
-        resolved, basis, week_scope_explicit = candidates[0]
+    if candidates and len(unique_dates) == 1:
+        resolved = next(iter(unique_dates))
+        bases = {basis for _, basis, _ in candidates}
+        basis = (
+            next(iter(bases))
+            if len(bases) == 1
+            else "consistent_date_evidence"
+        )
+        week_scope_explicit = any(
+            explicit for _, _, explicit in candidates
+        )
     elif (
         date_role == "move_target"
         and len(candidates) == 2
@@ -232,6 +257,20 @@ def validate_weekly_plan_date_set_binding(
         raise WeeklyPlanDateBindingError(
             "WEEKLY_PLAN_RECURRENCE_SCOPE_EVIDENCE_MISMATCH"
         )
+    if not _DAILY_RECURRENCE.search(scope):
+        recurrence_matches = tuple(_DAILY_RECURRENCE.finditer(clause))
+        scope_start = clause.index(scope)
+        scope_end = scope_start + len(scope)
+        if (
+            len(recurrence_matches) == 1
+            and recurrence_matches[0].start() >= scope_end
+            and not clause[
+                scope_end : recurrence_matches[0].start()
+            ].strip()
+        ):
+            scope = clause[
+                scope_start : recurrence_matches[0].end()
+            ]
     if source_occurred_at.tzinfo is None or source_occurred_at.utcoffset() is None:
         raise WeeklyPlanDateBindingError("WEEKLY_PLAN_SOURCE_TIME_REQUIRED")
     if target_week_start.weekday() != 0:

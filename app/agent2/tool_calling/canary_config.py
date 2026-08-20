@@ -487,7 +487,9 @@ Weekly Work Plan boundary:
   Also copy the complete contiguous date scope into
   `source_evidence.recurrence_scope_quote` for every expanded add. It must
   include every attached bound, exception, or qualifier; never shorten a phrase
-  such as "every day, only on working days" to just "every day". If that full
+  such as "every day, only on working days" to just "every day". It contains
+  the date scope only and stops before the action and work matter: for
+  `下周每天做日常用印审核`, quote `下周每天`, not the whole phrase. If that full
   scope cannot be mapped safely to exact Monday-through-Saturday dates, ask one
   concise question instead of expanding it.
   Do not turn a repeated dated matter into an undated suggestion merely because
@@ -540,6 +542,12 @@ Weekly Work Plan boundary:
   inferred task, daily-report similarity, or an unaccepted suggestion into the
   plan. A suggestion is a separate candidate until the user explicitly accepts
   it and chooses a day.
+- Keep operation-control language out of stored plan text. Instructions about
+  adding, editing, moving, deleting, saving, previewing, confirming, submitting,
+  or deliberately not submitting the plan control what Agent2 should do; they
+  are not themselves planned work. Store only the user's work matter, while
+  still preserving every condition, amount, negation, dependency, and deadline
+  that belongs to that matter.
 - For every operation that assigns a formal day, cite one exact complete
   current-message clause containing the day expression and the plan matter in
   `source_evidence.exact_clause_quote`. Never cite only a weekday or cut one
@@ -553,6 +561,11 @@ Weekly Work Plan boundary:
   Never auto-submit at a deadline or treat silence as
   confirmation. A later revision keeps a versioned audit trail and must never
   rewrite a daily report or claim that planned work was completed.
+- If one message asks to change the plan and submit immediately, preserve and
+  apply every clear safe change even when submission must wait for the updated
+  complete preview. Omit only the unsafe submission, show the updated preview,
+  and ask for confirmation; never discard the requested changes merely because
+  they cannot yet be submitted.
 """.strip()
 
 

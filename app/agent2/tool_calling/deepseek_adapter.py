@@ -1345,6 +1345,19 @@ class DeepSeekToolCallingAdapter:
                         and daily_weekly_review_tool_names
                         == frozenset({"add_daily_items"})
                     )
+                    focused_weekly_review = (
+                        {
+                            domain
+                            for call in parsed.tool_calls
+                            if (
+                                domain := _daily_weekly_write_domain(
+                                    call.tool_name
+                                )
+                            )
+                            is not None
+                        }
+                        == {"weekly"}
+                    )
                     review_messages = (
                         _bounded_daily_add_review_messages(
                             user_text=user_text,
@@ -1382,7 +1395,11 @@ class DeepSeekToolCallingAdapter:
                             thinking_enabled=(
                                 True
                                 if focused_daily_review
-                                else not bounded_daily_turn_active
+                                else (
+                                    False
+                                    if focused_weekly_review
+                                    else not bounded_daily_turn_active
+                                )
                             ),
                         )
                         iterations += 1
@@ -1930,6 +1947,7 @@ class DeepSeekToolCallingAdapter:
                             ),
                             context=context,
                         )
+                        parsed = _mark_reviewed_weekly_plan_content(parsed)
                         if bounded_daily_turn_active:
                             parsed = _mark_reviewed_daily_content(parsed)
                     except ValueError as exc:
@@ -3399,6 +3417,12 @@ def _parse_native_tool_call(
                 )
                 else parse_status
             )
+        elif name == "apply_next_weekly_plan" and isinstance(decoded, dict):
+            decoded = {
+                key: value
+                for key, value in decoded.items()
+                if key != "content_reviewed"
+            }
         validated = validate_tool_arguments(name, decoded)
     except UnknownToolError as exc:
         raise UnknownNativeToolError(
@@ -4797,6 +4821,19 @@ def _daily_weekly_write_review_messages(
 ) -> list[dict[str, str]]:
     ordered_messages = user_messages or (user_text,)
     allowed_domains = _daily_weekly_review_domains(allowed_tool_names)
+    draft_domains = {
+        domain
+        for call in calls
+        if (domain := _daily_weekly_write_domain(call.tool_name)) is not None
+    }
+    if draft_domains == {"weekly"}:
+        return _weekly_plan_write_review_messages(
+            ordered_messages=ordered_messages,
+            calls=calls,
+            context=context,
+            allowed_tool_names=allowed_tool_names,
+            allow_cross_domain_restoration=allowed_domains != {"weekly"},
+        )
     daily_only_constraint = (
         "For this Daily-only correction review, do not invent a report date or "
         "target. Preserve the draft target unless trusted_context proves that the "
@@ -4871,6 +4908,33 @@ def _daily_weekly_write_review_messages(
         if selected_targets
         else ""
     )
+    weekly_plan_content_constraint = (
+        "For apply_next_weekly_plan, every add or replacement content value contains "
+        "only the user's planned work matter. Instructions that control the operation—"
+        "adding, editing, moving, deleting, saving, previewing, confirming, submitting, "
+        "or deliberately not submitting—must never be stored as plan content. Preserve "
+        "all conditions, amounts, negations, dependencies, and deadlines that belong to "
+        "the work matter. Correct a draft that mixes operation control into content. "
+        if "apply_next_weekly_plan" in allowed_tool_names
+        else ""
+    )
+    weekly_plan_recurrence_evidence_constraint = (
+        "For repeated Weekly Work Plan additions, recurrence_scope_quote contains "
+        "only the complete date scope and stops before the action or work matter. "
+        "For 下周每天做日常用印审核, use 下周每天, never "
+        "下周每天做日常用印审核. Preserve every date qualifier or exclusion. "
+        if "apply_next_weekly_plan" in allowed_tool_names
+        else ""
+    )
+    weekly_plan_change_before_submit_constraint = (
+        "When the user requests clear Weekly Work Plan changes and immediate "
+        "submission but submission must wait for an updated complete preview, "
+        "preserve every safe apply_next_weekly_plan change and omit only the "
+        "submit_next_weekly_plan call. Never reject or remove the safe changes "
+        "merely because submission cannot yet proceed. "
+        if "apply_next_weekly_plan" in allowed_tool_names
+        else ""
+    )
     draft_calls = [
         _daily_weekly_review_draft_payload(call)
         for call in calls
@@ -4928,6 +4992,9 @@ def _daily_weekly_write_review_messages(
                 f"{targeted_operation_constraint}"
                 f"{trusted_completed_daily_query_constraint}"
                 f"{selected_target_constraint}"
+                f"{weekly_plan_content_constraint}"
+                f"{weekly_plan_recurrence_evidence_constraint}"
+                f"{weekly_plan_change_before_submit_constraint}"
                 "not manufacture completion, certainty, or a formal weekday. If any "
                 "material routing or meaning remains ambiguous, return no tool calls and "
                 "exactly one JSON object with keys decision and reply, where decision is "
@@ -4971,6 +5038,106 @@ def _daily_weekly_write_review_messages(
                         if selected_targets
                         else {}
                     ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _weekly_plan_write_review_messages(
+    *,
+    ordered_messages: tuple[str, ...],
+    calls: tuple[NativeToolCall, ...],
+    context: TrustedContext,
+    allowed_tool_names: frozenset[str],
+    allow_cross_domain_restoration: bool,
+) -> list[dict[str, str]]:
+    """Keep the Weekly Work Plan review focused on its own record and evidence."""
+
+    model_context = context.model_payload()
+    weekly_context = {
+        key: model_context[key]
+        for key in (
+            "current_time",
+            "timezone",
+            "recent_messages",
+            "resource_namespace",
+            "runtime_identity",
+            "authenticated_user",
+            "weekly_plan_targets",
+        )
+        if key in model_context
+    }
+    draft_calls = [
+        _daily_weekly_review_draft_payload(call)
+        for call in calls
+        if _daily_weekly_write_domain(call.tool_name) == "weekly"
+    ]
+    cross_domain_instruction = (
+        "The current messages may also state a separate explicit Daily Report fact "
+        "completed today or a retrospective Current Weekly Report matter that the "
+        "draft omitted. Independently restore each such clear separate record using "
+        "the supplied tools, while keeping the Weekly Work Plan operations. Never turn "
+        "planned work into completed work, and never move a retrospective weekly-report "
+        "matter into the forward plan. "
+        if allow_cross_domain_restoration
+        else ""
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the focused independent Agent2 reviewer for one unexecuted "
+                "Monday-to-Saturday Weekly Work Plan draft. Nothing has been written. "
+                "Reread every exact current user message and the trusted weekly targets; "
+                "do not rely on keywords or on the draft being correct. Keep Daily Reports "
+                "and retrospective Weekly Reports outside this review. Select only the exact "
+                "trusted target the user means and copy its plan_id and current version. "
+                "Review the whole batch atomically: preserve every clear matter, date, "
+                "recurrence, exception, condition, amount, negation, dependency, deadline, "
+                "stable item target, explicit empty day, and explicit submission decision. "
+                "Do not omit a valid operation because another operation needs correction. "
+                f"{cross_domain_instruction}"
+                "For repeated work, emit one add for every selected exact date. Each repeated "
+                "add cites the complete current message as exact_clause_quote and cites the "
+                "same date-only recurrence_scope_quote. That scope stops before the action "
+                "and work matter: for 下周每天做日常用印审核 use 下周每天, never "
+                "下周每天做日常用印审核; for 下周一到周五每天做两项工作 use "
+                "下周一到周五每天, never 下周一到周五. Preserve every date qualifier "
+                "or exclusion. "
+                "Each add or edit content contains only the planned work matter. Instructions "
+                "to add, edit, move, delete, save, preview, confirm, submit, or deliberately "
+                "not submit control the operation and must never be stored as content. "
+                "If the user asks for a clear change and immediate submission but the updated "
+                "complete preview must come first, preserve the safe change and omit only the "
+                "submission. Never discard the change for that reason. A reviewer may not use "
+                "submission as a substitute for a plan change. "
+                "If all meanings and bindings are clear, return exactly one complete corrected "
+                "native tool-call batch using only the supplied tools. For execute decisions, "
+                "return tool_calls only, with no JSON/text decision. If a material target, date, "
+                "matter, or action is genuinely ambiguous, return no tools and exactly one JSON "
+                "object with decision=clarification and a concise natural Chinese question. "
+                "Use {\"decision\":\"keep_original\"} only when no Weekly Work Plan operation "
+                "or clarification is needed. Never claim anything was saved or submitted."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "trusted_weekly_context": weekly_context,
+                    "unexecuted_weekly_plan_operation_draft": draft_calls,
+                    "allowed_weekly_tools": sorted(allowed_tool_names),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -5443,6 +5610,10 @@ def _merge_daily_weekly_write_review(
     reviewed_tool_names: frozenset[str],
     context: TrustedContext,
 ) -> _ParsedAssistantTurn:
+    reviewed = _constrain_weekly_plan_review_submission(
+        original=original,
+        reviewed=reviewed,
+    )
     if _has_daily_replacement_followup_context(context):
         original = _normalize_daily_replacement_call_order(original)
         reviewed = _normalize_daily_replacement_call_order(reviewed)
@@ -5551,6 +5722,68 @@ def _merge_daily_weekly_write_review(
     )
 
 
+def _constrain_weekly_plan_review_submission(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """A reviewer may correct a plan change but cannot newly authorize submission."""
+
+    original_has_submission = any(
+        call.tool_name == "submit_next_weekly_plan"
+        for call in original.tool_calls
+    )
+    reviewed_has_new_submission = any(
+        call.tool_name == "submit_next_weekly_plan"
+        for call in reviewed.tool_calls
+    )
+    if original_has_submission or not reviewed_has_new_submission:
+        return reviewed
+
+    kept_calls = tuple(
+        call
+        for call in reviewed.tool_calls
+        if call.tool_name != "submit_next_weekly_plan"
+    )
+    if not kept_calls:
+        return _ParsedAssistantTurn(
+            assistant_message={
+                "role": "assistant",
+                "content": json.dumps(
+                    {"decision": "keep_original"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+            tool_calls=(),
+            audit=reviewed.audit,
+        )
+
+    assistant_message = dict(reviewed.assistant_message)
+    assistant_message["tool_calls"] = [
+        {
+            "id": call.tool_call_id,
+            "type": "function",
+            "function": {
+                "name": call.tool_name,
+                "arguments": json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        for call in kept_calls
+    ]
+    return replace(
+        reviewed,
+        assistant_message=assistant_message,
+        tool_calls=kept_calls,
+    )
+
+
 def _normalize_daily_replacement_call_order(
     parsed: _ParsedAssistantTurn,
 ) -> _ParsedAssistantTurn:
@@ -5588,6 +5821,50 @@ def _mark_reviewed_daily_content(
             ),
         )
         if call.tool_name == "add_daily_items"
+        else call
+        for call in parsed.tool_calls
+    )
+    if reviewed_calls == parsed.tool_calls:
+        return parsed
+    assistant_message = dict(parsed.assistant_message)
+    assistant_message["tool_calls"] = [
+        {
+            "id": call.tool_call_id,
+            "type": "function",
+            "function": {
+                "name": call.tool_name,
+                "arguments": json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        for call in reviewed_calls
+    ]
+    return replace(
+        parsed,
+        assistant_message=assistant_message,
+        tool_calls=reviewed_calls,
+    )
+
+
+def _mark_reviewed_weekly_plan_content(
+    parsed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Attach server-only proof after weekly-plan semantic review passes."""
+
+    reviewed_calls = tuple(
+        NativeToolCall(
+            call.tool_call_id,
+            call.tool_name,
+            validate_tool_arguments(
+                "apply_next_weekly_plan",
+                {**call.arguments, "content_reviewed": True},
+            ),
+        )
+        if call.tool_name == "apply_next_weekly_plan"
         else call
         for call in parsed.tool_calls
     )

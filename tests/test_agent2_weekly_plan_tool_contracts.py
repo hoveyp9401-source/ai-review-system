@@ -132,6 +132,35 @@ def test_submit_weekly_plan_requires_current_message_confirmation_evidence():
         )
 
 
+def test_weekly_plan_edit_accepts_complete_replacement_evidence():
+    validated = validate_tool_arguments(
+        "apply_next_weekly_plan",
+        {
+            "plan_id": "11111111-1111-4111-8111-111111111111",
+            "expected_version": 7,
+            "operations": [
+                {
+                    "operation_id": "edit-1",
+                    "operation": "edit",
+                    "item_id": "item-1",
+                    "content": "准备星河案证据清单",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_clause_quote": (
+                            "把周三那条改成准备星河案证据清单"
+                        ),
+                    },
+                }
+            ],
+        },
+    )
+
+    assert validated["operations"][0]["source_evidence"] == {
+        "source_message_index": 1,
+        "exact_clause_quote": "把周三那条改成准备星河案证据清单",
+    }
+
+
 @pytest.mark.parametrize(
     "operation",
     (

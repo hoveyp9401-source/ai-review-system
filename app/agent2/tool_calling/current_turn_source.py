@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +28,11 @@ class CurrentTurnSourceEvidenceError(ValueError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+_MODEL_ADDED_WEEKLY_YEAR = re.compile(
+    r"^(?P<year>20\d{2})年(?P<remainder>\d{1,2}月\d{1,2}(?:日|号)?.*)$"
+)
 
 
 @dataclass(frozen=True)
@@ -138,6 +144,7 @@ class CurrentTurnSource:
             self._validate_evidence(typed_weekly_daily.source_evidence)
             return
         if tool_name == "apply_next_weekly_plan":
+            arguments = self._normalize_weekly_source_quotes(arguments)
             typed_weekly_plan = ApplyNextWeeklyPlanArgs.model_validate(
                 arguments
             )
@@ -179,7 +186,11 @@ class CurrentTurnSource:
                     if isinstance(exact_clause, str)
                     else source_message
                 )
-                if isinstance(content, str) and content not in grounded_source:
+                if (
+                    not typed_weekly_plan.content_reviewed
+                    and isinstance(content, str)
+                    and content not in grounded_source
+                ):
                     raise CurrentTurnSourceEvidenceError(
                         "WEEKLY_PLAN_CONTENT_NOT_GROUNDED"
                     )
@@ -260,6 +271,8 @@ class CurrentTurnSource:
                     arguments.get("content_reviewed")
                 ),
             )
+        elif tool_name == "apply_next_weekly_plan":
+            arguments = self._normalize_weekly_source_quotes(arguments)
         self.validate_tool_arguments(tool_name, arguments)
         if tool_name not in {"add_daily_items", "edit_daily_items"}:
             return arguments
@@ -293,6 +306,58 @@ class CurrentTurnSource:
             if not typed.content_reviewed:
                 bound["items"][index]["content"] = formatting_only
         return bound
+
+    def _normalize_weekly_source_quotes(
+        self,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_operations = arguments.get("operations")
+        if not isinstance(raw_operations, (list, tuple)):
+            return arguments
+        normalized_operations = []
+        changed = False
+        for operation in raw_operations:
+            if not isinstance(operation, dict):
+                normalized_operations.append(operation)
+                continue
+            evidence = operation.get("source_evidence")
+            if not isinstance(evidence, dict):
+                normalized_operations.append(operation)
+                continue
+            source_index = evidence.get("source_message_index")
+            exact_clause = evidence.get("exact_clause_quote")
+            if (
+                not isinstance(source_index, int)
+                or source_index < 1
+                or source_index > len(self.messages)
+                or not isinstance(exact_clause, str)
+                or exact_clause in self.messages[source_index - 1]
+            ):
+                normalized_operations.append(operation)
+                continue
+            match = _MODEL_ADDED_WEEKLY_YEAR.fullmatch(exact_clause)
+            plan_date = str(operation.get("plan_date") or "")
+            if (
+                match is None
+                or not plan_date.startswith(match.group("year") + "-")
+                or match.group("remainder")
+                not in self.messages[source_index - 1]
+            ):
+                normalized_operations.append(operation)
+                continue
+            normalized_operations.append(
+                {
+                    **operation,
+                    "source_evidence": {
+                        **evidence,
+                        "exact_clause_quote": match.group("remainder"),
+                    },
+                }
+            )
+            changed = True
+        if not changed:
+            return arguments
+        return {**arguments, "operations": normalized_operations}
 
     def _normalize_daily_source_quotes(
         self,

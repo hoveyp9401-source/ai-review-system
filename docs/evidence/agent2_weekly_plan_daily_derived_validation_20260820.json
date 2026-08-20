@@ -1,0 +1,70 @@
+{
+  "scope": "Agent2 Weekly Work Plan hardening derived from recent Daily Report structures and failures",
+  "candidate_release": "/home/ai_review_tunnel/releases/ai-review-system-weekly-plan-test-20260820",
+  "production_release_unchanged": "/home/ai_review_tunnel/releases/ai-review-system-agent2-daily-recovery-20260820-3b9ad8b",
+  "production_read_only_inputs": {
+    "daily_report_window": "2026-08-06 through 2026-08-20",
+    "daily_reports": 508,
+    "anonymous_users": 72,
+    "recent_adverse_event_window": "2026-08-17 19:00 through 2026-08-20 12:00 Asia/Shanghai",
+    "adverse_events": 181,
+    "unique_inputs": 121,
+    "identity_fields_saved": false,
+    "raw_user_text_saved": false
+  },
+  "isolated_real_flash_validation": {
+    "daily_derived_weekly_plan_matrix": {
+      "unique_cases": 14,
+      "rounds": 2,
+      "passed": 28,
+      "failed": 0,
+      "artifact_sha256": "11d7e83c1b29e37e28e1381a4466027ab7ac5c63f2e57cc520e0c8ee4b9246cf"
+    },
+    "daily_weekly_periodic_collision_matrix": {
+      "unique_cases": 7,
+      "initial_passed": 13,
+      "initial_failed_transport_timeout": 1,
+      "timed_out_case_retry_passed": 2,
+      "timed_out_case_retry_failed": 0,
+      "matrix_artifact_sha256": "24f3d7aad4cad6495334ccb1a7979b0a7c04d46f18f16db96a10bc1b07fb4608",
+      "retry_artifact_sha256": "6442868a4c5bff374c353951eb6959bf1ab10154e3e35e2002b839d35089ace8"
+    },
+    "recurrence_focus": {
+      "passed": 6,
+      "failed": 0,
+      "artifact_sha256": "2de07aa1a27d498a15f0d14936aa99e6c264b4134cc504b8a323def46834d5a1"
+    },
+    "do_not_submit_content_focus": {
+      "passed": 5,
+      "failed": 0,
+      "artifact_sha256": "3e9d2500505f37fe4260a98b70407525f03bc13afb61af3818b5df722cd0bbbb"
+    },
+    "business_database_connected": false,
+    "business_writes": 0,
+    "messages_sent": 0
+  },
+  "daily_report_non_regression": {
+    "targeted_tests_passed": 455,
+    "targeted_tests_failed": 0,
+    "production_database_outer_rollback_cases_passed": 13,
+    "production_database_outer_rollback_cases_failed": 0,
+    "existing_daily_plan_update_rollback_passed": true,
+    "failure_explanation_model_check_passed": true,
+    "rollback_report_residue": 0,
+    "rollback_receipt_residue": 0,
+    "messages_sent": 0
+  },
+  "full_repository_regression": {
+    "passed": 3699,
+    "failed": 219,
+    "skipped": 3,
+    "baseline_failed": 219,
+    "new_failures": 0
+  },
+  "deployment": {
+    "deployed": false,
+    "services_restarted": false,
+    "production_data_changed": false,
+    "production_messages_sent": false
+  }
+}

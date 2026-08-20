@@ -122,6 +122,9 @@ class MatrixCase:
         tuple[str, int, frozenset[str], frozenset[str]], ...
     ] = ()
     expected_plan_additions: tuple[tuple[str, str], ...] = ()
+    expected_plan_terms_by_date: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ] = ()
     expected_daily_submit: bool = False
     expected_periodic_submit: bool = False
     expected_plan_submit: tuple[str, int] | None = None
@@ -981,14 +984,37 @@ def _score(
             "weekly-plan bindings differ: expected "
             f"{sorted(case.expected_plan_bindings)}, got {sorted(actual_plan_bindings)}"
         )
+    normalized_actual_plan_additions = tuple(
+        (plan_date, content.strip().rstrip("。；;"))
+        for plan_date, content in actual_plan_additions
+    )
+    normalized_expected_plan_additions = tuple(
+        (plan_date, content.strip().rstrip("。；;"))
+        for plan_date, content in case.expected_plan_additions
+    )
     if (
         case.expected_plan_additions
-        and tuple(actual_plan_additions) != case.expected_plan_additions
+        and normalized_actual_plan_additions
+        != normalized_expected_plan_additions
     ):
         errors.append(
             "weekly-plan additions differ: expected "
             f"{case.expected_plan_additions}, got {tuple(actual_plan_additions)}"
         )
+    for plan_date, required_terms in case.expected_plan_terms_by_date:
+        combined_content = "\n".join(
+            content
+            for actual_date, content in actual_plan_additions
+            if actual_date == plan_date
+        )
+        missing_terms = tuple(
+            term for term in required_terms if term not in combined_content
+        )
+        if missing_terms:
+            errors.append(
+                f"weekly-plan date {plan_date} is missing required matter terms "
+                f"{missing_terms}; got {combined_content!r}"
+            )
 
     plan_submits = by_name.get("submit_next_weekly_plan", [])
     if bool(plan_submits) != bool(case.expected_plan_submit):
@@ -1034,6 +1060,7 @@ async def _evaluate_one(
             "plan_every_day_scope",
             "plan_monday_to_friday_daily_scope",
         }
+        or case.category.startswith("daily_derived")
         else _ZeroWriteRuntime(context)
     )
     started = perf_counter()
@@ -1124,6 +1151,16 @@ async def _evaluate_one(
         "recovered_by_review": bool(changed and final_ok and not initial_ok),
         "harmed_by_review": bool(changed and initial_ok and not final_ok),
         "runtime_batches": [[call.tool_name for call in batch.calls] for batch in runtime.batches],
+        "receipt_error_codes": [
+            receipt.error_code for receipt in result.receipts
+        ],
+        "blocked_attempts": [
+            [
+                {"name": call.tool_name, "arguments": call.arguments}
+                for call in attempt
+            ]
+            for attempt in getattr(runtime, "blocked_attempts", ())
+        ],
         "in_memory_commit_count": runtime.commit_count,
         "in_memory_rollback_count": runtime.rollback_count,
         "zero_business_writes": True,
@@ -1170,6 +1207,10 @@ def _case_manifest() -> list[dict[str, Any]]:
             "expected_plan_additions": [
                 {"plan_date": plan_date, "content": content}
                 for plan_date, content in case.expected_plan_additions
+            ],
+            "expected_plan_terms_by_date": [
+                {"plan_date": plan_date, "terms": list(terms)}
+                for plan_date, terms in case.expected_plan_terms_by_date
             ],
             "expected_daily_submit": case.expected_daily_submit,
             "expected_periodic_submit": case.expected_periodic_submit,

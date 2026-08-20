@@ -620,7 +620,10 @@ async def test_second_plan_rejects_first_plan_version_item_suggestion_and_date()
                         "operation": "edit",
                         "item_id": "existing-item",
                         "content": "8月17日安排材料",
-                        "source_evidence": {"source_message_index": 1},
+                        "source_evidence": {
+                            "source_message_index": 1,
+                            "exact_clause_quote": "8月17日安排材料",
+                        },
                     }
                 ],
             },

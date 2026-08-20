@@ -1,4 +1,5 @@
 import hashlib
+import json
 from types import SimpleNamespace
 
 from app.agent2.tool_calling.canary_config import (
@@ -13,6 +14,7 @@ from app.agent2.tool_calling.contracts import (
 )
 from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
+    deepseek_tool_schemas,
     runtime_registry_tool_names,
     validate_tool_arguments,
 )
@@ -121,6 +123,45 @@ def test_weekly_plan_prompt_preserves_repeated_ranges_and_shared_date_scope():
     assert "include every attached bound, exception, or qualifier" in prompt
     assert "never shorten a phrase" in prompt
     assert "do not turn a repeated dated matter into an undated suggestion" in prompt
+    assert "quote `下周每天`, not the whole phrase" in prompt
+    assert "stops before the action and work matter" in prompt
+
+
+def test_weekly_plan_prompt_keeps_operation_control_out_of_plan_content():
+    prompt = " ".join(canary_system_prompt().split()).lower()
+    description = TOOL_REGISTRY["apply_next_weekly_plan"].description.lower()
+
+    assert "operation-control language out of stored plan text" in prompt
+    assert "deliberately not submitting" in prompt
+    assert "store only the user's work matter" in prompt
+    assert "operation control" in description
+    assert "must not be included in content" in description
+
+
+def test_weekly_plan_prompt_preserves_safe_changes_when_submit_must_wait():
+    prompt = " ".join(canary_system_prompt().split()).lower()
+
+    assert "preserve and apply every clear safe change" in prompt
+    assert "omit only the unsafe submission" in prompt
+
+
+def test_weekly_plan_content_review_proof_is_server_only():
+    schema = deepseek_tool_schemas(
+        frozenset({"apply_next_weekly_plan"})
+    )[0]["function"]["parameters"]
+
+    assert "content_reviewed" in ApplyNextWeeklyPlanArgs.model_fields
+    assert "content_reviewed" not in schema["properties"]
+
+
+def test_weekly_plan_content_field_excludes_operation_instructions():
+    schema_text = json.dumps(
+        deepseek_tool_schemas(frozenset({"apply_next_weekly_plan"}))[0],
+        ensure_ascii=False,
+    )
+
+    assert "Only the user's planned work matter" in schema_text
+    assert "deliberately not submitting the plan" in schema_text
 
 
 def test_weekly_plan_prompt_explains_monday_dual_targets_and_report_boundary():

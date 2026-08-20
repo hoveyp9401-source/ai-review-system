@@ -399,12 +399,16 @@ TOOL_REGISTRY = MappingProxyType(
             "selected date and copy the entire current user message as exact_clause_quote "
             "plus the same complete "
             "recurrence_scope_quote. Include every attached bound, exception, or qualifier in "
-            "that scope quote; never shorten a restricted phrase to only 'every day'. If one leading date "
+            "that date-only scope quote; stop before the action and work matter, and never "
+            "shorten a restricted phrase to only 'every day'. If one leading date "
             "governs several clearly parallel matters, keep every matter as a separate add "
             "on that shared date and reuse the complete governing clause. "
             "For capture_suggestion, content must be one exact contiguous excerpt from the "
             "current user message, including any alternative days or uncertainty qualifiers; "
-            "never summarize or normalize it.",
+            "never summarize or normalize it. For formal add or replacement operations, store "
+            "only the planned work matter. Current-message instructions about adding, editing, "
+            "saving, previewing, confirming, submitting, or not submitting are operation control "
+            "and must not be included in content.",
             ApplyNextWeeklyPlanArgs,
             "write",
             "medium",
@@ -1075,7 +1079,15 @@ def _model_tool_description(definition: ToolDefinition) -> str:
 def _model_tool_input_schema(definition: ToolDefinition) -> dict[str, Any]:
     if definition.tool_name == "add_daily_items":
         return model_add_daily_items_schema()
-    return _thaw_json(definition.input_schema)
+    schema = _thaw_json(definition.input_schema)
+    if definition.tool_name == "apply_next_weekly_plan":
+        schema.get("properties", {}).pop("content_reviewed", None)
+        required = schema.get("required")
+        if isinstance(required, list):
+            schema["required"] = [
+                name for name in required if name != "content_reviewed"
+            ]
+    return schema
 
 
 def validate_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
@@ -1099,6 +1111,11 @@ def validate_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
     ):
         dumped.pop("reviewed_omitted_empty_fields", None)
     if tool_name == "add_daily_items" and not dumped.get("content_reviewed"):
+        dumped.pop("content_reviewed", None)
+    if (
+        tool_name == "apply_next_weekly_plan"
+        and not dumped.get("content_reviewed")
+    ):
         dumped.pop("content_reviewed", None)
     return dumped
 

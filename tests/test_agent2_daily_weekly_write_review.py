@@ -28,6 +28,9 @@ from app.agent2.tool_calling.deepseek_adapter import (
     DeepSeekToolCallingAdapter,
     InvalidNativeToolArgumentsError,
     _CompletionResponse,
+    _constrain_weekly_plan_review_submission,
+    _daily_weekly_write_review_messages,
+    _parse_assistant_turn,
 )
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
 from app.agent2.weekly_plan_context import (
@@ -411,6 +414,26 @@ def _weekly_call(*, call_id: str = "weekly") -> dict:
                             },
                         }
                     ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
+def _weekly_submit_call(*, call_id: str = "weekly-submit") -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "submit_next_weekly_plan",
+            "arguments": json.dumps(
+                {
+                    "plan_id": _PLAN_ID,
+                    "expected_version": 1,
+                    "confirmation_evidence": {
+                        "source_message_index": 1,
+                    },
                 },
                 ensure_ascii=False,
             ),
@@ -1318,6 +1341,55 @@ async def test_weekly_write_cannot_be_dropped_from_atomic_daily_delete_batch(
     assert runtime.execute_count == 0
     assert runtime.commit_count == 0
     assert runtime.rollback_count == 0
+
+
+def test_weekly_reviewer_cannot_newly_submit_after_a_safe_plan_change() -> None:
+    original = _parse_assistant_turn(
+        _tool_completion(
+            _weekly_call(call_id="draft-weekly"),
+        ).message
+    )
+    reviewed = _parse_assistant_turn(
+        _tool_completion(
+            _weekly_call(call_id="reviewed-weekly"),
+            _weekly_submit_call(),
+        ).message
+    )
+
+    constrained = _constrain_weekly_plan_review_submission(
+        original=original,
+        reviewed=reviewed,
+    )
+
+    assert [call.tool_name for call in constrained.tool_calls] == [
+        "apply_next_weekly_plan"
+    ]
+
+
+def test_weekly_only_review_prompt_excludes_daily_review_distractions() -> None:
+    parsed = _parse_assistant_turn(
+        _tool_completion(_weekly_call(call_id="draft-weekly")).message
+    )
+
+    messages = _daily_weekly_write_review_messages(
+        user_text="下周三整理案件材料",
+        user_messages=(),
+        calls=parsed.tool_calls,
+        context=_context(),
+        trusted_completed_daily_query_results=[],
+        selected_targets=[],
+        allowed_tool_names=frozenset(
+            {"add_daily_items", "apply_next_weekly_plan"}
+        ),
+    )
+
+    prompt = messages[0]["content"]
+    assert "focused independent Agent2 reviewer" in prompt
+    assert "recurrence_scope_quote" in prompt
+    assert "must never be stored as content" in prompt
+    assert "retryable_daily_write" not in prompt
+    assert "add_daily_items" not in prompt
+    assert "separate explicit Daily Report fact" in prompt
 
 
 @pytest.mark.asyncio
