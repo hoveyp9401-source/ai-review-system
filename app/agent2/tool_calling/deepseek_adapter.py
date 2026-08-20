@@ -1428,90 +1428,6 @@ class DeepSeekToolCallingAdapter:
                                 )
                             )
                             if focused_review_decision == "approve":
-                                missing_numbered_entries = (
-                                    _focused_daily_missing_numbered_entries(
-                                        user_text=user_text,
-                                        user_messages=user_messages,
-                                        calls=parsed.tool_calls,
-                                    )
-                                )
-                                if missing_numbered_entries:
-                                    focused_review_decision = "repair"
-                                    focused_review_reason = (
-                                        "numbered source entries are missing: "
-                                        + json.dumps(
-                                            missing_numbered_entries,
-                                            ensure_ascii=False,
-                                        )
-                                    )
-                            if (
-                                focused_review_decision == "approve"
-                                and _focused_daily_needs_completeness_challenge(
-                                    user_text=user_text,
-                                    user_messages=user_messages,
-                                    calls=parsed.tool_calls,
-                                )
-                            ):
-                                challenge_messages = (
-                                    _bounded_daily_add_review_messages(
-                                        user_text=user_text,
-                                        user_messages=user_messages,
-                                        context=context,
-                                        calls=parsed.tool_calls,
-                                        submission_evidence=(
-                                            parsed.focused_submission_evidence
-                                        ),
-                                        challenge_approval=True,
-                                    )
-                                )
-                                challenge_completion = await complete_model(
-                                    challenge_messages,
-                                    tool_schemas=(
-                                        _focused_daily_review_tool_schemas()
-                                    ),
-                                    thinking_enabled=True,
-                                )
-                                iterations += 1
-                                model_turns.append(
-                                    _model_turn_audit(
-                                        iterations,
-                                        challenge_completion.message,
-                                        response_metadata={
-                                            **challenge_completion.metadata,
-                                            "focused_daily_completeness_challenge": True,
-                                            "draft_executed": False,
-                                        },
-                                    )
-                                )
-                                if _focused_daily_review_needs_fast_retry(
-                                    challenge_completion
-                                ):
-                                    challenge_completion = await complete_model(
-                                        challenge_messages,
-                                        tool_schemas=(
-                                            _focused_daily_review_tool_schemas()
-                                        ),
-                                        thinking_enabled=False,
-                                    )
-                                    iterations += 1
-                                    model_turns.append(
-                                        _model_turn_audit(
-                                            iterations,
-                                            challenge_completion.message,
-                                            response_metadata={
-                                                **challenge_completion.metadata,
-                                                "focused_daily_challenge_fast_retry": True,
-                                                "draft_executed": False,
-                                            },
-                                        )
-                                    )
-                                (
-                                    focused_review_decision,
-                                    focused_review_reason,
-                                ) = _parse_focused_daily_review_completion(
-                                    challenge_completion
-                                )
-                            if focused_review_decision == "approve":
                                 reviewed = parsed
                             elif focused_review_decision == "repair":
                                 if focused_semantic_repair_count != 0:
@@ -1624,11 +1540,6 @@ class DeepSeekToolCallingAdapter:
                                     )
                                     if (
                                         repair_review_decision != "approve"
-                                        or _focused_daily_missing_numbered_entries(
-                                            user_text=user_text,
-                                            user_messages=user_messages,
-                                            calls=reviewed.tool_calls,
-                                        )
                                     ):
                                         raise ValueError(
                                             "focused semantic repair did not pass "
@@ -3865,10 +3776,14 @@ def _bounded_daily_add_review_messages(
                 "changes, additions, deletions, or moves is operation state, not empty-field "
                 "evidence. For a "
                 "self-contained pure Daily add, compare the entire source with the "
-                "candidate. Return decision=repair with a concise, specific reason when "
-                "any user-authored matter is missing, invented, in the wrong field, "
-                "arbitrarily merged, arbitrarily split, loses a qualifier, or when content "
-                "adds, removes, generalizes, or changes any source fact, or when an "
+                "candidate. An explicit request to write must remain usable: when the "
+                "candidate contains at least one grounded Daily item, never request repair "
+                "solely because another source matter was omitted. Omitted matters can be "
+                "supplemented naturally in a later turn. Approve a best-effort partial write "
+                "when every included item is faithful. Return decision=repair only when an "
+                "included item is invented, in the wrong field, arbitrarily merged or split "
+                "in a way that changes meaning, loses a qualifier from its own exact quote, "
+                "or otherwise adds, removes, generalizes, or changes a source fact, or when an "
                 "explicit empty field or submission intent is wrong. For a self-contained "
                 "Daily source that includes at least one report matter and explicitly asks "
                 "to submit now, candidate.reviewed_omitted_empty_fields lists fields that "
@@ -3892,9 +3807,9 @@ def _bounded_daily_add_review_messages(
                 "may separate items. Judge the user's coherent work topics, not individual verbs: "
                 "split a switch to an unrelated goal, project, case group, deliverable, or "
                 "workstream even without punctuation, while keeping coordinated actions together "
-                "inside one user-described topic or shared workstream. Audit in two passes: first "
-                "count and partition every top-level topic or workstream, then check grouping within "
-                "each partition. Then perform a third item-level entailment pass: for every "
+                "inside one user-described topic or shared workstream. Use a source-wide pass to "
+                "improve completeness, but do not turn an omission alone into a write blocker. "
+                "Then perform an item-level entailment pass: for every "
                 "candidate item, compare its exact_quote clause by clause with content and repair "
                 "if content drops any actor, condition, status, qualification, consequence, "
                 "exception, date, number, or pending action from that quote. Do not assume an "
@@ -3928,23 +3843,6 @@ def _bounded_daily_add_review_messages(
             ),
         },
     ]
-
-
-def _focused_daily_needs_completeness_challenge(
-    *,
-    user_text: str,
-    user_messages: tuple[str, ...],
-    calls: tuple[NativeToolCall, ...],
-) -> bool:
-    source_length = sum(
-        len(message) for message in (user_messages or (user_text,))
-    )
-    item_count = sum(
-        len(call.arguments.get("items") or ())
-        for call in calls
-        if call.tool_name == "add_daily_items"
-    )
-    return source_length >= 1000 or item_count >= 8
 
 
 def _focused_daily_review_needs_fast_retry(

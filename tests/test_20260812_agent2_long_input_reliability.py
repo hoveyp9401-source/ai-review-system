@@ -642,7 +642,9 @@ async def test_focused_daily_plan_preserves_reviewed_conservative_wording(
         "将合同评审技能改造成网页端agent，调用速度提升10倍"
     )
     assert "adds, removes, generalizes, or changes" in requests[1][0]["content"]
-    assert "Audit in two passes" in requests[1][0]["content"]
+    assert "do not turn an omission alone into a write blocker" in requests[1][0][
+        "content"
+    ]
     assert "one item spans two unrelated work domains" in requests[1][0]["content"]
 
 
@@ -1257,7 +1259,7 @@ async def test_focused_review_length_without_verdict_gets_one_fast_retry(
 
 
 @pytest.mark.asyncio
-async def test_complex_daily_requires_a_second_independent_approval(
+async def test_explicit_complex_daily_writes_grounded_items_even_if_one_is_omitted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     matters = [f"完成第{index}项合同复核" for index in range(1, 9)]
@@ -1275,14 +1277,13 @@ async def test_complex_daily_requires_a_second_independent_approval(
                         "exact_quote": matter,
                     },
                 }
-                for matter in matters
+                for matter in matters[:-1]
             ],
         },
     )
     completions = iter(
         (
             _focused_daily_plan_completion(call),
-            _focused_daily_review_completion(approved=True),
             _focused_daily_review_completion(approved=True),
         )
     )
@@ -1306,15 +1307,13 @@ async def test_complex_daily_requires_a_second_independent_approval(
     )
 
     assert result.final_content == "已按原文完整记录。"
-    assert len(requests) == 3
-    assert "final independent completeness challenger" in requests[2][0][
-        "content"
-    ]
-    assert result.model_turns[2].response_metadata[
-        "focused_daily_completeness_challenge"
-    ] is True
+    assert len(requests) == 2
+    assert "never request repair solely because another source matter was omitted" in (
+        requests[1][0]["content"]
+    )
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
+    assert len(runtime.calls[0].arguments["items"]) == 7
 
 
 @pytest.mark.asyncio
