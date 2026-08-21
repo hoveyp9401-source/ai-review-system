@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select, update
 
 from app.agent2.business.models import Agent2IdentityBinding
+from app.agent2.tool_calling.canary_store import ToolCallCanaryControl
 from app.agent2.tool_calling.production_store import (
     ToolCallCanaryReceipt,
     trusted_snapshot_from_report,
@@ -39,8 +40,8 @@ CASES = (
     (
         "daily_plan_followup",
         (
-            "你写的没有问题，不改。计划：跟进苏宁38家债权，"
-            "确认优先债权部分情况；准备齐河智慧产业园上诉状答辩资料。"
+            "你写的没有问题，不改。计划：跟进星河公司38笔债权，"
+            "确认优先债权部分情况；准备云谷产业园上诉状答辩资料。"
         ),
         "daily_plan_update",
     ),
@@ -342,8 +343,8 @@ async def _run_case(
                 if not all(
                     fragment in written_plans
                     for fragment in (
-                        "苏宁38家债权",
-                        "齐河智慧产业园",
+                        "星河公司38笔债权",
+                        "云谷产业园",
                     )
                 ):
                     raise AssertionError("Daily tomorrow plan content is missing")
@@ -406,9 +407,29 @@ async def _production_state() -> dict[str, object]:
             session,
             user_id=str(user.id),
         )
+        control = await session.scalar(
+            select(ToolCallCanaryControl).where(
+                ToolCallCanaryControl.user_id == str(user.id)
+            )
+        )
+        if control is None:
+            raise AssertionError("production Agent2 control is missing")
         state = {
             "daily": _daily_state(report),
             "weekly": _weekly_state(weekly),
+            "control": {
+                "control_id": str(control.control_id),
+                "enabled": bool(control.enabled),
+                "runtime": control.runtime,
+                "messages_enabled": bool(control.messages_enabled),
+                "registry_digest": control.registry_digest,
+                "prompt_sha256": control.prompt_sha256,
+                "model_name": control.model_name,
+                "version": int(control.version),
+                "changed_by": control.changed_by,
+                "change_reason": control.change_reason,
+                "updated_at": control.updated_at,
+            },
         }
         await session.rollback()
         return state
@@ -449,6 +470,9 @@ async def main() -> None:
         ),
         "weekly": int(
             production_before["weekly"] != production_after["weekly"]
+        ),
+        "control": int(
+            production_before["control"] != production_after["control"]
         ),
     }
     transport_enabled_cases = sum(
