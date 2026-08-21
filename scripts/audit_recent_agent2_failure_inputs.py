@@ -13,7 +13,6 @@ from app.agent2.tool_calling.production_store import _text_content
 from app.db import AsyncSessionLocal, engine
 from app.models import WebhookEvent
 
-
 OBSERVATION_KEY = "_agent2_turn_observation_v1"
 
 
@@ -38,7 +37,7 @@ async def main() -> None:
                         .where(
                             WebhookEvent.received_at >= args.since,
                             WebhookEvent.received_at < args.until,
-                            WebhookEvent.status == "processed",
+                            WebhookEvent.status.in_(("processed", "failed")),
                         )
                         .order_by(WebhookEvent.received_at)
                     )
@@ -55,38 +54,76 @@ async def main() -> None:
             else {}
         )
         observation = response.get(OBSERVATION_KEY)
-        if not isinstance(observation, dict):
-            continue
-        business_result = str(
-            observation.get("business_result_status") or ""
-        )
-        if business_result not in {
-            "failed",
-            "blocked",
-            "clarification_required",
-        }:
-            continue
+        if row.status == "failed":
+            business_result = "ingress_failed"
+            root_category = "ingress_failure"
+        else:
+            if not isinstance(observation, dict):
+                continue
+            business_result = str(
+                observation.get("business_result_status") or ""
+            )
+            if business_result not in {
+                "failed",
+                "blocked",
+                "clarification",
+                "clarification_required",
+            }:
+                continue
+            root_category = (
+                "model_or_execution_failure"
+                if business_result == "failed"
+                else (
+                    "business_blocked"
+                    if business_result == "blocked"
+                    else "clarification"
+                )
+            )
         message_text = _text_content(row.payload, max_length=None).strip()
-        if not message_text:
-            continue
         event_count += 1
-        digest = hashlib.sha256(message_text.encode("utf-8")).hexdigest()
+        replayable_text = bool(message_text)
+        digest_source = (
+            message_text
+            if replayable_text
+            else f"non-text-event:{row.id}:{row.received_at.isoformat()}"
+        )
+        digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
         candidate = by_input.get(digest)
         event = {
             "input_sha256": digest,
             "input_characters": len(message_text),
-            "message_text": message_text,
             "first_received_at": row.received_at.astimezone(
                 shanghai
             ).isoformat(),
             "event_count": 1,
+            "event_status": row.status,
             "business_result": business_result,
-            "model_result": observation.get("model_result_status"),
-            "model_call_count": observation.get("model_call_count"),
-            "tool_blocked_count": observation.get("tool_blocked_count"),
-            "tool_failure_count": observation.get("tool_failure_count"),
+            "root_category": root_category,
+            "replayable_text": replayable_text,
+            "model_result": (
+                observation.get("model_result_status")
+                if isinstance(observation, dict)
+                else None
+            ),
+            "model_call_count": (
+                observation.get("model_call_count")
+                if isinstance(observation, dict)
+                else None
+            ),
+            "tool_blocked_count": (
+                observation.get("tool_blocked_count")
+                if isinstance(observation, dict)
+                else None
+            ),
+            "tool_failure_count": (
+                observation.get("tool_failure_count")
+                if isinstance(observation, dict)
+                else None
+            ),
             "identity_included": False,
         }
+        if replayable_text:
+            event["message_text"] = message_text
         if candidate is None:
             by_input[digest] = event
         else:
@@ -103,7 +140,7 @@ async def main() -> None:
     print(
         json.dumps(
             {
-                "schema_version": "agent2.recent-failure-inputs.v1",
+                "schema_version": "agent2.recent-failure-inputs.v2",
                 "range": {
                     "since": args.since.isoformat(),
                     "until": args.until.isoformat(),

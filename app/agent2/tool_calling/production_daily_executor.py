@@ -1065,7 +1065,7 @@ class ProductionDailyExecutor:
         self,
         request: ProductionHandlerRequest,
     ) -> ProductionHandlerOutcome:
-        self._arguments(request, ConfirmReportArgs)
+        arguments = self._arguments(request, ConfirmReportArgs)
         bound = self._bound(request)
         report = self._required_bound_report(bound)
         before = await self._snapshot(report.report_date)
@@ -1086,7 +1086,17 @@ class ProductionDailyExecutor:
                 after=before,
                 typed_receipt_ids=(),
             )
-        if completion_facts["missing_sections"]:
+        missing_sections = tuple(completion_facts["missing_sections"])
+        reviewed_omitted = tuple(
+            arguments.reviewed_omitted_empty_fields
+        )
+        if reviewed_omitted and set(reviewed_omitted) != set(
+            missing_sections
+        ):
+            raise ProductionExecutionError(
+                "INCOMPLETE_CONFIRM_REVIEW_MISMATCH"
+            )
+        if missing_sections and not reviewed_omitted:
             return ProductionHandlerOutcome(
                 target_type="daily_report",
                 target_id=str(report.report_id),
@@ -1102,17 +1112,33 @@ class ProductionDailyExecutor:
                 status_if_unchanged=ReceiptStatus.CLARIFICATION_REQUIRED,
                 error_code="REPORT_INCOMPLETE",
             )
-        command = self._command(
-            request,
-            ordinal=0,
-            command_type="submit_report",
-            report_id=report.report_id,
-            report_version=live.version,
-            patch={},
+        commands: list[TypedDailyCommand] = []
+        next_version = live.version
+        for field_name in reviewed_omitted:
+            commands.append(
+                self._command(
+                    request,
+                    ordinal=len(commands),
+                    command_type="acknowledge_empty_section",
+                    report_id=report.report_id,
+                    report_version=next_version,
+                    patch={"field": field_name},
+                )
+            )
+            next_version += 1
+        commands.append(
+            self._command(
+                request,
+                ordinal=len(commands),
+                command_type="submit_report",
+                report_id=report.report_id,
+                report_version=next_version,
+                patch={},
+            )
         )
         typed_receipts = await self._execute_typed(
             report.report_date,
-            (command,),
+            tuple(commands),
         )
         after = await self._snapshot(report.report_date)
         return self._outcome(

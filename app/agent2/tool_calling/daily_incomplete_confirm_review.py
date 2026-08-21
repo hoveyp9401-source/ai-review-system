@@ -160,3 +160,29 @@ def validate_daily_incomplete_confirm_replacements(
             raise ValueError(
                 "a reviewed daily addition requires current-message content evidence"
             )
+
+
+def attach_reviewed_omitted_sections(
+    *,
+    targets: tuple[IncompleteConfirmReviewTarget, ...],
+    replacements: tuple[NativeToolCall, ...],
+) -> tuple[NativeToolCall, ...]:
+    """Attach server proof only after the independent review preserves confirm."""
+
+    return tuple(
+        NativeToolCall(
+            tool_call_id=call.tool_call_id,
+            tool_name=call.tool_name,
+            arguments=(
+                {
+                    **call.arguments,
+                    "reviewed_omitted_empty_fields": list(
+                        target.missing_sections
+                    ),
+                }
+                if call.tool_name == "confirm_report"
+                else call.arguments
+            ),
+        )
+        for target, call in zip(targets, replacements, strict=True)
+    )

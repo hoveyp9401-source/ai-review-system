@@ -794,7 +794,13 @@ TOOL_REGISTRY = MappingProxyType(
             "replacement_evidence.exact_quote as the complete contiguous "
             "current-message passage that states only the intended new item content; exclude "
             "the target description, ordinal, old content, and edit instruction. The server "
-            "copies that passage and never persists model-authored replacement wording. Do not "
+            "copies that passage and never persists unreviewed model-authored wording. When the "
+            "user explicitly spells corrected characters or requests a substring correction, "
+            "supply the complete intended final item as replacement and cite the whole contiguous "
+            "correction statement as evidence; an independent reviewer and the server must approve "
+            "it before persistence. If several targets produce different final item text, use one "
+            "edit call per distinct final item; group targets only when their complete final text "
+            "is identical. Do not "
             "replace it with another item's content merely because the "
             "replacement resembles an item label or ordinal. Trusted context may resolve the "
             "target but cannot supply replacement content unless the current user_message "
@@ -846,6 +852,12 @@ TOOL_REGISTRY = MappingProxyType(
             "Copy the authenticated user's complete report from the model-resolved source date "
             "into today. The model supplies only the source-date meaning; the server binds the "
             "owned source report, its current version, and today's target report. "
+            "Use this when a brief current message semantically adopts one unique trusted "
+            "previous report as today's complete report; do not require the user to repeat "
+            "content already present in that trusted report. The source report need not be "
+            "preloaded in model context: when the current date expression resolves uniquely, "
+            "call this tool and let the server verify the authenticated user's source report. "
+            "Never claim that the source report is missing merely because it was not preloaded. "
             "When the same "
             "user request also adds a new independent item, pair this call with add_daily_items "
             "in the same initial write batch against the same trusted pre-write today snapshot. "
@@ -1080,6 +1092,37 @@ def _model_tool_input_schema(definition: ToolDefinition) -> dict[str, Any]:
     if definition.tool_name == "add_daily_items":
         return model_add_daily_items_schema()
     schema = _thaw_json(definition.input_schema)
+    if definition.tool_name == "confirm_report":
+        schema.get("properties", {}).pop(
+            "reviewed_omitted_empty_fields",
+            None,
+        )
+        required = schema.get("required")
+        if isinstance(required, list):
+            schema["required"] = [
+                name
+                for name in required
+                if name != "reviewed_omitted_empty_fields"
+            ]
+    if definition.tool_name == "edit_daily_items":
+        schema.get("properties", {}).pop("replacement_reviewed", None)
+        required = schema.get("required")
+        if isinstance(required, list):
+            schema["required"] = [
+                name for name in required if name != "replacement_reviewed"
+            ]
+    if definition.tool_name == "submit_next_weekly_plan":
+        schema.get("properties", {}).pop(
+            "reviewed_unfilled_days_as_empty",
+            None,
+        )
+        required = schema.get("required")
+        if isinstance(required, list):
+            schema["required"] = [
+                name
+                for name in required
+                if name != "reviewed_unfilled_days_as_empty"
+            ]
     if definition.tool_name in {
         "apply_current_weekly_report",
         "apply_next_weekly_plan",
@@ -1108,6 +1151,20 @@ def validate_tool_arguments(tool_name: str, arguments: Any) -> dict[str, Any]:
         )
         raise ToolArgumentsValidationError(tool_name, errors) from exc
     dumped = validated.model_dump(mode="json")
+    if (
+        tool_name == "confirm_report"
+        and not dumped.get("reviewed_omitted_empty_fields")
+    ):
+        dumped.pop("reviewed_omitted_empty_fields", None)
+    if tool_name == "edit_daily_items" and not dumped.get(
+        "replacement_reviewed"
+    ):
+        dumped.pop("replacement_reviewed", None)
+    if (
+        tool_name == "submit_next_weekly_plan"
+        and not dumped.get("reviewed_unfilled_days_as_empty")
+    ):
+        dumped.pop("reviewed_unfilled_days_as_empty", None)
     if (
         tool_name == "add_daily_items"
         and not dumped.get("reviewed_omitted_empty_fields")

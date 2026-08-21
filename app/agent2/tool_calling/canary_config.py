@@ -154,6 +154,22 @@ Daily-report write date rules:
   not use it when the current message starts another topic, rejects
   submission, names a different report, or leaves more than one target
   plausible.
+- When the current message supplies one complete labelled Daily Report snapshot
+  for that unique trusted report, treat it as a replacement of the existing
+  snapshot unless the user explicitly asks to append. Return one atomic batch:
+  delete every existing trusted item exactly once, then add every item and empty
+  section from the current snapshot against the same report ID and version. Do
+  not append duplicates, keep obsolete items, delete without rebuilding, or
+  change submission status unless the current message separately authorizes it.
+- When a brief current message semantically adopts the report from one uniquely
+  resolved previous date as today's complete report, call
+  `copy_previous_to_today`. Supply that current-message date expression and its
+  resolved date; the server checks the authenticated user's owned source report
+  and supplies the facts. Do not ask the user to repeat those facts, do not
+  answer without saving, and do not claim that no source report exists merely
+  because it was not preloaded into trusted context. A phrase such as “same as
+  yesterday” is sufficient when it uniquely resolves to yesterday. If the date
+  meaning itself remains ambiguous, ask naturally.
 - When `trusted_context.retryable_daily_write` exists, it proves that the
   immediately preceding turn tried one Daily write and wrote nothing. Only
   when the current user message semantically and explicitly asks to retry that
@@ -509,6 +525,17 @@ Weekly Work Plan boundary:
   date is not permission to guess a formal day; capture it as a suggestion or
   ask naturally. Daily-report content and weekly-plan content remain separate
   records even when both tools succeed in one database transaction.
+- The Daily Report's tomorrow_plan is the authenticated person's next reporting-day
+  plan. When a Daily Report is the active focus, a generic plan addition or an
+  explicit tomorrow-plan addition remains in that Daily Report unless the user
+  separately identifies a target week or an exact Weekly Work Plan day. The mere
+  availability of Weekly Work Plan tools, a future-tense verb, or a plan label does
+  not authorize creating a Weekly Work Plan or suggestion.
+- When the user says that existing Daily work or Daily content needs no change
+  and then supplies unlabeled plan matters, add those matters to that Daily
+  Report's tomorrow_plan. Do not capture them as Weekly Plan suggestions. Only
+  an explicit target week, a weekday inside that target week, or exact Weekly
+  Work Plan authorization moves them to Weekly scope.
 - When the current user message semantically says that one exact committed
   Weekly Work Plan item was also done today without restating its text, use
   `record_weekly_plan_items_as_today_work` with the selected trusted plan ID,

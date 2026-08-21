@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 
 from app.api import reports
-
 
 NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
 
@@ -40,7 +41,7 @@ async def test_public_manual_request_source_never_reaches_agent2_route_decision(
         return {"report_id": None, "reply_kind": "trusted_route"}
 
     monkeypatch.setattr(reports, "get_active_user_by_dingtalk_id", get_user)
-    monkeypatch.setattr(reports, "_submit_manual_agent2_if_applicable", submit_agent2)
+    monkeypatch.setattr(reports, "_submit_manual_tool_call_agent2", submit_agent2)
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
@@ -64,6 +65,268 @@ async def test_public_manual_request_source_never_reaches_agent2_route_decision(
     assert response["reply_kind"] == "trusted_route"
     assert len(captured_kwargs) == 1
     assert "source" not in captured_kwargs[0]
+
+
+@pytest.mark.asyncio
+async def test_manual_api_uses_the_same_direct_tool_call_runtime_as_dingtalk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = uuid4()
+    report_id = uuid4()
+    user = SimpleNamespace(
+        id=user_id,
+        dingtalk_user_id="ding-user",
+        name="Test User",
+        timezone="Asia/Shanghai",
+    )
+    report = SimpleNamespace(
+        id=report_id,
+        user_id=user_id,
+        report_date=date.today(),
+        status="pending_confirmation",
+        today_work=["完成合同复核"],
+        problems=[],
+        tomorrow_plan=["继续跟进"],
+        section_status={"problems_acknowledged_empty": True},
+        confirmation_type="none",
+        confirmed_by_user=False,
+        quality_warning=None,
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        reports,
+        "get_settings",
+        lambda: SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+
+    async def process(*args, **kwargs):
+        captured.update(kwargs)
+        return reports.CanaryIngressOutcome(
+            owner="tool_call_core",
+            reason="allowed",
+            message="已保存。",
+            report_id=str(report_id),
+            handled=True,
+            actual_write=True,
+            messages_enabled=True,
+            user_visible_result="success",
+            reply_formed=True,
+        )
+
+    async def get_current_report(*args, **kwargs):
+        return report
+
+    monkeypatch.setattr(reports, "process_tool_call_canary_ingress", process)
+    monkeypatch.setattr(reports, "get_report", get_current_report)
+    session = _Session()
+
+    async def session_get(model, object_id):
+        assert model is reports.DailyReport
+        return report if object_id == report_id else None
+
+    session.get = session_get  # type: ignore[attr-defined]
+
+    response = await reports._submit_manual_tool_call_agent2(
+        session=session,  # type: ignore[arg-type]
+        user=user,
+        raw_input="今天完成合同复核",
+        report_date=None,
+        llm_client=object(),
+        message_id="manual-message-1",
+        conversation_id="conversation-1",
+    )
+
+    assert captured["source_channel"] == "manual_text"
+    assert captured["conversation_kind"] == "direct"
+    assert captured["user_text"] == "今天完成合同复核"
+    assert response["reply_kind"] == "agent2_tool_call"
+    assert response["actual_write"] is True
+    assert response["user_visible_result"] == "success"
+    assert response["outcome_reason"] == "allowed"
+    assert response["merged_report"]["today_work"] == ["完成合同复核"]
+
+
+@pytest.mark.asyncio
+async def test_manual_api_returns_the_exact_daily_report_written_by_agent2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = uuid4()
+    today_report = SimpleNamespace(
+        id=uuid4(),
+        user_id=user_id,
+        report_date=date(2026, 8, 21),
+        status="collecting",
+        today_work=["今天原有内容"],
+        problems=[],
+        tomorrow_plan=[],
+        section_status={},
+        confirmation_type="none",
+        confirmed_by_user=False,
+        quality_warning=None,
+    )
+    yesterday_report = SimpleNamespace(
+        id=uuid4(),
+        user_id=user_id,
+        report_date=date(2026, 8, 20),
+        status="pending_confirmation",
+        today_work=["补写昨天的合同复核"],
+        problems=[],
+        tomorrow_plan=["昨天计划的后续"],
+        section_status={},
+        confirmation_type="none",
+        confirmed_by_user=False,
+        quality_warning=None,
+    )
+    user = SimpleNamespace(
+        id=user_id,
+        dingtalk_user_id="ding-user",
+        timezone="Asia/Shanghai",
+    )
+    session = _Session()
+
+    async def session_get(model, object_id):
+        assert model is reports.DailyReport
+        return (
+            yesterday_report
+            if object_id == yesterday_report.id
+            else None
+        )
+
+    session.get = session_get  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        reports,
+        "get_settings",
+        lambda: SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+
+    async def process(*args, **kwargs):
+        return reports.CanaryIngressOutcome(
+            owner="tool_call_core",
+            reason="allowed",
+            message="昨天的日报已补写。",
+            report_id=str(yesterday_report.id),
+            handled=True,
+            actual_write=True,
+            messages_enabled=True,
+            user_visible_result="success",
+            reply_formed=True,
+        )
+
+    async def get_fallback(*args, **kwargs):
+        return today_report
+
+    monkeypatch.setattr(reports, "process_tool_call_canary_ingress", process)
+    monkeypatch.setattr(reports, "get_report", get_fallback)
+
+    response = await reports._submit_manual_tool_call_agent2(
+        session=session,  # type: ignore[arg-type]
+        user=user,
+        raw_input="补写昨天：完成合同复核",
+        report_date=None,
+        llm_client=object(),
+        message_id="manual-history-write",
+        conversation_id="conversation-1",
+    )
+
+    assert response["report_id"] == str(yesterday_report.id)
+    assert response["report_date"] == "2026-08-20"
+    assert response["merged_report"]["today_work"] == [
+        "补写昨天的合同复核"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_manual_api_does_not_allow_a_hidden_report_date_to_override_agent2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = SimpleNamespace(id=uuid4(), dingtalk_user_id="ding-user")
+
+    async def get_user(*args, **kwargs):
+        return user
+
+    monkeypatch.setattr(reports, "get_active_user_by_dingtalk_id", get_user)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await reports.submit_manual_report(
+            request=request,
+            body=reports.ManualReportRequest(
+                dingtalk_user_id="ding-user",
+                raw_input="完成合同复核",
+                report_date=date(2026, 8, 20),
+            ),
+            session=_Session(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "日期写进 raw_input" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_manual_api_preserves_partial_failure_even_when_a_write_happened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = uuid4()
+    report_id = uuid4()
+    user = SimpleNamespace(
+        id=user_id,
+        dingtalk_user_id="ding-user",
+        timezone="Asia/Shanghai",
+    )
+    report = SimpleNamespace(
+        id=report_id,
+        user_id=user_id,
+        report_date=date.today(),
+        status="collecting",
+        today_work=["已安全写入的一项"],
+        problems=[],
+        tomorrow_plan=[],
+        section_status={},
+        confirmation_type="none",
+        confirmed_by_user=False,
+        quality_warning=None,
+    )
+    session = _Session()
+
+    async def session_get(model, object_id):
+        return report if object_id == report_id else None
+
+    session.get = session_get  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        reports,
+        "get_settings",
+        lambda: SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+
+    async def process(*args, **kwargs):
+        return reports.CanaryIngressOutcome(
+            owner="tool_call_core",
+            reason="partial_clarification",
+            message="一项已记录，另一项还需要你确认具体日期。",
+            report_id=str(report_id),
+            handled=True,
+            actual_write=True,
+            messages_enabled=True,
+            user_visible_result="clarification",
+            reply_formed=True,
+        )
+
+    monkeypatch.setattr(reports, "process_tool_call_canary_ingress", process)
+
+    response = await reports._submit_manual_tool_call_agent2(
+        session=session,  # type: ignore[arg-type]
+        user=user,
+        raw_input="记录一项并确认另一项",
+        report_date=None,
+        llm_client=object(),
+        message_id="partial-write",
+        conversation_id="conversation-1",
+    )
+
+    assert response["reply_kind"] == "agent2_tool_call_clarification"
+    assert response["actual_write"] is True
+    assert response["user_visible_result"] == "clarification"
 
 
 @pytest.mark.parametrize("trusted_route", ("agent1", "agent2_shadow"))

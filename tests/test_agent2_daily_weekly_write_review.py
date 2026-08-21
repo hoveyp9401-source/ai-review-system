@@ -14,8 +14,8 @@ from app.agent2.tool_calling.context import (
     TrustedPrincipal,
     TrustedRecentMessage,
     TrustedRecentOperation,
-    TrustedReportReference,
     TrustedReportItem,
+    TrustedReportReference,
     TrustedReportSnapshot,
 )
 from app.agent2.tool_calling.contracts import (
@@ -30,7 +30,9 @@ from app.agent2.tool_calling.deepseek_adapter import (
     _CompletionResponse,
     _constrain_weekly_plan_review_submission,
     _daily_weekly_write_review_messages,
+    _daily_weekly_write_review_tool_names,
     _parse_assistant_turn,
+    _validate_completion_protocol,
 )
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
 from app.agent2.weekly_plan_context import (
@@ -194,6 +196,85 @@ def _daily_context_with_tools(*tool_names: str) -> TrustedContext:
             "gate_decisions": {name: True for name in allowed},
         }
     )
+
+
+def test_previous_report_copy_review_stays_on_the_server_bound_copy_tool():
+    parsed = _parse_assistant_turn(
+        _tool_completion(
+            {
+                "id": "copy-yesterday",
+                "type": "function",
+                "function": {
+                    "name": "copy_previous_to_today",
+                    "arguments": json.dumps(
+                        {
+                            "source_date_expression": "昨天",
+                            "proposed_source_date": "2026-08-13",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ).message
+    )
+    context = _daily_context_with_tools(
+        "add_daily_items",
+        "copy_previous_to_today",
+        "apply_next_weekly_plan",
+    )
+
+    assert _daily_weekly_write_review_tool_names(
+        parsed.tool_calls,
+        context=context,
+    ) == frozenset({"copy_previous_to_today"})
+
+
+def test_review_only_textual_execute_envelope_becomes_a_valid_native_call():
+    message = {
+        "role": "assistant",
+        "content": json.dumps(
+            {
+                "decision": "execute",
+                "tool_calls": [
+                    {
+                        "name": "edit_daily_items",
+                        "arguments": {
+                            "report_id": "20000000-0000-4000-8000-000000000009",
+                            "expected_version": 9,
+                            "target_item_ids": ["today-9"],
+                            "replacement": "完成合同终稿复核",
+                            "replacement_evidence": {
+                                "source_message_index": 1,
+                                "exact_quote": "完成合同终稿复核",
+                            },
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    }
+    parsed = _parse_assistant_turn(
+        message,
+        allow_review_arguments_envelope=True,
+    )
+
+    assert [call.tool_name for call in parsed.tool_calls] == [
+        "edit_daily_items"
+    ]
+    assert parsed.audit[0].parse_status == (
+        "validated_review_textual_execute_envelope"
+    )
+    _validate_completion_protocol(
+        _CompletionResponse(
+            message=message,
+            metadata={"finish_reason": "stop"},
+        ),
+        parsed,
+    )
+
+    ordinary = _parse_assistant_turn(message)
+    assert ordinary.tool_calls == ()
 
 
 def _monday_dual_target_context() -> TrustedContext:
@@ -615,6 +696,7 @@ async def _run_scripted_write_review(
     user_text: str,
     draft_calls: tuple[dict, ...],
     reviewed_calls: tuple[dict, ...],
+    structure_retry_calls: tuple[dict, ...] | None = None,
     adjudicated_calls: tuple[dict, ...] | None = None,
     adjudication_completion: _CompletionResponse | None = None,
     weekly_reclassification_completion: _CompletionResponse | None = None,
@@ -631,6 +713,8 @@ async def _run_scripted_write_review(
         _tool_completion(*draft_calls),
         _tool_completion(*reviewed_calls),
     ]
+    if structure_retry_calls is not None:
+        scripted.append(_tool_completion(*structure_retry_calls))
     if adjudicated_calls is not None and adjudication_completion is not None:
         raise ValueError("choose adjudicated_calls or adjudication_completion")
     if adjudicated_calls is not None:
@@ -1026,15 +1110,10 @@ async def test_daily_edit_negation_partial_quote_is_corrected_before_any_write(
     )
 
     assert runtime.execute_count == 1
+    reviewed_arguments = json.loads(reviewed["function"]["arguments"])
     assert runtime.calls[0].arguments == {
-        "report_id": "20000000-0000-4000-8000-000000000009",
-        "expected_version": 9,
-        "target_item_ids": ["today-9"],
-        "replacement": "每周一记录旧内容",
-        "replacement_evidence": {
-            "source_message_index": 1,
-            "exact_quote": "不再每周一记录",
-        },
+        **reviewed_arguments,
+        "replacement_reviewed": True,
     }
     assert requested_tool_schemas == [
         ("edit_daily_items",),
@@ -1454,9 +1533,15 @@ async def test_daily_edit_replacement_rule_is_present_with_weekly_tools_enabled(
     ]
     assert "For edit_daily_items" in review_system_prompts[0]
     assert "complete contiguous new replacement" in review_system_prompts[0]
+    assert "explicitly spells corrected characters" in review_system_prompts[0]
+    assert "construct the complete intended final item" in review_system_prompts[0]
     assert [call.tool_name for call in runtime.calls] == [
         "edit_daily_items"
     ]
+    assert runtime.calls[0].arguments["replacement"] == (
+        "不再每周一记录旧内容"
+    )
+    assert runtime.calls[0].arguments["replacement_reviewed"] is True
 
 
 def _daily_add_call(*, call_id: str) -> dict:
@@ -1473,6 +1558,43 @@ def _daily_add_call(*, call_id: str) -> dict:
             }
         ],
     )
+
+
+def test_daily_review_prompt_replaces_a_complete_snapshot_instead_of_appending():
+    draft = _parse_assistant_turn(
+        _tool_completion(_daily_add_call(call_id="whole-snapshot-draft")).message
+    )
+    messages = _daily_weekly_write_review_messages(
+        user_text="今日工作：完整新版内容",
+        user_messages=(),
+        calls=draft.tool_calls,
+        context=_daily_context_with_tools(
+            "add_daily_items",
+            "delete_daily_items",
+            "apply_next_weekly_plan",
+        ),
+        trusted_completed_daily_query_results=[],
+        selected_targets=[],
+        allowed_tool_names=frozenset(
+            {
+                "add_daily_items",
+                "delete_daily_items",
+                "apply_next_weekly_plan",
+            }
+        ),
+    )
+
+    prompt = messages[0]["content"]
+    assert "complete labelled Daily Report snapshot" in prompt
+    assert "replace the snapshot atomically" in prompt
+    assert "delete without rebuilding" in prompt
+    prompt_lower = prompt.lower()
+    assert "independently partition unrelated projects" in prompt_lower
+    assert "does not cancel separate new work" in prompt_lower
+    assert "existing daily work or daily content" in prompt_lower
+    assert "do not turn them into weekly plan suggestions" in prompt_lower
+    assert "different primary work objects or deliverables" in prompt_lower
+    assert "independent progress" in prompt_lower
 
 
 @pytest.mark.asyncio
@@ -1848,6 +1970,73 @@ async def test_daily_edit_review_keeps_multiple_same_text_edit_targets(
     )
     assert result.model_turns[1].response_metadata[
         "daily_weekly_write_semantic_review"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_daily_edit_review_retries_a_wrongly_merged_target_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    draft_calls = (
+        _daily_edit_call(
+            call_id="draft-edit-9",
+            replacement="陆静芳处理第一项",
+            exact_quote="陆静芳不是陆警方",
+            target_item_ids=["today-9"],
+        ),
+        _daily_edit_call(
+            call_id="draft-edit-10",
+            replacement="陆静芳处理第二项",
+            exact_quote="陆静芳不是陆警方",
+            target_item_ids=["today-10"],
+        ),
+    )
+    merged_review = (
+        _daily_edit_call(
+            call_id="merged-review",
+            replacement="陆静芳",
+            exact_quote="陆静芳不是陆警方",
+            target_item_ids=["today-9", "today-10"],
+        ),
+    )
+    retry_calls = (
+        _daily_edit_call(
+            call_id="retry-edit-9",
+            replacement="陆静芳处理第一项",
+            exact_quote="陆静芳不是陆警方",
+            target_item_ids=["today-9"],
+        ),
+        _daily_edit_call(
+            call_id="retry-edit-10",
+            replacement="陆静芳处理第二项",
+            exact_quote="陆静芳不是陆警方",
+            target_item_ids=["today-10"],
+        ),
+    )
+
+    result = await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=_daily_context_with_tools(
+            "edit_daily_items",
+            "apply_next_weekly_plan",
+        ),
+        user_text="陆静芳不是陆警方，大陆的陆，安静的静",
+        draft_calls=draft_calls,
+        reviewed_calls=merged_review,
+        structure_retry_calls=retry_calls,
+    )
+
+    assert [
+        tuple(call.arguments["target_item_ids"]) for call in runtime.calls
+    ] == [("today-9",), ("today-10",)]
+    assert all(
+        call.arguments["replacement_reviewed"] is True
+        for call in runtime.calls
+    )
+    assert result.model_turns[2].response_metadata[
+        "daily_edit_review_structure_retry"
     ] is True
 
 
@@ -3296,6 +3485,87 @@ async def test_zero_tool_review_agreement_ignores_ephemeral_operation_ids(
         "apply_next_weekly_plan"
     ]
     assert runtime.calls[0].arguments["operations"][0]["operation_id"] == "op-1"
+
+
+@pytest.mark.asyncio
+async def test_zero_tool_daily_reviewers_may_use_different_safe_item_grouping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RecordingRuntime()
+    adapter = DeepSeekToolCallingAdapter(
+        http_client=object(),
+        model="deepseek-v4-flash",
+        timeout_seconds=10,
+        max_tool_loops=2,
+        endpoint="https://example.invalid/chat/completions",
+    )
+    source = "今天完成合同审核并整理付款材料"
+    first = _daily_items_call(
+        call_id="first-daily-grouping",
+        items=[
+            {
+                "field": "today_work",
+                "content": source,
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "今天完成合同审核、并整理付款材料",
+                },
+            }
+        ],
+    )
+    second = _daily_items_call(
+        call_id="second-daily-grouping",
+        items=[
+            {
+                "field": "today_work",
+                "content": "今天完成合同审核",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "今天完成合同审核",
+                },
+            },
+            {
+                "field": "today_work",
+                "content": "整理付款材料",
+                "source_evidence": {
+                    "source_message_index": 1,
+                    "exact_quote": "整理付款材料",
+                },
+            },
+        ],
+    )
+    completions = iter(
+        (
+            _direct_completion("好的。"),
+            _tool_completion(first),
+            _tool_completion(second),
+            _terminal_completion("日报已记录。"),
+        )
+    )
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 test",
+        user_text=source,
+        context=_context(),
+        runtime_session=runtime,
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "add_daily_items"
+    ]
+    assert len(runtime.calls[0].arguments["items"]) == 1
+    assert runtime.calls[0].arguments["items"][0]["source_evidence"][
+        "exact_quote"
+    ] == source
+    assert result.model_turns[2].response_metadata[
+        "daily_weekly_zero_draft_daily_semantic_quorum"
+    ] is True
 
 
 @pytest.mark.asyncio

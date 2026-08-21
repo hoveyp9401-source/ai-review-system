@@ -529,6 +529,104 @@ async def test_incomplete_confirmation_returns_only_the_actual_missing_section(
     assert outcome.safe_user_facts["actual_write"] is False
 
 
+@pytest.mark.asyncio
+async def test_independently_reviewed_submit_acknowledges_only_the_missing_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_id = uuid5(NAMESPACE_URL, "reviewed-incomplete-submit")
+    user_id = uuid5(NAMESPACE_URL, "reviewed-incomplete-submit-user")
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="tenant-test",
+        owner_user_id=user_id,
+        report_date=date(2026, 8, 14),
+        version=2,
+        status="collecting",
+        items=(
+            TrustedReportItem(
+                item_id="today-1",
+                field="today_work",
+                content="完成合同复核",
+                report_id=report_id,
+                report_version=2,
+            ),
+            TrustedReportItem(
+                item_id="plan-1",
+                field="tomorrow_plan",
+                content="继续跟进",
+                report_id=report_id,
+                report_version=2,
+            ),
+        ),
+    )
+    completed = report.model_copy(update={"version": 4, "status": "completed"})
+    executor = ProductionDailyExecutor.__new__(ProductionDailyExecutor)
+    executor._context = SimpleNamespace(
+        principal=SimpleNamespace(
+            tenant_id="tenant-test",
+            user_id=user_id,
+            conversation_id="conversation-test",
+            source_message_id="message-test",
+            timezone="Asia/Shanghai",
+        ),
+        now=datetime(2026, 8, 14, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    executor._settings = SimpleNamespace()
+    executor._source_text_hash = "a" * 64
+    executor._arguments = lambda request, _expected_type: request.arguments
+    executor._bound = lambda _request: SimpleNamespace(report=report)
+    executor._required_bound_report = lambda _bound: report
+    executor._require_same_report = lambda _trusted, _live_id: None
+    executor._tool_idempotency_key = lambda _request: "daily:reviewed-submit"
+    snapshots = iter((report, completed))
+
+    async def snapshot(_report_date):
+        return next(snapshots)
+
+    async def typed_snapshot(_report_date):
+        return SimpleNamespace(
+            report_id=report_id,
+            version=2,
+            status="collecting",
+            today_work=("完成合同复核",),
+            problems=(),
+            tomorrow_plan=("继续跟进",),
+            acknowledged_empty_fields=frozenset(),
+        )
+
+    captured = []
+
+    async def execute(_report_date, commands, **_kwargs):
+        captured.extend(commands)
+        return ("receipt-1", "receipt-2")
+
+    monkeypatch.setattr(executor, "_snapshot", snapshot)
+    monkeypatch.setattr(executor, "_typed_snapshot", typed_snapshot)
+    monkeypatch.setattr(executor, "_execute_typed", execute)
+    request = ProductionHandlerRequest(
+        tool_call_id="reviewed-confirm",
+        tool_name="confirm_report",
+        arguments=ConfirmReportArgs(
+            report_id=report_id,
+            expected_version=2,
+            reviewed_omitted_empty_fields=("problems",),
+        ),
+        executor=executor,
+        memory_executor=executor,
+    )
+
+    outcome = await executor.confirm_report(request)
+
+    assert [command.command_type for command in captured] == [
+        "acknowledge_empty_section",
+        "submit_report",
+    ]
+    assert [command.report_version for command in captured] == [2, 3]
+    assert captured[0].patch == {"field": "problems"}
+    assert outcome.after_report == completed
+    assert outcome.typed_receipt_ids == ("receipt-1", "receipt-2")
+
+
 def test_incomplete_confirmation_reply_cannot_expand_one_missing_section_to_three() -> None:
     receipt = ToolReceipt(
         status=ReceiptStatus.CLARIFICATION_REQUIRED,

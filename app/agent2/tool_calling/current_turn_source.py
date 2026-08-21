@@ -97,6 +97,7 @@ class CurrentTurnSource:
         arguments: dict[str, Any],
         *,
         allow_approximate_daily_quotes: bool = False,
+        allow_reviewed_repeated_daily_quotes: bool = False,
     ) -> None:
         if tool_name == "add_daily_items":
             arguments = self._normalize_daily_source_quotes(
@@ -104,7 +105,12 @@ class CurrentTurnSource:
                 allow_approximate=allow_approximate_daily_quotes,
             )
             typed = AddDailyItemsArgs.model_validate(arguments)
-            self._validate_daily_item_spans(typed)
+            self._validate_daily_item_spans(
+                typed,
+                allow_extra_occurrences=(
+                    allow_reviewed_repeated_daily_quotes
+                ),
+            )
             for item in typed.empty_field_evidence:
                 self._validate_evidence(item.source_evidence)
             if typed.date_evidence is not None:
@@ -125,11 +131,12 @@ class CurrentTurnSource:
                 raise CurrentTurnSourceEvidenceError(
                     "DAILY_EDIT_REPLACEMENT_QUOTE_MISMATCH"
                 )
-            if occurrence_count != 1:
+            if occurrence_count != 1 and not typed_edit.replacement_reviewed:
                 raise CurrentTurnSourceEvidenceError(
                     "DAILY_EDIT_REPLACEMENT_SPAN_AMBIGUOUS"
                 )
             return
+
         if tool_name == "correct_daily_report_date":
             typed_correction = CorrectDailyReportDateArgs.model_validate(
                 arguments
@@ -280,7 +287,18 @@ class CurrentTurnSource:
             arguments = self._normalize_weekly_source_quotes(arguments)
         elif tool_name == "apply_current_weekly_report":
             arguments = self._normalize_periodic_source_content(arguments)
-        self.validate_tool_arguments(tool_name, arguments)
+        self.validate_tool_arguments(
+            tool_name,
+            arguments,
+            allow_approximate_daily_quotes=bool(
+                tool_name == "add_daily_items"
+                and arguments.get("content_reviewed")
+            ),
+            allow_reviewed_repeated_daily_quotes=bool(
+                tool_name == "add_daily_items"
+                and arguments.get("content_reviewed")
+            ),
+        )
         if tool_name not in {"add_daily_items", "edit_daily_items"}:
             return arguments
 
@@ -289,6 +307,8 @@ class CurrentTurnSource:
             bound_edit = typed_edit.model_dump(mode="json")
             evidence = typed_edit.replacement_evidence
             source_message = self._validate_evidence(evidence)
+            if typed_edit.replacement_reviewed:
+                return bound_edit
             quote_start = source_message.find(evidence.exact_quote)
             quote_end = quote_start + len(evidence.exact_quote)
             bound_edit["replacement"] = source_message[
@@ -313,6 +333,24 @@ class CurrentTurnSource:
             if not typed.content_reviewed:
                 bound["items"][index]["content"] = formatting_only
         return bound
+
+    def bind_reviewed_daily_arguments(
+        self,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Bind reviewer-approved approximate quotes to exact current spans."""
+
+        normalized = self._normalize_daily_source_quotes(
+            arguments,
+            allow_approximate=True,
+        )
+        self.validate_tool_arguments(
+            "add_daily_items",
+            normalized,
+            allow_approximate_daily_quotes=False,
+            allow_reviewed_repeated_daily_quotes=True,
+        )
+        return normalized
 
     def _normalize_weekly_source_quotes(
         self,
@@ -473,7 +511,12 @@ class CurrentTurnSource:
             return arguments
         return {**arguments, "items": normalized_items}
 
-    def _validate_daily_item_spans(self, typed: AddDailyItemsArgs) -> None:
+    def _validate_daily_item_spans(
+        self,
+        typed: AddDailyItemsArgs,
+        *,
+        allow_extra_occurrences: bool = False,
+    ) -> None:
         item_counts: dict[tuple[int, str], int] = {}
         occurrence_queues: dict[
             tuple[int, str],
@@ -503,11 +546,16 @@ class CurrentTurnSource:
                     if (source_index, exact_quote) in quote_is_content
                     else "DAILY_ITEM_EXACT_QUOTE_MISMATCH"
                 )
-            if len(occurrences) != item_count:
+            if len(occurrences) < item_count or (
+                len(occurrences) > item_count
+                and not allow_extra_occurrences
+            ):
                 raise CurrentTurnSourceEvidenceError(
                     "DAILY_ITEM_SOURCE_SPAN_AMBIGUOUS"
                 )
-            occurrence_queues[(source_index, exact_quote)] = occurrences
+            occurrence_queues[(source_index, exact_quote)] = occurrences[
+                :item_count
+            ]
 
         spans_by_message: dict[
             int,

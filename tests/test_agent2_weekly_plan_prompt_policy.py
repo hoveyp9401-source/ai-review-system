@@ -112,6 +112,33 @@ def test_weekly_plan_prompt_requires_one_preview_and_explicit_submission():
     assert "remain separate records" in prompt
 
 
+def test_weekly_plan_prompt_keeps_generic_tomorrow_plan_in_active_daily_report():
+    prompt = " ".join(canary_system_prompt().split()).lower()
+
+    assert (
+        "tomorrow_plan is the authenticated person's next reporting-day plan"
+        in prompt
+    )
+    assert "a generic plan addition" in prompt
+    assert (
+        "does not authorize creating a weekly work plan or suggestion" in prompt
+    )
+    assert "existing daily work or daily content needs no change" in prompt
+    assert "do not capture them as weekly plan suggestions" in prompt
+
+
+def test_daily_prompt_uses_the_unique_trusted_previous_report_for_a_brief_copy():
+    prompt = " ".join(canary_system_prompt().split()).lower()
+    description = TOOL_REGISTRY["copy_previous_to_today"].description.lower()
+
+    assert "call `copy_previous_to_today`" in prompt
+    assert "do not ask the user to repeat those facts" in prompt
+    assert "do not claim that no source report exists" in prompt
+    assert "same as yesterday" in prompt
+    assert "need not be preloaded" in description
+    assert "let the server verify" in description
+
+
 def test_weekly_plan_prompt_preserves_repeated_ranges_and_shared_date_scope():
     prompt = " ".join(canary_system_prompt().split()).lower()
 
@@ -152,6 +179,14 @@ def test_weekly_plan_content_review_proof_is_server_only():
 
     assert "content_reviewed" in ApplyNextWeeklyPlanArgs.model_fields
     assert "content_reviewed" not in schema["properties"]
+
+    submit_schema = deepseek_tool_schemas(
+        frozenset({"submit_next_weekly_plan"})
+    )[0]["function"]["parameters"]
+    assert "reviewed_unfilled_days_as_empty" in (
+        SubmitNextWeeklyPlanArgs.model_fields
+    )
+    assert "reviewed_unfilled_days_as_empty" not in submit_schema["properties"]
 
 
 def test_weekly_plan_content_field_excludes_operation_instructions():

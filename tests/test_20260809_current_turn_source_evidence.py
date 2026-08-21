@@ -388,6 +388,29 @@ def test_daily_item_quote_must_identify_one_source_occurrence() -> None:
         )
 
 
+def test_independently_reviewed_daily_item_may_bind_one_repeated_occurrence() -> None:
+    source = CurrentTurnSource(("完成核对；完成核对",))
+
+    bound = source.bind_tool_arguments(
+        "add_daily_items",
+        {
+            "items": [
+                {
+                    "field": "today_work",
+                    "content": "完成核对",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "完成核对",
+                    },
+                }
+            ],
+            "content_reviewed": True,
+        },
+    )
+
+    assert bound["items"][0]["content"] == "完成核对"
+
+
 def test_daily_item_binder_accepts_all_repeated_list_occurrences() -> None:
     source = CurrentTurnSource(
         (
@@ -468,6 +491,50 @@ def test_daily_edit_replacement_quote_must_identify_one_source_occurrence() -> N
                 },
             },
         )
+
+
+def test_independently_reviewed_edit_accepts_a_repeated_replacement_word() -> None:
+    source = CurrentTurnSource(("把甲改为总部，乙也改为总部",))
+
+    bound = source.bind_tool_arguments(
+        "edit_daily_items",
+        {
+            "report_id": "20000000-0000-0000-0000-000000000001",
+            "expected_version": 9,
+            "target_item_ids": ["today-1", "plan-1"],
+            "replacement": "总部",
+            "replacement_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "总部",
+            },
+            "replacement_reviewed": True,
+        },
+    )
+
+    assert bound["replacement"] == "总部"
+
+
+def test_independently_reviewed_edit_preserves_a_spelled_correction() -> None:
+    source = CurrentTurnSource(
+        ("英语审核的英语改成用印作用的用，印章的印",)
+    )
+
+    bound = source.bind_tool_arguments(
+        "edit_daily_items",
+        {
+            "report_id": "20000000-0000-0000-0000-000000000001",
+            "expected_version": 9,
+            "target_item_ids": ["today-1"],
+            "replacement": "用印审核",
+            "replacement_evidence": {
+                "source_message_index": 1,
+                "exact_quote": "英语审核的英语改成用印作用的用，印章的印",
+            },
+            "replacement_reviewed": True,
+        },
+    )
+
+    assert bound["replacement"] == "用印审核"
 
 
 def test_daily_edit_tool_contract_requires_the_replacement_quote() -> None:

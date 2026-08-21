@@ -438,7 +438,10 @@ def _apply_command(
         evidence = build_trusted_evidence(
             owner_user_id=plan.owner_user_id,
             source_kind=TrustedSourceKind.USER_ORIGINAL_MESSAGE,
-            source_ref=command.source_message_id,
+            source_ref=str(
+                command.patch.get("source_ref")
+                or command.source_message_id
+            ),
             source_version=str(command.patch["source_version"]),
             evidence_text=str(command.patch["evidence_text"]),
         )

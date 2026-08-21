@@ -42,6 +42,7 @@ from app.agent2.tool_calling.daily_briefing_reply import (
     validate_daily_briefing_reply,
 )
 from app.agent2.tool_calling.daily_incomplete_confirm_review import (
+    attach_reviewed_omitted_sections,
     daily_incomplete_confirm_review_messages,
     incomplete_confirm_review_targets,
     validate_daily_incomplete_confirm_replacements,
@@ -55,7 +56,6 @@ from app.agent2.tool_calling.receipt_reply import (
     finalize_canary_content,
     finalize_shadow_content,
 )
-from app.agent2.tool_calling.reporting_date import default_daily_write_date
 from app.agent2.tool_calling.registry import (
     TOOL_REGISTRY,
     ToolArgumentsValidationError,
@@ -63,6 +63,7 @@ from app.agent2.tool_calling.registry import (
     deepseek_tool_schemas,
     validate_tool_arguments,
 )
+from app.agent2.tool_calling.reporting_date import default_daily_write_date
 from app.agent2.tool_calling.runtime import (
     NativeToolCall,
     ShadowRuntime,
@@ -532,6 +533,7 @@ class DeepSeekToolCallingAdapter:
         incomplete_confirm_review_count = 0
         daily_submit_section_review_count = 0
         daily_weekly_write_review_count = 0
+        daily_edit_review_structure_retry_count = 0
         bounded_daily_probe_pending = _should_run_bounded_daily_probe(
             user_text=user_text,
             user_messages=user_messages,
@@ -1218,19 +1220,37 @@ class DeepSeekToolCallingAdapter:
                                         "add call"
                                     )
                             except DeepSeekToolCallingError as repair_exc:
-                                raise _with_canary_turn_state(
-                                    repair_exc,
-                                    audits=audits,
-                                    model_turns=model_turns,
-                                ) from repair_exc
+                                audits.extend(repair_exc.raw_tool_call_audit)
+                                model_turns[-1] = replace(
+                                    model_turns[-1],
+                                    response_metadata={
+                                        **model_turns[-1].response_metadata,
+                                        "focused_daily_argument_repair_fell_back_to_main_agent2": True,
+                                        "draft_executed": False,
+                                    },
+                                )
+                                tool_argument_repair_count += 1
+                                bounded_daily_probe_pending = False
+                                bounded_daily_turn_active = False
+                                bounded_daily_success_reply = None
+                                continue
                             except ValueError as repair_exc:
-                                raise _with_canary_turn_state(
-                                    DeepSeekResponseError(
-                                        "compact Daily argument repair failed"
-                                    ),
-                                    audits=audits,
-                                    model_turns=model_turns,
-                                ) from repair_exc
+                                model_turns[-1] = replace(
+                                    model_turns[-1],
+                                    response_metadata={
+                                        **model_turns[-1].response_metadata,
+                                        "focused_daily_argument_repair_fell_back_to_main_agent2": True,
+                                        "focused_daily_argument_repair_error": type(
+                                            repair_exc
+                                        ).__name__,
+                                        "draft_executed": False,
+                                    },
+                                )
+                                tool_argument_repair_count += 1
+                                bounded_daily_probe_pending = False
+                                bounded_daily_turn_active = False
+                                bounded_daily_success_reply = None
+                                continue
                             tool_argument_repair_count += 1
                             bounded_daily_probe_pending = False
                             bounded_daily_turn_active = True
@@ -1465,8 +1485,9 @@ class DeepSeekToolCallingAdapter:
                     )
                     focused_daily_review = (
                         bounded_daily_turn_active
-                        and daily_weekly_review_tool_names
-                        == frozenset({"add_daily_items"})
+                        and len(parsed.tool_calls) == 1
+                        and parsed.tool_calls[0].tool_name
+                        == "add_daily_items"
                     )
                     focused_weekly_review = (
                         {
@@ -1574,6 +1595,12 @@ class DeepSeekToolCallingAdapter:
                                     raise DeepSeekResponseError(
                                         "focused Daily repair budget exhausted"
                                     )
+                                omission_only_repair = str(
+                                    focused_review_reason or ""
+                                ).casefold().startswith("omission_only:")
+                                original_bounded_daily_success_reply = (
+                                    bounded_daily_success_reply
+                                )
                                 try:
                                     semantic_repair_completion = await complete_model(
                                         _compact_daily_add_argument_repair_messages(
@@ -1687,13 +1714,41 @@ class DeepSeekToolCallingAdapter:
                                         )
                                 except DeepSeekToolCallingError as repair_exc:
                                     audits.extend(repair_exc.raw_tool_call_audit)
-                                    raise DeepSeekResponseError(
-                                        "focused Daily semantic repair failed"
-                                    ) from repair_exc
+                                    if omission_only_repair:
+                                        reviewed = parsed
+                                        bounded_daily_success_reply = (
+                                            original_bounded_daily_success_reply
+                                        )
+                                        model_turns[-1] = replace(
+                                            model_turns[-1],
+                                            response_metadata={
+                                                **model_turns[-1].response_metadata,
+                                                "focused_daily_omission_repair_fell_back_to_safe_partial": True,
+                                                "draft_executed": False,
+                                            },
+                                        )
+                                    else:
+                                        raise DeepSeekResponseError(
+                                            "focused Daily semantic repair failed"
+                                        ) from repair_exc
                                 except ValueError as repair_exc:
-                                    raise DeepSeekResponseError(
-                                        "focused Daily semantic repair failed"
-                                    ) from repair_exc
+                                    if omission_only_repair:
+                                        reviewed = parsed
+                                        bounded_daily_success_reply = (
+                                            original_bounded_daily_success_reply
+                                        )
+                                        model_turns[-1] = replace(
+                                            model_turns[-1],
+                                            response_metadata={
+                                                **model_turns[-1].response_metadata,
+                                                "focused_daily_omission_repair_fell_back_to_safe_partial": True,
+                                                "draft_executed": False,
+                                            },
+                                        )
+                                    else:
+                                        raise DeepSeekResponseError(
+                                            "focused Daily semantic repair failed"
+                                        ) from repair_exc
                             else:
                                 reviewed = _ParsedAssistantTurn(
                                     assistant_message={
@@ -2025,6 +2080,26 @@ class DeepSeekToolCallingAdapter:
                                         "draft_executed": False,
                                     },
                                 )
+                            elif (
+                                source_bound_daily_review := (
+                                    _bind_zero_draft_daily_add_quorum(
+                                        first=reviewed,
+                                        second=confirmed,
+                                        context=context,
+                                        user_text=user_text,
+                                        user_messages=user_messages,
+                                    )
+                                )
+                            ) is not None:
+                                reviewed = source_bound_daily_review
+                                model_turns[-1] = replace(
+                                    model_turns[-1],
+                                    response_metadata={
+                                        **model_turns[-1].response_metadata,
+                                        "daily_weekly_zero_draft_daily_semantic_quorum": True,
+                                        "draft_executed": False,
+                                    },
+                                )
                             else:
                                 clarification_kind = _zero_draft_disagreement_kind(
                                     first=reviewed.tool_calls,
@@ -2082,6 +2157,93 @@ class DeepSeekToolCallingAdapter:
                                         audits=audits,
                                         model_turns=model_turns,
                                     ) from clarify_exc
+                    targeted_daily_review = any(
+                        call.tool_name
+                        in {
+                            "edit_daily_items",
+                            "delete_daily_items",
+                            "move_daily_items",
+                        }
+                        for call in parsed.tool_calls
+                    )
+                    if (
+                        targeted_daily_review
+                        and reviewed.tool_calls
+                        and daily_edit_review_structure_retry_count == 0
+                    ):
+                        try:
+                            _constrain_daily_edit_review(
+                                original=parsed,
+                                reviewed=reviewed,
+                            )
+                        except ValueError as structure_exc:
+                            if not _daily_edit_review_has_only_target_grouping_mismatch(
+                                original=parsed,
+                                reviewed=reviewed,
+                            ):
+                                raise
+                            retry_completion = await complete_model(
+                                [
+                                    *review_messages,
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "The previous independent review was structurally "
+                                            "invalid and nothing executed. Return a fresh native "
+                                            "tool batch. Preserve every immutable target group "
+                                            "from the unexecuted draft: keep the same number and "
+                                            "order of targeted Daily calls, and do not combine, "
+                                            "split, add, or drop target_item_ids. Different target "
+                                            "items with different complete final text require "
+                                            "separate edit calls. Re-evaluate each complete final "
+                                            "replacement from the trusted target plus current "
+                                            "correction. Do not reproduce the invalid structure "
+                                            "and do not claim execution."
+                                        ),
+                                    },
+                                ],
+                                tool_schemas=deepseek_tool_schemas(
+                                    daily_weekly_review_tool_names
+                                ),
+                                thinking_enabled=True,
+                            )
+                            iterations += 1
+                            model_turns.append(
+                                _model_turn_audit(
+                                    iterations,
+                                    retry_completion.message,
+                                    response_metadata={
+                                        **retry_completion.metadata,
+                                        "daily_edit_review_structure_retry": True,
+                                        "daily_edit_review_structure_error": type(
+                                            structure_exc
+                                        ).__name__,
+                                        "draft_executed": False,
+                                    },
+                                )
+                            )
+                            retried_review = _parse_assistant_turn(
+                                retry_completion.message,
+                                allow_review_arguments_envelope=True,
+                            )
+                            _validate_completion_protocol(
+                                retry_completion,
+                                retried_review,
+                            )
+                            audits.extend(retried_review.audit)
+                            _validate_daily_weekly_write_review(
+                                reviewed=retried_review,
+                                allowed_tool_names=(
+                                    daily_weekly_review_tool_names
+                                ),
+                                original_has_domain_writes=True,
+                            )
+                            _constrain_daily_edit_review(
+                                original=parsed,
+                                reviewed=retried_review,
+                            )
+                            reviewed = retried_review
+                            daily_edit_review_structure_retry_count += 1
                     try:
                         parsed = _merge_daily_weekly_write_review(
                             original=parsed,
@@ -2092,7 +2254,11 @@ class DeepSeekToolCallingAdapter:
                             context=context,
                         )
                         parsed = _mark_reviewed_periodic_report_content(parsed)
-                        parsed = _mark_reviewed_weekly_plan_content(parsed)
+                        parsed = _mark_reviewed_weekly_plan_content(
+                            parsed,
+                            context=context,
+                        )
+                        parsed = _mark_reviewed_daily_edit_content(parsed)
                         if bounded_daily_turn_active:
                             parsed = _mark_reviewed_daily_content(parsed)
                     except ValueError as exc:
@@ -2560,6 +2726,13 @@ class DeepSeekToolCallingAdapter:
                                 for call in reviewed.tool_calls
                             ),
                             allowed_tool_names=context.allowed_tool_names,
+                        )
+                        reviewed = replace(
+                            reviewed,
+                            tool_calls=attach_reviewed_omitted_sections(
+                                targets=incomplete_confirm_targets,
+                                replacements=reviewed.tool_calls,
+                            ),
                         )
                     except ValueError as exc:
                         raise _with_canary_turn_state(
@@ -3314,6 +3487,7 @@ def _validate_focused_daily_source(
                 call.tool_name,
                 call.arguments,
                 allow_approximate_daily_quotes=True,
+                allow_reviewed_repeated_daily_quotes=True,
             )
     except CurrentTurnSourceEvidenceError as exc:
         raise InvalidNativeToolArgumentsError(
@@ -3375,6 +3549,10 @@ def _parse_assistant_turn(
     raw_calls = message.get("tool_calls")
     if raw_calls is None:
         raw_calls = ()
+    textual_review_execute = False
+    if allow_review_arguments_envelope and not raw_calls:
+        raw_calls = _review_textual_execute_tool_calls(message)
+        textual_review_execute = bool(raw_calls)
     if not isinstance(raw_calls, (list, tuple)):
         raise MalformedToolCallError("tool_calls must be an array")
     calls: list[NativeToolCall] = []
@@ -3389,7 +3567,14 @@ def _parse_assistant_turn(
             )
         except DeepSeekToolCallingError as exc:
             raise _with_accumulated_audit(exc, audits) from exc
-        audits.append(audit)
+        audits.append(
+            replace(
+                audit,
+                parse_status="validated_review_textual_execute_envelope",
+            )
+            if textual_review_execute
+            else audit
+        )
         calls.append(call)
     assistant_message = {
         key: value
@@ -3399,7 +3584,59 @@ def _parse_assistant_turn(
     assistant_message["role"] = "assistant"
     if calls and assistant_message.get("content") is None:
         assistant_message["content"] = ""
+    if textual_review_execute:
+        assistant_message["content"] = ""
+        assistant_message["tool_calls"] = list(raw_calls)
     return _ParsedAssistantTurn(assistant_message, tuple(calls), tuple(audits))
+
+
+def _review_textual_execute_tool_calls(
+    message: dict[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Validate one review-only textual execute envelope as native calls."""
+
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return ()
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return ()
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"decision", "tool_calls"}
+        or payload.get("decision") != "execute"
+        or not isinstance(payload.get("tool_calls"), list)
+        or not payload["tool_calls"]
+    ):
+        return ()
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    result: list[dict[str, Any]] = []
+    for index, candidate in enumerate(payload["tool_calls"], start=1):
+        if (
+            not isinstance(candidate, dict)
+            or set(candidate) != {"name", "arguments"}
+            or not isinstance(candidate.get("name"), str)
+            or not candidate["name"]
+            or not isinstance(candidate.get("arguments"), dict)
+        ):
+            return ()
+        result.append(
+            {
+                "id": f"review-text-{digest[:16]}-{index}",
+                "type": "function",
+                "function": {
+                    "name": candidate["name"],
+                    "arguments": json.dumps(
+                        candidate["arguments"],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+        )
+    return tuple(result)
 
 
 def _is_retryable_transport_error(error: httpx.HTTPError) -> bool:
@@ -3437,7 +3674,14 @@ def _validate_completion_protocol(
 ) -> str | None:
     finish_reason = completion.metadata.get("finish_reason")
     if parsed.tool_calls:
-        if finish_reason != "tool_calls":
+        review_textual_execute = bool(parsed.audit) and all(
+            item.parse_status
+            == "validated_review_textual_execute_envelope"
+            for item in parsed.audit
+        )
+        if finish_reason != "tool_calls" and not (
+            finish_reason == "stop" and review_textual_execute
+        ):
             raise DeepSeekResponseError(
                 "DeepSeek finish_reason is inconsistent with native tool calls"
             )
@@ -3569,6 +3813,24 @@ def _parse_native_tool_call(
                 )
                 else parse_status
             )
+        elif name == "confirm_report" and isinstance(decoded, dict):
+            decoded = {
+                key: value
+                for key, value in decoded.items()
+                if key != "reviewed_omitted_empty_fields"
+            }
+        elif name == "edit_daily_items" and isinstance(decoded, dict):
+            decoded = {
+                key: value
+                for key, value in decoded.items()
+                if key != "replacement_reviewed"
+            }
+        elif name == "submit_next_weekly_plan" and isinstance(decoded, dict):
+            decoded = {
+                key: value
+                for key, value in decoded.items()
+                if key != "reviewed_unfilled_days_as_empty"
+            }
         elif name in {
             "apply_current_weekly_report",
             "apply_next_weekly_plan",
@@ -3802,6 +4064,10 @@ def _compact_daily_add_argument_repair_messages(
                 "workstream, then preserve related coordinated actions inside each partition. "
                 "The first pass has priority: one item must never span two unrelated work "
                 "domains merely because the source has no punctuation or uses a transition. "
+                "A transition or coordinating word does not create one topic. When adjacent "
+                "clauses have different primary work objects or deliverables, no shared outcome, "
+                "and can be progressed or reported independently, split them even when natural "
+                "wording connects the clauses and punctuation is absent. "
                 "Preserve every clause-level modifier and "
                 "transition; do not trim it merely because the remaining words still form "
                 "a substring. Keep a clause together "
@@ -3856,9 +4122,18 @@ def _bounded_daily_probe_messages(
                 "assigns a non-default report date, return exactly "
                 "{\"decision\":\"not_daily\"} without a tool call. Otherwise call "
                 "plan_daily_report exactly once. This tool only prepares a plan and "
-                "cannot write anything. Its fields must contain all three keys "
-                "today_work, problems, "
-                "and tomorrow_plan. Each value is an array with one object containing "
+                "cannot write anything. Its fields must contain all three keys: "
+                "today_work, problems, and tomorrow_plan. "
+                "A Daily tomorrow_plan covers only the next reporting day. An explicit "
+                "target week, a schedule on specific weekdays inside that target week, "
+                "or a Monday-to-Saturday Weekly Work Plan is another task and must return "
+                "not_daily, even if the user also calls it a plan. "
+                "A detailed first-person account of work actually reviewed or performed, "
+                "a real issue or risk encountered, and definite follow-up actions remains a "
+                "Daily Report even when it contains legal analysis or advice and never says "
+                "the word Daily. Separate actual work and risks from hypotheticals, but do "
+                "not return not_daily merely because the explanation is long or analytical. "
+                "Each field value is an array with one object containing "
                 "content and source_evidence per independently editable matter. content "
                 "is concise professional Daily wording: remove only oral filler, repetition, "
                 "or obvious grammar noise, and never add, remove, generalize, or change an "
@@ -3890,7 +4165,14 @@ def _bounded_daily_probe_messages(
                 "every top-level topic or workstream, then preserve related coordinated actions "
                 "inside each partition. The first pass has priority: one item must never span "
                 "two unrelated work domains merely because punctuation is missing or a transition "
-                "connects them. "
+                "connects them. A shared report field, time horizon, or transition never by "
+                "itself makes different projects, cases, goals, or deliverables one topic. "
+                "Before returning, assign one short topic label to each proposed item in your "
+                "reasoning. If one item needs two unrelated labels to describe its source matter, "
+                "split it; do not expose these reasoning labels in the tool call. A transition "
+                "or coordinating word does not create a shared topic: clauses with different "
+                "primary work objects or deliverables, no shared outcome, and independent progress "
+                "must be separate items even without punctuation. "
                 "Preserve every clause-level modifier and transition; do not trim it merely "
                 "because the remaining words still form a substring. Keep a clause "
                 "together when its latter part only "
@@ -3929,8 +4211,11 @@ def _bounded_daily_add_review_messages(
     submission_evidence: dict[str, Any] | None = None,
     challenge_approval: bool = False,
 ) -> list[dict[str, str]]:
-    del context
     ordered_messages = user_messages or (user_text,)
+    weekly_scope_available = bool(
+        "apply_next_weekly_plan" in context.allowed_tool_names
+        and context.all_weekly_plans()
+    )
     return [
         {
             "role": "system",
@@ -3949,17 +4234,32 @@ def _bounded_daily_add_review_messages(
                 "Use decision=fallback with a concise "
                 "reason only when the source also asks a non-Daily task, depends on "
                 "conversation history, retries an earlier failed write, targets an "
-                "existing report, or assigns a non-default report date. For a "
+                "existing report, or assigns a non-default report date. "
+                "A Daily tomorrow_plan covers only the next reporting day. When weekly "
+                "scope is available, an explicit target week, specific weekdays inside "
+                "that target week, or a Monday-to-Saturday Weekly Work Plan is non-Daily "
+                "scope and requires fallback, even if the user calls it a plan. "
+                "A detailed first-person account of work actually reviewed or performed, "
+                "a real issue or risk encountered, and definite follow-up actions remains "
+                "Daily scope even when it contains legal analysis or advice and lacks a "
+                "Daily label. Do not use fallback merely because it is long or analytical. "
                 "source that supplies no report content and only asks to submit an "
                 "existing report, also use fallback; a statement that there are no edits, "
                 "changes, additions, deletions, or moves is operation state, not empty-field "
                 "evidence. For a "
                 "self-contained pure Daily add, compare the entire source with the "
                 "candidate. An explicit request to write must remain usable: when the "
-                "candidate contains at least one grounded Daily item, never request repair "
-                "solely because another source matter was omitted. Omitted matters can be "
-                "supplemented naturally in a later turn. Approve a best-effort partial write "
-                "when every included item is faithful. Return decision=repair only when an "
+                "candidate contains at least one grounded Daily item, never use fallback or "
+                "reject solely because another source matter was omitted. Instead request one "
+                "best-effort repair so the missing clear matters can be restored. When every "
+                "included item is faithful and omission is the only defect, the repair reason "
+                "must start exactly with omission_only:. This marks a completeness improvement, "
+                "not an unsafe candidate; if that improvement cannot finish, the faithful partial "
+                "write must remain usable for natural supplementation later. For an invented, "
+                "wrong-field, meaning-changing, or otherwise unsafe candidate, the repair reason "
+                "must start exactly with unsafe_candidate:. A clear matter remains eligible even "
+                "when it is terse, fragmentary, or ends with one missing detail; preserve the "
+                "available wording and never invent the value. Return decision=repair only when an "
                 "included item is invented, in the wrong field, arbitrarily merged or split "
                 "in a way that changes meaning, loses a qualifier from its own exact quote, "
                 "or otherwise adds, removes, generalizes, or changes a source fact, or when an "
@@ -3987,7 +4287,14 @@ def _bounded_daily_add_review_messages(
                 "split a switch to an unrelated goal, project, case group, deliverable, or "
                 "workstream even without punctuation, while keeping coordinated actions together "
                 "inside one user-described topic or shared workstream. Use a source-wide pass to "
-                "improve completeness, but do not turn an omission alone into a write blocker. "
+                "improve completeness, but never turn an omission alone into a zero-write blocker. "
+                "Before reading the candidate grouping, independently assign one short topic label "
+                "to every asserted source matter in your reasoning. Then compare those labels with "
+                "the candidate items. A shared report field, time horizon, or transition is not "
+                "evidence that different projects, cases, goals, or deliverables are one topic. "
+                "Require repair when one candidate item joins clauses with different primary work "
+                "objects or deliverables, no shared outcome, and independent progress merely through "
+                "a transition or coordinating word, even when the source has no punctuation. "
                 "Then perform an item-level entailment pass: for every "
                 "candidate item, compare its exact_quote clause by clause with content and repair "
                 "if content drops any actor, condition, status, qualification, consequence, "
@@ -4014,6 +4321,19 @@ def _bounded_daily_add_review_messages(
                     "candidate": _focused_daily_review_candidate(
                         calls,
                         submission_evidence=submission_evidence,
+                    ),
+                    "weekly_scope_available": weekly_scope_available,
+                    **(
+                        {
+                            "trusted_weekly_plan_targets": (
+                                context.model_payload().get(
+                                    "weekly_plan_targets",
+                                    [],
+                                )
+                            )
+                        }
+                        if weekly_scope_available
+                        else {}
                     ),
                 },
                 ensure_ascii=False,
@@ -4479,6 +4799,11 @@ def _daily_weekly_write_review_tool_names(
         and call.tool_name in context.allowed_tool_names
         and context.gate_decisions.get(call.tool_name) is True
     }
+    if current_reviewed_operations == {"copy_previous_to_today"}:
+        # The model already selected a date-resolved, server-bound Daily copy.
+        # Keep the independent review on that exact operation instead of
+        # exposing unrelated rewrite and Weekly-plan tools.
+        return frozenset(current_reviewed_operations)
     if len(available_domains) < 2:
         if available_domains == {"daily"}:
             source_fidelity_operations = current_reviewed_operations.intersection(
@@ -4915,7 +5240,24 @@ def _review_domain_list(domains: frozenset[str]) -> str:
 def _daily_weekly_review_domain_policy(domains: frozenset[str]) -> str:
     policies: list[str] = []
     if "daily" in domains:
-        policies.append("A Daily Report records one reporting day.")
+        policies.append(
+            "A Daily Report records one reporting day. A clear Daily matter may "
+            "be terse, fragmentary, or end with one missing detail. Preserve the "
+            "available matter for later supplementation instead of blocking or "
+            "inventing the missing value. A brief current instruction that semantically "
+            "adopts the report from one uniquely resolved previous date as today's report "
+            "is a Daily copy, not an empty or unsupported request. The server verifies the "
+            "owned source report; do not reject the copy merely because that report was not "
+            "preloaded into model context. Detailed first-person work, real-risk, "
+            "and definite follow-up analysis also remains Daily scope even without a Daily label. "
+            "Independently partition unrelated projects, cases, goals, and deliverables into "
+            "separate editable matters even when commas or transitions connect them, and cover "
+            "each matter exactly once. A current statement that existing content needs no change "
+            "preserves that content; it does not cancel separate new work, risk, or plan content "
+            "in the same message. A transition or coordinating word cannot merge clauses with "
+            "different primary work objects or deliverables, no shared outcome, and independent "
+            "progress; those clauses remain separate items even without punctuation."
+        )
     if "periodic" in domains:
         policies.append(
             "A Current Weekly Report reviews the current ISO week in "
@@ -4942,6 +5284,17 @@ def _daily_weekly_review_domain_policy(domains: frozenset[str]) -> str:
         )
     if {"daily", "weekly"}.issubset(domains):
         policies.append(
+            "The Daily Report's tomorrow_plan is the next reporting-day plan. "
+            "When one Daily Report is the active focus, a generic plan addition or "
+            "a tomorrow-plan addition stays in that Daily Report unless the user "
+            "separately identifies a target week or one exact Weekly Work Plan day. "
+            "In particular, when the user says that existing Daily work or Daily content "
+            "needs no change and then supplies unlabeled plan matters, those matters are "
+            "additions to that Daily Report's tomorrow_plan. Do not turn them into Weekly "
+            "Plan suggestions. Only an explicit target week, weekday in that target week, "
+            "or exact Weekly Work Plan authorization moves those matters to Weekly scope. "
+            "Weekly tools being available, future tense, or a generic plan label is "
+            "not weekly-plan authorization. "
             "A standalone bare expression such as 'Friday: do X' is ambiguous "
             "between the current Friday's daily report and a future plan, so "
             "ask a natural clarification instead of guessing. When one sentence "
@@ -5013,8 +5366,25 @@ def _daily_weekly_write_review_messages(
         "remove oral filler, repetition, or obvious grammar noise, but must preserve "
         "every actor, project, action, object, date, number, attribution, negation, "
         "condition, completion state, risk, and plan. "
+        "A user-authored Daily matter may be terse, fragmentary, or end with a detail "
+        "whose value was not supplied. When its field and core matter are clear, preserve "
+        "the available wording instead of clarifying or dropping the entire matter merely "
+        "to obtain that detail; never invent the missing value. "
         if allowed_domains == {"daily"}
         and any(call.tool_name == "add_daily_items" for call in calls)
+        else ""
+    )
+    whole_daily_snapshot_constraint = (
+        "When the current message is one complete labelled Daily Report snapshot for "
+        "the unique trusted report and does not explicitly request append, replace the "
+        "snapshot atomically: return delete_daily_items for every existing trusted item "
+        "and one add_daily_items call containing every current snapshot item and empty "
+        "section, both against the same report ID and version. Do not append duplicates, "
+        "keep obsolete items, delete without rebuilding, or change submission status "
+        "without separate current authorization. "
+        if {"add_daily_items", "delete_daily_items"}.issubset(
+            allowed_tool_names
+        )
         else ""
     )
     edit_source_constraint = (
@@ -5023,8 +5393,13 @@ def _daily_weekly_write_review_messages(
         "be the complete contiguous new replacement stated by the user, excluding "
         "the target description, old content, ordinal, and edit instruction. It "
         "must preserve every negation, condition, deadline, consequence, and "
-        "exception attached to that replacement. If no complete replacement-only "
-        "span exists, ask a clarification and return no tools. "
+        "exception attached to that replacement. When the user explicitly spells corrected "
+        "characters or requests a substring correction, construct the complete intended final "
+        "item from the trusted target plus the current correction and cite the whole contiguous "
+        "correction statement as replacement_evidence. For several targets, use one edit call "
+        "only when their complete final text is identical; otherwise return separate edit calls "
+        "with the same immutable report/version and each exact target. If the final item or "
+        "target remains ambiguous, ask a clarification and return no tools. "
         if "edit_daily_items" in allowed_tool_names
         else ""
     )
@@ -5144,6 +5519,7 @@ def _daily_weekly_write_review_messages(
                 "clear, return exactly one complete corrected native tool-call batch using "
                 "only the supplied tools. Preserve exact current-message grounding and do "
                 f"{daily_only_constraint}{edit_source_constraint}"
+                f"{whole_daily_snapshot_constraint}"
                 f"{targeted_operation_constraint}"
                 f"{trusted_completed_daily_query_constraint}"
                 f"{selected_target_constraint}"
@@ -6021,6 +6397,50 @@ def _mark_reviewed_daily_content(
     )
 
 
+def _mark_reviewed_daily_edit_content(
+    parsed: _ParsedAssistantTurn,
+) -> _ParsedAssistantTurn:
+    """Attach server proof after independent Daily edit review passes."""
+
+    reviewed_calls = tuple(
+        NativeToolCall(
+            call.tool_call_id,
+            call.tool_name,
+            validate_tool_arguments(
+                "edit_daily_items",
+                {**call.arguments, "replacement_reviewed": True},
+            ),
+        )
+        if call.tool_name == "edit_daily_items"
+        else call
+        for call in parsed.tool_calls
+    )
+    if reviewed_calls == parsed.tool_calls:
+        return parsed
+    assistant_message = dict(parsed.assistant_message)
+    assistant_message["tool_calls"] = [
+        {
+            "id": call.tool_call_id,
+            "type": "function",
+            "function": {
+                "name": call.tool_name,
+                "arguments": json.dumps(
+                    call.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        for call in reviewed_calls
+    ]
+    return replace(
+        parsed,
+        assistant_message=assistant_message,
+        tool_calls=reviewed_calls,
+    )
+
+
 def _mark_reviewed_periodic_report_content(
     parsed: _ParsedAssistantTurn,
 ) -> _ParsedAssistantTurn:
@@ -6067,22 +6487,58 @@ def _mark_reviewed_periodic_report_content(
 
 def _mark_reviewed_weekly_plan_content(
     parsed: _ParsedAssistantTurn,
+    *,
+    context: TrustedContext,
 ) -> _ParsedAssistantTurn:
     """Attach server-only proof after weekly-plan semantic review passes."""
 
-    reviewed_calls = tuple(
-        NativeToolCall(
-            call.tool_call_id,
-            call.tool_name,
-            validate_tool_arguments(
-                "apply_next_weekly_plan",
-                {**call.arguments, "content_reviewed": True},
-            ),
-        )
-        if call.tool_name == "apply_next_weekly_plan"
-        else call
-        for call in parsed.tool_calls
-    )
+    reviewed_calls = []
+    for call in parsed.tool_calls:
+        if call.tool_name == "apply_next_weekly_plan":
+            reviewed_calls.append(
+                NativeToolCall(
+                    call.tool_call_id,
+                    call.tool_name,
+                    validate_tool_arguments(
+                        "apply_next_weekly_plan",
+                        {**call.arguments, "content_reviewed": True},
+                    ),
+                )
+            )
+            continue
+        if call.tool_name == "submit_next_weekly_plan":
+            plan_id = str(call.arguments.get("plan_id") or "")
+            weekly = (
+                context.weekly_plan_by_id(plan_id)
+                if plan_id
+                else None
+            )
+            unresolved = (
+                [
+                    day.plan_date.isoformat()
+                    for day in weekly.days
+                    if day.state == "unfilled"
+                ]
+                if weekly is not None
+                and call.arguments.get("expected_version") == weekly.version
+                else []
+            )
+            reviewed_calls.append(
+                NativeToolCall(
+                    call.tool_call_id,
+                    call.tool_name,
+                    validate_tool_arguments(
+                        "submit_next_weekly_plan",
+                        {
+                            **call.arguments,
+                            "reviewed_unfilled_days_as_empty": unresolved,
+                        },
+                    ),
+                )
+            )
+            continue
+        reviewed_calls.append(call)
+    reviewed_calls = tuple(reviewed_calls)
     if reviewed_calls == parsed.tool_calls:
         return parsed
     assistant_message = dict(parsed.assistant_message)
@@ -6213,10 +6669,8 @@ def _constrain_daily_edit_review(
         if reviewed_call.tool_name == "edit_daily_items":
             constrained_arguments.update(
                 {
-                    "replacement": (
-                        draft_call.arguments.get("replacement")
-                        if draft_call.tool_name == "edit_daily_items"
-                        else reviewed_call.arguments.get("replacement")
+                    "replacement": reviewed_call.arguments.get(
+                        "replacement"
                     ),
                     "replacement_evidence": reviewed_call.arguments.get(
                         "replacement_evidence"
@@ -6246,6 +6700,89 @@ def _constrain_daily_edit_review(
             constrained_by_review_id.get(call.tool_call_id, call)
             for call in reviewed.tool_calls
         ),
+    )
+
+
+def _daily_edit_review_has_only_target_grouping_mismatch(
+    *,
+    original: _ParsedAssistantTurn,
+    reviewed: _ParsedAssistantTurn,
+) -> bool:
+    """Allow one retry only when identical edit targets were regrouped."""
+
+    targeted_tools = {
+        "edit_daily_items",
+        "delete_daily_items",
+        "move_daily_items",
+    }
+    original_siblings = tuple(
+        (call.tool_name, call.arguments)
+        for call in original.tool_calls
+        if _daily_weekly_write_domain(call.tool_name) == "daily"
+        and call.tool_name not in targeted_tools
+    )
+    reviewed_siblings = tuple(
+        (call.tool_name, call.arguments)
+        for call in reviewed.tool_calls
+        if _daily_weekly_write_domain(call.tool_name) == "daily"
+        and call.tool_name not in targeted_tools
+    )
+    if original_siblings != reviewed_siblings:
+        return False
+    original_edits = tuple(
+        call
+        for call in original.tool_calls
+        if call.tool_name in targeted_tools
+    )
+    reviewed_edits = tuple(
+        call
+        for call in reviewed.tool_calls
+        if call.tool_name in targeted_tools
+    )
+    if (
+        not original_edits
+        or not reviewed_edits
+        or any(call.tool_name != "edit_daily_items" for call in original_edits)
+        or any(call.tool_name != "edit_daily_items" for call in reviewed_edits)
+    ):
+        return False
+
+    def flattened_targets(
+        calls: tuple[NativeToolCall, ...],
+    ) -> tuple[tuple[str, int, str], ...] | None:
+        flattened: list[tuple[str, int, str]] = []
+        for call in calls:
+            report_id = str(call.arguments.get("report_id") or "")
+            expected_version = call.arguments.get("expected_version")
+            item_ids = call.arguments.get("target_item_ids")
+            if (
+                not report_id
+                or not isinstance(expected_version, int)
+                or not isinstance(item_ids, list)
+                or not item_ids
+            ):
+                return None
+            flattened.extend(
+                (report_id, expected_version, str(item_id))
+                for item_id in item_ids
+            )
+        if len(flattened) != len(set(flattened)):
+            return None
+        return tuple(sorted(flattened))
+
+    original_targets = flattened_targets(original_edits)
+    reviewed_targets = flattened_targets(reviewed_edits)
+    return bool(
+        original_targets is not None
+        and original_targets == reviewed_targets
+        and tuple(
+            tuple(call.arguments.get("target_item_ids") or ())
+            for call in original_edits
+        )
+        != tuple(
+            tuple(call.arguments.get("target_item_ids") or ())
+            for call in reviewed_edits
+        )
     )
 
 
@@ -6359,6 +6896,115 @@ def _validate_daily_weekly_zero_draft_agreement(
 
     if semantic_payload(first) != semantic_payload(second):
         raise ValueError("independent review batches differ")
+
+
+def _zero_draft_daily_adds_agree_on_safe_write(
+    *,
+    first: tuple[NativeToolCall, ...],
+    second: tuple[NativeToolCall, ...],
+    context: TrustedContext,
+) -> bool:
+    """Accept two independently selected Daily adds despite grouping variance."""
+
+    if (
+        len(first) != 1
+        or len(second) != 1
+        or first[0].tool_name != "add_daily_items"
+        or second[0].tool_name != "add_daily_items"
+    ):
+        return False
+    first_arguments = first[0].arguments
+    second_arguments = second[0].arguments
+    if bool(first_arguments.get("submit_after_write")) != bool(
+        second_arguments.get("submit_after_write")
+    ):
+        return False
+    if sorted(first_arguments.get("acknowledged_empty_fields", ())) != sorted(
+        second_arguments.get("acknowledged_empty_fields", ())
+    ):
+        return False
+
+    def field_presence(arguments: dict[str, Any]) -> frozenset[str]:
+        return frozenset(
+            str(item.get("field") or "")
+            for item in arguments.get("items", ())
+            if isinstance(item, dict) and item.get("field")
+        )
+
+    if (
+        not field_presence(first_arguments)
+        or field_presence(first_arguments) != field_presence(second_arguments)
+    ):
+        return False
+    first_date = _daily_add_target_date(
+        first_arguments,
+        context=context,
+    )
+    second_date = _daily_add_target_date(
+        second_arguments,
+        context=context,
+    )
+    return bool(
+        first_date is not None
+        and first_date == second_date
+    )
+
+
+def _bind_zero_draft_daily_add_quorum(
+    *,
+    first: _ParsedAssistantTurn,
+    second: _ParsedAssistantTurn,
+    context: TrustedContext,
+    user_text: str,
+    user_messages: tuple[str, ...],
+) -> _ParsedAssistantTurn | None:
+    if not _zero_draft_daily_adds_agree_on_safe_write(
+        first=first.tool_calls,
+        second=second.tool_calls,
+        context=context,
+    ):
+        return None
+    source = CurrentTurnSource(user_messages or (user_text,))
+    for candidate in (first, second):
+        call = candidate.tool_calls[0]
+        try:
+            arguments = source.bind_reviewed_daily_arguments(
+                call.arguments
+            )
+        except (
+            CurrentTurnSourceEvidenceError,
+            ValidationError,
+            ValueError,
+        ):
+            continue
+        bound_call = NativeToolCall(
+            call.tool_call_id,
+            call.tool_name,
+            arguments,
+        )
+        assistant_message = dict(candidate.assistant_message)
+        assistant_message["content"] = ""
+        assistant_message["tool_calls"] = [
+            {
+                "id": bound_call.tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": bound_call.tool_name,
+                    "arguments": json.dumps(
+                        bound_call.arguments,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+        ]
+        return replace(
+            candidate,
+            assistant_message=assistant_message,
+            tool_calls=(bound_call,),
+        )
+    return None
 
 
 def _zero_draft_disagreement_kind(

@@ -1209,6 +1209,9 @@ async def test_incomplete_report_review_preserves_a_pure_confirmation(
     assert runtime.execute_count == 1
     assert runtime.calls[0].tool_name == "confirm_report"
     assert runtime.calls[0].tool_call_id == "reviewed-confirm"
+    assert runtime.calls[0].arguments["reviewed_omitted_empty_fields"] == [
+        "problems"
+    ]
 
 
 @pytest.mark.asyncio

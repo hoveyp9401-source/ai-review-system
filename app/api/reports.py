@@ -2,22 +2,31 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import date
-from typing import Any, Mapping
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent2.assistant_tools import build_tool_assisted_reply
-from app.agent2.case_table_rag import CaseTableRagAdapter, DEFAULT_CASE_RAG_INDEX
+from app.agent2.business.composition import Phase2BusinessComposer
 from app.agent2.business.entrypoint import (
     build_business_command_context,
     decide_runtime_owner,
     resolve_agent2_entrypoint,
 )
-from app.agent2.context_pack import Agent2ContextPack, build_agent2_context_pack
+from app.agent2.business.policy import BusinessEffectPolicy
+from app.agent2.business.repositories import (
+    CaseFollowupPolicySqlRepository,
+    CaseProgressSqlRepository,
+    CaseSqlRepository,
+    PartySqlRepository,
+)
+from app.agent2.business.sql_executor import SqlBusinessExecutor
+from app.agent2.case_table_rag import DEFAULT_CASE_RAG_INDEX, CaseTableRagAdapter
 from app.agent2.cognitive_reply_v3 import (
     append_cognitive_clarification,
     has_bound_confirmation_pending,
@@ -29,24 +38,30 @@ from app.agent2.cognitive_runtime_v3 import (
     finalize_cognitive_core_v3_execution,
     selection_request_reply,
 )
-from app.agent2.business.composition import Phase2BusinessComposer
-from app.agent2.business.policy import BusinessEffectPolicy
-from app.agent2.business.repositories import (
-    CaseFollowupPolicySqlRepository,
-    CaseProgressSqlRepository,
-    CaseSqlRepository,
-    PartySqlRepository,
+from app.agent2.context_pack import Agent2ContextPack, build_agent2_context_pack
+from app.agent2.daily_execution import (
+    Agent2DailyExecutionResult,
+    agent2_daily_report_version,
+    execute_agent2_daily_commands,
 )
-from app.agent2.business.sql_executor import SqlBusinessExecutor
-from app.agent2.operation_outcomes import OutcomeReplyComposer
+from app.agent2.daily_shadow import DailyShadowEvaluation, evaluate_daily_shadow
+from app.agent2.knowledge_resolver import KnowledgeQuery, resolve_knowledge
 from app.agent2.operation_outcome_store import persist_operation_outcomes
+from app.agent2.operation_outcomes import OutcomeReplyComposer
 from app.agent2.outcome_adapters import (
     business_composition_outcomes,
     daily_execution_outcomes,
     periodic_execution_outcomes,
     text_outcome,
 )
+from app.agent2.personal_memory import build_personal_memory_profile
+from app.agent2.recent_context import load_recent_case_context_messages
 from app.agent2.report_sql_executor import execute_periodic_report_commands
+from app.agent2.tool_calling.canary_service import (
+    CanaryIngressExecutionError,
+    CanaryIngressOutcome,
+    process_tool_call_canary_ingress,
+)
 from app.agent2.turn_runtime import (
     InformationContinuationBlocked,
     SelectionContinuationBlocked,
@@ -55,32 +70,23 @@ from app.agent2.turn_runtime import (
     production_agent2_turn_runtime,
     verified_turn_rejection_reply,
 )
-from app.agent2.daily_execution import (
-    Agent2DailyExecutionResult,
-    agent2_daily_report_version,
-    execute_agent2_daily_commands,
-)
-from app.agent2.daily_shadow import DailyShadowEvaluation, evaluate_daily_shadow
-from app.agent2.knowledge_resolver import KnowledgeQuery, resolve_knowledge
-from app.agent2.personal_memory import build_personal_memory_profile
-from app.agent2.recent_context import load_recent_case_context_messages
 from app.agent2.typed_daily_executor import execute_typed_agent2_daily_commands
 from app.config import get_settings
 from app.db import get_session
+from app.models import DailyReport
 from app.repositories import (
     create_webhook_event_once,
     get_active_user_by_dingtalk_id,
     get_report,
     list_active_user_habits,
     list_reports_for_date,
-    mark_webhook_event_failed,
     mark_webhook_event_processed,
 )
 from app.schemas import StructuredDailyReport
 from app.services.report_service import DailyReportService
 from app.utils.time import now_in_timezone
 from app.workflows.daily_context import build_live_daily_active_task
-from app.workflows.intake import IncomingMessageEnvelope, WORKFLOW_DAILY_REPORT
+from app.workflows.intake import WORKFLOW_DAILY_REPORT, IncomingMessageEnvelope
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 logger = logging.getLogger(__name__)
@@ -104,6 +110,14 @@ async def submit_manual_report(
     user = await get_active_user_by_dingtalk_id(session, body.dingtalk_user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+    if body.report_date is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Agent2 只从 raw_input 的自然语言日期判断目标日报；"
+                "请把日期写进 raw_input，不要同时使用 report_date。"
+            ),
+        )
 
     if body.idempotency_key:
         event, inserted = await create_webhook_event_once(
@@ -124,7 +138,7 @@ async def submit_manual_report(
 
     service: DailyReportService = request.app.state.report_service
     llm_client = getattr(getattr(service, "extractor", None), "client", None) or getattr(request.app.state, "llm_client", None)
-    agent2_response = await _submit_manual_agent2_if_applicable(
+    agent2_response = await _submit_manual_tool_call_agent2(
         session=session,
         user=user,
         raw_input=body.raw_input,
@@ -180,6 +194,137 @@ async def submit_manual_report(
             now=now_in_timezone(user.timezone),
         )
     await session.commit()
+    return response
+
+
+async def _submit_manual_tool_call_agent2(
+    *,
+    session: AsyncSession,
+    user: Any,
+    raw_input: str,
+    report_date: date | None,
+    llm_client: Any | None,
+    message_id: str,
+    conversation_id: str,
+) -> dict[str, Any]:
+    """Use the same formal Agent2 Tool-Call runtime as DingTalk ingress."""
+
+    settings = get_settings()
+    now = now_in_timezone(
+        getattr(user, "timezone", None) or settings.timezone
+    )
+    if llm_client is None:
+        outcome = CanaryIngressOutcome(
+            owner="blocked",
+            reason="tool_call_canary_llm_missing",
+            message="当前 Agent2 暂时无法处理，本次没有写入任何内容，请稍后再试。",
+            handled=True,
+            actual_write=False,
+            messages_enabled=True,
+            user_visible_result="failed",
+            reply_formed=True,
+        )
+    else:
+        try:
+            outcome = await process_tool_call_canary_ingress(
+                session,
+                user=user,
+                dingtalk_user_id=str(
+                    getattr(user, "dingtalk_user_id", "") or ""
+                ),
+                user_text=raw_input,
+                source_channel="manual_text",
+                conversation_id=conversation_id,
+                source_message_id=message_id,
+                settings=settings,
+                llm_client=llm_client,
+                now=now,
+                conversation_kind="direct",
+                message_occurred_at=now,
+            )
+        except CanaryIngressExecutionError as exc:
+            outcome = exc.outcome()
+    if not outcome.handled:
+        outcome = CanaryIngressOutcome(
+            owner="blocked",
+            reason="tool_call_canary_unhandled",
+            message="当前 Agent2 暂时无法处理，本次没有写入任何内容，请稍后再试。",
+            handled=True,
+            actual_write=False,
+            messages_enabled=True,
+            user_visible_result="failed",
+            reply_formed=True,
+        )
+
+    fallback_report_date = report_date or now.date()
+    report = None
+    if outcome.report_id:
+        try:
+            outcome_report_id = uuid.UUID(str(outcome.report_id))
+        except ValueError as exc:
+            raise RuntimeError(
+                "Agent2 returned an invalid Daily Report identity"
+            ) from exc
+        report = await session.get(DailyReport, outcome_report_id)
+        if report is None or report.user_id != user.id:
+            raise RuntimeError(
+                "Agent2 Daily Report outcome is not bound to this user"
+            )
+    if report is None:
+        report = await get_report(session, user.id, fallback_report_date)
+    target_report_date = (
+        report.report_date if report is not None else fallback_report_date
+    )
+    if outcome.user_visible_result not in {"success", "reply_only"}:
+        reply_kind = f"agent2_tool_call_{outcome.user_visible_result}"
+    elif outcome.successful_pure_read:
+        reply_kind = "agent2_tool_call_read_only"
+    elif outcome.actual_write:
+        reply_kind = "agent2_tool_call"
+    else:
+        reply_kind = f"agent2_tool_call_{outcome.user_visible_result}"
+    response = _manual_response_payload(
+        report_id=(
+            outcome.report_id
+            or str(getattr(report, "id", "") or "")
+            or None
+        ),
+        report_date=target_report_date,
+        status_text=str(getattr(report, "status", "") or "collecting"),
+        today_work=list(getattr(report, "today_work", []) or []),
+        problems=list(getattr(report, "problems", []) or []),
+        tomorrow_plan=list(getattr(report, "tomorrow_plan", []) or []),
+        section_status=dict(getattr(report, "section_status", None) or {}),
+        message=outcome.message,
+        reply_kind=reply_kind,
+        confirmation_type=str(
+            getattr(report, "confirmation_type", "") or "none"
+        ),
+        confirmed_by_user=bool(
+            getattr(report, "confirmed_by_user", False)
+        ),
+        quality_warning=getattr(report, "quality_warning", None),
+    )
+    response["actual_write"] = bool(outcome.actual_write)
+    response["user_visible_result"] = outcome.user_visible_result
+    response["outcome_reason"] = outcome.reason
+    response["model_call_count"] = outcome.model_call_count
+    response["model_request_attempt_count"] = (
+        outcome.model_request_attempt_count
+    )
+    response["model_transport_retry_count"] = (
+        outcome.model_transport_retry_count
+    )
+    response["tool_success_count"] = outcome.tool_success_count
+    response["tool_no_op_count"] = outcome.tool_no_op_count
+    response["tool_clarification_count"] = (
+        outcome.tool_clarification_count
+    )
+    response["tool_blocked_count"] = outcome.tool_blocked_count
+    response["tool_failure_count"] = outcome.tool_failure_count
+    response["pre_execution_block_observations"] = list(
+        outcome.pre_execution_block_observations
+    )
     return response
 
 

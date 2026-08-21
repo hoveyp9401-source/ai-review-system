@@ -218,6 +218,7 @@ class _CompletedReportEditRuntime:
                 "source_message_index": 1,
                 "exact_quote": "完成合同终稿复核",
             },
+            "replacement_reviewed": True,
         }
         self._write_receipt = ToolReceipt(
             status=ReceiptStatus.SUCCESS,
@@ -389,7 +390,12 @@ class _CompletedReportContentWriteRuntime(_CompletedReportEditRuntime):
             return await super().execute(calls, **kwargs)
         self.executed_tools.append(call.tool_name)
         assert call.tool_name == self.write_tool_name
-        assert call.arguments == self.write_arguments
+        expected_arguments = (
+            {**self.write_arguments, "replacement_reviewed": True}
+            if call.tool_name == "edit_daily_items"
+            else self.write_arguments
+        )
+        assert call.arguments == expected_arguments
         assert kwargs.get("defer_finalization") is True
         self._write_receipt = ToolReceipt(
             status=ReceiptStatus.SUCCESS,

@@ -358,6 +358,24 @@ class SubmitNextWeeklyPlanArgs(StrictContract):
     plan_id: UUID
     expected_version: int = Field(ge=0)
     confirmation_evidence: CurrentUserMessageEvidence
+    reviewed_unfilled_days_as_empty: tuple[date, ...] = Field(
+        default=(),
+        max_length=6,
+        description=(
+            "Server-only proof that independent review approved submitting "
+            "the current plan with these otherwise-unfilled dates empty."
+        ),
+    )
+
+    @field_validator("reviewed_unfilled_days_as_empty")
+    @classmethod
+    def reviewed_empty_dates_must_be_unique(
+        cls,
+        value: tuple[date, ...],
+    ) -> tuple[date, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("reviewed unfilled weekly dates must be unique")
+        return value
 
 
 class RecordWeeklyPlanItemsAsTodayWorkArgs(StrictContract):
@@ -832,6 +850,13 @@ class _VersionedItemTarget(StrictContract):
 class EditDailyItemsArgs(_VersionedItemTarget):
     replacement: NonEmptyText
     replacement_evidence: DailyItemSourceEvidence
+    replacement_reviewed: bool = Field(
+        default=False,
+        description=(
+            "Server-only proof that an independent semantic review approved "
+            "the replacement and its trusted item targets."
+        ),
+    )
 
 
 class DeleteDailyItemsArgs(_VersionedItemTarget):
@@ -901,6 +926,24 @@ class CompletePreviousPlanArgs(_VersionedItemTarget):
 class ConfirmReportArgs(StrictContract):
     report_id: UUID
     expected_version: int = Field(ge=0)
+    reviewed_omitted_empty_fields: tuple[ReportField, ...] = Field(
+        default=(),
+        max_length=3,
+        description=(
+            "Server-only proof that the independent incomplete-confirm review "
+            "approved submitting the existing snapshot with these sections empty."
+        ),
+    )
+
+    @field_validator("reviewed_omitted_empty_fields")
+    @classmethod
+    def reviewed_empty_fields_must_be_unique(
+        cls,
+        value: tuple[ReportField, ...],
+    ) -> tuple[ReportField, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("reviewed omitted empty fields must be unique")
+        return value
 
 
 class RequestClearReportArgs(StrictContract):

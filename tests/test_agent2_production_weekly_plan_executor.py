@@ -781,7 +781,55 @@ async def test_undated_next_week_statement_is_persisted_only_in_suggestion_zone(
     suggestion = outcome.safe_user_facts["suggestion_zone"][0]
     assert suggestion["evidence_excerpt"] == content
     assert suggestion["is_formal_plan_item"] is False
-    assert store.plan.suggestions[0].source_ref == "message-1"
+    assert store.plan.suggestions[0].source_ref.startswith(
+        "message-1#matter:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_message_can_capture_two_distinct_undated_suggestions():
+    context = _context()
+    store = _FakeWeeklyPlanStore()
+    message = "下周安排合同评审；另安排资料归档"
+    arguments = ApplyNextWeeklyPlanArgs.model_validate(
+        {
+            "plan_id": context.weekly_plan.plan_id,
+            "expected_version": 0,
+            "operations": [
+                {
+                    "operation_id": "suggest-contract",
+                    "operation": "capture_suggestion",
+                    "content": "合同评审",
+                    "source_evidence": {"source_message_index": 1},
+                },
+                {
+                    "operation_id": "suggest-archive",
+                    "operation": "capture_suggestion",
+                    "content": "资料归档",
+                    "source_evidence": {"source_message_index": 1},
+                },
+            ],
+        }
+    )
+    request, bound_calls = _request("apply_next_weekly_plan", arguments)
+    executor = _executor(
+        store=store,
+        context=context,
+        bound_calls=bound_calls,
+        source=CurrentTurnSource((message,)),
+    )
+
+    outcome = await executor.apply_next_weekly_plan(request)
+
+    suggestions = outcome.safe_user_facts["suggestion_zone"]
+    assert len(suggestions) == 2
+    assert {item["evidence_excerpt"] for item in suggestions} == {
+        "合同评审",
+        "资料归档",
+    }
+    source_refs = {item.source_ref for item in store.plan.suggestions}
+    assert len(source_refs) == 2
+    assert all(value.startswith("message-1#matter:") for value in source_refs)
 
 
 @pytest.mark.asyncio
@@ -1039,6 +1087,75 @@ async def test_submit_requires_current_turn_evidence_and_all_six_days_resolved()
         "2026-08-21",
         "2026-08-22",
     ]
+
+
+@pytest.mark.asyncio
+async def test_reviewed_submit_marks_unfilled_days_empty_in_one_atomic_batch():
+    plan = _domain_plan()
+    monday = plan.days[0]
+    from app.agent2.weekly_plan_models import WeeklyPlanCommand
+
+    plan = execute_weekly_plan_command(
+        WeeklyPlanCommand(
+            command_id="seed-monday",
+            command_type="add_item",
+            tenant_id=TENANT_ID,
+            actor_user_id=str(USER_ID),
+            plan_id=plan.plan_id,
+            expected_version=0,
+            idempotency_key="seed-monday",
+            source_message_id="seed-message",
+            patch={
+                "plan_date": monday.plan_date.isoformat(),
+                "original_text": "复核采购合同",
+                "source": "manual",
+            },
+        ),
+        plan=plan,
+        executed_at=NOW,
+    ).after
+    context = _context(plan)
+    store = _FakeWeeklyPlanStore(plan)
+    unresolved = tuple(day.plan_date for day in plan.days[1:])
+    arguments = SubmitNextWeeklyPlanArgs.model_validate(
+        {
+            "plan_id": plan.plan_id,
+            "expected_version": plan.version,
+            "confirmation_evidence": {"source_message_index": 1},
+            "reviewed_unfilled_days_as_empty": [
+                value.isoformat() for value in unresolved
+            ],
+        }
+    )
+    request, bound_calls = _request("submit_next_weekly_plan", arguments)
+    bound_calls = {
+        key: replace(
+            value,
+            arguments={
+                name: item
+                for name, item in value.arguments.items()
+                if name != "reviewed_unfilled_days_as_empty"
+            },
+        )
+        for key, value in bound_calls.items()
+    }
+    executor = _executor(
+        store=store,
+        context=context,
+        bound_calls=bound_calls,
+        source=CurrentTurnSource(("按当前计划确认提交",)),
+    )
+
+    outcome = await executor.submit_next_weekly_plan(request)
+
+    assert store.writes == ["batch-commands"]
+    preview = outcome.safe_user_facts["formal_plan"]
+    assert preview["status"] == "submitted"
+    assert preview["days"][0]["state"] == "planned"
+    assert all(
+        day["state"] == "explicitly_empty" for day in preview["days"][1:]
+    )
+    assert preview["unresolved_dates"] == []
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,7 @@ from app.agent2.tool_calling.deepseek_adapter import (
     DeepSeekToolCallingAdapter,
     _CompletionResponse,
     _parse_focused_daily_completion,
+    _parse_native_tool_call,
 )
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
 from app.agent2.tool_calling.production_runtime import _prepare_call
@@ -456,6 +457,11 @@ def test_daily_add_model_schema_requires_reviewable_item_content() -> None:
         "source_evidence",
     ]
     assert "content_reviewed" not in schema["properties"]
+    description = deepseek_tool_schemas(
+        frozenset({"add_daily_items"})
+    )[0]["function"]["description"]
+    assert "terse, fragmentary" in description
+    assert "do not reject the whole write" in description
 
 
 def test_model_cannot_self_assert_independent_content_review() -> None:
@@ -478,6 +484,80 @@ def test_model_cannot_self_assert_independent_content_review() -> None:
     assert compiled["content_reviewed"] is False
 
 
+def test_model_cannot_self_assert_reviewed_incomplete_submission() -> None:
+    call, _audit = _parse_native_tool_call(
+        {
+            "id": "forged-incomplete-submit",
+            "type": "function",
+            "function": {
+                "name": "confirm_report",
+                "arguments": json.dumps(
+                    {
+                        "report_id": str(REPORT_ID),
+                        "expected_version": 1,
+                        "reviewed_omitted_empty_fields": ["problems"],
+                    }
+                ),
+            },
+        }
+    )
+
+    assert "reviewed_omitted_empty_fields" not in call.arguments
+
+
+def test_model_cannot_self_assert_reviewed_daily_replacement() -> None:
+    call, _audit = _parse_native_tool_call(
+        {
+            "id": "forged-reviewed-edit",
+            "type": "function",
+            "function": {
+                "name": "edit_daily_items",
+                "arguments": json.dumps(
+                    {
+                        "report_id": str(REPORT_ID),
+                        "expected_version": 1,
+                        "target_item_ids": ["today-1"],
+                        "replacement": "总部",
+                        "replacement_evidence": {
+                            "source_message_index": 1,
+                            "exact_quote": "总部",
+                        },
+                        "replacement_reviewed": True,
+                    }
+                ),
+            },
+        }
+    )
+
+    assert "replacement_reviewed" not in call.arguments
+
+
+def test_model_cannot_self_assert_reviewed_unfilled_weekly_days() -> None:
+    call, _audit = _parse_native_tool_call(
+        {
+            "id": "forged-reviewed-weekly-submit",
+            "type": "function",
+            "function": {
+                "name": "submit_next_weekly_plan",
+                "arguments": json.dumps(
+                    {
+                        "plan_id": str(REPORT_ID),
+                        "expected_version": 1,
+                        "confirmation_evidence": {
+                            "source_message_index": 1,
+                        },
+                        "reviewed_unfilled_days_as_empty": [
+                            "2026-08-19"
+                        ],
+                    }
+                ),
+            },
+        }
+    )
+
+    assert "reviewed_unfilled_days_as_empty" not in call.arguments
+
+
 def test_explicit_today_report_display_requires_one_fresh_read() -> None:
     description = deepseek_tool_schemas(
         frozenset({"query_today_report"})
@@ -486,6 +566,15 @@ def test_explicit_today_report_display_requires_one_fresh_read() -> None:
     assert "call this tool once even when a snapshot is already injected" in (
         description
     )
+
+
+def test_daily_copy_tool_accepts_one_trusted_previous_report_reference() -> None:
+    description = deepseek_tool_schemas(
+        frozenset({"copy_previous_to_today"})
+    )[0]["function"]["description"]
+
+    assert "semantically adopts one unique trusted previous report" in description
+    assert "do not require the user to repeat" in description
 
 
 def test_focused_daily_plan_accepts_one_complete_36_item_report() -> None:
@@ -622,7 +711,16 @@ async def test_focused_daily_plan_preserves_reviewed_conservative_wording(
     result = await adapter.run_canary_turn(
         system_prompt="Agent2 full production prompt",
         user_text=source,
-        context=_context(),
+        context=_context(
+            allowed_tool_names=frozenset(
+                {
+                    "add_daily_items",
+                    "confirm_report",
+                    "apply_next_weekly_plan",
+                    "submit_next_weekly_plan",
+                }
+            )
+        ),
         runtime_session=runtime,
         thinking_enabled=True,
     )
@@ -642,10 +740,27 @@ async def test_focused_daily_plan_preserves_reviewed_conservative_wording(
         "将合同评审技能改造成网页端agent，调用速度提升10倍"
     )
     assert "adds, removes, generalizes, or changes" in requests[1][0]["content"]
-    assert "do not turn an omission alone into a write blocker" in requests[1][0][
+    assert "never turn an omission alone into a zero-write blocker" in requests[1][0][
         "content"
     ]
+    assert "omission_only:" in requests[1][0]["content"]
     assert "one item spans two unrelated work domains" in requests[1][0]["content"]
+    assert "shared report field, time horizon, or transition" in requests[0][0][
+        "content"
+    ]
+    assert "assign one short topic label" in requests[0][0]["content"]
+    assert "specific weekdays inside that target week" in requests[0][0][
+        "content"
+    ]
+    assert "detailed first-person account" in requests[0][0]["content"]
+    assert "independently assign one short topic label" in requests[1][0][
+        "content"
+    ]
+    assert "terse, fragmentary" in requests[1][0]["content"]
+    assert "detailed first-person account" in requests[1][0]["content"]
+    assert "specific weekdays inside that target week" in requests[1][0][
+        "content"
+    ]
 
 
 def test_focused_daily_plan_preserves_explicit_empty_field_evidence() -> None:
@@ -1074,6 +1189,77 @@ async def test_malformed_long_daily_uses_bounded_compact_repair_without_full_rep
 
 
 @pytest.mark.asyncio
+async def test_two_invalid_focused_plans_fall_back_to_the_main_agent2_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+    main_call = _compact_long_daily_call("main-agent2-after-focused-failure")
+    reviewed_call = _compact_long_daily_call(
+        "main-agent2-review-after-focused-failure"
+    )
+    completions = iter(
+        (
+            _malformed_daily_completion(),
+            _malformed_daily_completion(),
+            _tool_completion(main_call),
+            _tool_completion(reviewed_call),
+            _CompletionResponse(
+                message={
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "reply": "已按原文完整记录。",
+                            "actual_write": True,
+                            "operation_outcome": "changed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                metadata={"finish_reason": "stop"},
+            ),
+        )
+    )
+    requests: list[tuple[str, tuple[str, ...]]] = []
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del thinking_enabled
+        requests.append(
+            (
+                messages[0]["content"],
+                tuple(
+                    item["function"]["name"] for item in tool_schemas
+                ),
+            )
+        )
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=LONG_DAILY_TEXT,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert runtime.execute_count == 1
+    assert requests[0][1] == ("plan_daily_report",)
+    assert requests[1][1] == ("plan_daily_report",)
+    assert requests[2][0] == "Agent2 full production prompt"
+    assert "add_daily_items" in requests[2][1]
+    assert any(
+        turn.response_metadata.get(
+            "focused_daily_argument_repair_fell_back_to_main_agent2"
+        )
+        is True
+        for turn in result.model_turns
+    )
+
+
+@pytest.mark.asyncio
 async def test_exact_quote_mismatch_uses_fast_source_repair_then_full_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1308,9 +1494,10 @@ async def test_explicit_complex_daily_writes_grounded_items_even_if_one_is_omitt
 
     assert result.final_content == "已按原文完整记录。"
     assert len(requests) == 2
-    assert "never request repair solely because another source matter was omitted" in (
+    assert "never use fallback or reject solely because another source matter was omitted" in (
         requests[1][0]["content"]
     )
+    assert "best-effort repair" in requests[1][0]["content"]
     assert runtime.execute_count == 1
     assert runtime.commit_count == 1
     assert len(runtime.calls[0].arguments["items"]) == 7
@@ -1492,7 +1679,16 @@ async def test_focused_daily_can_submit_without_inventing_a_missing_section(
     result = await adapter.run_canary_turn(
         system_prompt="Agent2 full production prompt",
         user_text=source,
-        context=_context(),
+        context=_context(
+            allowed_tool_names=frozenset(
+                {
+                    "add_daily_items",
+                    "confirm_report",
+                    "apply_next_weekly_plan",
+                    "submit_next_weekly_plan",
+                }
+            )
+        ),
         runtime_session=runtime,
         thinking_enabled=True,
     )
@@ -1651,6 +1847,68 @@ async def test_focused_review_repairs_over_split_daily_before_execution(
     assert requests[2]["thinking_enabled"] is True
     assert requests[3]["tool_names"] == ("review_daily_plan",)
     assert requests[3]["thinking_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_omission_only_repair_failure_keeps_the_safe_partial_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "今天完成合同复核，另完成付款材料整理。"
+    partial = NativeToolCall(
+        tool_call_id="safe-partial",
+        tool_name="add_daily_items",
+        arguments={
+            "date_selection": "server_default",
+            "items": [
+                {
+                    "field": "today_work",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_quote": "今天完成合同复核",
+                    },
+                }
+            ],
+        },
+    )
+    completions = iter(
+        (
+            _focused_daily_plan_completion(partial),
+            _focused_daily_repair_review_completion(
+                "omission_only: payment-material matter is missing"
+            ),
+            _focused_daily_plan_completion(partial),
+            _focused_daily_repair_review_completion(
+                "omission_only: payment-material matter is still missing"
+            ),
+        )
+    )
+    runtime = _DeferredRuntime()
+    adapter = _adapter()
+
+    async def fake_complete(messages, *, tool_schemas, thinking_enabled):
+        del messages, tool_schemas, thinking_enabled
+        return next(completions)
+
+    monkeypatch.setattr(adapter, "_complete", fake_complete)
+
+    result = await adapter.run_canary_turn(
+        system_prompt="Agent2 full production prompt",
+        user_text=source,
+        context=_context(),
+        runtime_session=runtime,
+        thinking_enabled=True,
+    )
+
+    assert result.final_content == "已按原文完整记录。"
+    assert runtime.execute_count == 1
+    assert len(runtime.calls[0].arguments["items"]) == 1
+    assert any(
+        turn.response_metadata.get(
+            "focused_daily_omission_repair_fell_back_to_safe_partial"
+        )
+        is True
+        for turn in result.model_turns
+    )
 
 
 @pytest.mark.asyncio
@@ -2376,7 +2634,13 @@ async def test_natural_confirmation_uses_model_selected_trusted_report_not_progr
     assert result.final_content == "好的，已按刚才那份日报提交。"
     assert len(runtime.calls) == 1
     assert runtime.calls[0].tool_name == "confirm_report"
-    assert runtime.calls[0].arguments == confirm_call.arguments
+    assert runtime.calls[0].arguments == {
+        **confirm_call.arguments,
+        "reviewed_omitted_empty_fields": [
+            "problems",
+            "tomorrow_plan",
+        ],
+    }
     first_user_payload = json.loads(captured_first_request[1]["content"])
     assert first_user_payload["user_message"] == "行，照刚才那个来"
     assert first_user_payload["trusted_context"]["recent_messages"][0][

@@ -222,7 +222,17 @@ class ProductionWeeklyPlanExecutor:
             for day in live.days
             if day.state == "unfilled"
         )
-        if unresolved:
+        reviewed_empty_dates = tuple(
+            value.isoformat()
+            for value in arguments.reviewed_unfilled_days_as_empty
+        )
+        if reviewed_empty_dates and set(reviewed_empty_dates) != set(
+            unresolved
+        ):
+            raise ProductionExecutionError(
+                "WEEKLY_PLAN_EMPTY_DAY_REVIEW_MISMATCH"
+            )
+        if unresolved and not reviewed_empty_dates:
             return self._outcome(
                 plan=live,
                 before_version=live.version,
@@ -243,24 +253,53 @@ class ProductionWeeklyPlanExecutor:
                     request, arguments
                 ),
             )
-        command = self._command(
-            request=request,
-            operation_id="submit",
-            command_type="submit_plan",
-            expected_version=live.version,
-            patch={},
-            ordinal=1,
-            arguments=arguments,
+        commands = [
+            self._command(
+                request=request,
+                operation_id=f"reviewed-empty:{plan_date}",
+                command_type="set_day_empty",
+                expected_version=live.version,
+                patch={"plan_date": plan_date},
+                ordinal=index,
+                arguments=arguments,
+            )
+            for index, plan_date in enumerate(
+                reviewed_empty_dates,
+                start=1,
+            )
+        ]
+        commands.append(
+            self._command(
+                request=request,
+                operation_id="submit",
+                command_type="submit_plan",
+                expected_version=live.version,
+                patch={},
+                ordinal=len(commands) + 1,
+                arguments=arguments,
+            )
         )
         try:
-            execution = await self._store.execute(
-                command,
-                executed_at=executed_at,
-            )
+            if reviewed_empty_dates:
+                self._preflight_batch(tuple(commands), plan=live)
+                executions = await self._store.execute_batch(
+                    tuple(commands),
+                    executed_at=executed_at,
+                )
+            else:
+                executions = (
+                    await self._store.execute(
+                        commands[-1],
+                        executed_at=executed_at,
+                    ),
+                )
         except ValueError as exc:
             raise ProductionExecutionError(
                 _store_error_code(exc)
             ) from exc
+        if not executions:
+            raise ProductionExecutionError("WEEKLY_PLAN_EXECUTION_MISSING")
+        execution = executions[-1]
         if execution.receipt.status == "blocked":
             return self._outcome(
                 plan=live,
@@ -693,6 +732,12 @@ class ProductionWeeklyPlanExecutor:
                 patch = {
                     "matter_excerpt": operation.content,
                     "evidence_text": evidence_text,
+                    "source_ref": (
+                        f"{self._context.principal.source_message_id}#matter:"
+                        + hashlib.sha256(
+                            operation.content.encode("utf-8")
+                        ).hexdigest()
+                    ),
                     "source_version": hashlib.sha256(
                         evidence_text.encode("utf-8")
                     ).hexdigest(),
@@ -787,8 +832,24 @@ class ProductionWeeklyPlanExecutor:
         if bound is None or bound.call.tool_name != request.tool_name:
             raise ProductionExecutionError("BOUND_TOOL_CALL_REQUIRED")
         dumped = request.arguments.model_dump(mode="json")
-        if bound.arguments != dumped:
-            raise ProductionExecutionError("BOUND_TOOL_ARGUMENTS_CHANGED")
+        bound_arguments = dict(bound.arguments)
+        if isinstance(request.arguments, SubmitNextWeeklyPlanArgs):
+            dumped = dict(dumped)
+            dumped.pop("reviewed_unfilled_days_as_empty", None)
+            bound_arguments.pop(
+                "reviewed_unfilled_days_as_empty",
+                None,
+            )
+        if bound_arguments != dumped:
+            mismatch_keys = sorted(
+                key
+                for key in set(bound_arguments).union(dumped)
+                if bound_arguments.get(key) != dumped.get(key)
+            )
+            raise ProductionExecutionError(
+                "BOUND_TOOL_ARGUMENTS_CHANGED:"
+                + ",".join(mismatch_keys)
+            )
         return bound
 
     def _weekly_target(
