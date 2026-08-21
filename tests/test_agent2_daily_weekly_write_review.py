@@ -32,6 +32,7 @@ from app.agent2.tool_calling.deepseek_adapter import (
     _daily_weekly_write_review_messages,
     _daily_weekly_write_review_tool_names,
     _parse_assistant_turn,
+    _trusted_persisted_pending_summary,
     _validate_completion_protocol,
 )
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
@@ -184,6 +185,122 @@ def _daily_edit_and_weekly_context() -> TrustedContext:
             "allowed_tool_names": allowed,
             "gate_decisions": {name: True for name in allowed},
         }
+    )
+
+
+def _recent_daily_focus_with_pending_weekly_context() -> TrustedContext:
+    base = _context()
+    now = datetime(
+        2026,
+        8,
+        21,
+        22,
+        1,
+        tzinfo=ZoneInfo("Asia/Shanghai"),
+    )
+    report_id = UUID("20000000-0000-4000-8000-000000000021")
+    report = TrustedReportSnapshot(
+        report_id=report_id,
+        tenant_id="tenant-a",
+        owner_user_id=_USER_ID,
+        report_date=date(2026, 8, 21),
+        version=4,
+        status="collecting",
+        items=(
+            TrustedReportItem(
+                item_id="today-21",
+                field="today_work",
+                content="完成未结案件签阅单",
+                report_id=report_id,
+                report_version=4,
+            ),
+            TrustedReportItem(
+                item_id="tomorrow-21",
+                field="tomorrow_plan",
+                content="研究绩效维度指标周完成情况填写",
+                report_id=report_id,
+                report_version=4,
+            ),
+        ),
+    )
+    weekly = base.weekly_plan.model_copy(
+        update={
+            "target_week_start": date(2026, 8, 24),
+            "version": 3,
+            "status": "pending_confirmation",
+            "days": tuple(
+                TrustedWeeklyPlanDay(
+                    day_id=f"pending-day-{offset}",
+                    plan_date=date(2026, 8, 24) + timedelta(days=offset),
+                    state="explicitly_empty",
+                )
+                for offset in range(6)
+            ),
+            "roles": ("active_collection",),
+            "natural_next_for_message_indexes": (),
+        }
+    )
+    recent_operation = TrustedRecentOperation(
+        tenant_id="tenant-a",
+        user_id=_USER_ID,
+        conversation_id="direct-user-a",
+        source_message_id="previous-daily-message",
+        tool_call_id="previous-daily-add",
+        tool_name="add_daily_items",
+        status=ReceiptStatus.SUCCESS,
+        changed=True,
+        target_type="daily_report",
+        target_id=str(report_id),
+        before_version=3,
+        after_version=4,
+        affected_item_ids=("today-21", "tomorrow-21"),
+        report_reference=TrustedReportReference(
+            report_id=report_id,
+            report_date=report.report_date,
+            report_version=report.version,
+            report_status=report.status,
+            report_state_sha256=report.state_sha256,
+        ),
+        occurred_at=now - timedelta(minutes=1),
+    )
+    allowed = frozenset(
+        {
+            "add_daily_items",
+            "confirm_report",
+            "apply_next_weekly_plan",
+            "submit_next_weekly_plan",
+        }
+    )
+    return TrustedContext(
+        namespace=CANARY_STATE_NAMESPACE,
+        now=now,
+        principal=base.principal.model_copy(
+            update={"source_message_id": "current-submit-message"}
+        ),
+        today_report=report,
+        recent_messages=(
+            TrustedRecentMessage(
+                role="user",
+                content=(
+                    "今天完成未结案件签阅单，明天研究绩效维度指标周完成情况填写"
+                ),
+                source_message_id="previous-daily-message",
+            ),
+            TrustedRecentMessage(
+                role="assistant",
+                content=(
+                    "已记录今日日报，问题风险未填写，状态：收集整理中。"
+                ),
+                source_message_id="previous-daily-reply",
+                source_turn_id="previous-daily-message",
+                delivery_status="verified",
+            ),
+        ),
+        recent_operations=(recent_operation,),
+        weekly_plan=weekly,
+        weekly_plans=(weekly,),
+        allowed_tool_names=allowed,
+        gate_decisions={name: True for name in allowed},
     )
 
 
@@ -522,6 +639,41 @@ def _weekly_submit_call(*, call_id: str = "weekly-submit") -> dict:
     }
 
 
+def _daily_empty_risk_submit_call(
+    *,
+    context: TrustedContext,
+    call_id: str = "daily-submit",
+) -> dict:
+    report = context.today_report
+    assert report is not None
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "add_daily_items",
+            "arguments": json.dumps(
+                {
+                    "date_selection": "trusted_report",
+                    "report_id": str(report.report_id),
+                    "expected_version": report.version,
+                    "items": [],
+                    "acknowledged_empty_fields": ["problems"],
+                    "empty_field_evidence": [
+                        {
+                            "field": "problems",
+                            "source_evidence": {
+                                "source_message_index": 1,
+                            },
+                        }
+                    ],
+                    "submit_after_write": True,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
+
+
 def _weekly_recurrence_call(
     *,
     call_id: str,
@@ -641,7 +793,9 @@ class _RecordingRuntime:
                 "edit_daily_items",
                 "delete_daily_items",
                 "move_daily_items",
+                "confirm_report",
                 "apply_next_weekly_plan",
+                "submit_next_weekly_plan",
                 "remember_personal_memory",
             }
             for call in calls
@@ -1477,6 +1631,141 @@ def test_weekly_only_review_prompt_excludes_daily_review_distractions() -> None:
     assert "retryable_daily_write" not in prompt
     assert "add_daily_items" not in prompt
     assert "separate explicit Daily Report fact" in prompt
+
+
+def test_recent_daily_focus_disables_bare_weekly_plan_confirmation() -> None:
+    context = _recent_daily_focus_with_pending_weekly_context()
+
+    summaries = _trusted_persisted_pending_summary(context)
+
+    weekly = next(
+        item
+        for item in summaries
+        if item["pending_kind"] == "weekly_plan_submission_confirmation"
+    )
+    assert weekly["executable_now"] is True
+    assert weekly["allows_bare_confirmation"] is False
+
+
+def test_weekly_submit_review_keeps_recent_daily_focus_evidence() -> None:
+    context = _recent_daily_focus_with_pending_weekly_context()
+    weekly_submit = _weekly_submit_call()
+    arguments = json.loads(weekly_submit["function"]["arguments"])
+    arguments["expected_version"] = 3
+    weekly_submit["function"]["arguments"] = json.dumps(arguments)
+    parsed = _parse_assistant_turn(
+        _tool_completion(weekly_submit).message
+    )
+
+    messages = _daily_weekly_write_review_messages(
+        user_text="没问题 提交",
+        user_messages=(),
+        calls=parsed.tool_calls,
+        context=context,
+        trusted_completed_daily_query_results=[],
+        selected_targets=[],
+        allowed_tool_names=_daily_weekly_write_review_tool_names(
+            parsed.tool_calls,
+            context=context,
+        ),
+    )
+
+    prompt = messages[0]["content"]
+    payload = json.loads(messages[1]["content"])
+    assert "isolated Agent2 semantic reviewer" in prompt
+    assert "recent Daily Report focus" in prompt
+    assert payload["trusted_context"]["today_report"]["report_date"] == (
+        "2026-08-21"
+    )
+    assert payload["trusted_context"]["recent_record_focus"][
+        "target_type"
+    ] == "daily_report"
+    assert payload["trusted_context"]["recent_operations"][-1][
+        "tool_name"
+    ] == "add_daily_items"
+
+
+@pytest.mark.asyncio
+async def test_bare_submit_after_daily_preview_cannot_submit_older_weekly_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _recent_daily_focus_with_pending_weekly_context()
+    weekly_submit = _weekly_submit_call(call_id="wrong-weekly-submit")
+    weekly_arguments = json.loads(
+        weekly_submit["function"]["arguments"]
+    )
+    weekly_arguments["expected_version"] = 3
+    weekly_submit["function"]["arguments"] = json.dumps(
+        weekly_arguments,
+        ensure_ascii=False,
+    )
+    runtime = _RecordingRuntime()
+    await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=context,
+        user_text="没问题 提交",
+        draft_calls=(weekly_submit,),
+        reviewed_calls=(
+            _daily_empty_risk_submit_call(context=context),
+        ),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "add_daily_items"
+    ]
+    arguments = runtime.calls[0].arguments
+    assert arguments["date_selection"] == "trusted_report"
+    assert arguments["report_id"] == str(context.today_report.report_id)
+    assert arguments["expected_version"] == context.today_report.version
+    assert arguments["acknowledged_empty_fields"] == ["problems"]
+    assert arguments["submit_after_write"] is True
+    assert runtime.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_weekly_submit_can_switch_away_from_recent_daily_focus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _recent_daily_focus_with_pending_weekly_context()
+    weekly_submit = _weekly_submit_call(call_id="explicit-weekly-submit")
+    weekly_arguments = json.loads(
+        weekly_submit["function"]["arguments"]
+    )
+    weekly_arguments["expected_version"] = 3
+    weekly_submit["function"]["arguments"] = json.dumps(
+        weekly_arguments,
+        ensure_ascii=False,
+    )
+    reviewed_weekly_submit = _weekly_submit_call(
+        call_id="reviewed-explicit-weekly-submit"
+    )
+    reviewed_arguments = json.loads(
+        reviewed_weekly_submit["function"]["arguments"]
+    )
+    reviewed_arguments["expected_version"] = 3
+    reviewed_weekly_submit["function"]["arguments"] = json.dumps(
+        reviewed_arguments,
+        ensure_ascii=False,
+    )
+    runtime = _RecordingRuntime()
+
+    await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=context,
+        user_text="这次提交下周工作计划",
+        draft_calls=(weekly_submit,),
+        reviewed_calls=(reviewed_weekly_submit,),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "submit_next_weekly_plan"
+    ]
+    assert not any(
+        call.tool_name in {"add_daily_items", "confirm_report"}
+        for call in runtime.calls
+    )
 
 
 @pytest.mark.asyncio

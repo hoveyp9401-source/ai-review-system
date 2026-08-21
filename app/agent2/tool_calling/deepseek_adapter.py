@@ -4484,6 +4484,19 @@ def _exposed_business_write_domains(
     return tuple(sorted(domains))
 
 
+def _recent_record_focus_domain(
+    context: TrustedContext,
+) -> str | None:
+    focus = context.recent_record_focus()
+    if focus is None:
+        return None
+    return {
+        "daily_report": "daily",
+        "weekly_plan": "weekly",
+        "periodic_report": "periodic",
+    }.get(str(focus.get("target_type") or ""))
+
+
 def _trusted_persisted_pending_summary(
     context: TrustedContext,
 ) -> tuple[dict[str, Any], ...]:
@@ -4494,6 +4507,7 @@ def _trusted_persisted_pending_summary(
         )
 
     summaries: list[dict[str, Any]] = []
+    recent_focus = _recent_record_focus_domain(context)
 
     def review_reference() -> str:
         # This value is deliberately scoped to this reviewer payload.  The
@@ -4526,7 +4540,8 @@ def _trusted_persisted_pending_summary(
                 },
                 "expires_at": clear_pending.expires_at.isoformat(),
                 "executable_now": executable,
-                "allows_bare_confirmation": executable,
+                "allows_bare_confirmation": executable
+                and recent_focus in {None, "daily"},
                 "provenance": "server_pending",
             }
         )
@@ -4555,7 +4570,8 @@ def _trusted_persisted_pending_summary(
                 },
                 "expires_at": None,
                 "executable_now": executable,
-                "allows_bare_confirmation": executable,
+                "allows_bare_confirmation": executable
+                and recent_focus in {None, "daily"},
                 "provenance": "server_report_state",
             }
         )
@@ -4581,7 +4597,8 @@ def _trusted_persisted_pending_summary(
                 },
                 "expires_at": None,
                 "executable_now": executable,
-                "allows_bare_confirmation": executable,
+                "allows_bare_confirmation": executable
+                and recent_focus in {None, "weekly"},
                 "provenance": "server_weekly_plan_state",
             }
         )
@@ -5285,6 +5302,16 @@ def _daily_weekly_review_domain_policy(domains: frozenset[str]) -> str:
     if {"daily", "weekly"}.issubset(domains):
         policies.append(
             "The Daily Report's tomorrow_plan is the next reporting-day plan. "
+            "Treat trusted_context.recent_record_focus as a server-derived recency "
+            "hint, never as write authorization. When it identifies a recent Daily "
+            "Report focus and recent_messages show the assistant just displayed or "
+            "continued that Daily Report, a brief context-dependent confirmation, "
+            "empty-section answer, or submission request continues that Daily Report "
+            "unless the current message explicitly switches to one Weekly Work Plan "
+            "target. An older pending Weekly Work Plan, its availability, or its "
+            "ability to accept a bare confirmation is not by itself evidence of a "
+            "domain switch. Apply the same rule in reverse for a recent Weekly Work "
+            "Plan focus; the current message may still switch records explicitly. "
             "When one Daily Report is the active focus, a generic plan addition or "
             "a tomorrow-plan addition stays in that Daily Report unless the user "
             "separately identifies a target week or one exact Weekly Work Plan day. "
@@ -5334,7 +5361,11 @@ def _daily_weekly_write_review_messages(
         for call in calls
         if (domain := _daily_weekly_write_domain(call.tool_name)) is not None
     }
-    if draft_domains == {"weekly"}:
+    recent_focus = _recent_record_focus_domain(context)
+    if draft_domains == {"weekly"} and (
+        recent_focus in {None, "weekly"}
+        or recent_focus not in allowed_domains
+    ):
         return _weekly_plan_write_review_messages(
             ordered_messages=ordered_messages,
             calls=calls,
@@ -6172,10 +6203,26 @@ def _merge_daily_weekly_write_review(
         and "daily" not in reviewed_domains
         and reviewed_domains
     )
+    recent_daily_submit_reclassification = bool(
+        original_reviewed_domains == {"weekly"}
+        and original.tool_calls
+        and all(
+            call.tool_name == "submit_next_weekly_plan"
+            for call in original.tool_calls
+            if _daily_weekly_write_domain(call.tool_name) is not None
+        )
+        and reviewed_domains == {"daily"}
+        and all(
+            call.tool_name in {"add_daily_items", "confirm_report"}
+            for call in reviewed.tool_calls
+        )
+        and _recent_record_focus_domain(context) == "daily"
+    )
     if (
         reviewed.tool_calls
         and not original_reviewed_domains.issubset(reviewed_domains)
         and not adjudicated_daily_add_reclassification
+        and not recent_daily_submit_reclassification
     ):
         raise ValueError(
             "review must preserve every reviewed write domain; "

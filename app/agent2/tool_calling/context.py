@@ -521,6 +521,27 @@ class TrustedContext(_FrozenModel):
             None,
         )
 
+    def recent_record_focus(self) -> dict[str, Any] | None:
+        """Return the latest trusted business-record focus without inferring intent."""
+
+        for operation in reversed(self.recent_operations):
+            if operation.status not in {"success", "no_op"}:
+                continue
+            if operation.target_type not in {
+                "daily_report",
+                "weekly_plan",
+                "periodic_report",
+            }:
+                continue
+            return {
+                "target_type": operation.target_type,
+                "tool_name": operation.tool_name,
+                "changed": operation.changed,
+                "occurred_at": operation.occurred_at.isoformat(),
+                "provenance": operation.provenance,
+            }
+        return None
+
     def report_by_id(self, report_id: UUID) -> TrustedReportSnapshot | None:
         return next((item for item in self.all_reports() if item.report_id == report_id), None)
 
@@ -596,6 +617,9 @@ class TrustedContext(_FrozenModel):
             ],
             "resource_namespace": self.namespace,
         }
+        recent_record_focus = self.recent_record_focus()
+        if recent_record_focus is not None:
+            payload["recent_record_focus"] = recent_record_focus
         if self.runtime_identity is not None:
             payload["runtime_identity"] = self.runtime_identity.model_dump(
                 mode="json"
