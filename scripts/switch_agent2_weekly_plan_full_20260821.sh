@@ -4,7 +4,7 @@ set -euo pipefail
 action="${1:-}"
 backup_path="${2:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-agent2-weekly-plan-full-20260821-v2"
+candidate="$releases/ai-review-system-agent2-weekly-plan-full-20260821-v3"
 previous="$releases/ai-review-system-agent2-weekly-plan-20260821-b6bfb95"
 current="$releases/current"
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
