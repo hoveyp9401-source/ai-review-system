@@ -56,6 +56,7 @@ ENV_KEYS = (
     "WEEKLY_PLAN_REMINDER_HOUR",
     "WEEKLY_PLAN_REMINDER_MINUTE",
 )
+REQUIRED_ENV_KEYS = frozenset(ENV_KEYS[:6])
 
 
 def _sha256(value: bytes) -> str:
@@ -84,15 +85,24 @@ def _read_env(path: Path) -> tuple[bytes, dict[str, str]]:
             if key in values:
                 raise RuntimeError(f"duplicate weekly-plan env key: {key}")
             values[key] = value
-    missing = set(ENV_KEYS) - set(values)
+    missing = set(REQUIRED_ENV_KEYS) - set(values)
     if missing:
         raise RuntimeError(f"missing weekly-plan env keys: {sorted(missing)}")
     return encoded, values
 
 
-def _write_env(path: Path, replacements: dict[str, str]) -> dict[str, object]:
+def _write_env(
+    path: Path,
+    replacements: dict[str, str],
+    *,
+    final_newline: bool | None = None,
+) -> dict[str, object]:
     encoded, current = _read_env(path)
-    if set(replacements) != set(ENV_KEYS):
+    replacement_keys = set(replacements)
+    if (
+        not REQUIRED_ENV_KEYS.issubset(replacement_keys)
+        or not replacement_keys.issubset(ENV_KEYS)
+    ):
         raise RuntimeError("weekly-plan env replacement is incomplete")
     lines = encoded.decode("utf-8").splitlines(keepends=True)
     replaced: set[str] = set()
@@ -100,17 +110,28 @@ def _write_env(path: Path, replacements: dict[str, str]) -> dict[str, object]:
     for raw_line in lines:
         stripped = raw_line.rstrip("\r\n")
         key = stripped.split("=", 1)[0] if "=" in stripped else ""
-        if key not in replacements:
+        if key not in ENV_KEYS:
             output.append(raw_line)
+            continue
+        if key not in replacements:
             continue
         newline = "\r\n" if raw_line.endswith("\r\n") else "\n"
         if not raw_line.endswith(("\n", "\r")):
             newline = ""
         output.append(f"{key}={replacements[key]}{newline}")
         replaced.add(key)
-    if replaced != set(replacements):
-        raise RuntimeError("weekly-plan env replacement did not cover every key")
+    missing_replacements = replacement_keys - replaced
+    if missing_replacements:
+        if output and not output[-1].endswith(("\n", "\r")):
+            output[-1] += "\n"
+        for key in ENV_KEYS:
+            if key in missing_replacements:
+                output.append(f"{key}={replacements[key]}\n")
     updated = "".join(output).encode("utf-8")
+    if final_newline is False:
+        updated = updated.removesuffix(b"\r\n").removesuffix(b"\n")
+    elif final_newline is True and not updated.endswith((b"\n", b"\r")):
+        updated += b"\n"
     temporary = path.with_name(f".{path.name}.weekly-plan-{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -395,6 +416,7 @@ async def backup(path: Path, *, target_week_start: date) -> None:
         "formal_user_count": len(user_ids),
         "formal_user_ids_sha256": _sha256(",".join(user_ids).encode("utf-8")),
         "env_sha256": _sha256(env_encoded),
+        "env_had_final_newline": env_encoded.endswith((b"\n", b"\r")),
         "env_values": env_values,
         "batch": batch,
     }
@@ -549,7 +571,11 @@ async def restore(path: Path, *, target_week_start: date) -> None:
         replacements["AGENT2_WEEKLY_PLAN_ENABLED"] = "false"
         replacements["AGENT2_WEEKLY_PLAN_WRITE_ENABLED"] = "false"
         replacements["AGENT2_WEEKLY_PLAN_SEND_ENABLED"] = "false"
-    env_result = _write_env(ENV_PATH, replacements)
+    env_result = _write_env(
+        ENV_PATH,
+        replacements,
+        final_newline=bool(payload["env_had_final_newline"]),
+    )
     print(json.dumps({"action": "restore", "removed_roster_members": removed, "fallback_disabled": fallback_disable, "env": env_result}, sort_keys=True))
     if fallback_disable:
         raise RuntimeError(

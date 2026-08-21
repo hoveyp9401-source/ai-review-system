@@ -75,6 +75,36 @@ def test_env_reader_fails_closed_on_a_duplicate_rollout_key(tmp_path: Path) -> N
         rollout._read_env(path)
 
 
+def test_optional_schedule_keys_can_be_added_and_removed_exactly(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".env"
+    original = _env_text()
+    for key in rollout.ENV_KEYS[6:]:
+        original = "".join(
+            line
+            for line in original.splitlines(keepends=True)
+            if not line.startswith(f"{key}=")
+        )
+    original = original.removesuffix("\n")
+    path.write_text(original, encoding="utf-8")
+    original_encoded, original_values = rollout._read_env(path)
+    expanded = {
+        **original_values,
+        "WEEKLY_PLAN_COLLECTION_OPEN_HOUR": "15",
+        "WEEKLY_PLAN_COLLECTION_OPEN_MINUTE": "0",
+        "WEEKLY_PLAN_REMINDER_HOUR": "15",
+        "WEEKLY_PLAN_REMINDER_MINUTE": "0",
+    }
+
+    rollout._write_env(path, expanded)
+    _encoded, applied = rollout._read_env(path)
+    rollout._write_env(path, original_values, final_newline=False)
+
+    assert applied == expanded
+    assert path.read_bytes() == original_encoded
+
+
 def test_reminder_send_remains_blocked_until_copy_is_user_approved() -> None:
     with pytest.raises(RuntimeError, match="reminder copy is not user-approved"):
         rollout._require_user_approved_reminder_template(send_enabled=True)
