@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,8 @@ import pytest
 
 from app.scheduler import runner
 from app.scheduler.runner import (
+    PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY,
+    run_bounded_personal_weekly_brief_model_batch,
     run_personal_weekly_brief_dispatch_job,
     run_personal_weekly_brief_generation_job,
     run_personal_weekly_brief_reconcile_job,
@@ -90,3 +93,44 @@ def test_main_scheduler_wires_generation_and_reconciliation_registration() -> No
     assert "register_personal_weekly_brief_jobs(" in source
     assert "run_personal_weekly_brief_generation_job(" in source
     assert "run_personal_weekly_brief_reconcile_job(" in source
+
+
+def test_weekly_batch_is_not_wired_into_daily_chat_request_paths() -> None:
+    webhook = Path("app/api/webhook.py").read_text(encoding="utf-8")
+    stream = Path("app/stream_runner.py").read_text(encoding="utf-8")
+
+    assert "run_personal_weekly_brief_generation_job" not in webhook
+    assert "run_personal_weekly_brief_generation_job" not in stream
+    assert "Agent2PersonalWeeklyBriefModelPipeline" not in webhook
+    assert "Agent2PersonalWeeklyBriefModelPipeline" not in stream
+
+
+@pytest.mark.asyncio
+async def test_model_batch_has_fixed_concurrency_and_isolates_one_user_failure() -> None:
+    active = 0
+    maximum_active = 0
+    completed: list[int] = []
+
+    async def worker(value: int) -> int:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            if value == 17:
+                raise RuntimeError("one redacted user failed")
+            completed.append(value)
+            return value
+        finally:
+            active -= 1
+
+    results = await run_bounded_personal_weekly_brief_model_batch(
+        tuple(range(74)),
+        worker=worker,
+    )
+
+    assert PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY == 4
+    assert maximum_active == 4
+    assert len(results) == 74
+    assert isinstance(results[17], RuntimeError)
+    assert len(completed) == 73

@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import hashlib
 import json
+from time import perf_counter
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from app.services.dingtalk import validate_dingtalk_outbound_text
+from app.utils.json import extract_json_object
 
 
 PlanProgressStatus = Literal[
@@ -27,6 +29,9 @@ PLAN_PROGRESS_STATUSES = frozenset(
     }
 )
 _MAX_MESSAGE_CHARS = 3600
+_MAX_SOURCE_COUNT = 120
+_MAX_SOURCE_TEXT_CHARS = 2000
+_MAX_TOTAL_SOURCE_CHARS = 30000
 _MAX_SECTION_ITEMS = {
     "completed": 12,
     "possible_open_loops": 8,
@@ -79,6 +84,8 @@ class SourceEvidence:
             raise ValueError("personal weekly brief source is incomplete")
         if self.source_kind not in {"daily_report", "weekly_plan"}:
             raise ValueError("personal weekly brief source kind is invalid")
+        if len(self.original_text) > _MAX_SOURCE_TEXT_CHARS:
+            raise ValueError("personal weekly brief source text is too long")
 
     def as_payload(self) -> dict[str, str]:
         return {
@@ -110,6 +117,10 @@ class PersonalWeeklyBriefSnapshot:
         if self.week_start.weekday() != 0 or self.week_end != self.week_start + timedelta(days=4):
             raise ValueError("personal weekly brief snapshot week is invalid")
         source_ids = [source.source_id for source in self.sources]
+        if len(self.sources) > _MAX_SOURCE_COUNT:
+            raise ValueError("personal weekly brief has too many sources")
+        if sum(len(source.original_text) for source in self.sources) > _MAX_TOTAL_SOURCE_CHARS:
+            raise ValueError("personal weekly brief total source text is too long")
         if len(source_ids) != len(set(source_ids)):
             raise ValueError("personal weekly brief source ids must be unique")
         if any(
@@ -259,12 +270,18 @@ class Agent2PersonalWeeklyBriefGenerator:
         *,
         model: str,
         thinking_enabled: bool = True,
+        timeout_seconds: float = 60.0,
+        max_retries: int = 1,
     ) -> None:
         if not model.strip():
             raise ValueError("Agent2 model is required")
         self._llm_client = llm_client
         self.model = model
         self._thinking_enabled = thinking_enabled
+        if timeout_seconds <= 0 or max_retries < 0 or max_retries > 1:
+            raise ValueError("Agent2 weekly brief request limits are invalid")
+        self._timeout_seconds = timeout_seconds
+        self._max_retries = max_retries
 
     async def generate(
         self,
@@ -272,32 +289,46 @@ class Agent2PersonalWeeklyBriefGenerator:
         snapshot: PersonalWeeklyBriefSnapshot,
         recipient_name: str,
         personal_memory: dict[str, Any],
+        repair_context: dict[str, Any] | None = None,
     ) -> PersonalWeeklyBriefContent:
+        user_payload: dict[str, Any] = {
+            "task": "生成个人本周工作简报",
+            "recipient": {
+                "authenticated_display_name": recipient_name,
+                "personal_memory": personal_memory,
+            },
+            "trusted_snapshot": snapshot.as_payload(),
+        }
+        if repair_context is not None:
+            encoded_repair = json.dumps(
+                repair_context,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if len(encoded_repair) > 12000:
+                raise ValueError("personal weekly brief repair context is too long")
+            user_payload["repair_context"] = repair_context
         response = await self._llm_client.complete_json(
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=json.dumps(
-                {
-                    "task": "生成个人本周工作简报",
-                    "recipient": {
-                        "authenticated_display_name": recipient_name,
-                        "personal_memory": personal_memory,
-                    },
-                    "trusted_snapshot": snapshot.as_payload(),
-                },
+                user_payload,
                 ensure_ascii=False,
                 sort_keys=True,
             ),
             model=self.model,
             thinking_enabled=self._thinking_enabled,
-            max_tokens=3000,
+            timeout_seconds=self._timeout_seconds,
+            max_retries=self._max_retries,
+            max_tokens=8000,
         )
         try:
-            payload = json.loads(response)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("personal weekly brief model returned invalid JSON") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("personal weekly brief model returned invalid payload")
-        content = _validated_content(payload, snapshot=snapshot)
+            payload = extract_json_object(response)
+            content = _validated_content(payload, snapshot=snapshot)
+        except (TypeError, ValueError) as exc:
+            detail = str(exc)
+            if "JSON" not in detail and "JSON object" not in detail:
+                detail = f"invalid output: {detail}"
+            raise PersonalWeeklyBriefModelOutputInvalid(detail) from exc
         message_text = _render_message(content, snapshot=snapshot)
         return PersonalWeeklyBriefContent(
             intro=content["intro"],
@@ -318,12 +349,18 @@ class Agent2PersonalWeeklyBriefReviewer:
         *,
         model: str,
         thinking_enabled: bool = False,
+        timeout_seconds: float = 60.0,
+        max_retries: int = 1,
     ) -> None:
         if not model.strip():
             raise ValueError("Agent2 review model is required")
         self._llm_client = llm_client
         self.model = model
         self._thinking_enabled = thinking_enabled
+        if timeout_seconds <= 0 or max_retries < 0 or max_retries > 1:
+            raise ValueError("Agent2 weekly brief review limits are invalid")
+        self._timeout_seconds = timeout_seconds
+        self._max_retries = max_retries
 
     async def review(
         self,
@@ -344,13 +381,15 @@ class Agent2PersonalWeeklyBriefReviewer:
             ),
             model=self.model,
             thinking_enabled=self._thinking_enabled,
-            max_tokens=1600,
+            timeout_seconds=self._timeout_seconds,
+            max_retries=self._max_retries,
+            max_tokens=8000,
         )
         try:
-            payload = json.loads(raw)
-        except (TypeError, json.JSONDecodeError) as exc:
+            payload = extract_json_object(raw)
+        except (TypeError, ValueError) as exc:
             raise ValueError("independent model review returned invalid JSON") from exc
-        if not isinstance(payload, dict) or set(payload) != {
+        if set(payload) != {
             "approved",
             "reviewed_matter_keys",
             "issues",
@@ -388,13 +427,147 @@ class Agent2PersonalWeeklyBriefReviewer:
                 raise ValueError("independent model review issue has unknown matter")
             normalized_issues.append({"matter_key": matter_key, "reason": reason})
         if payload["approved"] is not True or normalized_issues:
-            raise ValueError("independent model review rejected the brief")
+            raise PersonalWeeklyBriefReviewRejected(normalized_issues)
         return {
             "approved": True,
             "reviewed_matter_keys": sorted(reviewed_keys),
             "issues": [],
             "model": self.model,
         }
+
+
+class PersonalWeeklyBriefReviewRejected(ValueError):
+    """A safe rejection whose message never includes user-derived content."""
+
+    def __init__(self, issues: list[dict[str, str]]) -> None:
+        super().__init__("independent model review rejected the brief")
+        self.issues = tuple(dict(issue) for issue in issues)
+
+
+class PersonalWeeklyBriefModelOutputInvalid(ValueError):
+    """A model response failed JSON or deterministic source validation."""
+
+
+@dataclass(frozen=True)
+class PersonalWeeklyBriefModelOutcome:
+    content: PersonalWeeklyBriefContent
+    review: dict[str, Any]
+    semantic_attempts: int
+    model_calls: int
+    generation_seconds: tuple[float, ...]
+    review_seconds: tuple[float, ...]
+    total_seconds: float
+
+
+class Agent2PersonalWeeklyBriefModelPipeline:
+    """Generate, independently review, and perform at most one semantic repair."""
+
+    def __init__(
+        self,
+        *,
+        generator: Agent2PersonalWeeklyBriefGenerator,
+        reviewer: Agent2PersonalWeeklyBriefReviewer,
+        max_semantic_attempts: int = 2,
+    ) -> None:
+        if max_semantic_attempts != 2:
+            raise ValueError("personal weekly brief semantic attempts must equal two")
+        self._generator = generator
+        self._reviewer = reviewer
+        self._max_semantic_attempts = max_semantic_attempts
+
+    async def generate_and_review(
+        self,
+        *,
+        snapshot: PersonalWeeklyBriefSnapshot,
+        recipient_name: str,
+        personal_memory: dict[str, Any],
+    ) -> PersonalWeeklyBriefModelOutcome:
+        started = perf_counter()
+        repair_context: dict[str, Any] | None = None
+        generation_durations: list[float] = []
+        review_durations: list[float] = []
+        model_calls = 0
+        for attempt in range(1, self._max_semantic_attempts + 1):
+            generation_started = perf_counter()
+            model_calls += 1
+            try:
+                content = await self._generator.generate(
+                    snapshot=snapshot,
+                    recipient_name=recipient_name,
+                    personal_memory=personal_memory,
+                    repair_context=repair_context,
+                )
+            except PersonalWeeklyBriefModelOutputInvalid as exc:
+                generation_durations.append(perf_counter() - generation_started)
+                if attempt >= self._max_semantic_attempts:
+                    raise
+                repair_context = {
+                    "instruction": (
+                        "上一版模型输出未通过服务器结构或来源校验。"
+                        "保持完整 trusted_snapshot，重新返回严格的完整 JSON；"
+                        "只能包含规定的四个顶层字段。"
+                    ),
+                    "issues": [
+                        {
+                            "matter_key": "__model_output__",
+                            "reason": str(exc),
+                        }
+                    ],
+                }
+                continue
+            generation_durations.append(perf_counter() - generation_started)
+            review_started = perf_counter()
+            model_calls += 1
+            try:
+                review = await self._reviewer.review(
+                    snapshot=snapshot,
+                    content=content,
+                )
+            except PersonalWeeklyBriefReviewRejected as exc:
+                review_durations.append(perf_counter() - review_started)
+                if attempt >= self._max_semantic_attempts:
+                    raise
+                repair_context = {
+                    "instruction": (
+                        "上一版未通过独立事实复核。保持同一可信快照，"
+                        "逐项修复下列问题并重新返回完整 JSON；不得删除未被指出的关键事实。"
+                        "只能返回 intro、completed、plan_progress、possible_open_loops "
+                        "四个顶层字段，不得增加 repair_notes、说明或其他字段。"
+                    ),
+                    "previous_draft": content.as_payload(),
+                    "issues": list(exc.issues)[:20],
+                }
+                continue
+            except ValueError:
+                review_durations.append(perf_counter() - review_started)
+                if attempt >= self._max_semantic_attempts:
+                    raise
+                repair_context = {
+                    "instruction": (
+                        "上一轮独立复核输出未通过服务器 JSON/结构校验。"
+                        "保持完整 trusted_snapshot，重新生成完整四字段 JSON，"
+                        "随后服务器会重新执行独立复核。"
+                    ),
+                    "previous_draft": content.as_payload(),
+                    "issues": [
+                        {
+                            "matter_key": "__review_output__",
+                            "reason": "独立复核输出无效，需要重新生成后再次复核。",
+                        }
+                    ],
+                }
+                continue
+            review_durations.append(perf_counter() - review_started)
+            return PersonalWeeklyBriefModelOutcome(
+                content=content,
+                review=review,
+                semantic_attempts=attempt,
+                model_calls=model_calls,
+                generation_seconds=tuple(generation_durations),
+                review_seconds=tuple(review_durations),
+                total_seconds=perf_counter() - started,
+            )
+        raise AssertionError("personal weekly brief pipeline exited unexpectedly")
 
 
 def _validated_content(
@@ -404,7 +577,12 @@ def _validated_content(
 ) -> dict[str, Any]:
     expected = {"intro", "completed", "plan_progress", "possible_open_loops"}
     if set(payload) != expected:
-        raise ValueError("personal weekly brief model payload keys are invalid")
+        missing = sorted(expected - set(payload))
+        unexpected = sorted(set(payload) - expected)
+        raise ValueError(
+            "personal weekly brief model payload keys are invalid "
+            f"missing={missing!r} unexpected={unexpected!r}"
+        )
     intro = _bounded_text(payload["intro"], field="intro", maximum=500)
     source_by_id = {source.source_id: source for source in snapshot.sources}
     completed = _validated_section(
@@ -445,6 +623,11 @@ def _validated_content(
     open_keys = {item.matter_key for item in possible_open_loops.items}
     if plan_keys & open_keys:
         raise ValueError("duplicate matter across sections")
+    plan_progress_source_ids = {
+        source_id
+        for item in plan_progress.items
+        for source_id in item.source_ids
+    }
     open_source_ids = {
         source_id
         for item in possible_open_loops.items
@@ -452,6 +635,8 @@ def _validated_content(
     }
     if expected_plan_source_ids & open_source_ids:
         raise ValueError("weekly plan source cannot repeat in open loops")
+    if plan_progress_source_ids & open_source_ids:
+        raise ValueError("plan progress source cannot repeat in open loops")
     return {
         "intro": intro,
         "completed": completed,
@@ -613,12 +798,13 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 请把当周周一至周五的日报与本周周计划整理成自然、简洁、像服务同事的中文。所有语义判断、跨日合并、计划进展判断和未闭环判断都由你完成，但必须遵守：
 1. 只能使用 trusted_snapshot.sources；每条结论必须列出实际支持它的 source_ids，不得伪造来源，也不得声称“已核对”。completed 中每一项必须至少引用一条 section=today_work 的日报来源；问题、明日计划或周计划只能作为补充证据，不能单独成为“本周完成事项”。
 2. 今日工作中的“跟进、沟通、准备、起草、计划”等不得改写成“完成”。金额、日期、对象、条件、否定等关键事实不能遗漏或改变。
-3. 同一事项跨多天可合并为一条，保留所有关键进展和事实。
+3. 同一项目、案件或事项跨多天重复且指向明确时，必须合并为一条，保留所有关键进展和事实；只有无法可靠判断是否同一事项时才分开，不得靠猜测强行合并。
 4. 计划进展状态只能是：已完成、持续推进、安排调整、后续安排、暂时没有找到后续记录。除最后一种外，必须同时引用周计划和当日或后来日报证据；没有后来记录时只能用最后一种，绝不能说“未完成”。trusted_snapshot 中每个 source_kind=weekly_plan 的 source_id 都必须在 plan_progress 中恰好引用一次；同一事项跨日时可以在一条进展中引用多条周计划来源，但不得漏项或重复。
-5. plan_progress 与 possible_open_loops 中同一事项只能出现一次，并使用相同的稳定 matter_key 来帮助服务器去重。
+5. plan_progress 与 possible_open_loops 中同一事项只能出现一次，并使用相同的稳定 matter_key 来帮助服务器去重；plan_progress 已引用的任何 source_id 都不能再次用于 possible_open_loops，即使换了 matter_key 也不行。
 6. 没有数据、只有部分日期、没有周计划或没有风险栏时如实说明，不得编造。
 7. 简报只读，不得建议系统已经修改、补写、确认或提交日报、周计划。
 8. 不要在文字中称呼用户；称呼由服务器根据个人记忆安全添加。
+9. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的四个顶层字段，不能附加修复说明或其他字段。
 
 仅返回 JSON，严格使用以下结构，不得增加字段：
 {
@@ -631,12 +817,12 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 
 _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核步骤。你不能改写草稿，只能逐项判断是否安全通过。
 
-对每个 matter_key 检查：
+必须先按 trace 中每一条实际引用的 source_id 逐条对照原文，再按 matter_key 汇总结论；不能只看草稿是否通顺。对每个 matter_key 检查：
 1. 结论引用的 source_ids 是否真的支持文字，是否有伪造来源；completed 每项是否至少引用 today_work 日报来源；
-2. 是否改变或遗漏金额、日期、对象、条件、否定、归属和完成状态；
+2. 对该事项引用的每个 source_id，是否改变或遗漏其中任何金额、日期、对象、条件、否定、归属和完成状态；只要一个来源中的关键事实没有进入结论，就必须拒绝；
 3. 是否把跟进、沟通、准备、起草或计划武断写成完成；
-4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”；每条 weekly_plan 来源是否在计划进展中恰好出现一次；
-5. 计划进展和可能未闭环中是否重复同一事项；
+4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”；每条 weekly_plan 来源是否在计划进展中恰好出现一次。“后续安排”可以由后来日报的 tomorrow_plan 支持，它不表示已完成；“安排调整”只需后来日报明确记录安排发生变化，不要求再有调整后事项的最终完成证据。
+5. 计划进展和可能未闭环中是否重复同一事项。仅来自日报、并非周计划的谨慎未闭环事项可以只出现在 possible_open_loops，不要求进入 plan_progress；已经在 plan_progress 中说明调整或未找到后续记录的计划事项，不应再复制到 possible_open_loops。
 6. 无数据或部分数据时是否编造。
 
 必须覆盖草稿里的每个唯一 matter_key。只返回 JSON：
@@ -651,11 +837,15 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
 __all__ = [
     "Agent2PersonalWeeklyBriefGenerator",
     "Agent2PersonalWeeklyBriefReviewer",
+    "Agent2PersonalWeeklyBriefModelPipeline",
     "PLAN_PROGRESS_STATUSES",
     "PersonalWeeklyBriefContent",
     "PersonalWeeklyBriefItem",
+    "PersonalWeeklyBriefModelOutcome",
+    "PersonalWeeklyBriefModelOutputInvalid",
     "PersonalWeeklyBriefSection",
     "PersonalWeeklyBriefSnapshot",
+    "PersonalWeeklyBriefReviewRejected",
     "PersonalWeeklyBriefWindow",
     "SourceEvidence",
     "derive_personal_weekly_brief_window",

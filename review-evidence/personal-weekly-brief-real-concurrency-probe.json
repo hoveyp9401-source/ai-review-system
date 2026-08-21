@@ -1,0 +1,54 @@
+{
+  "config_attestation": {
+    "base_url_host": "api.deepseek.com",
+    "database_accessed": false,
+    "dingtalk_transport_called": false,
+    "loaded_config_fields": [
+      "LLM_API_KEY",
+      "LLM_BASE_URL",
+      "LLM_MAX_RETRIES",
+      "LLM_TIMEOUT_SECONDS"
+    ],
+    "real_user_data_used": false
+  },
+  "configured_concurrency": 4,
+  "failure_count": 0,
+  "finished_at": "2026-08-21T18:07:55.057337+00:00",
+  "maximum_observed_active_owners": 4,
+  "model": "deepseek-v4-flash",
+  "results": [
+    {
+      "model_calls": 2,
+      "owner_index": 0,
+      "seconds": 6.123,
+      "semantic_attempts": 1,
+      "status": "PASS"
+    },
+    {
+      "model_calls": 2,
+      "owner_index": 1,
+      "seconds": 10.331,
+      "semantic_attempts": 1,
+      "status": "PASS"
+    },
+    {
+      "model_calls": 2,
+      "owner_index": 2,
+      "seconds": 9.172,
+      "semantic_attempts": 1,
+      "status": "PASS"
+    },
+    {
+      "model_calls": 2,
+      "owner_index": 3,
+      "seconds": 8.189,
+      "semantic_attempts": 1,
+      "status": "PASS"
+    }
+  ],
+  "schema_version": "agent2.personal_weekly_brief.real_concurrency_probe.v1",
+  "started_at": "2026-08-21T18:07:44.721028+00:00",
+  "status": "PASS",
+  "success_count": 4,
+  "wall_seconds": 10.336
+}

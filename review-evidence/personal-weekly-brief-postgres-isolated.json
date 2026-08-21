@@ -1,0 +1,24 @@
+{
+  "checks": {
+    "archive_sha256": "25e6fcdfb8caec38691bf461125e7564508760666f7b8e5dc6a5f0818f58f81e",
+    "archive_size_bytes": 332441502,
+    "archive_zip_crc": "PASS",
+    "database_cleanup_zero_residual": "PASS",
+    "first_apply": "PASS",
+    "idempotent_second_apply": "PASS",
+    "migration_sha256": "6196e63ab46b6f2e935f141ed2ba59f94aebf4ec87e99959c4cb699b33f258d4",
+    "owner_week_duplicate_guard": "PASS",
+    "postgresql_version": "16.15",
+    "snapshot_to_delivered_transitions": "PASS",
+    "temporary_directory_removed": "PASS"
+  },
+  "database_target": "ephemeral_local_postgresql_only",
+  "dingtalk_messages_sent": 0,
+  "failure": "",
+  "finished_at": "2026-08-21T17:48:35.776897+00:00",
+  "listen_address": "127.0.0.1",
+  "production_database_connections": 0,
+  "schema_version": "agent2.personal_weekly_brief.postgres_isolated_gate.v1",
+  "started_at": "2026-08-21T17:48:07.630280+00:00",
+  "status": "PASS"
+}

@@ -1,0 +1,19 @@
+{
+  "ambiguous_context_rejected": true,
+  "ambiguous_identity_rejected": true,
+  "center_member_count": 2,
+  "child_department_count": 7,
+  "child_member_count": 72,
+  "cross_scope_rejected": 74,
+  "database_accessed": false,
+  "formal_target_count": 74,
+  "generation_switch_enabled": false,
+  "outsider_rejected": true,
+  "own_scope_passed": 74,
+  "real_user_data_used": false,
+  "schema_version": "agent2.personal_weekly_brief.scope_simulation.v1",
+  "send_switch_enabled": false,
+  "source_isolation_passed": 74,
+  "status": "PASS",
+  "transport_calls": 0
+}

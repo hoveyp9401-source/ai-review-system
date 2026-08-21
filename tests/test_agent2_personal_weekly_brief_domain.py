@@ -9,6 +9,9 @@ import pytest
 from app.agent2.personal_weekly_brief import (
     Agent2PersonalWeeklyBriefGenerator,
     Agent2PersonalWeeklyBriefReviewer,
+    Agent2PersonalWeeklyBriefModelPipeline,
+    PersonalWeeklyBriefReviewRejected,
+    PersonalWeeklyBriefModelOutputInvalid,
     PersonalWeeklyBriefSnapshot,
     SourceEvidence,
     derive_personal_weekly_brief_window,
@@ -26,7 +29,19 @@ class _FakeLLM:
 
     async def complete_json(self, **kwargs) -> str:
         self.calls.append(kwargs)
+        if isinstance(self.payload, str):
+            return self.payload
         return json.dumps(self.payload, ensure_ascii=False)
+
+
+class _SequenceLLM:
+    def __init__(self, *payloads: dict) -> None:
+        self.payloads = list(payloads)
+        self.calls: list[dict] = []
+
+    async def complete_json(self, **kwargs) -> str:
+        self.calls.append(kwargs)
+        return json.dumps(self.payloads.pop(0), ensure_ascii=False)
 
 
 def _source(
@@ -73,6 +88,333 @@ def _snapshot(*sources: SourceEvidence) -> PersonalWeeklyBriefSnapshot:
 
 def _empty_section(note: str) -> dict:
     return {"empty_note": note, "items": []}
+
+
+@pytest.mark.asyncio
+async def test_generator_accepts_real_model_json_code_fence() -> None:
+    raw = """```json
+{"intro":"本周没有已保存的数据。","completed":{"empty_note":"没有日报今日工作记录。","items":[]},"plan_progress":{"empty_note":"没有周计划记录。","items":[]},"possible_open_loops":{"empty_note":"没有数据时不推测。","items":[]}}
+```"""
+
+    llm = _FakeLLM(raw)
+    result = await Agent2PersonalWeeklyBriefGenerator(
+        llm,
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert result.completed.items == ()
+    assert llm.calls[0]["max_tokens"] == 8000
+    assert llm.calls[0]["timeout_seconds"] == 60.0
+    assert llm.calls[0]["max_retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_independent_reviewer_accepts_real_model_json_code_fence() -> None:
+    content = await Agent2PersonalWeeklyBriefGenerator(
+        _FakeLLM(
+            {
+                "intro": "本周没有已保存的数据。",
+                "completed": _empty_section("没有日报今日工作记录。"),
+                "plan_progress": _empty_section("没有周计划记录。"),
+                "possible_open_loops": _empty_section("没有数据时不推测。"),
+            }
+        ),
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+    review_llm = _FakeLLM(
+            "```json\n"
+            '{"approved":true,"reviewed_matter_keys":[],"issues":[]}'
+            "\n```"
+        )
+    reviewer = Agent2PersonalWeeklyBriefReviewer(
+        review_llm,
+        model="agent2-model",
+    )
+
+    review = await reviewer.review(snapshot=_snapshot(), content=content)
+
+    assert review["approved"] is True
+    assert review_llm.calls[0]["max_tokens"] == 8000
+    assert review_llm.calls[0]["timeout_seconds"] == 60.0
+    assert review_llm.calls[0]["max_retries"] == 1
+
+
+def test_snapshot_rejects_unbounded_model_input() -> None:
+    oversized_text = "甲" * 2001
+    with pytest.raises(ValueError, match="source text is too long"):
+        _snapshot(
+            _source(
+                "daily:oversized",
+                kind="daily_report",
+                on_date=date(2026, 8, 18),
+                section="today_work",
+                text=oversized_text,
+            )
+        )
+
+    too_many = tuple(
+        _source(
+            f"daily:many:{index}",
+            kind="daily_report",
+            on_date=date(2026, 8, 17 + index % 5),
+            section="today_work",
+            text=f"脱敏事项{index}",
+        )
+        for index in range(121)
+    )
+    with pytest.raises(ValueError, match="too many sources"):
+        _snapshot(*too_many)
+
+
+def test_snapshot_rejects_excessive_total_source_text() -> None:
+    sources = tuple(
+        _source(
+            f"daily:total:{index}",
+            kind="daily_report",
+            on_date=date(2026, 8, 17 + index % 5),
+            section="today_work",
+            text=f"脱敏{index}" + "乙" * 1490,
+        )
+        for index in range(21)
+    )
+
+    with pytest.raises(ValueError, match="total source text is too long"):
+        _snapshot(*sources)
+
+
+@pytest.mark.asyncio
+async def test_model_pipeline_repairs_once_after_independent_rejection() -> None:
+    source = _source(
+        "daily:repair:1",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="today_work",
+        text="跟进甲事项，需在8月20日前回复。",
+    )
+    first_draft = {
+        "intro": "本周简报。",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "matter-a",
+                    "text": "跟进甲事项。",
+                    "source_ids": [source.source_id],
+                }
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有重复提示。"),
+    }
+    repaired_draft = {
+        **first_draft,
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "matter-a",
+                    "text": "跟进甲事项，需在8月20日前回复。",
+                    "source_ids": [source.source_id],
+                }
+            ],
+        },
+    }
+    llm = _SequenceLLM(
+        first_draft,
+        {
+            "approved": False,
+            "reviewed_matter_keys": ["matter-a"],
+            "issues": [
+                {"matter_key": "matter-a", "reason": "遗漏8月20日前的日期条件"}
+            ],
+        },
+        repaired_draft,
+        {
+            "approved": True,
+            "reviewed_matter_keys": ["matter-a"],
+            "issues": [],
+        },
+    )
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(source),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.semantic_attempts == 2
+    assert outcome.model_calls == 4
+    assert "8月20日前" in outcome.content.message_text
+    repair_prompt = json.loads(llm.calls[2]["user_prompt"])
+    assert repair_prompt["repair_context"]["issues"][0]["matter_key"] == "matter-a"
+    assert "previous_draft" in repair_prompt["repair_context"]
+
+
+@pytest.mark.asyncio
+async def test_model_pipeline_stops_after_one_semantic_repair() -> None:
+    source = _source(
+        "daily:repair:stop",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="today_work",
+        text="跟进甲事项，需在8月20日前回复。",
+    )
+    draft = {
+        "intro": "本周简报。",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "matter-a",
+                    "text": "跟进甲事项。",
+                    "source_ids": [source.source_id],
+                }
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有重复提示。"),
+    }
+    rejection = {
+        "approved": False,
+        "reviewed_matter_keys": ["matter-a"],
+        "issues": [{"matter_key": "matter-a", "reason": "仍然遗漏日期条件"}],
+    }
+    llm = _SequenceLLM(draft, rejection, draft, rejection)
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    with pytest.raises(PersonalWeeklyBriefReviewRejected):
+        await pipeline.generate_and_review(
+            snapshot=_snapshot(source),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+    assert len(llm.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_model_pipeline_retries_one_invalid_generation_then_reviews() -> None:
+    valid = {
+        "intro": "本周没有已保存的数据。",
+        "completed": _empty_section("没有日报今日工作记录。"),
+        "plan_progress": _empty_section("没有周计划记录。"),
+        "possible_open_loops": _empty_section("没有数据时不推测。"),
+    }
+    llm = _SequenceLLM(
+        "not-a-json-object",
+        valid,
+        {
+            "approved": True,
+            "reviewed_matter_keys": [],
+            "issues": [],
+        },
+    )
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.semantic_attempts == 2
+    assert outcome.model_calls == 3
+    assert len(outcome.generation_seconds) == 2
+    assert len(outcome.review_seconds) == 1
+
+
+@pytest.mark.asyncio
+async def test_model_pipeline_stops_after_two_invalid_generations() -> None:
+    llm = _SequenceLLM("not-json-one", "not-json-two")
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid):
+        await pipeline.generate_and_review(
+            snapshot=_snapshot(),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_model_pipeline_retries_after_one_invalid_review_output() -> None:
+    valid = {
+        "intro": "本周没有已保存的数据。",
+        "completed": _empty_section("没有日报今日工作记录。"),
+        "plan_progress": _empty_section("没有周计划记录。"),
+        "possible_open_loops": _empty_section("没有数据时不推测。"),
+    }
+    llm = _SequenceLLM(
+        valid,
+        "review-not-json",
+        valid,
+        {
+            "approved": True,
+            "reviewed_matter_keys": [],
+            "issues": [],
+        },
+    )
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.model_calls == 4
+    assert outcome.semantic_attempts == 2
+    assert len(outcome.review_seconds) == 2
+
+
+@pytest.mark.asyncio
+async def test_model_pipeline_stops_after_second_invalid_review_output() -> None:
+    valid = {
+        "intro": "本周没有已保存的数据。",
+        "completed": _empty_section("没有日报今日工作记录。"),
+        "plan_progress": _empty_section("没有周计划记录。"),
+        "possible_open_loops": _empty_section("没有数据时不推测。"),
+    }
+    llm = _SequenceLLM(valid, "bad-review-one", valid, "bad-review-two")
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    with pytest.raises(ValueError, match="review returned invalid JSON"):
+        await pipeline.generate_and_review(
+            snapshot=_snapshot(),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+    assert len(llm.calls) == 4
 
 
 def test_window_is_saturday_generation_with_monday_to_friday_report_dates() -> None:
@@ -464,6 +806,61 @@ async def test_plan_progress_and_open_loops_cannot_repeat_the_same_matter() -> N
             model="agent2-model",
         ).generate(
             snapshot=_snapshot(plan),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_progress_and_open_loops_cannot_reuse_the_same_daily_source() -> None:
+    plan = _source(
+        "plan:invoice",
+        kind="weekly_plan",
+        on_date=date(2026, 8, 20),
+        section="plan_item",
+        text="确认丁公司发票条件。",
+    )
+    later_plan = _source(
+        "daily:invoice:later",
+        kind="daily_report",
+        on_date=date(2026, 8, 21),
+        section="tomorrow_plan",
+        text="后续安排下周一确认丁公司发票条件。",
+    )
+    llm = _FakeLLM(
+        {
+            "intro": "本周简报。",
+            "completed": _empty_section("没有日报今日工作记录。"),
+            "plan_progress": {
+                "empty_note": "",
+                "items": [
+                    {
+                        "matter_key": "invoice-plan",
+                        "text": "丁公司发票条件后续安排下周一确认。",
+                        "status": "后续安排",
+                        "source_ids": [plan.source_id, later_plan.source_id],
+                    }
+                ],
+            },
+            "possible_open_loops": {
+                "empty_note": "",
+                "items": [
+                    {
+                        "matter_key": "invoice-open-loop-renamed",
+                        "text": "丁公司发票条件仍待确认。",
+                        "source_ids": [later_plan.source_id],
+                    }
+                ],
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="source cannot repeat in open loops"):
+        await Agent2PersonalWeeklyBriefGenerator(
+            llm,
+            model="agent2-model",
+        ).generate(
+            snapshot=_snapshot(plan, later_plan),
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )

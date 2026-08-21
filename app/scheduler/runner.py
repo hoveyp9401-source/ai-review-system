@@ -35,6 +35,7 @@ from app.agent2.case_followup_service import (
 )
 from app.agent2.personal_weekly_brief import (
     Agent2PersonalWeeklyBriefGenerator,
+    Agent2PersonalWeeklyBriefModelPipeline,
     Agent2PersonalWeeklyBriefReviewer,
     PersonalWeeklyBriefSnapshot,
     derive_personal_weekly_brief_window,
@@ -60,8 +61,10 @@ from app.agent2.personal_weekly_brief_store import (
 )
 from app.agent2.personal_memory_reply import address_with_preferred_salutation
 from app.agent2.tool_calling.canary_config import (
+    CANARY_MAX_REQUEST_ATTEMPTS,
     CANARY_MODEL_NAME,
     CANARY_THINKING_ENABLED,
+    CANARY_TIMEOUT_SECONDS,
 )
 from app.agent2.tool_calling.outbound_context import (
     record_verified_outbound_context_message,
@@ -118,6 +121,7 @@ _DAILY_BRIEFING_EVENT_ACTIONS = frozenset(
     }
 )
 PERSONAL_WEEKLY_BRIEF_TIMEZONE = "Asia/Shanghai"
+PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY = 4
 
 
 class DailyBriefingResumeConflict(RuntimeError):
@@ -323,6 +327,28 @@ def register_personal_weekly_brief_jobs(
     return tuple(registered)
 
 
+async def run_bounded_personal_weekly_brief_model_batch(
+    rows,
+    *,
+    worker,
+    concurrency_limit: int = PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY,
+) -> tuple[object, ...]:
+    """Run isolated per-owner model work with a fixed concurrency ceiling."""
+
+    if concurrency_limit < 1 or concurrency_limit > 8:
+        raise ValueError("personal weekly brief model concurrency is invalid")
+    semaphore = asyncio.Semaphore(concurrency_limit)
+
+    async def run_one(row):
+        async with semaphore:
+            try:
+                return await worker(row)
+            except Exception as exc:  # one owner must not cancel the other 73
+                return exc
+
+    return tuple(await asyncio.gather(*(run_one(row) for row in rows)))
+
+
 async def run_personal_weekly_brief_generation_job(
     settings,
     *,
@@ -389,31 +415,38 @@ async def run_personal_weekly_brief_generation_job(
         llm_client,
         model=CANARY_MODEL_NAME,
         thinking_enabled=CANARY_THINKING_ENABLED,
+        timeout_seconds=CANARY_TIMEOUT_SECONDS,
+        max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
     )
     reviewer = Agent2PersonalWeeklyBriefReviewer(
         llm_client,
         model=CANARY_MODEL_NAME,
-        thinking_enabled=False,
+        thinking_enabled=True,
+        timeout_seconds=CANARY_TIMEOUT_SECONDS,
+        max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
     )
-    generated = 0
-    generation_failed = 0
-    for row in ready:
+    model_pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=generator,
+        reviewer=reviewer,
+    )
+
+    async def generate_one(row) -> bool:
         target = target_by_user.get(row.owner_user_id)
         if target is None:
             raise RuntimeError("personal weekly brief staged owner left exact scope")
+        loop = asyncio.get_running_loop()
+        owner_started = loop.time()
         try:
             snapshot = PersonalWeeklyBriefSnapshot.from_payload(row.source_snapshot)
             if snapshot.fingerprint != row.source_fingerprint:
                 raise ValueError("personal weekly brief source fingerprint mismatch")
-            content = await generator.generate(
+            model_outcome = await model_pipeline.generate_and_review(
                 snapshot=snapshot,
                 recipient_name=target.display_name,
                 personal_memory=dict(row.personal_memory_json or {}),
             )
-            model_review = await reviewer.review(
-                snapshot=snapshot,
-                content=content,
-            )
+            content = model_outcome.content
+            model_review = model_outcome.review
             salutation = str(
                 (row.personal_memory_json or {}).get(
                     "server_preferred_salutation",
@@ -435,13 +468,32 @@ async def run_personal_weekly_brief_generation_job(
                         **content.as_payload(),
                         "trace": content.trace_payload(),
                         "model_review": model_review,
+                        "model_metrics": {
+                            "model_calls": model_outcome.model_calls,
+                            "semantic_attempts": model_outcome.semantic_attempts,
+                            "generation_seconds": [
+                                round(value, 3)
+                                for value in model_outcome.generation_seconds
+                            ],
+                            "review_seconds": [
+                                round(value, 3)
+                                for value in model_outcome.review_seconds
+                            ],
+                            "model_pipeline_seconds": round(
+                                model_outcome.total_seconds, 3
+                            ),
+                            "total_seconds": round(loop.time() - owner_started, 3),
+                            "concurrency_limit": PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY,
+                            "timeout_seconds_per_attempt": CANARY_TIMEOUT_SECONDS,
+                            "max_attempts_per_call": CANARY_MAX_REQUEST_ATTEMPTS,
+                        },
                     },
                     message_text=message_text,
                     llm_model=generator.model,
                     changed_at=local_now,
                 )
                 await write_session.commit()
-            generated += 1
+            return True
         except Exception as exc:
             logger.exception(
                 "personal weekly brief generation failed owner=%s week=%s",
@@ -461,7 +513,14 @@ async def run_personal_weekly_brief_generation_job(
                     await failure_session.commit()
                 except ValueError:
                     await failure_session.rollback()
-            generation_failed += 1
+            return False
+
+    batch_results = await run_bounded_personal_weekly_brief_model_batch(
+        ready,
+        worker=generate_one,
+    )
+    generated = sum(result is True for result in batch_results)
+    generation_failed = len(batch_results) - generated
 
     dispatched = 0
     if getattr(settings, "agent2_personal_weekly_brief_send_enabled", False) is True:
