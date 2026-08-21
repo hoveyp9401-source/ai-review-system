@@ -32,6 +32,7 @@ from app.agent2.tool_calling.deepseek_adapter import (
     _daily_weekly_write_review_messages,
     _daily_weekly_write_review_tool_names,
     _parse_assistant_turn,
+    _recent_focus_conflict_adjudication_messages,
     _trusted_persisted_pending_summary,
     _validate_completion_protocol,
 )
@@ -850,6 +851,9 @@ async def _run_scripted_write_review(
     user_text: str,
     draft_calls: tuple[dict, ...],
     reviewed_calls: tuple[dict, ...],
+    recent_focus_adjudication_completions: tuple[
+        _CompletionResponse, ...
+    ] = (),
     structure_retry_calls: tuple[dict, ...] | None = None,
     adjudicated_calls: tuple[dict, ...] | None = None,
     adjudication_completion: _CompletionResponse | None = None,
@@ -867,6 +871,7 @@ async def _run_scripted_write_review(
         _tool_completion(*draft_calls),
         _tool_completion(*reviewed_calls),
     ]
+    scripted.extend(recent_focus_adjudication_completions)
     if structure_retry_calls is not None:
         scripted.append(_tool_completion(*structure_retry_calls))
     if adjudicated_calls is not None and adjudication_completion is not None:
@@ -904,6 +909,30 @@ def _keep_original_completion() -> _CompletionResponse:
         message={
             "role": "assistant",
             "content": json.dumps({"decision": "keep_original"}),
+        },
+        metadata={"finish_reason": "stop"},
+    )
+
+
+def _explicit_weekly_switch_completion(
+    *,
+    exact_quote: str,
+    proposed_target_week_start: str = "2026-08-24",
+) -> _CompletionResponse:
+    return _CompletionResponse(
+        message={
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "decision": "explicit_weekly_switch",
+                    "source_message_index": 1,
+                    "exact_quote": exact_quote,
+                    "proposed_target_week_start": (
+                        proposed_target_week_start
+                    ),
+                },
+                ensure_ascii=False,
+            ),
         },
         metadata={"finish_reason": "stop"},
     )
@@ -1685,6 +1714,25 @@ def test_weekly_submit_review_keeps_recent_daily_focus_evidence() -> None:
     ] == "add_daily_items"
 
 
+def test_focus_conflict_adjudicator_does_not_see_older_weekly_plan_state() -> None:
+    context = _recent_daily_focus_with_pending_weekly_context()
+
+    messages = _recent_focus_conflict_adjudication_messages(
+        user_text="没问题 提交",
+        user_messages=(),
+        context=context,
+    )
+
+    payload = json.loads(messages[1]["content"])
+    focus_context = payload["trusted_recent_focus_context"]
+    assert focus_context["recent_record_focus"]["target_type"] == (
+        "daily_report"
+    )
+    assert focus_context["today_report"]["report_date"] == "2026-08-21"
+    assert "weekly_plan" not in focus_context
+    assert "weekly_plan_targets" not in focus_context
+
+
 @pytest.mark.asyncio
 async def test_bare_submit_after_daily_preview_cannot_submit_older_weekly_plan(
     monkeypatch: pytest.MonkeyPatch,
@@ -1754,9 +1802,17 @@ async def test_explicit_weekly_submit_can_switch_away_from_recent_daily_focus(
         monkeypatch,
         runtime=runtime,
         context=context,
-        user_text="这次提交下周工作计划",
+        user_text="这次提交2026-08-24当周的周工作计划",
         draft_calls=(weekly_submit,),
         reviewed_calls=(reviewed_weekly_submit,),
+        recent_focus_adjudication_completions=(
+            _explicit_weekly_switch_completion(
+                exact_quote="这次提交2026-08-24当周的周工作计划"
+            ),
+            _explicit_weekly_switch_completion(
+                exact_quote="这次提交2026-08-24当周的周工作计划"
+            ),
+        ),
     )
 
     assert [call.tool_name for call in runtime.calls] == [
@@ -1766,6 +1822,91 @@ async def test_explicit_weekly_submit_can_switch_away_from_recent_daily_focus(
         call.tool_name in {"add_daily_items", "confirm_report"}
         for call in runtime.calls
     )
+
+
+@pytest.mark.asyncio
+async def test_two_weekly_submit_votes_still_need_recent_focus_adjudication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _recent_daily_focus_with_pending_weekly_context()
+
+    def weekly_submit(call_id: str) -> dict:
+        call = _weekly_submit_call(call_id=call_id)
+        arguments = json.loads(call["function"]["arguments"])
+        arguments["expected_version"] = 3
+        call["function"]["arguments"] = json.dumps(
+            arguments,
+            ensure_ascii=False,
+        )
+        return call
+
+    runtime = _RecordingRuntime()
+    await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=context,
+        user_text="没问题 提交",
+        draft_calls=(weekly_submit("wrong-weekly-draft"),),
+        reviewed_calls=(weekly_submit("wrong-weekly-review"),),
+        recent_focus_adjudication_completions=(
+            _tool_completion(
+                _daily_empty_risk_submit_call(
+                    context=context,
+                    call_id="focus-adjudicated-daily-submit",
+                )
+            ),
+        ),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "add_daily_items"
+    ]
+    assert runtime.calls[0].arguments["submit_after_write"] is True
+    assert runtime.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_one_focus_switch_vote_cannot_override_recent_daily_focus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _recent_daily_focus_with_pending_weekly_context()
+
+    def weekly_submit(call_id: str) -> dict:
+        call = _weekly_submit_call(call_id=call_id)
+        arguments = json.loads(call["function"]["arguments"])
+        arguments["expected_version"] = 3
+        call["function"]["arguments"] = json.dumps(
+            arguments,
+            ensure_ascii=False,
+        )
+        return call
+
+    runtime = _RecordingRuntime()
+    await _run_scripted_write_review(
+        monkeypatch,
+        runtime=runtime,
+        context=context,
+        user_text="没有问题，按这个提交",
+        draft_calls=(weekly_submit("wrong-weekly-draft"),),
+        reviewed_calls=(weekly_submit("wrong-weekly-review"),),
+        recent_focus_adjudication_completions=(
+            _explicit_weekly_switch_completion(
+                exact_quote="没有问题，按这个提交"
+            ),
+            _tool_completion(
+                _daily_empty_risk_submit_call(
+                    context=context,
+                    call_id="second-focus-adjudicated-daily-submit",
+                )
+            ),
+        ),
+    )
+
+    assert [call.tool_name for call in runtime.calls] == [
+        "add_daily_items"
+    ]
+    assert runtime.calls[0].arguments["submit_after_write"] is True
+    assert runtime.commit_count == 1
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
@@ -32,14 +33,42 @@ RUN_ID = f"daily-focus-weekly-submit-{uuid4()}"
 REPORT_DATE = date(2026, 8, 21)
 TARGET_WEEK_START = date(2026, 8, 24)
 CASES = (
-    ("bare", "没问题 提交"),
-    ("natural", "问题风险没有，提交吧"),
-    ("followup", "没有问题，按这个提交"),
+    ("bare", "没问题 提交", "daily"),
+    ("natural", "问题风险没有，提交吧", "daily"),
+    ("followup", "没有问题，按这个提交", "daily"),
+    (
+        "explicit_weekly_switch",
+        "这次提交2026-08-24当周的周工作计划",
+        "weekly",
+    ),
 )
 
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _safe_failure(name: str, exc: Exception) -> dict[str, object]:
+    failure: dict[str, object] = {
+        "name": name,
+        "error_type": type(exc).__name__,
+    }
+    raw = exc.args[0] if exc.args else None
+    if isinstance(raw, str):
+        failure["reason"] = raw[:300]
+    elif isinstance(raw, dict):
+        for key in (
+            "reason",
+            "business_result",
+            "release_blockers",
+            "daily_date_votes",
+            "model_flow",
+            "result_receipts",
+            "unexpected_tools",
+        ):
+            if key in raw:
+                failure[key] = raw[key]
+    return failure
 
 
 def _daily_state(report: DailyReport) -> dict[str, object]:
@@ -195,7 +224,13 @@ async def _prepare_recent_daily_focus(
     return report, previous_source_id
 
 
-async def _run_case(llm_client: LLMClient, *, name: str, text: str):
+async def _run_case(
+    llm_client: LLMClient,
+    *,
+    name: str,
+    text: str,
+    expected_domain: str,
+):
     now = datetime(2026, 8, 21, 22, 2, tzinfo=ZoneInfo("Asia/Shanghai"))
     conversation_id = f"{RUN_ID}-{name}-conversation"
     source_message_id = f"{RUN_ID}-{name}-current"
@@ -264,20 +299,32 @@ async def _run_case(llm_client: LLMClient, *, name: str, text: str):
             )
             await session.refresh(report)
             tools = [row.tool_name for row in receipts]
-            if "submit_next_weekly_plan" in tools:
-                raise AssertionError("older Weekly Work Plan was submitted")
-            if tools != ["add_daily_items"]:
-                raise AssertionError({"unexpected_tools": tools})
-            if report.status != "completed" or not report.confirmed_by_user:
-                raise AssertionError("Daily Report was not submitted")
-            if not bool(
-                dict(report.section_status or {}).get(
-                    "problems_acknowledged_empty"
-                )
-            ):
-                raise AssertionError("Daily risk field was not acknowledged empty")
-            if weekly_after["status"] != "pending_confirmation":
-                raise AssertionError("Weekly Work Plan state changed")
+            if expected_domain == "daily":
+                if "submit_next_weekly_plan" in tools:
+                    raise AssertionError("older Weekly Work Plan was submitted")
+                if tools not in (["add_daily_items"], ["confirm_report"]):
+                    raise AssertionError({"unexpected_tools": tools})
+                if report.status != "completed" or not report.confirmed_by_user:
+                    raise AssertionError("Daily Report was not submitted")
+                if not bool(
+                    dict(report.section_status or {}).get(
+                        "problems_acknowledged_empty"
+                    )
+                ):
+                    raise AssertionError(
+                        "Daily risk field was not acknowledged empty"
+                    )
+                if weekly_after["status"] != "pending_confirmation":
+                    raise AssertionError("Weekly Work Plan state changed")
+            elif expected_domain == "weekly":
+                if tools != ["submit_next_weekly_plan"]:
+                    raise AssertionError({"unexpected_tools": tools})
+                if weekly_after["status"] != "submitted":
+                    raise AssertionError("explicit Weekly Work Plan was not submitted")
+                if report.status != "collecting" or report.confirmed_by_user:
+                    raise AssertionError("explicit Weekly switch changed Daily Report")
+            else:
+                raise AssertionError("unknown expected domain")
             return {
                 "name": name,
                 "status": "pass",
@@ -319,16 +366,26 @@ async def main() -> None:
     llm_client = LLMClient(get_settings())
     results = []
     failures = []
+    selected = {
+        value.strip()
+        for value in os.getenv("SMOKE_CASE_NAMES", "").split(",")
+        if value.strip()
+    }
     try:
-        for name, text in CASES:
+        for name, text, expected_domain in CASES:
+            if selected and name not in selected:
+                continue
             try:
                 results.append(
-                    await _run_case(llm_client, name=name, text=text)
+                    await _run_case(
+                        llm_client,
+                        name=name,
+                        text=text,
+                        expected_domain=expected_domain,
+                    )
                 )
             except Exception as exc:
-                failures.append(
-                    {"name": name, "error_type": type(exc).__name__}
-                )
+                failures.append(_safe_failure(name, exc))
     finally:
         await llm_client.close()
     residue = await _residue()

@@ -77,6 +77,9 @@ from app.agent2.tool_calling.write_reply import (
     write_reply_protocol,
     write_reply_retry_messages,
 )
+from app.agent2.weekly_plan_date_binding import (
+    validate_weekly_plan_date_binding,
+)
 
 _TEXTUAL_TOOL_PROTOCOL_MARKERS = (
     "<｜DSML｜tool_calls",
@@ -1011,6 +1014,200 @@ class DeepSeekToolCallingAdapter:
                     },
                 )
             return reviewed
+
+        async def adjudicate_recent_focus_conflict(
+            *,
+            original: _ParsedAssistantTurn,
+            reviewed: _ParsedAssistantTurn,
+        ) -> _ParsedAssistantTurn:
+            """Require a narrow final decision before crossing recent Daily focus."""
+
+            nonlocal iterations
+            if _recent_record_focus_domain(context) != "daily":
+                return reviewed
+            original_domain_calls = tuple(
+                call
+                for call in original.tool_calls
+                if _daily_weekly_write_domain(call.tool_name) is not None
+            )
+            reviewed_domain_calls = tuple(
+                call
+                for call in reviewed.tool_calls
+                if _daily_weekly_write_domain(call.tool_name) is not None
+            )
+            if (
+                not original_domain_calls
+                or not reviewed_domain_calls
+                or any(
+                    call.tool_name != "submit_next_weekly_plan"
+                    for call in (
+                        *original_domain_calls,
+                        *reviewed_domain_calls,
+                    )
+                )
+            ):
+                return reviewed
+            daily_tool_names = frozenset(
+                name
+                for name in (
+                    "add_daily_items",
+                    "confirm_report",
+                )
+                if name in context.allowed_tool_names
+                and context.gate_decisions.get(name) is True
+            )
+            if not daily_tool_names:
+                raise _with_canary_turn_state(
+                    DeepSeekResponseError(
+                        "recent Daily focus has no safe submission tools"
+                    ),
+                    audits=audits,
+                    model_turns=model_turns,
+                )
+            adjudication_messages = _recent_focus_conflict_adjudication_messages(
+                user_text=user_text,
+                user_messages=user_messages,
+                context=context,
+            )
+            ordered_current_messages = user_messages or (user_text,)
+            reviewed_plan_ids = {
+                str(call.arguments.get("plan_id") or "")
+                for call in reviewed_domain_calls
+            }
+            for attempt in range(1, 3):
+                try:
+                    completion = await complete_model(
+                        adjudication_messages,
+                        tool_schemas=deepseek_tool_schemas(
+                            daily_tool_names
+                        ),
+                        thinking_enabled=True,
+                    )
+                    iterations += 1
+                    model_turns.append(
+                        _model_turn_audit(
+                            iterations,
+                            completion.message,
+                            response_metadata={
+                                **completion.metadata,
+                                "recent_record_focus_conflict_adjudication": True,
+                                "recent_record_focus_adjudication_attempt": attempt,
+                                "draft_executed": False,
+                            },
+                        )
+                    )
+                    adjudicated = _parse_assistant_turn(
+                        completion.message,
+                        allow_review_arguments_envelope=True,
+                    )
+                    _validate_completion_protocol(
+                        completion,
+                        adjudicated,
+                    )
+                    audits.extend(adjudicated.audit)
+                    if not adjudicated.tool_calls:
+                        raw_content = adjudicated.assistant_message.get(
+                            "content"
+                        )
+                        payload = (
+                            json.loads(raw_content)
+                            if isinstance(raw_content, str)
+                            else None
+                        )
+                        explicit_switch_keys = {
+                            "decision",
+                            "source_message_index",
+                            "exact_quote",
+                            "proposed_target_week_start",
+                        }
+                        if (
+                            isinstance(payload, dict)
+                            and set(payload) == explicit_switch_keys
+                            and payload.get("decision")
+                            == "explicit_weekly_switch"
+                        ):
+                            try:
+                                source_index = int(
+                                    payload["source_message_index"]
+                                )
+                                exact_quote = str(payload["exact_quote"])
+                                proposed_week_start = date.fromisoformat(
+                                    str(
+                                        payload[
+                                            "proposed_target_week_start"
+                                        ]
+                                    )
+                                )
+                                if (
+                                    source_index < 1
+                                    or source_index
+                                    > len(ordered_current_messages)
+                                    or len(reviewed_plan_ids) != 1
+                                ):
+                                    raise ValueError(
+                                        "weekly focus evidence scope mismatch"
+                                    )
+                                plan = context.weekly_plan_by_id(
+                                    next(iter(reviewed_plan_ids))
+                                )
+                                if (
+                                    plan is None
+                                    or proposed_week_start
+                                    != plan.target_week_start
+                                ):
+                                    raise ValueError(
+                                        "weekly focus target mismatch"
+                                    )
+                                validate_weekly_plan_date_binding(
+                                    source_message=(
+                                        ordered_current_messages[
+                                            source_index - 1
+                                        ]
+                                    ),
+                                    exact_clause_quote=exact_quote,
+                                    source_occurred_at=context.now,
+                                    business_timezone=(
+                                        context.principal.timezone
+                                    ),
+                                    target_week_start=(
+                                        plan.target_week_start
+                                    ),
+                                    proposed_date=proposed_week_start,
+                                )
+                            except (TypeError, ValueError):
+                                if attempt == 1:
+                                    continue
+                                raise
+                            if attempt == 1:
+                                continue
+                            return reviewed
+                    _validate_daily_weekly_write_review(
+                        reviewed=adjudicated,
+                        allowed_tool_names=daily_tool_names,
+                        original_has_domain_writes=True,
+                    )
+                    return adjudicated
+                except DeepSeekToolCallingError as exc:
+                    raise _with_canary_turn_state(
+                        exc,
+                        audits=audits,
+                        model_turns=model_turns,
+                    ) from exc
+                except ValueError as exc:
+                    raise _with_canary_turn_state(
+                        DeepSeekResponseError(
+                            "recent record focus adjudication returned an invalid decision"
+                        ),
+                        audits=audits,
+                        model_turns=model_turns,
+                    ) from exc
+            raise _with_canary_turn_state(
+                DeepSeekResponseError(
+                    "recent record focus adjudication did not reach a decision"
+                ),
+                audits=audits,
+                model_turns=model_turns,
+            )
 
         try:
             while True:
@@ -1999,6 +2196,10 @@ class DeepSeekToolCallingAdapter:
                         original=parsed,
                         reviewed=reviewed,
                         allowed_tool_names=daily_weekly_review_tool_names,
+                    )
+                    reviewed = await adjudicate_recent_focus_conflict(
+                        original=parsed,
+                        reviewed=reviewed,
                     )
                     completed_daily_flow.record_write_review(
                         reviewed,
@@ -5302,16 +5503,6 @@ def _daily_weekly_review_domain_policy(domains: frozenset[str]) -> str:
     if {"daily", "weekly"}.issubset(domains):
         policies.append(
             "The Daily Report's tomorrow_plan is the next reporting-day plan. "
-            "Treat trusted_context.recent_record_focus as a server-derived recency "
-            "hint, never as write authorization. When it identifies a recent Daily "
-            "Report focus and recent_messages show the assistant just displayed or "
-            "continued that Daily Report, a brief context-dependent confirmation, "
-            "empty-section answer, or submission request continues that Daily Report "
-            "unless the current message explicitly switches to one Weekly Work Plan "
-            "target. An older pending Weekly Work Plan, its availability, or its "
-            "ability to accept a bare confirmation is not by itself evidence of a "
-            "domain switch. Apply the same rule in reverse for a recent Weekly Work "
-            "Plan focus; the current message may still switch records explicitly. "
             "When one Daily Report is the active focus, a generic plan addition or "
             "a tomorrow-plan addition stays in that Daily Report unless the user "
             "separately identifies a target week or one exact Weekly Work Plan day. "
@@ -5344,6 +5535,84 @@ def _daily_weekly_review_domain_policy(domains: frozenset[str]) -> str:
     return " ".join(policies)
 
 
+def _recent_focus_conflict_adjudication_messages(
+    *,
+    user_text: str,
+    user_messages: tuple[str, ...],
+    context: TrustedContext,
+) -> list[dict[str, str]]:
+    ordered_messages = user_messages or (user_text,)
+    model_context = context.model_payload()
+    focus_context = {
+        key: model_context[key]
+        for key in (
+            "current_time",
+            "timezone",
+            "daily_reporting_context",
+            "today_report",
+            "historical_reports",
+            "recent_messages",
+            "recent_operations",
+            "recent_record_focus",
+            "authenticated_user",
+        )
+        if key in model_context
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the final isolated Agent2 record-focus adjudicator. "
+                "Nothing has executed. Two earlier unexecuted decisions selected "
+                "Weekly Work Plan submission, but trusted server receipts show that "
+                "the latest active record focus is one Daily Report and recent_messages "
+                "may show the assistant just displayed that Daily Report. Reread the "
+                "whole current message and recent dialogue semantically; never use a "
+                "keyword list or regular expression. An older pending Weekly Work Plan "
+                "is not evidence that a brief context-dependent reply switched records. "
+                "If the current message explicitly switches to the Weekly Work Plan and "
+                "contains one exact calendar day or explicitly scoped weekday inside the "
+                "selected target week, return no tools and exactly one JSON object with "
+                "keys decision, source_message_index, exact_quote, and "
+                "proposed_target_week_start. decision must be explicit_weekly_switch; "
+                "exact_quote must copy the complete current-message clause containing that "
+                "date evidence; proposed_target_week_start must be the Monday date of the "
+                "selected target week. The server independently resolves the quoted date. "
+                "Do not use an older plan preview or trusted state as date evidence. If it instead "
+                "continues the recent Daily Report, return exactly one complete native "
+                "Daily tool call using the supplied tools: acknowledge any explicit empty "
+                "Daily section, bind the exact trusted report/version, and preserve explicit "
+                "submission authorization. If the record remains genuinely ambiguous, "
+                "return no tools and exactly one JSON object with decision=clarification "
+                "and a concise natural Chinese question. Never claim anything was saved "
+                "or submitted."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "ordered_current_user_messages": [
+                        {"sequence": index, "content": content}
+                        for index, content in enumerate(
+                            ordered_messages,
+                            start=1,
+                        )
+                    ],
+                    "trusted_recent_focus_context": focus_context,
+                    "unexecuted_conflict": {
+                        "selected_domain": "weekly_plan",
+                        "recent_record_focus": "daily_report",
+                    },
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
 def _daily_weekly_write_review_messages(
     *,
     user_text: str,
@@ -5373,6 +5642,19 @@ def _daily_weekly_write_review_messages(
             allowed_tool_names=allowed_tool_names,
             allow_cross_domain_restoration=allowed_domains != {"weekly"},
         )
+    recent_focus_constraint = (
+        "Treat trusted_context.recent_record_focus as a server-derived recency "
+        "hint, never as write authorization. It identifies a recent Daily Report "
+        "focus, and recent_messages may show the assistant just displayed or "
+        "continued that Daily Report. A brief context-dependent confirmation, "
+        "empty-section answer, or submission request continues that Daily Report "
+        "unless the current message explicitly switches to one Weekly Work Plan "
+        "target. An older pending Weekly Work Plan, its availability, or its "
+        "ability to accept a bare confirmation is not by itself evidence of a "
+        "domain switch. "
+        if recent_focus == "daily"
+        else ""
+    )
     daily_only_constraint = (
         "For this Daily-only correction review, do not invent a report date or "
         "target. Preserve the draft target unless trusted_context proves that the "
@@ -5517,6 +5799,7 @@ def _daily_weekly_write_review_messages(
                 "acknowledgement, or leaving the action unspecified is not enough; request "
                 "clarification instead of selecting the candidate. "
                 f"{_daily_weekly_review_domain_policy(allowed_domains)} "
+                f"{recent_focus_constraint}"
                 "Treat the supplied draft as fallible: it may omit one domain, omit a "
                 "matter, or contain the wrong otherwise-valid arguments. The draft has "
                 "not executed and has written nothing. "
