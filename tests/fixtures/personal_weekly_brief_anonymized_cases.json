@@ -1,0 +1,46 @@
+[
+  {
+    "case_id": "short_single_item",
+    "report_date": "2026-08-17",
+    "created_at": "2026-08-17T19:10:00+08:00",
+    "today_work": ["完成甲项目合同复核。"],
+    "problems": [],
+    "tomorrow_plan": []
+  },
+  {
+    "case_id": "long_multi_section_narrative",
+    "report_date": "2026-08-18",
+    "created_at": "2026-08-18T22:30:00+08:00",
+    "today_work": [
+      "复核乙项目补充协议并逐项标注修改意见；与财务核对付款节点和所需审批材料；更新案件进展台账并核对本周收到的证据材料。"
+    ],
+    "problems": [
+      "如果8月25日前仍未收到授权文件，付款审批将无法按原计划发起，需要项目负责人决定是否调整节点。"
+    ],
+    "tomorrow_plan": ["继续催收授权文件并按实际回复更新处理进展。"]
+  },
+  {
+    "case_id": "continuous_supplement_first",
+    "report_date": "2026-08-19",
+    "created_at": "2026-08-19T18:05:00+08:00",
+    "today_work": ["跟进丙案件证据清单。"],
+    "problems": [],
+    "tomorrow_plan": []
+  },
+  {
+    "case_id": "continuous_supplement_second",
+    "report_date": "2026-08-19",
+    "created_at": "2026-08-19T20:15:00+08:00",
+    "today_work": ["跟进丙案件证据清单。", "与法院沟通后得知仍需补充一份送达证明。"],
+    "problems": [],
+    "tomorrow_plan": ["收到送达证明后再提交材料。"]
+  },
+  {
+    "case_id": "historical_date_late_entry",
+    "report_date": "2026-08-20",
+    "created_at": "2026-08-21T23:45:00+08:00",
+    "today_work": ["周五晚补录：周四与丁公司沟通争议款项120万元，对方没有承诺付款。"],
+    "problems": ["只有补充材料齐全后才发正式函。"],
+    "tomorrow_plan": []
+  }
+]

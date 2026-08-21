@@ -140,6 +140,13 @@ class Settings(BaseSettings):
     weekly_plan_reminder_minute: int = Field(default=0, ge=0, le=59)
     weekly_plan_snapshot_hour: int = Field(default=9, ge=0, le=23)
     weekly_plan_snapshot_minute: int = Field(default=0, ge=0, le=59)
+    # 个人本周工作简报的生成与真实私发分别受控；默认都关闭。
+    # 正式范围从法务合约中心的可信 74 人名册读取，不接受姓名白名单。
+    agent2_personal_weekly_brief_enabled: bool = False
+    agent2_personal_weekly_brief_send_enabled: bool = False
+    agent2_personal_weekly_brief_tenant_id: str = ""
+    personal_weekly_brief_hour: int = Field(default=9, ge=0, le=23)
+    personal_weekly_brief_minute: int = Field(default=0, ge=0, le=59)
     agent2_cognitive_core_v3_enabled: bool = False
     agent2_cognitive_core_v3_model: str = "deepseek-v4-pro"
     agent2_cognitive_core_v3_thinking: bool = True

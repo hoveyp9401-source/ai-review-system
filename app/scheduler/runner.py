@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.agent2.business.models import Agent2IdentityBinding
 from app.agent2.business.notifications import (
@@ -32,6 +32,39 @@ from app.agent2.case_followup_scheduler import plan_due_case_followups
 from app.agent2.case_followup_service import (
     CaseFollowupTaskCreator,
     FollowupCreationContext,
+)
+from app.agent2.personal_weekly_brief import (
+    Agent2PersonalWeeklyBriefGenerator,
+    Agent2PersonalWeeklyBriefReviewer,
+    PersonalWeeklyBriefSnapshot,
+    derive_personal_weekly_brief_window,
+)
+from app.agent2.personal_weekly_brief_delivery import (
+    DingTalkPersonalWeeklyBriefTransport,
+    PersonalWeeklyBriefDispatcher,
+    PersonalWeeklyBriefRecipient,
+)
+from app.agent2.personal_weekly_brief_scope import (
+    PersonalWeeklyBriefTarget,
+    load_personal_weekly_brief_targets,
+)
+from app.agent2.personal_weekly_brief_service import (
+    PersonalWeeklyBriefSnapshotService,
+)
+from app.agent2.personal_weekly_brief_sources import (
+    SqlPersonalWeeklyBriefSourceLoader,
+)
+from app.agent2.personal_weekly_brief_store import (
+    PersonalWeeklyBriefRecord,
+    SqlPersonalWeeklyBriefStore,
+)
+from app.agent2.personal_memory_reply import address_with_preferred_salutation
+from app.agent2.tool_calling.canary_config import (
+    CANARY_MODEL_NAME,
+    CANARY_THINKING_ENABLED,
+)
+from app.agent2.tool_calling.outbound_context import (
+    record_verified_outbound_context_message,
 )
 from app.agent2.case_followup_sql_store import SqlCaseFollowupTaskStore
 from app.agent2.weekly_plan_collection import derive_weekly_plan_collection_schedule
@@ -61,7 +94,7 @@ from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.llm.client import LLMClient
 from app.llm.extractor import TeamSummaryGenerator
-from app.models import Agent2ConversationState, ReportInteractionEvent
+from app.models import Agent2ConversationState, ReportInteractionEvent, User
 from app.scheduler.jobs import (
     ReminderDispatchEvidence,
     auto_submit_due_pending_reports,
@@ -226,6 +259,417 @@ def register_weekly_plan_jobs(
         ),
     )
     return tuple(registered)
+
+
+def _strict_personal_weekly_brief_tenant(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if (
+        value != value.strip()
+        or not value.isascii()
+        or any(character.isspace() for character in value)
+        or "," in value
+    ):
+        return None
+    return value
+
+
+def register_personal_weekly_brief_jobs(
+    scheduler,
+    *,
+    settings,
+    generation_job,
+    reconciliation_job,
+) -> tuple[str, ...]:
+    """Register the Saturday Agent2 brief only behind closed-by-default switches."""
+
+    tenant_id = _strict_personal_weekly_brief_tenant(
+        getattr(settings, "agent2_personal_weekly_brief_tenant_id", "")
+    )
+    if (
+        getattr(settings, "agent2_personal_weekly_brief_enabled", False) is not True
+        or tenant_id is None
+    ):
+        return ()
+    registered: list[str] = []
+    scheduler.add_job(
+        generation_job,
+        CronTrigger(
+            day_of_week="sat",
+            hour=settings.personal_weekly_brief_hour,
+            minute=settings.personal_weekly_brief_minute,
+            timezone=settings.timezone,
+        ),
+        id="agent2_personal_weekly_brief_generate",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    registered.append("agent2_personal_weekly_brief_generate")
+    if getattr(settings, "agent2_personal_weekly_brief_send_enabled", False) is True:
+        scheduler.add_job(
+            reconciliation_job,
+            IntervalTrigger(minutes=5, timezone=settings.timezone),
+            id="agent2_personal_weekly_brief_reconcile",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        registered.append("agent2_personal_weekly_brief_reconcile")
+    return tuple(registered)
+
+
+async def run_personal_weekly_brief_generation_job(
+    settings,
+    *,
+    llm_client: LLMClient,
+    robot: DingTalkRobotClient,
+    now: datetime,
+) -> dict[str, int]:
+    """Freeze 74 owner snapshots, then let Agent2 generate each private brief."""
+
+    tenant_id = _strict_personal_weekly_brief_tenant(
+        getattr(settings, "agent2_personal_weekly_brief_tenant_id", "")
+    )
+    if (
+        getattr(settings, "agent2_personal_weekly_brief_enabled", False) is not True
+        or tenant_id is None
+    ):
+        return {"staged": 0, "generated": 0, "generation_failed": 0, "dispatched": 0}
+    local_now = now.astimezone(ZoneInfo(settings.timezone))
+    if local_now.weekday() != 5:
+        raise ValueError("personal_weekly_brief_generation_requires_saturday")
+    window = derive_personal_weekly_brief_window(
+        local_now,
+        timezone_name=settings.timezone,
+    )
+
+    # Establish one repeatable database view before reading any of the 74
+    # owners.  Model calls happen only after these source snapshots commit.
+    async with AsyncSessionLocal() as snapshot_session:
+        await snapshot_session.execute(
+            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        )
+        targets = await load_personal_weekly_brief_targets(
+            snapshot_session,
+            tenant_id=tenant_id,
+            on_date=local_now.date(),
+            expected_model_name=CANARY_MODEL_NAME,
+        )
+        source_loader = SqlPersonalWeeklyBriefSourceLoader(snapshot_session)
+        snapshot_service = PersonalWeeklyBriefSnapshotService(
+            store=SqlPersonalWeeklyBriefStore(snapshot_session),
+            source_loader=source_loader,
+        )
+        staged = 0
+        for target in targets:
+            row = await snapshot_service.stage_target(
+                target=target,
+                week_start=window.week_start,
+                snapshot_at=window.snapshot_at,
+            )
+            if row.status == "snapshot_ready":
+                staged += 1
+        await snapshot_session.commit()
+
+    target_by_user = {target.internal_user_id: target for target in targets}
+    async with AsyncSessionLocal() as read_session:
+        ready = await SqlPersonalWeeklyBriefStore(read_session).load_for_status(
+            tenant_id=tenant_id,
+            status="snapshot_ready",
+            week_start=window.week_start,
+            limit=100,
+        )
+
+    generator = Agent2PersonalWeeklyBriefGenerator(
+        llm_client,
+        model=CANARY_MODEL_NAME,
+        thinking_enabled=CANARY_THINKING_ENABLED,
+    )
+    reviewer = Agent2PersonalWeeklyBriefReviewer(
+        llm_client,
+        model=CANARY_MODEL_NAME,
+        thinking_enabled=False,
+    )
+    generated = 0
+    generation_failed = 0
+    for row in ready:
+        target = target_by_user.get(row.owner_user_id)
+        if target is None:
+            raise RuntimeError("personal weekly brief staged owner left exact scope")
+        try:
+            snapshot = PersonalWeeklyBriefSnapshot.from_payload(row.source_snapshot)
+            if snapshot.fingerprint != row.source_fingerprint:
+                raise ValueError("personal weekly brief source fingerprint mismatch")
+            content = await generator.generate(
+                snapshot=snapshot,
+                recipient_name=target.display_name,
+                personal_memory=dict(row.personal_memory_json or {}),
+            )
+            model_review = await reviewer.review(
+                snapshot=snapshot,
+                content=content,
+            )
+            salutation = str(
+                (row.personal_memory_json or {}).get(
+                    "server_preferred_salutation",
+                    "",
+                )
+                or target.display_name
+            ).strip()
+            message_text = address_with_preferred_salutation(
+                content=content.message_text,
+                salutation=salutation,
+                authenticated_display_name=target.display_name,
+            )
+            async with AsyncSessionLocal() as write_session:
+                await SqlPersonalWeeklyBriefStore(write_session).record_generation(
+                    tenant_id=tenant_id,
+                    brief_id=row.brief_id,
+                    source_fingerprint=row.source_fingerprint,
+                    content_json={
+                        **content.as_payload(),
+                        "trace": content.trace_payload(),
+                        "model_review": model_review,
+                    },
+                    message_text=message_text,
+                    llm_model=generator.model,
+                    changed_at=local_now,
+                )
+                await write_session.commit()
+            generated += 1
+        except Exception as exc:
+            logger.exception(
+                "personal weekly brief generation failed owner=%s week=%s",
+                row.owner_user_id,
+                row.week_start,
+            )
+            async with AsyncSessionLocal() as failure_session:
+                try:
+                    await SqlPersonalWeeklyBriefStore(
+                        failure_session
+                    ).record_generation_failure(
+                        tenant_id=tenant_id,
+                        brief_id=row.brief_id,
+                        error=f"generation_error:{type(exc).__name__}",
+                        changed_at=local_now,
+                    )
+                    await failure_session.commit()
+                except ValueError:
+                    await failure_session.rollback()
+            generation_failed += 1
+
+    dispatched = 0
+    if getattr(settings, "agent2_personal_weekly_brief_send_enabled", False) is True:
+        dispatched = await run_personal_weekly_brief_dispatch_job(
+            settings,
+            robot=robot,
+            now=local_now,
+            targets=targets,
+            week_start=window.week_start,
+        )
+    return {
+        "staged": staged,
+        "generated": generated,
+        "generation_failed": generation_failed,
+        "dispatched": dispatched,
+    }
+
+
+async def run_personal_weekly_brief_dispatch_job(
+    settings,
+    *,
+    robot: DingTalkRobotClient,
+    now: datetime,
+    targets: tuple[PersonalWeeklyBriefTarget, ...] | None = None,
+    week_start: date | None = None,
+) -> int:
+    tenant_id = _strict_personal_weekly_brief_tenant(
+        getattr(settings, "agent2_personal_weekly_brief_tenant_id", "")
+    )
+    if (
+        getattr(settings, "agent2_personal_weekly_brief_enabled", False) is not True
+        or getattr(settings, "agent2_personal_weekly_brief_send_enabled", False) is not True
+        or tenant_id is None
+    ):
+        return 0
+    local_now = now.astimezone(ZoneInfo(settings.timezone))
+    target_week_start = week_start or derive_personal_weekly_brief_window(
+        local_now,
+        timezone_name=settings.timezone,
+    ).week_start
+    if targets is None:
+        async with AsyncSessionLocal() as scope_session:
+            targets = await load_personal_weekly_brief_targets(
+                scope_session,
+                tenant_id=tenant_id,
+                on_date=local_now.date(),
+                expected_model_name=CANARY_MODEL_NAME,
+            )
+    target_by_user = {target.internal_user_id: target for target in targets}
+    allowed_user_ids = frozenset(target_by_user)
+    async with AsyncSessionLocal() as read_session:
+        rows = await SqlPersonalWeeklyBriefStore(read_session).load_for_status(
+            tenant_id=tenant_id,
+            status="generated",
+            week_start=target_week_start,
+            limit=100,
+        )
+    delivered_count = 0
+    for row in rows:
+        target = target_by_user.get(row.owner_user_id)
+        if target is None:
+            raise RuntimeError("personal weekly brief dispatch owner left exact scope")
+        async with AsyncSessionLocal() as delivery_session:
+            dispatcher = PersonalWeeklyBriefDispatcher(
+                store=SqlPersonalWeeklyBriefStore(delivery_session),
+                transport=DingTalkPersonalWeeklyBriefTransport(robot),
+                tenant_id=tenant_id,
+                allowed_user_ids=allowed_user_ids,
+            )
+            delivered = await dispatcher.dispatch(
+                row=row,
+                recipient=_personal_weekly_recipient(target),
+                changed_at=local_now,
+                claim_token=f"personal-weekly:{row.brief_id}:{local_now.isoformat()}",
+            )
+            await delivery_session.commit()
+        if delivered.status == "delivered":
+            delivered_count += 1
+            await _record_personal_weekly_brief_context(
+                tenant_id=tenant_id,
+                row=delivered,
+                target=target,
+                changed_at=local_now,
+            )
+    return delivered_count
+
+
+async def run_personal_weekly_brief_reconcile_job(
+    settings,
+    *,
+    robot: DingTalkRobotClient,
+    now: datetime,
+) -> int:
+    tenant_id = _strict_personal_weekly_brief_tenant(
+        getattr(settings, "agent2_personal_weekly_brief_tenant_id", "")
+    )
+    if (
+        getattr(settings, "agent2_personal_weekly_brief_enabled", False) is not True
+        or getattr(settings, "agent2_personal_weekly_brief_send_enabled", False) is not True
+        or tenant_id is None
+    ):
+        return 0
+    local_now = now.astimezone(ZoneInfo(settings.timezone))
+    async with AsyncSessionLocal() as scope_session:
+        targets = await load_personal_weekly_brief_targets(
+            scope_session,
+            tenant_id=tenant_id,
+            on_date=local_now.date(),
+            expected_model_name=CANARY_MODEL_NAME,
+        )
+        store = SqlPersonalWeeklyBriefStore(scope_session)
+        pending = await store.load_for_status(
+            tenant_id=tenant_id,
+            status="delivery_pending",
+            limit=100,
+        )
+        context_pending = await store.load_delivered_without_context(
+            tenant_id=tenant_id,
+            limit=100,
+        )
+    target_by_user = {target.internal_user_id: target for target in targets}
+    allowed_user_ids = frozenset(target_by_user)
+    delivered_count = 0
+    for row in pending:
+        target = target_by_user.get(row.owner_user_id)
+        if target is None:
+            raise RuntimeError("personal weekly brief reconcile owner left exact scope")
+        async with AsyncSessionLocal() as delivery_session:
+            delivered = await PersonalWeeklyBriefDispatcher(
+                store=SqlPersonalWeeklyBriefStore(delivery_session),
+                transport=DingTalkPersonalWeeklyBriefTransport(robot),
+                tenant_id=tenant_id,
+                allowed_user_ids=allowed_user_ids,
+            ).reconcile_pending(
+                row=row,
+                recipient=_personal_weekly_recipient(target),
+                changed_at=local_now,
+            )
+            await delivery_session.commit()
+        if delivered.status == "delivered":
+            delivered_count += 1
+            await _record_personal_weekly_brief_context(
+                tenant_id=tenant_id,
+                row=delivered,
+                target=target,
+                changed_at=local_now,
+            )
+    for row in context_pending:
+        target = target_by_user.get(row.owner_user_id)
+        if target is not None:
+            await _record_personal_weekly_brief_context(
+                tenant_id=tenant_id,
+                row=row,
+                target=target,
+                changed_at=local_now,
+            )
+    return delivered_count
+
+
+def _personal_weekly_recipient(
+    target: PersonalWeeklyBriefTarget,
+) -> PersonalWeeklyBriefRecipient:
+    return PersonalWeeklyBriefRecipient(
+        tenant_id=target.tenant_id,
+        internal_user_id=target.internal_user_id,
+        dingtalk_user_id=target.dingtalk_user_id,
+        conversation_id=target.conversation_id,
+    )
+
+
+async def _record_personal_weekly_brief_context(
+    *,
+    tenant_id: str,
+    row: PersonalWeeklyBriefRecord,
+    target: PersonalWeeklyBriefTarget,
+    changed_at: datetime,
+) -> None:
+    if row.status != "delivered" or not row.provider_message_id:
+        return
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(
+            select(User).where(
+                User.id == UUID(target.internal_user_id),
+                User.active.is_(True),
+                User.dingtalk_user_id == target.dingtalk_user_id,
+            )
+        )
+        if user is None:
+            raise RuntimeError("personal weekly brief delivered user identity changed")
+        await record_verified_outbound_context_message(
+            session,
+            user=user,
+            conversation_id=target.conversation_id,
+            message_text=row.message_text,
+            source_message_id=f"personal-weekly-brief:{row.brief_id}",
+            delivery_receipt={
+                "deliveryVerified": True,
+                "deliveryStatus": "SUCCESS",
+                "deliveryRecipientUserIds": [target.dingtalk_user_id],
+                "invalidStaffIdList": [],
+                "filteredStaffIdList": [],
+                "flowControlledStaffIdList": [],
+                "processQueryKey": row.provider_message_id,
+            },
+            sent_at=row.delivered_at or changed_at,
+        )
+        await SqlPersonalWeeklyBriefStore(session).record_context(
+            tenant_id=tenant_id,
+            brief_id=row.brief_id,
+            changed_at=changed_at,
+        )
+        await session.commit()
 
 
 def _weekly_plan_schedule_facts(settings, *, now: datetime):
@@ -1169,6 +1613,35 @@ async def run_scheduler() -> None:
         reminder_job=weekly_plan_reminder_job,
         reminder_reconcile_job=weekly_plan_reminder_reconcile_job,
         snapshot_job=weekly_plan_snapshot_job,
+    )
+
+    async def personal_weekly_brief_job() -> None:
+        result = await run_personal_weekly_brief_generation_job(
+            settings,
+            llm_client=llm_client,
+            robot=robot,
+            now=datetime.now(ZoneInfo(settings.timezone)),
+        )
+        if any(result.values()):
+            logger.info("Agent2 personal weekly brief result=%s", result)
+
+    async def personal_weekly_brief_reconcile_job() -> None:
+        delivered = await run_personal_weekly_brief_reconcile_job(
+            settings,
+            robot=robot,
+            now=datetime.now(ZoneInfo(settings.timezone)),
+        )
+        if delivered:
+            logger.info(
+                "Agent2 personal weekly brief reconciled delivered=%s",
+                delivered,
+            )
+
+    register_personal_weekly_brief_jobs(
+        scheduler,
+        settings=settings,
+        generation_job=personal_weekly_brief_job,
+        reconciliation_job=personal_weekly_brief_reconcile_job,
     )
 
     loop = asyncio.get_running_loop()
