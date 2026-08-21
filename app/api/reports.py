@@ -266,9 +266,13 @@ async def _submit_manual_tool_call_agent2(
                 "Agent2 returned an invalid Daily Report identity"
             ) from exc
         report = await session.get(DailyReport, outcome_report_id)
-        if report is None or report.user_id != user.id:
+        if report is not None and report.user_id != user.id:
             raise RuntimeError(
                 "Agent2 Daily Report outcome is not bound to this user"
+            )
+        if report is None and outcome.actual_write:
+            raise RuntimeError(
+                "Agent2 write outcome does not resolve to a saved Daily Report"
             )
     if report is None:
         report = await get_report(session, user.id, fallback_report_date)
@@ -285,8 +289,7 @@ async def _submit_manual_tool_call_agent2(
         reply_kind = f"agent2_tool_call_{outcome.user_visible_result}"
     response = _manual_response_payload(
         report_id=(
-            outcome.report_id
-            or str(getattr(report, "id", "") or "")
+            str(getattr(report, "id", "") or "")
             or None
         ),
         report_date=target_report_date,

@@ -237,6 +237,69 @@ async def test_manual_api_returns_the_exact_daily_report_written_by_agent2(
 
 
 @pytest.mark.asyncio
+async def test_manual_read_can_return_no_saved_report_without_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = uuid4()
+    virtual_report_id = uuid4()
+    user = SimpleNamespace(
+        id=user_id,
+        dingtalk_user_id="ding-user",
+        timezone="Asia/Shanghai",
+    )
+    session = _Session()
+
+    async def session_get(model, object_id):
+        assert model is reports.DailyReport
+        assert object_id == virtual_report_id
+        return None
+
+    session.get = session_get  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        reports,
+        "get_settings",
+        lambda: SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+
+    async def process(*args, **kwargs):
+        return reports.CanaryIngressOutcome(
+            owner="tool_call_core",
+            reason="allowed",
+            message="今天还没有日报。",
+            report_id=str(virtual_report_id),
+            handled=True,
+            actual_write=False,
+            messages_enabled=True,
+            model_call_count=1,
+            tool_no_op_count=1,
+            successful_pure_read=True,
+            user_visible_result="success",
+            reply_formed=True,
+        )
+
+    async def get_fallback(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(reports, "process_tool_call_canary_ingress", process)
+    monkeypatch.setattr(reports, "get_report", get_fallback)
+
+    response = await reports._submit_manual_tool_call_agent2(
+        session=session,  # type: ignore[arg-type]
+        user=user,
+        raw_input="给我看一下今天的日报。",
+        report_date=None,
+        llm_client=object(),
+        message_id="manual-read-empty",
+        conversation_id="conversation-1",
+    )
+
+    assert response["report_id"] is None
+    assert response["reply_kind"] == "agent2_tool_call_read_only"
+    assert response["actual_write"] is False
+    assert response["merged_report"]["today_work"] == []
+
+
+@pytest.mark.asyncio
 async def test_manual_api_does_not_allow_a_hidden_report_date_to_override_agent2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
