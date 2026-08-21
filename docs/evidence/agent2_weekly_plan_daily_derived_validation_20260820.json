@@ -100,9 +100,23 @@
     "new_failures": 0
   },
   "deployment": {
-    "deployed": false,
-    "services_restarted": false,
-    "production_data_changed": false,
+    "deployed": true,
+    "deployed_at": "2026-08-21T08:45:00+08:00",
+    "release": "/home/ai_review_tunnel/releases/ai-review-system-agent2-weekly-plan-20260821-b6bfb95",
+    "previous_release": "/home/ai_review_tunnel/releases/ai-review-system-agent2-daily-recovery-20260820-3b9ad8b",
+    "control_backup": "/home/ai_review_tunnel/backups/agent2-weekly-plan-b6bfb95-20260821T084432-controls-before.json",
+    "control_backup_sha256": "f612ea0a394486c5840e33cf4dc8ca67c6f48897f1ba788572459ca504dff97c",
+    "services_restarted": true,
+    "services_active": 3,
+    "health_ok": true,
+    "runtime_controls_aligned": 74,
+    "runtime_controls_mismatched": 0,
+    "runtime_control_rows_updated": 74,
+    "post_deploy_weekly_daily_rollback_passed": 6,
+    "post_deploy_daily_rollback_passed": 13,
+    "post_deploy_progress_gate_passed": 12,
+    "post_deploy_test_residue": 0,
+    "user_daily_or_weekly_plan_data_changed": false,
     "production_messages_sent": false
   }
 }
