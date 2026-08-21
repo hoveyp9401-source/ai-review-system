@@ -917,7 +917,6 @@ def _keep_original_completion() -> _CompletionResponse:
 def _explicit_weekly_switch_completion(
     *,
     exact_quote: str,
-    proposed_target_week_start: str = "2026-08-24",
 ) -> _CompletionResponse:
     return _CompletionResponse(
         message={
@@ -927,9 +926,7 @@ def _explicit_weekly_switch_completion(
                     "decision": "explicit_weekly_switch",
                     "source_message_index": 1,
                     "exact_quote": exact_quote,
-                    "proposed_target_week_start": (
-                        proposed_target_week_start
-                    ),
+                    "scope_basis": "explicit_record_name",
                 },
                 ensure_ascii=False,
             ),
@@ -1802,15 +1799,15 @@ async def test_explicit_weekly_submit_can_switch_away_from_recent_daily_focus(
         monkeypatch,
         runtime=runtime,
         context=context,
-        user_text="这次提交2026-08-24当周的周工作计划",
+        user_text="这次提交周工作计划",
         draft_calls=(weekly_submit,),
         reviewed_calls=(reviewed_weekly_submit,),
         recent_focus_adjudication_completions=(
             _explicit_weekly_switch_completion(
-                exact_quote="这次提交2026-08-24当周的周工作计划"
+                exact_quote="这次提交周工作计划"
             ),
             _explicit_weekly_switch_completion(
-                exact_quote="这次提交2026-08-24当周的周工作计划"
+                exact_quote="这次提交周工作计划"
             ),
         ),
     )

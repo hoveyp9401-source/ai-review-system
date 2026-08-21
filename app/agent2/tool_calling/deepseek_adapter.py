@@ -77,9 +77,6 @@ from app.agent2.tool_calling.write_reply import (
     write_reply_protocol,
     write_reply_retry_messages,
 )
-from app.agent2.weekly_plan_date_binding import (
-    validate_weekly_plan_date_binding,
-)
 
 _TEXTUAL_TOOL_PROTOCOL_MARKERS = (
     "<｜DSML｜tool_calls",
@@ -1074,6 +1071,7 @@ class DeepSeekToolCallingAdapter:
                 str(call.arguments.get("plan_id") or "")
                 for call in reviewed_domain_calls
             }
+            approved_switch_evidence: dict[str, object] | None = None
             for attempt in range(1, 3):
                 try:
                     completion = await complete_model(
@@ -1118,7 +1116,7 @@ class DeepSeekToolCallingAdapter:
                             "decision",
                             "source_message_index",
                             "exact_quote",
-                            "proposed_target_week_start",
+                            "scope_basis",
                         }
                         if (
                             isinstance(payload, dict)
@@ -1131,18 +1129,18 @@ class DeepSeekToolCallingAdapter:
                                     payload["source_message_index"]
                                 )
                                 exact_quote = str(payload["exact_quote"])
-                                proposed_week_start = date.fromisoformat(
-                                    str(
-                                        payload[
-                                            "proposed_target_week_start"
-                                        ]
-                                    )
-                                )
                                 if (
                                     source_index < 1
                                     or source_index
                                     > len(ordered_current_messages)
                                     or len(reviewed_plan_ids) != 1
+                                    or payload.get("scope_basis")
+                                    != "explicit_record_name"
+                                    or not exact_quote.strip()
+                                    or exact_quote
+                                    not in ordered_current_messages[
+                                        source_index - 1
+                                    ]
                                 ):
                                     raise ValueError(
                                         "weekly focus evidence scope mismatch"
@@ -1150,36 +1148,31 @@ class DeepSeekToolCallingAdapter:
                                 plan = context.weekly_plan_by_id(
                                     next(iter(reviewed_plan_ids))
                                 )
-                                if (
-                                    plan is None
-                                    or proposed_week_start
-                                    != plan.target_week_start
-                                ):
+                                if plan is None:
                                     raise ValueError(
                                         "weekly focus target mismatch"
                                     )
-                                validate_weekly_plan_date_binding(
-                                    source_message=(
-                                        ordered_current_messages[
-                                            source_index - 1
-                                        ]
-                                    ),
-                                    exact_clause_quote=exact_quote,
-                                    source_occurred_at=context.now,
-                                    business_timezone=(
-                                        context.principal.timezone
-                                    ),
-                                    target_week_start=(
-                                        plan.target_week_start
-                                    ),
-                                    proposed_date=proposed_week_start,
-                                )
                             except (TypeError, ValueError):
                                 if attempt == 1:
                                     continue
                                 raise
+                            current_switch_evidence = {
+                                "source_message_index": source_index,
+                                "exact_quote": exact_quote,
+                                "scope_basis": "explicit_record_name",
+                            }
                             if attempt == 1:
+                                approved_switch_evidence = (
+                                    current_switch_evidence
+                                )
                                 continue
+                            if (
+                                approved_switch_evidence
+                                != current_switch_evidence
+                            ):
+                                raise ValueError(
+                                    "weekly focus reviewers disagreed"
+                                )
                             return reviewed
                     _validate_daily_weekly_write_review(
                         reviewed=adjudicated,
@@ -5570,15 +5563,14 @@ def _recent_focus_conflict_adjudication_messages(
                 "whole current message and recent dialogue semantically; never use a "
                 "keyword list or regular expression. An older pending Weekly Work Plan "
                 "is not evidence that a brief context-dependent reply switched records. "
-                "If the current message explicitly switches to the Weekly Work Plan and "
-                "contains one exact calendar day or explicitly scoped weekday inside the "
-                "selected target week, return no tools and exactly one JSON object with "
-                "keys decision, source_message_index, exact_quote, and "
-                "proposed_target_week_start. decision must be explicit_weekly_switch; "
-                "exact_quote must copy the complete current-message clause containing that "
-                "date evidence; proposed_target_week_start must be the Monday date of the "
-                "selected target week. The server independently resolves the quoted date. "
-                "Do not use an older plan preview or trusted state as date evidence. If it instead "
+                "If the current message explicitly switches to the Weekly Work Plan, "
+                "return no tools and exactly one JSON object with keys decision, "
+                "source_message_index, exact_quote, and scope_basis. decision must be "
+                "explicit_weekly_switch; scope_basis must be explicit_record_name; "
+                "exact_quote must copy one current-message clause that itself explicitly "
+                "identifies the Weekly Work Plan as the record to submit. A generic "
+                "confirmation or submission phrase is never sufficient. Do not use an older "
+                "plan preview or trusted state as scope evidence. If it instead "
                 "continues the recent Daily Report, return exactly one complete native "
                 "Daily tool call using the supplied tools: acknowledge any explicit empty "
                 "Daily section, bind the exact trusted report/version, and preserve explicit "

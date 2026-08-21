@@ -21,7 +21,7 @@ from app.agent2.weekly_plan_store import _plans as weekly_plan_rows
 from app.config import get_settings
 from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
-from app.models import DailyReport, WebhookEvent
+from app.models import DailyReport, User, WebhookEvent
 from scripts.smoke_20260811_overnight_daily_rollback import (
     PANG_USER_ID,
     _turn,
@@ -37,8 +37,16 @@ CASES = (
     ("natural", "问题风险没有，提交吧", "daily"),
     ("followup", "没有问题，按这个提交", "daily"),
     (
+        "daily_plan_followup",
+        (
+            "你写的没有问题，不改。计划：跟进苏宁38家债权，"
+            "确认优先债权部分情况；准备齐河智慧产业园上诉状答辩资料。"
+        ),
+        "daily_plan_update",
+    ),
+    (
         "explicit_weekly_switch",
-        "这次提交2026-08-24当周的周工作计划",
+        "这次提交周工作计划",
         "weekly",
     ),
 )
@@ -280,6 +288,8 @@ async def _run_case(
                 conversation_kind="direct",
                 message_occurred_at=now,
             )
+            if outcome.messages_enabled:
+                raise AssertionError("rollback smoke transport was enabled")
             await session.flush()
             receipts = list(
                 (
@@ -323,6 +333,22 @@ async def _run_case(
                     raise AssertionError("explicit Weekly Work Plan was not submitted")
                 if report.status != "collecting" or report.confirmed_by_user:
                     raise AssertionError("explicit Weekly switch changed Daily Report")
+            elif expected_domain == "daily_plan_update":
+                if "submit_next_weekly_plan" in tools:
+                    raise AssertionError("Daily plan update submitted Weekly Work Plan")
+                if tools != ["add_daily_items"]:
+                    raise AssertionError({"unexpected_tools": tools})
+                written_plans = "\n".join(report.tomorrow_plan or ())
+                if not all(
+                    fragment in written_plans
+                    for fragment in (
+                        "苏宁38家债权",
+                        "齐河智慧产业园",
+                    )
+                ):
+                    raise AssertionError("Daily tomorrow plan content is missing")
+                if weekly_after["status"] != "pending_confirmation":
+                    raise AssertionError("Daily plan update changed Weekly Work Plan")
             else:
                 raise AssertionError("unknown expected domain")
             return {
@@ -333,6 +359,7 @@ async def _run_case(
                 "model_call_count": outcome.model_call_count,
                 "daily_status": report.status,
                 "weekly_status": weekly_after["status"],
+                "transport_suppressed": not outcome.messages_enabled,
             }
         finally:
             await session.rollback()
@@ -362,7 +389,33 @@ async def _residue() -> dict[str, int]:
         return {"events": event_count, "receipts": receipt_count}
 
 
+async def _production_state() -> dict[str, object]:
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, PANG_USER_ID)
+        if user is None:
+            raise AssertionError("rollback smoke user is missing")
+        report = await session.scalar(
+            select(DailyReport).where(
+                DailyReport.user_id == user.id,
+                DailyReport.report_date == REPORT_DATE,
+            )
+        )
+        if report is None:
+            raise AssertionError("production Daily Report is missing")
+        weekly = await _load_weekly_row(
+            session,
+            user_id=str(user.id),
+        )
+        state = {
+            "daily": _daily_state(report),
+            "weekly": _weekly_state(weekly),
+        }
+        await session.rollback()
+        return state
+
+
 async def main() -> None:
+    production_before = await _production_state()
     llm_client = LLMClient(get_settings())
     results = []
     failures = []
@@ -389,16 +442,34 @@ async def main() -> None:
     finally:
         await llm_client.close()
     residue = await _residue()
+    production_after = await _production_state()
+    production_state_changes = {
+        "daily": int(
+            production_before["daily"] != production_after["daily"]
+        ),
+        "weekly": int(
+            production_before["weekly"] != production_after["weekly"]
+        ),
+    }
+    transport_enabled_cases = sum(
+        not bool(item.get("transport_suppressed"))
+        for item in results
+    )
     output = {
         "status": (
             "pass"
-            if not failures and not any(residue.values())
+            if not failures
+            and not any(residue.values())
+            and not any(production_state_changes.values())
+            and transport_enabled_cases == 0
             else "failed"
         ),
         "passed": len(results),
         "failed": len(failures),
         "dingtalk_send_calls": 0,
+        "transport_enabled_cases": transport_enabled_cases,
         "rollback_residue": residue,
+        "production_state_changes": production_state_changes,
         "results": results,
         "failures": failures,
     }
