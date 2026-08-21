@@ -116,3 +116,42 @@ def test_switch_reports_an_incomplete_rollback_as_failure() -> None:
     assert 'wait_healthy "$previous" || rollback_failed=1' in source
     assert 'if [[ "$rollback_failed" -ne 0 ]]' in source
     assert "status=1" in source
+
+
+def test_switch_current_cannot_abort_the_rest_of_rollback() -> None:
+    source = ROLLOUT_SWITCH.read_text(encoding="utf-8")
+    switch_current = source.split("switch_current() {", 1)[1].split(
+        "\n}\n\nrun_config()", 1
+    )[0]
+
+    assert "return 1" in switch_current
+    assert "exit 1" not in switch_current
+
+
+def test_partial_freeze_is_resumed_before_rollback_can_mutate_state() -> None:
+    source = ROLLOUT_SWITCH.read_text(encoding="utf-8")
+    freeze_all = source.split("freeze_all_services() {", 1)[1].split(
+        "\n}\n\nterminate_frozen_services()", 1
+    )[0]
+    rollback_all = source.split("rollback_all() {", 1)[1].split(
+        "\n}\n\nrequire_release", 1
+    )[0]
+
+    assert "service_pids=()" in freeze_all
+    assert "resume_partial_freeze" in freeze_all
+    assert "all_frozen_pids_are_stopped" in freeze_all
+    assert freeze_all.index("processes_frozen=1") > freeze_all.index(
+        "all_frozen_pids_are_stopped"
+    )
+    assert 'rollback_frozen=0' in rollback_all
+    assert 'if [[ "$rollback_frozen" -eq 1 ]]' in rollback_all
+
+
+def test_preserved_real_plans_make_restore_explicitly_incomplete() -> None:
+    source = Path(rollout.__file__).read_text(encoding="utf-8")
+    restore = source.split("async def restore(", 1)[1].split(
+        "\n\nasync def verify(", 1
+    )[0]
+
+    assert "if fallback_disable:" in restore
+    assert "manual intervention is required" in restore

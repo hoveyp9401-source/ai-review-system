@@ -30,7 +30,7 @@ switch_current() {
   local temp="$releases/.current-$label"
   if [[ -e "$temp" || -L "$temp" ]]; then
     echo "temporary path already exists: $temp" >&2
-    exit 1
+    return 1
   fi
   ln -s "$target" "$temp"
   mv -Tf "$temp" "$current"
@@ -52,27 +52,53 @@ run_config() {
 frozen_pids=()
 processes_frozen=0
 
-freeze_all_services() {
-  local service pid state
+resume_partial_freeze() {
+  local pid
+  for pid in "${frozen_pids[@]}"; do
+    kill -CONT "$pid" 2>/dev/null || true
+  done
   frozen_pids=()
+  processes_frozen=0
+}
+
+all_frozen_pids_are_stopped() {
+  local pid state
+  for pid in "${frozen_pids[@]}"; do
+    state="$(awk '/^State:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)"
+    if [[ "$state" != "T" ]]; then
+      echo "service process is not frozen: $pid:$state" >&2
+      return 1
+    fi
+  done
+}
+
+freeze_all_services() {
+  local service pid
+  local service_pids=()
+  frozen_pids=()
+  processes_frozen=0
   for service in "${services[@]}"; do
     pid="$(systemctl show "$service" -p MainPID --value)"
     if [[ ! "$pid" =~ ^[0-9]+$ || "$pid" -le 1 ]]; then
       echo "invalid MainPID for $service: $pid" >&2
       return 1
     fi
-    frozen_pids+=("$pid")
-    processes_frozen=1
-    kill -STOP "$pid"
+    service_pids+=("$pid")
   done
-  sleep 0.2
-  for pid in "${frozen_pids[@]}"; do
-    state="$(awk '/^State:/{print $2}' "/proc/$pid/status")"
-    if [[ "$state" != "T" ]]; then
-      echo "service process did not freeze: $pid:$state" >&2
+  for pid in "${service_pids[@]}"; do
+    if ! kill -STOP "$pid"; then
+      echo "could not freeze service process: $pid" >&2
+      resume_partial_freeze
       return 1
     fi
+    frozen_pids+=("$pid")
   done
+  sleep 0.2
+  if ! all_frozen_pids_are_stopped; then
+    resume_partial_freeze
+    return 1
+  fi
+  processes_frozen=1
 }
 
 terminate_frozen_services() {
@@ -90,17 +116,10 @@ terminate_frozen_services() {
 freeze_running_services_for_rollback() {
   if [[ "$processes_frozen" -eq 0 ]]; then
     freeze_all_services
+  elif ! all_frozen_pids_are_stopped; then
+    resume_partial_freeze
+    return 1
   fi
-}
-
-restart_by_owner_signal() {
-  local service pid
-  for service in "${services[@]}"; do
-    pid="$(systemctl show "$service" -p MainPID --value)"
-    if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]]; then
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
 }
 
 wait_healthy() {
@@ -139,22 +158,29 @@ code_switched=0
 rollback_all() {
   local status="${1:-1}"
   local rollback_failed=0
+  local rollback_frozen=1
   trap - ERR INT TERM
   set +e
-  freeze_running_services_for_rollback || rollback_failed=1
-  if [[ "$code_switched" -eq 1 ]]; then
-    switch_current "$previous" agent2-weekly-plan-full-rollback \
-      || rollback_failed=1
+  if ! freeze_running_services_for_rollback; then
+    rollback_failed=1
+    rollback_frozen=0
   fi
-  if [[ "$config_applied" -eq 1 ]]; then
-    run_config restore --backup-path "$backup_path" || rollback_failed=1
-  fi
-  if [[ "$processes_frozen" -eq 1 ]]; then
+  if [[ "$rollback_frozen" -eq 1 ]]; then
+    if [[ "$code_switched" -eq 1 ]]; then
+      switch_current "$previous" agent2-weekly-plan-full-rollback \
+        || rollback_failed=1
+    fi
+    if [[ "$config_applied" -eq 1 ]]; then
+      run_config restore --backup-path "$backup_path" || rollback_failed=1
+    fi
     terminate_frozen_services || rollback_failed=1
+    wait_healthy "$previous" || rollback_failed=1
   else
-    restart_by_owner_signal || rollback_failed=1
+    echo "services could not be fully frozen; rollback left code and config unchanged" >&2
+    if [[ "$code_switched" -eq 0 && "$config_applied" -eq 0 ]]; then
+      wait_healthy "$previous" || rollback_failed=1
+    fi
   fi
-  wait_healthy "$previous" || rollback_failed=1
   if [[ "$rollback_failed" -ne 0 ]]; then
     echo "weekly-plan rollback did not fully recover; manual intervention required" >&2
     if [[ "$status" -eq 0 ]]; then

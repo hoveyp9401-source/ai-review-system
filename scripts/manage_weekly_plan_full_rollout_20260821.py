@@ -542,6 +542,11 @@ async def restore(path: Path, *, target_week_start: date) -> None:
         replacements["AGENT2_WEEKLY_PLAN_SEND_ENABLED"] = "false"
     env_result = _write_env(ENV_PATH, replacements)
     print(json.dumps({"action": "restore", "removed_roster_members": removed, "fallback_disabled": fallback_disable, "env": env_result}, sort_keys=True))
+    if fallback_disable:
+        raise RuntimeError(
+            "weekly-plan rollback preserved real user data and disabled Weekly Plan; "
+            "manual intervention is required"
+        )
 
 
 async def verify(*, target_week_start: date) -> None:
