@@ -29,7 +29,6 @@ PLAN_PROGRESS_STATUSES = frozenset(
 _MAX_MESSAGE_CHARS = 3600
 _MAX_SECTION_ITEMS = {
     "completed": 12,
-    "plan_progress": 12,
     "possible_open_loops": 8,
 }
 
@@ -420,6 +419,22 @@ def _validated_content(
         source_by_id=source_by_id,
         require_status=True,
     )
+    expected_plan_source_ids = {
+        source_id
+        for source_id, source in source_by_id.items()
+        if source.source_kind == "weekly_plan"
+    }
+    cited_plan_source_ids = [
+        source_id
+        for item in plan_progress.items
+        for source_id in item.source_ids
+        if source_by_id[source_id].source_kind == "weekly_plan"
+    ]
+    if (
+        set(cited_plan_source_ids) != expected_plan_source_ids
+        or len(cited_plan_source_ids) != len(set(cited_plan_source_ids))
+    ):
+        raise ValueError("plan progress must cover every weekly plan source once")
     possible_open_loops = _validated_section(
         payload["possible_open_loops"],
         name="possible_open_loops",
@@ -430,6 +445,13 @@ def _validated_content(
     open_keys = {item.matter_key for item in possible_open_loops.items}
     if plan_keys & open_keys:
         raise ValueError("duplicate matter across sections")
+    open_source_ids = {
+        source_id
+        for item in possible_open_loops.items
+        for source_id in item.source_ids
+    }
+    if expected_plan_source_ids & open_source_ids:
+        raise ValueError("weekly plan source cannot repeat in open loops")
     return {
         "intro": intro,
         "completed": completed,
@@ -448,7 +470,13 @@ def _validated_section(
     if not isinstance(value, dict) or set(value) != {"empty_note", "items"}:
         raise ValueError(f"personal weekly brief {name} section is invalid")
     raw_items = value["items"]
-    if not isinstance(raw_items, list) or len(raw_items) > _MAX_SECTION_ITEMS[name]:
+    if name == "plan_progress":
+        maximum_items = sum(
+            source.source_kind == "weekly_plan" for source in source_by_id.values()
+        )
+    else:
+        maximum_items = _MAX_SECTION_ITEMS[name]
+    if not isinstance(raw_items, list) or len(raw_items) > maximum_items:
         raise ValueError(f"personal weekly brief {name} items are invalid")
     empty_note = str(value["empty_note"] or "").strip()
     if raw_items and empty_note:
@@ -586,7 +614,7 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 1. 只能使用 trusted_snapshot.sources；每条结论必须列出实际支持它的 source_ids，不得伪造来源，也不得声称“已核对”。completed 中每一项必须至少引用一条 section=today_work 的日报来源；问题、明日计划或周计划只能作为补充证据，不能单独成为“本周完成事项”。
 2. 今日工作中的“跟进、沟通、准备、起草、计划”等不得改写成“完成”。金额、日期、对象、条件、否定等关键事实不能遗漏或改变。
 3. 同一事项跨多天可合并为一条，保留所有关键进展和事实。
-4. 计划进展状态只能是：已完成、持续推进、安排调整、后续安排、暂时没有找到后续记录。除最后一种外，必须同时引用周计划和当日或后来日报证据；没有后来记录时只能用最后一种，绝不能说“未完成”。
+4. 计划进展状态只能是：已完成、持续推进、安排调整、后续安排、暂时没有找到后续记录。除最后一种外，必须同时引用周计划和当日或后来日报证据；没有后来记录时只能用最后一种，绝不能说“未完成”。trusted_snapshot 中每个 source_kind=weekly_plan 的 source_id 都必须在 plan_progress 中恰好引用一次；同一事项跨日时可以在一条进展中引用多条周计划来源，但不得漏项或重复。
 5. plan_progress 与 possible_open_loops 中同一事项只能出现一次，并使用相同的稳定 matter_key 来帮助服务器去重。
 6. 没有数据、只有部分日期、没有周计划或没有风险栏时如实说明，不得编造。
 7. 简报只读，不得建议系统已经修改、补写、确认或提交日报、周计划。
@@ -607,7 +635,7 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
 1. 结论引用的 source_ids 是否真的支持文字，是否有伪造来源；completed 每项是否至少引用 today_work 日报来源；
 2. 是否改变或遗漏金额、日期、对象、条件、否定、归属和完成状态；
 3. 是否把跟进、沟通、准备、起草或计划武断写成完成；
-4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”；
+4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”；每条 weekly_plan 来源是否在计划进展中恰好出现一次；
 5. 计划进展和可能未闭环中是否重复同一事项；
 6. 无数据或部分数据时是否编造。
 

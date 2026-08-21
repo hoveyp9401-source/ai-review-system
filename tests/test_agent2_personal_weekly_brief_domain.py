@@ -326,6 +326,102 @@ async def test_completed_item_must_be_anchored_in_today_work() -> None:
 
 
 @pytest.mark.asyncio
+async def test_every_weekly_plan_source_must_appear_once_in_plan_progress() -> None:
+    first = _source(
+        "plan:first",
+        kind="weekly_plan",
+        on_date=date(2026, 8, 17),
+        section="plan_item",
+        text="复核甲项目合同。",
+    )
+    omitted = _source(
+        "plan:omitted",
+        kind="weekly_plan",
+        on_date=date(2026, 8, 18),
+        section="plan_item",
+        text="整理乙案件证据。",
+    )
+    llm = _FakeLLM(
+        {
+            "intro": "本周简报。",
+            "completed": _empty_section("没有日报今日工作记录。"),
+            "plan_progress": {
+                "empty_note": "",
+                "items": [
+                    {
+                        "matter_key": "matter-first",
+                        "text": "复核甲项目合同，暂时没有找到后续记录。",
+                        "status": "暂时没有找到后续记录",
+                        "source_ids": [first.source_id],
+                    }
+                ],
+            },
+            "possible_open_loops": _empty_section("没有重复提示。"),
+        }
+    )
+
+    with pytest.raises(ValueError, match="must cover every weekly plan source once"):
+        await Agent2PersonalWeeklyBriefGenerator(
+            llm,
+            model="agent2-model",
+        ).generate(
+            snapshot=_snapshot(first, omitted),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+
+@pytest.mark.asyncio
+async def test_more_than_twelve_distinct_plan_items_can_be_reported_one_by_one() -> None:
+    plans = tuple(
+        _source(
+            f"plan:item:{index}",
+            kind="weekly_plan",
+            on_date=date(2026, 8, 17 + index % 5),
+            section="plan_item",
+            text=f"脱敏周计划事项{index}。",
+            record_id="plan-many",
+        )
+        for index in range(13)
+    )
+    llm = _FakeLLM(
+        {
+            "intro": "本周简报。",
+            "completed": _empty_section("没有日报今日工作记录。"),
+            "plan_progress": {
+                "empty_note": "",
+                "items": [
+                    {
+                        "matter_key": f"matter-{index}",
+                        "text": f"脱敏周计划事项{index}暂时没有找到后续记录。",
+                        "status": "暂时没有找到后续记录",
+                        "source_ids": [plan.source_id],
+                    }
+                    for index, plan in enumerate(plans)
+                ],
+            },
+            "possible_open_loops": _empty_section("没有重复提示。"),
+        }
+    )
+
+    result = await Agent2PersonalWeeklyBriefGenerator(
+        llm,
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(*plans),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert len(result.plan_progress.items) == 13
+    assert {
+        source_id
+        for item in result.plan_progress.items
+        for source_id in item.source_ids
+    } == {plan.source_id for plan in plans}
+
+
+@pytest.mark.asyncio
 async def test_plan_progress_and_open_loops_cannot_repeat_the_same_matter() -> None:
     plan = _source(
         "plan:a",
