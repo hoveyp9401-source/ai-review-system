@@ -8,6 +8,11 @@ from typing import Protocol
 
 from app.agent2.weekly_plan_reminder_outbox import WeeklyPlanReminderOutbox
 
+WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE = (
+    "你从{monday}开始的周工作计划{state_hint}。"
+    "可以直接一句话告诉我周一到周六的安排，我会整理后请你确认。"
+)
+
 
 @dataclass(frozen=True)
 class WeeklyPlanReminderRecipient:
@@ -268,13 +273,14 @@ def _reminder_text(row: WeeklyPlanReminderOutbox) -> str:
         "pending_confirmation": "正在等待你确认提交",
     }.get(row.collection_state, "还没有确认提交")
     monday = row.target_week_start.strftime("%m月%d日")
-    return (
-        f"你从{monday}开始的周工作计划{state_hint}。"
-        "可以直接一句话告诉我周一到周六的安排，我会整理后请你确认。"
+    return WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE.format(
+        monday=monday,
+        state_hint=state_hint,
     )
 
 
 __all__ = [
+    "WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE",
     "DingTalkWeeklyPlanReminderTransport",
     "WeeklyPlanReminderDelivery",
     "WeeklyPlanReminderDispatcher",

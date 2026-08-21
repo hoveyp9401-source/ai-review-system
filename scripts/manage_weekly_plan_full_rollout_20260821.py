@@ -20,6 +20,9 @@ from app.agent2.weekly_plan_access import (
     WeeklyPlanAccessPolicy,
 )
 from app.agent2.weekly_plan_domain import _stable_id
+from app.agent2.weekly_plan_reminder_dispatch import (
+    WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE,
+)
 from app.agent2.weekly_plan_store import (
     _audits,
     _batches,
@@ -36,6 +39,9 @@ from app.legal_daily_roster import load_formal_legal_daily_roster
 from app.scheduler.runner import register_weekly_plan_jobs
 
 EXPECTED_USERS = 74
+# Kept empty until the user approves the final reminder wording.  Apply and
+# verify both fail before changing production while this approval is absent.
+USER_APPROVED_REMINDER_TEMPLATE_SHA256 = ""
 ENV_PATH = Path("/home/ai_review_tunnel/ai-review-system/.env")
 ENV_KEYS = (
     "AGENT2_WEEKLY_PLAN_ENABLED",
@@ -53,6 +59,14 @@ ENV_KEYS = (
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _require_user_approved_reminder_template() -> None:
+    actual = _sha256(WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE.encode("utf-8"))
+    if not USER_APPROVED_REMINDER_TEMPLATE_SHA256:
+        raise RuntimeError("weekly-plan reminder copy is not user-approved")
+    if actual != USER_APPROVED_REMINDER_TEMPLATE_SHA256:
+        raise RuntimeError("weekly-plan reminder copy changed after approval")
 
 
 def _read_env(path: Path) -> tuple[bytes, dict[str, str]]:
@@ -386,6 +400,7 @@ async def backup(path: Path, *, target_week_start: date) -> None:
 
 
 async def apply(path: Path, *, target_week_start: date) -> None:
+    _require_user_approved_reminder_template()
     backup_payload = _load_backup(path)
     if backup_payload["target_week_start"] != target_week_start.isoformat():
         raise RuntimeError("backup target week does not match")
@@ -530,6 +545,7 @@ async def restore(path: Path, *, target_week_start: date) -> None:
 
 
 async def verify(*, target_week_start: date) -> None:
+    _require_user_approved_reminder_template()
     settings = get_settings()
     async with AsyncSessionLocal() as session:
         tenant_id, user_ids, _bindings = await _exact_scope(session)

@@ -4,6 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from app.agent2.weekly_plan_reminder_dispatch import (
+    WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE,
+)
 from scripts import manage_weekly_plan_full_rollout_20260821 as rollout
 
 ROLLOUT_SWITCH = (
@@ -70,6 +73,29 @@ def test_env_reader_fails_closed_on_a_duplicate_rollout_key(tmp_path: Path) -> N
 
     with pytest.raises(RuntimeError, match="duplicate weekly-plan env key"):
         rollout._read_env(path)
+
+
+def test_apply_remains_blocked_until_reminder_copy_is_user_approved() -> None:
+    with pytest.raises(RuntimeError, match="reminder copy is not user-approved"):
+        rollout._require_user_approved_reminder_template()
+
+
+def test_approved_reminder_copy_must_still_match_exactly(monkeypatch) -> None:
+    monkeypatch.setattr(
+        rollout,
+        "USER_APPROVED_REMINDER_TEMPLATE_SHA256",
+        rollout._sha256(WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE.encode("utf-8")),
+    )
+
+    rollout._require_user_approved_reminder_template()
+
+    monkeypatch.setattr(
+        rollout,
+        "WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE",
+        WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE + " changed",
+    )
+    with pytest.raises(RuntimeError, match="reminder copy changed after approval"):
+        rollout._require_user_approved_reminder_template()
 
 
 def test_switch_requires_config_restore_before_apply_can_partially_fail() -> None:
