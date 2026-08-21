@@ -112,7 +112,7 @@ class SqlWeeklyPlanCollectionOrchestrator:
         canary_user_ids: frozenset[str],
         reminder_at,
         created_at,
-        reminder_slot: str = "sunday-primary",
+        reminder_slot: str = "friday-primary",
     ) -> tuple[WeeklyPlanReminderOutbox, ...]:
         if self._outbox_store is None:
             raise ValueError("weekly_plan_reminder_outbox_not_configured")

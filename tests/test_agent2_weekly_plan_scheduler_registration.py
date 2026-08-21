@@ -12,6 +12,8 @@ from app.scheduler.runner import (
     register_weekly_plan_jobs,
     run_weekly_plan_collection_open_job,
     run_weekly_plan_history_suggestion_refresh_job,
+    run_weekly_plan_reminder_dispatch_job,
+    run_weekly_plan_reminder_enqueue_job,
     run_weekly_plan_reminder_maintenance_job,
 )
 
@@ -33,7 +35,7 @@ def _settings(**overrides):
         "agent2_weekly_plan_tenant_allowlist": "",
         "agent2_weekly_plan_user_allowlist": "",
         "agent2_weekly_plan_send_user_allowlist": "",
-        "weekly_plan_collection_open_hour": 16,
+        "weekly_plan_collection_open_hour": 15,
         "weekly_plan_collection_open_minute": 0,
         "weekly_plan_reminder_hour": 15,
         "weekly_plan_reminder_minute": 0,
@@ -124,8 +126,8 @@ def test_single_canary_registers_open_reminder_and_snapshot_without_sender() -> 
     )
     assert [job["id"] for job in scheduler.jobs] == list(registered)
     assert [str(job["trigger"]) for job in scheduler.jobs] == [
-        "cron[day_of_week='fri', hour='16', minute='0']",
-        "cron[day_of_week='sun', hour='15', minute='0']",
+        "cron[day_of_week='fri', hour='15', minute='0']",
+        "cron[day_of_week='fri', hour='15', minute='0']",
         "interval[0:05:00]",
         "cron[day_of_week='mon', hour='9', minute='0']",
     ]
@@ -186,8 +188,48 @@ def test_two_user_canary_registers_open_and_snapshot_but_no_send_jobs() -> None:
     assert [job["id"] for job in scheduler.jobs] == list(registered)
 
 
-def test_weekly_plan_scheduler_rejects_three_user_canary_scope() -> None:
+def test_74_user_scope_registers_friday_1500_reminder_for_the_same_scope() -> None:
     scheduler = _Scheduler()
+    user_ids = tuple(f"user-{index:03d}" for index in range(74))
+    scope = ",".join(user_ids)
+
+    registered = register_weekly_plan_jobs(
+        scheduler,
+        settings=_settings(
+            agent2_weekly_plan_enabled=True,
+            agent2_weekly_plan_write_enabled=True,
+            agent2_weekly_plan_send_enabled=True,
+            agent2_weekly_plan_tenant_allowlist="tenant-a",
+            agent2_weekly_plan_user_allowlist=scope,
+            agent2_weekly_plan_send_user_allowlist=scope,
+            weekly_plan_collection_open_hour=15,
+            weekly_plan_collection_open_minute=0,
+            weekly_plan_reminder_hour=15,
+            weekly_plan_reminder_minute=0,
+        ),
+        open_job=_noop,
+        reminder_job=_noop,
+        reminder_reconcile_job=_noop,
+        snapshot_job=_noop,
+    )
+
+    assert registered == (
+        "agent2_weekly_plan_collection_open",
+        "agent2_weekly_plan_reminder_enqueue",
+        "agent2_weekly_plan_reminder_reconcile",
+        "agent2_weekly_plan_monday_snapshot",
+    )
+    assert [str(job["trigger"]) for job in scheduler.jobs] == [
+        "cron[day_of_week='fri', hour='15', minute='0']",
+        "cron[day_of_week='fri', hour='15', minute='0']",
+        "interval[0:05:00]",
+        "cron[day_of_week='mon', hour='9', minute='0']",
+    ]
+
+
+def test_weekly_plan_scheduler_rejects_more_than_74_users() -> None:
+    scheduler = _Scheduler()
+    user_scope = ",".join(f"user-{index:03d}" for index in range(75))
 
     registered = register_weekly_plan_jobs(
         scheduler,
@@ -195,7 +237,7 @@ def test_weekly_plan_scheduler_rejects_three_user_canary_scope() -> None:
             agent2_weekly_plan_enabled=True,
             agent2_weekly_plan_write_enabled=True,
             agent2_weekly_plan_tenant_allowlist="tenant-a",
-            agent2_weekly_plan_user_allowlist="user-a,user-b,user-c",
+            agent2_weekly_plan_user_allowlist=user_scope,
         ),
         open_job=_noop,
         reminder_job=_noop,
@@ -243,7 +285,7 @@ async def test_two_user_open_job_freezes_both_configured_members_in_stable_order
             captured.update(kwargs)
 
     monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
-    monkeypatch.setattr(runner, "_load_weekly_plan_canary_member", _member)
+    monkeypatch.setattr(runner, "_load_weekly_plan_member", _member)
     monkeypatch.setattr(runner, "SqlWeeklyPlanStore", lambda _session: object())
     monkeypatch.setattr(
         runner,
@@ -267,6 +309,193 @@ async def test_two_user_open_job_freezes_both_configured_members_in_stable_order
     ]
     assert captured["canary_user_ids"] == frozenset({"user-a", "user-b"})
     assert captured["committed"] is True
+
+
+@pytest.mark.asyncio
+async def test_friday_reminder_enqueues_each_of_the_74_enabled_users_once(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    user_ids = tuple(f"user-{index:03d}" for index in range(74))
+    scope = ",".join(user_ids)
+
+    class _Session:
+        async def commit(self) -> None:
+            captured["committed"] = True
+
+    class _Sessions:
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def __call__(self):
+            return self
+
+    class _Orchestrator:
+        async def enqueue_private_reminders(self, **kwargs):
+            captured.update(kwargs)
+
+    async def _opening(_settings, *, now, session):
+        del _settings, now, session
+        return object(), _Orchestrator()
+
+    monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
+    monkeypatch.setattr(runner, "_load_weekly_plan_opening", _opening)
+
+    await run_weekly_plan_reminder_enqueue_job(
+        _settings(
+            agent2_weekly_plan_enabled=True,
+            agent2_weekly_plan_write_enabled=True,
+            agent2_weekly_plan_send_enabled=True,
+            agent2_weekly_plan_tenant_allowlist="tenant-a",
+            agent2_weekly_plan_user_allowlist=scope,
+            agent2_weekly_plan_send_user_allowlist=scope,
+        ),
+        now=datetime(2026, 8, 21, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert captured["canary_user_ids"] == frozenset(user_ids)
+    assert captured["reminder_slot"] == "friday-primary"
+    assert captured["committed"] is True
+
+
+@pytest.mark.asyncio
+async def test_reminder_dispatch_visits_every_enabled_recipient_once(
+    monkeypatch,
+) -> None:
+    dispatched: list[str] = []
+
+    class _Session:
+        class _Bindings:
+            def all(self):
+                return [
+                    SimpleNamespace(
+                        user_id=user_id,
+                        dingtalk_user_id=f"ding-{user_id}",
+                    )
+                    for user_id in ("user-a", "user-b")
+                ]
+
+        async def scalars(self, _statement):
+            return self._Bindings()
+
+        async def commit(self) -> None:
+            return None
+
+    class _Sessions:
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def __call__(self):
+            return self
+
+    class _Outbox:
+        async def load_due_queued(
+            self, *, tenant_id, recipient_internal_user_id, as_of, limit
+        ):
+            del tenant_id, as_of, limit
+            return (SimpleNamespace(
+                outbox_id=f"row-{recipient_internal_user_id}",
+            ),)
+
+    class _Dispatcher:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def dispatch(self, *, recipient, **_kwargs):
+            dispatched.append(recipient.internal_user_id)
+
+    monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
+    monkeypatch.setattr(
+        runner,
+        "SqlWeeklyPlanReminderOutboxStore",
+        lambda _session: _Outbox(),
+    )
+    monkeypatch.setattr(runner, "WeeklyPlanReminderDispatcher", _Dispatcher)
+
+    await run_weekly_plan_reminder_dispatch_job(
+        _settings(
+            agent2_weekly_plan_enabled=True,
+            agent2_weekly_plan_write_enabled=True,
+            agent2_weekly_plan_send_enabled=True,
+            agent2_weekly_plan_tenant_allowlist="tenant-a",
+            agent2_weekly_plan_user_allowlist="user-a,user-b",
+            agent2_weekly_plan_send_user_allowlist="user-a,user-b",
+        ),
+        robot=object(),
+        now=datetime(2026, 8, 21, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert dispatched == ["user-a", "user-b"]
+
+
+@pytest.mark.asyncio
+async def test_reminder_dispatch_validates_the_whole_scope_before_any_send(
+    monkeypatch,
+) -> None:
+    dispatcher_created = False
+
+    class _Session:
+        class _Bindings:
+            def all(self):
+                return [
+                    SimpleNamespace(
+                        user_id="user-a",
+                        dingtalk_user_id="ding-user-a",
+                    )
+                ]
+
+        async def scalars(self, _statement):
+            return self._Bindings()
+
+    class _Sessions:
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def __call__(self):
+            return self
+
+    class _Dispatcher:
+        def __init__(self, **_kwargs):
+            nonlocal dispatcher_created
+            dispatcher_created = True
+
+    monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
+    monkeypatch.setattr(runner, "WeeklyPlanReminderDispatcher", _Dispatcher)
+
+    with pytest.raises(
+        ValueError,
+        match="weekly_plan_reminder_identity_binding_missing",
+    ):
+        await run_weekly_plan_reminder_dispatch_job(
+            _settings(
+                agent2_weekly_plan_enabled=True,
+                agent2_weekly_plan_write_enabled=True,
+                agent2_weekly_plan_send_enabled=True,
+                agent2_weekly_plan_tenant_allowlist="tenant-a",
+                agent2_weekly_plan_user_allowlist="user-a,user-b",
+                agent2_weekly_plan_send_user_allowlist="user-a,user-b",
+            ),
+            robot=object(),
+            now=datetime(
+                2026,
+                8,
+                21,
+                15,
+                0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+        )
+
+    assert dispatcher_created is False
 
 
 @pytest.mark.asyncio

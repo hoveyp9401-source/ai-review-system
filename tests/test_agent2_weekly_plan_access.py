@@ -133,21 +133,38 @@ def test_two_user_canary_still_rejects_group_and_unknown_conversations() -> None
         assert decision.reason == "weekly_plan_direct_conversation_required"
 
 
-def test_weekly_plan_canary_never_expands_beyond_two_users() -> None:
+def test_formal_74_user_scope_allows_each_member() -> None:
+    user_ids = frozenset(f"user-internal-{index:03d}" for index in range(74))
     decision = WeeklyPlanAccessPolicy(
         enabled=True,
         tenant_allowlist=frozenset({TENANT_ID}),
-        user_allowlist=frozenset(
-            {USER_ID, "user-internal-043", "user-internal-044"}
-        ),
+        user_allowlist=user_ids,
     ).decide(
         action=WeeklyPlanAccessAction.READ,
         tenant_id=TENANT_ID,
-        user_id=USER_ID,
+        user_id="user-internal-073",
         conversation_kind="direct",
     )
 
-    assert decision.reason == "weekly_plan_two_user_canary_scope_required"
+    assert decision.allowed is True
+    assert decision.reason == "allowed"
+
+
+def test_more_than_74_users_fails_closed() -> None:
+    user_ids = frozenset(f"user-internal-{index:03d}" for index in range(75))
+    decision = WeeklyPlanAccessPolicy(
+        enabled=True,
+        tenant_allowlist=frozenset({TENANT_ID}),
+        user_allowlist=user_ids,
+    ).decide(
+        action=WeeklyPlanAccessAction.READ,
+        tenant_id=TENANT_ID,
+        user_id="user-internal-000",
+        conversation_kind="direct",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "weekly_plan_user_scope_too_large"
 
 
 def test_only_an_explicit_direct_conversation_is_permitted() -> None:
@@ -260,6 +277,24 @@ def test_send_requires_both_send_switch_and_exact_send_user_allowlist() -> None:
     assert not_send_allowlisted.reason == "weekly_plan_send_user_not_allowlisted"
     assert display_name_only.reason == "weekly_plan_allowlist_invalid"
     assert allowed.allowed is True
+
+
+def test_send_scope_must_be_a_subset_of_the_enabled_user_scope() -> None:
+    decision = WeeklyPlanAccessPolicy(
+        enabled=True,
+        send_enabled=True,
+        tenant_allowlist=frozenset({TENANT_ID}),
+        user_allowlist=frozenset({USER_ID}),
+        send_user_allowlist=frozenset({USER_ID, "outside-weekly-scope"}),
+    ).decide(
+        action=WeeklyPlanAccessAction.SEND,
+        tenant_id=TENANT_ID,
+        user_id=USER_ID,
+        conversation_kind="direct",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "weekly_plan_send_scope_not_enabled"
 
 
 def test_unknown_action_fails_closed_instead_of_falling_through_to_read() -> None:

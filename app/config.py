@@ -134,7 +134,7 @@ class Settings(BaseSettings):
     agent2_current_weekly_report_enabled: bool = False
     agent2_current_weekly_report_tenant_allowlist: str = ""
     agent2_current_weekly_report_user_allowlist: str = ""
-    weekly_plan_collection_open_hour: int = Field(default=16, ge=0, le=23)
+    weekly_plan_collection_open_hour: int = Field(default=15, ge=0, le=23)
     weekly_plan_collection_open_minute: int = Field(default=0, ge=0, le=59)
     weekly_plan_reminder_hour: int = Field(default=15, ge=0, le=23)
     weekly_plan_reminder_minute: int = Field(default=0, ge=0, le=59)

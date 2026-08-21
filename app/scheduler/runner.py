@@ -110,7 +110,7 @@ def _strict_weekly_plan_user_ids(value: object) -> tuple[str, ...] | None:
     if not isinstance(value, str) or not value:
         return None
     parts = value.split(",")
-    if not 1 <= len(parts) <= 2 or len(parts) != len(set(parts)):
+    if not 1 <= len(parts) <= 74 or len(parts) != len(set(parts)):
         return None
     if any(
         item != item.strip()
@@ -123,10 +123,10 @@ def _strict_weekly_plan_user_ids(value: object) -> tuple[str, ...] | None:
     return tuple(sorted(parts))
 
 
-def _strict_weekly_plan_canary_scope(
+def _strict_weekly_plan_scope(
     settings,
 ) -> tuple[str, tuple[str, ...]] | None:
-    """Return one tenant and at most two stable users, with no name matching."""
+    """Return one tenant and at most 74 stable users, with no name matching."""
 
     tenant_id = _strict_weekly_plan_single_id(
         getattr(settings, "agent2_weekly_plan_tenant_allowlist", "")
@@ -146,12 +146,12 @@ def register_weekly_plan_jobs(
     reminder_reconcile_job,
     snapshot_job,
 ) -> tuple[str, ...]:
-    """Register deterministic collection jobs; none of them sends a message."""
+    """Register collection jobs and the verified private reminder outbox worker."""
 
     if (
         getattr(settings, "agent2_weekly_plan_enabled", False) is not True
         or getattr(settings, "agent2_weekly_plan_write_enabled", False) is not True
-        or _strict_weekly_plan_canary_scope(settings) is None
+        or _strict_weekly_plan_scope(settings) is None
     ):
         return ()
 
@@ -178,20 +178,32 @@ def register_weekly_plan_jobs(
             timezone=settings.timezone,
         ),
     )
-    send_user_id = (
-        _strict_weekly_plan_single_id(
+    send_user_ids = (
+        _strict_weekly_plan_user_ids(
             getattr(settings, "agent2_weekly_plan_send_user_allowlist", "")
         )
         if getattr(settings, "agent2_weekly_plan_send_enabled", False) is True
         else None
     )
-    scope = _strict_weekly_plan_canary_scope(settings)
-    if scope is not None and send_user_id in scope[1]:
+    scope = _strict_weekly_plan_scope(settings)
+    if (
+        scope is not None
+        and send_user_ids is not None
+        and set(send_user_ids).issubset(scope[1])
+        and (
+            settings.weekly_plan_collection_open_hour,
+            settings.weekly_plan_collection_open_minute,
+        )
+        <= (
+            settings.weekly_plan_reminder_hour,
+            settings.weekly_plan_reminder_minute,
+        )
+    ):
         add(
             "agent2_weekly_plan_reminder_enqueue",
             reminder_job,
             CronTrigger(
-                day_of_week="sun",
+                day_of_week="fri",
                 hour=settings.weekly_plan_reminder_hour,
                 minute=settings.weekly_plan_reminder_minute,
                 timezone=settings.timezone,
@@ -230,7 +242,7 @@ def _weekly_plan_schedule_facts(settings, *, now: datetime):
     return schedule.target_week_start, schedule.window
 
 
-async def _load_weekly_plan_canary_member(
+async def _load_weekly_plan_member(
     session,
     *,
     tenant_id: str,
@@ -244,7 +256,7 @@ async def _load_weekly_plan_canary_member(
         )
     )
     if binding is None:
-        raise ValueError("weekly_plan_canary_identity_binding_missing")
+        raise ValueError("weekly_plan_identity_binding_missing")
     return WeeklyPlanRosterMember(
         user_id=binding.user_id,
         display_name=binding.display_name,
@@ -253,8 +265,43 @@ async def _load_weekly_plan_canary_member(
     )
 
 
+async def _load_weekly_plan_reminder_recipients(
+    session,
+    *,
+    tenant_id: str,
+    user_ids: tuple[str, ...],
+) -> tuple[WeeklyPlanReminderRecipient, ...]:
+    bindings = list(
+        (
+            await session.scalars(
+                select(Agent2IdentityBinding).where(
+                    Agent2IdentityBinding.tenant_id == tenant_id,
+                    Agent2IdentityBinding.user_id.in_(user_ids),
+                    Agent2IdentityBinding.active.is_(True),
+                )
+            )
+        ).all()
+    )
+    by_user_id = {str(binding.user_id): binding for binding in bindings}
+    if set(by_user_id) != set(user_ids):
+        raise ValueError("weekly_plan_reminder_identity_binding_missing")
+    dingtalk_user_ids = {
+        str(binding.dingtalk_user_id).strip() for binding in bindings
+    }
+    if "" in dingtalk_user_ids or len(dingtalk_user_ids) != len(user_ids):
+        raise ValueError("weekly_plan_reminder_identity_binding_invalid")
+    return tuple(
+        WeeklyPlanReminderRecipient(
+            tenant_id=tenant_id,
+            internal_user_id=user_id,
+            dingtalk_user_id=str(by_user_id[user_id].dingtalk_user_id).strip(),
+        )
+        for user_id in user_ids
+    )
+
+
 async def run_weekly_plan_collection_open_job(settings, *, now: datetime) -> None:
-    scope = _strict_weekly_plan_canary_scope(settings)
+    scope = _strict_weekly_plan_scope(settings)
     if scope is None:
         return
     tenant_id, user_ids = scope
@@ -262,7 +309,7 @@ async def run_weekly_plan_collection_open_job(settings, *, now: datetime) -> Non
     async with AsyncSessionLocal() as session:
         members = tuple(
             [
-                await _load_weekly_plan_canary_member(
+                await _load_weekly_plan_member(
                     session,
                     tenant_id=tenant_id,
                     user_id=user_id,
@@ -291,7 +338,7 @@ async def run_weekly_plan_history_suggestion_refresh_job(
 ) -> None:
     """Refresh optional history suggestions after the canary plan exists."""
 
-    scope = _strict_weekly_plan_canary_scope(settings)
+    scope = _strict_weekly_plan_scope(settings)
     if (
         scope is None
         or getattr(settings, "agent2_weekly_plan_enabled", False) is not True
@@ -327,14 +374,14 @@ async def run_weekly_plan_history_suggestion_refresh_job(
 
 
 async def _load_weekly_plan_opening(settings, *, now: datetime, session):
-    scope = _strict_weekly_plan_canary_scope(settings)
+    scope = _strict_weekly_plan_scope(settings)
     if scope is None:
         return None, None
     tenant_id, user_ids = scope
     target_week_start, window = _weekly_plan_schedule_facts(settings, now=now)
     members = tuple(
         [
-            await _load_weekly_plan_canary_member(
+            await _load_weekly_plan_member(
                 session,
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -357,14 +404,15 @@ async def _load_weekly_plan_opening(settings, *, now: datetime, session):
 
 
 async def run_weekly_plan_reminder_enqueue_job(settings, *, now: datetime) -> None:
-    scope = _strict_weekly_plan_canary_scope(settings)
-    send_user_id = _strict_weekly_plan_single_id(
+    scope = _strict_weekly_plan_scope(settings)
+    send_user_ids = _strict_weekly_plan_user_ids(
         getattr(settings, "agent2_weekly_plan_send_user_allowlist", "")
     )
     if (
         scope is None
         or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
-        or send_user_id not in scope[1]
+        or send_user_ids is None
+        or not set(send_user_ids).issubset(scope[1])
     ):
         return
     async with AsyncSessionLocal() as session:
@@ -375,10 +423,10 @@ async def run_weekly_plan_reminder_enqueue_job(settings, *, now: datetime) -> No
             return
         await orchestrator.enqueue_private_reminders(
             opening=opening,
-            canary_user_ids=frozenset({send_user_id}),
+            canary_user_ids=frozenset(send_user_ids),
             reminder_at=now,
             created_at=now,
-            reminder_slot="sunday-primary",
+            reminder_slot="friday-primary",
         )
         await session.commit()
 
@@ -389,52 +437,47 @@ async def run_weekly_plan_reminder_dispatch_job(
     robot: DingTalkRobotClient,
     now: datetime,
 ) -> None:
-    scope = _strict_weekly_plan_canary_scope(settings)
-    send_user_id = _strict_weekly_plan_single_id(
+    scope = _strict_weekly_plan_scope(settings)
+    send_user_ids = _strict_weekly_plan_user_ids(
         getattr(settings, "agent2_weekly_plan_send_user_allowlist", "")
     )
     if (
         scope is None
         or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
-        or send_user_id not in scope[1]
+        or send_user_ids is None
+        or not set(send_user_ids).issubset(scope[1])
     ):
         return
     tenant_id, _user_ids = scope
-    user_id = send_user_id
     async with AsyncSessionLocal() as session:
-        binding = await session.scalar(
-            select(Agent2IdentityBinding).where(
-                Agent2IdentityBinding.tenant_id == tenant_id,
-                Agent2IdentityBinding.user_id == user_id,
-                Agent2IdentityBinding.active.is_(True),
-            )
-        )
-        if binding is None or not str(binding.dingtalk_user_id).strip():
-            raise ValueError("weekly_plan_reminder_identity_binding_missing")
-        outbox = SqlWeeklyPlanReminderOutboxStore(session)
-        rows = await outbox.load_due_queued(
+        recipients = await _load_weekly_plan_reminder_recipients(
+            session,
             tenant_id=tenant_id,
-            recipient_internal_user_id=user_id,
-            as_of=now,
-            limit=1,
+            user_ids=send_user_ids,
         )
+        outbox = SqlWeeklyPlanReminderOutboxStore(session)
         dispatcher = WeeklyPlanReminderDispatcher(
             outbox=outbox,
             transport=DingTalkWeeklyPlanReminderTransport(robot),
             tenant_allowlist=frozenset({tenant_id}),
-            user_allowlist=frozenset({user_id}),
+            user_allowlist=frozenset(send_user_ids),
         )
-        for row in rows:
-            await dispatcher.dispatch(
-                row=row,
-                recipient=WeeklyPlanReminderRecipient(
-                    tenant_id=tenant_id,
-                    internal_user_id=user_id,
-                    dingtalk_user_id=str(binding.dingtalk_user_id),
-                ),
-                changed_at=now,
-                claim_token=f"weekly-plan:{row.outbox_id}:{now.isoformat()}",
+        for recipient in recipients:
+            rows = await outbox.load_due_queued(
+                tenant_id=tenant_id,
+                recipient_internal_user_id=recipient.internal_user_id,
+                as_of=now,
+                limit=1,
             )
+            for row in rows:
+                await dispatcher.dispatch(
+                    row=row,
+                    recipient=recipient,
+                    changed_at=now,
+                    claim_token=(
+                        f"weekly-plan:{row.outbox_id}:{now.isoformat()}"
+                    ),
+                )
         await session.commit()
 
 
@@ -444,51 +487,43 @@ async def run_weekly_plan_reminder_reconcile_job(
     robot: DingTalkRobotClient,
     now: datetime,
 ) -> None:
-    scope = _strict_weekly_plan_canary_scope(settings)
-    send_user_id = _strict_weekly_plan_single_id(
+    scope = _strict_weekly_plan_scope(settings)
+    send_user_ids = _strict_weekly_plan_user_ids(
         getattr(settings, "agent2_weekly_plan_send_user_allowlist", "")
     )
     if (
         scope is None
         or getattr(settings, "agent2_weekly_plan_send_enabled", False) is not True
-        or send_user_id not in scope[1]
+        or send_user_ids is None
+        or not set(send_user_ids).issubset(scope[1])
     ):
         return
     tenant_id, _user_ids = scope
-    user_id = send_user_id
     async with AsyncSessionLocal() as session:
-        binding = await session.scalar(
-            select(Agent2IdentityBinding).where(
-                Agent2IdentityBinding.tenant_id == tenant_id,
-                Agent2IdentityBinding.user_id == user_id,
-                Agent2IdentityBinding.active.is_(True),
-            )
-        )
-        if binding is None or not str(binding.dingtalk_user_id).strip():
-            raise ValueError("weekly_plan_reminder_identity_binding_missing")
-        outbox = SqlWeeklyPlanReminderOutboxStore(session)
-        rows = await outbox.load_delivery_pending(
+        recipients = await _load_weekly_plan_reminder_recipients(
+            session,
             tenant_id=tenant_id,
-            recipient_internal_user_id=user_id,
-            limit=10,
+            user_ids=send_user_ids,
         )
+        outbox = SqlWeeklyPlanReminderOutboxStore(session)
         dispatcher = WeeklyPlanReminderDispatcher(
             outbox=outbox,
             transport=DingTalkWeeklyPlanReminderTransport(robot),
             tenant_allowlist=frozenset({tenant_id}),
-            user_allowlist=frozenset({user_id}),
+            user_allowlist=frozenset(send_user_ids),
         )
-        recipient = WeeklyPlanReminderRecipient(
-            tenant_id=tenant_id,
-            internal_user_id=user_id,
-            dingtalk_user_id=str(binding.dingtalk_user_id),
-        )
-        for row in rows:
-            await dispatcher.reconcile_pending(
-                row=row,
-                recipient=recipient,
-                changed_at=now,
+        for recipient in recipients:
+            rows = await outbox.load_delivery_pending(
+                tenant_id=tenant_id,
+                recipient_internal_user_id=recipient.internal_user_id,
+                limit=10,
             )
+            for row in rows:
+                await dispatcher.reconcile_pending(
+                    row=row,
+                    recipient=recipient,
+                    changed_at=now,
+                )
         await session.commit()
 
 
@@ -515,7 +550,7 @@ async def run_weekly_plan_reminder_maintenance_job(
 async def run_weekly_plan_monday_snapshot_job(settings, *, now: datetime) -> None:
     # On Monday the target being frozen is the week that starts today, not the
     # following natural week used for new mentions.
-    scope = _strict_weekly_plan_canary_scope(settings)
+    scope = _strict_weekly_plan_scope(settings)
     if scope is None:
         return
     local_now = now.astimezone(ZoneInfo(settings.timezone))
@@ -1089,8 +1124,8 @@ async def run_scheduler() -> None:
             coalesce=True,
         )
 
-    # Weekly-plan sending remains inside the exact one-person canary. Provider
-    # acceptance is recorded as pending until exact-recipient delivery proof.
+    # Weekly-plan reminders remain inside the exact configured private scope.
+    # Provider acceptance stays pending until exact-recipient delivery proof.
     async def weekly_plan_open_job() -> None:
         now = datetime.now(ZoneInfo(settings.timezone))
         await run_weekly_plan_collection_open_job(

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+MAX_WEEKLY_PLAN_USERS = 74
+
 
 class WeeklyPlanAccessAction(str, Enum):
     READ = "read"
@@ -51,10 +53,12 @@ class WeeklyPlanAccessPolicy:
             return _deny("weekly_plan_allowlist_invalid")
         if len(self.tenant_allowlist) > 1:
             return _deny("weekly_plan_single_canary_scope_required")
-        if len(self.user_allowlist) > 2:
-            return _deny("weekly_plan_two_user_canary_scope_required")
-        if len(self.send_user_allowlist) > 1:
-            return _deny("weekly_plan_single_canary_scope_required")
+        if len(self.user_allowlist) > MAX_WEEKLY_PLAN_USERS:
+            return _deny("weekly_plan_user_scope_too_large")
+        if len(self.send_user_allowlist) > MAX_WEEKLY_PLAN_USERS:
+            return _deny("weekly_plan_send_scope_too_large")
+        if not self.send_user_allowlist.issubset(self.user_allowlist):
+            return _deny("weekly_plan_send_scope_not_enabled")
         if not isinstance(tenant_id, str) or not tenant_id:
             return _deny("weekly_plan_tenant_id_missing")
         if not isinstance(user_id, str) or not user_id:

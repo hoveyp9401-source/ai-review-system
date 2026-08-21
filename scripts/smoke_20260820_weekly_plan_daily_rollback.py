@@ -22,7 +22,11 @@ from app.agent2.tool_calling.production_store import (
 from app.agent2.tool_calling.registry import runtime_registry_contract_digest
 from app.agent2.weekly_plan_store import (
     SqlWeeklyPlanStore,
+)
+from app.agent2.weekly_plan_store import (
     _audits as weekly_audits,
+)
+from app.agent2.weekly_plan_store import (
     _receipts as weekly_receipts,
 )
 from app.config import get_settings
@@ -30,7 +34,6 @@ from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
 from app.models import DailyReport, User
 from scripts.smoke_20260811_overnight_daily_rollback import _turn
-
 
 TARGET_WEEK_START = date(2026, 8, 24)
 RUN_ID = f"weekly-daily-rollback-{uuid4().hex[:12]}"
@@ -76,7 +79,7 @@ async def _select_unused_weekday(session, *, user_id: UUID) -> date:
     raise AssertionError("no unused rollback Daily Report date is available")
 
 
-async def _select_empty_plan_canary(
+async def _select_empty_plan_user(
     session,
 ) -> tuple[User, ToolCallCanaryControl, object]:
     settings = get_settings()
@@ -84,8 +87,8 @@ async def _select_empty_plan_canary(
     user_ids = tuple(
         value.strip() for value in raw_user_ids.split(",") if value.strip()
     )
-    if len(user_ids) != 2 or len(set(user_ids)) != 2:
-        raise AssertionError("weekly-plan rollback requires the exact two-user canary")
+    if not 1 <= len(user_ids) <= 74 or len(set(user_ids)) != len(user_ids):
+        raise AssertionError("weekly-plan rollback requires a valid enabled scope")
     tenant_id = str(settings.agent2_weekly_plan_tenant_allowlist or "")
     if not tenant_id:
         raise AssertionError("weekly-plan tenant canary is not configured")
@@ -109,10 +112,8 @@ async def _select_empty_plan_canary(
         )
         if plan is None:
             candidates.append((user, control))
-    if len(candidates) != 1:
-        raise AssertionError(
-            "rollback requires exactly one canary without a next-week plan"
-        )
+    if not candidates:
+        raise AssertionError("rollback requires one enabled user without a next-week plan")
     user, control = candidates[0]
     return user, control, settings
 
@@ -262,7 +263,7 @@ async def main() -> None:
     try:
         async with AsyncSessionLocal() as session:
             try:
-                user, control, settings = await _select_empty_plan_canary(session)
+                user, control, settings = await _select_empty_plan_user(session)
                 user_id = user.id
                 tenant_id = str(control.tenant_id)
                 baseline_control = _control_snapshot(control)

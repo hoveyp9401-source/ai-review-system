@@ -190,7 +190,7 @@ class WeeklyPlanCollectionOrchestrator:
         current_plans: tuple[WeeklyPlan, ...],
         canary_user_ids: frozenset[str],
         reminder_at: datetime,
-        reminder_slot: str = "sunday-primary",
+        reminder_slot: str = "friday-primary",
     ) -> tuple[WeeklyPlanReminderCandidate, ...]:
         if reminder_at.tzinfo is None or reminder_at.utcoffset() is None:
             raise ValueError("reminder_at must be timezone-aware")
