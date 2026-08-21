@@ -37,6 +37,7 @@ from app.agent2.tool_calling.production_daily_executor import (
 )
 from app.agent2.tool_calling.production_handlers import ProductionHandlerRequest
 from app.agent2.tool_calling.validation import BoundCall
+from app.agent2.weekly_plan_access import MAX_WEEKLY_PLAN_USERS
 from app.agent2.weekly_plan_context import TrustedWeeklyPlanContext
 from app.agent2.weekly_plan_domain import (
     create_weekly_plan,
@@ -377,7 +378,7 @@ class ProductionWeeklyPlanExecutor:
         if injected_member is not None:
             members = (injected_member,)
         else:
-            user_ids = _configured_canary_roster_user_ids(
+            user_ids = _configured_weekly_plan_roster_user_ids(
                 self._settings,
                 tenant_id=principal.tenant_id,
             )
@@ -420,7 +421,7 @@ class ProductionWeeklyPlanExecutor:
         canonical = tuple(sorted(members, key=lambda item: item.user_id))
         if (
             not canonical
-            or len(canonical) > 2
+            or len(canonical) > MAX_WEEKLY_PLAN_USERS
             or len({member.user_id for member in canonical}) != len(canonical)
             or str(principal.user_id)
             not in {member.user_id for member in canonical}
@@ -864,7 +865,7 @@ class ProductionWeeklyPlanExecutor:
         )
 
 
-def _configured_canary_roster_user_ids(
+def _configured_weekly_plan_roster_user_ids(
     settings: object | None,
     *,
     tenant_id: str,
@@ -886,7 +887,10 @@ def _configured_canary_roster_user_ids(
     if not isinstance(user_raw, str) or not user_raw:
         return None
     parts = user_raw.split(",")
-    if not 1 <= len(parts) <= 2 or len(parts) != len(set(parts)):
+    if (
+        not 1 <= len(parts) <= MAX_WEEKLY_PLAN_USERS
+        or len(parts) != len(set(parts))
+    ):
         return None
     if any(
         item != item.strip()

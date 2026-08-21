@@ -89,7 +89,7 @@ terminate_frozen_services() {
 
 freeze_running_services_for_rollback() {
   if [[ "$processes_frozen" -eq 0 ]]; then
-    freeze_all_services || true
+    freeze_all_services
   fi
 }
 
@@ -138,21 +138,29 @@ code_switched=0
 
 rollback_all() {
   local status="${1:-1}"
+  local rollback_failed=0
   trap - ERR INT TERM
   set +e
-  freeze_running_services_for_rollback
+  freeze_running_services_for_rollback || rollback_failed=1
   if [[ "$code_switched" -eq 1 ]]; then
-    switch_current "$previous" agent2-weekly-plan-full-rollback
+    switch_current "$previous" agent2-weekly-plan-full-rollback \
+      || rollback_failed=1
   fi
   if [[ "$config_applied" -eq 1 ]]; then
-    run_config restore --backup-path "$backup_path"
+    run_config restore --backup-path "$backup_path" || rollback_failed=1
   fi
   if [[ "$processes_frozen" -eq 1 ]]; then
-    terminate_frozen_services
+    terminate_frozen_services || rollback_failed=1
   else
-    restart_by_owner_signal
+    restart_by_owner_signal || rollback_failed=1
   fi
-  wait_healthy "$previous"
+  wait_healthy "$previous" || rollback_failed=1
+  if [[ "$rollback_failed" -ne 0 ]]; then
+    echo "weekly-plan rollback did not fully recover; manual intervention required" >&2
+    if [[ "$status" -eq 0 ]]; then
+      status=1
+    fi
+  fi
   exit "$status"
 }
 
@@ -172,8 +180,10 @@ if [[ "$action" == "deploy" ]]; then
   trap 'rollback_all 130' INT
   trap 'rollback_all 143' TERM
   freeze_all_services
-  run_config apply --backup-path "$backup_path"
+  # Apply may commit the roster before replacing the env file.  Mark the
+  # rollback as required before entering it so either partial outcome restores.
   config_applied=1
+  run_config apply --backup-path "$backup_path"
   switch_current "$candidate" agent2-weekly-plan-full-next
   code_switched=1
   terminate_frozen_services

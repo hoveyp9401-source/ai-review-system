@@ -6,6 +6,12 @@ import pytest
 
 from scripts import manage_weekly_plan_full_rollout_20260821 as rollout
 
+ROLLOUT_SWITCH = (
+    Path(__file__).parents[1]
+    / "scripts"
+    / "switch_agent2_weekly_plan_full_20260821.sh"
+)
+
 
 def _env_text(**overrides: str) -> str:
     values = {
@@ -64,3 +70,23 @@ def test_env_reader_fails_closed_on_a_duplicate_rollout_key(tmp_path: Path) -> N
 
     with pytest.raises(RuntimeError, match="duplicate weekly-plan env key"):
         rollout._read_env(path)
+
+
+def test_switch_requires_config_restore_before_apply_can_partially_fail() -> None:
+    source = ROLLOUT_SWITCH.read_text(encoding="utf-8")
+
+    assert source.index("config_applied=1\n  run_config apply") < source.index(
+        "run_config apply --backup-path"
+    )
+
+
+def test_switch_reports_an_incomplete_rollback_as_failure() -> None:
+    source = ROLLOUT_SWITCH.read_text(encoding="utf-8")
+
+    assert (
+        'run_config restore --backup-path "$backup_path" || rollback_failed=1'
+        in source
+    )
+    assert 'wait_healthy "$previous" || rollback_failed=1' in source
+    assert 'if [[ "$rollback_failed" -ne 0 ]]' in source
+    assert "status=1" in source

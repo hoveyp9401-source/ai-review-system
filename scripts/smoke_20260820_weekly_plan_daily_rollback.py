@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from datetime import date, datetime, timedelta
 from time import perf_counter
 from uuid import UUID, uuid4
@@ -33,11 +34,17 @@ from app.config import get_settings
 from app.db import AsyncSessionLocal, engine
 from app.llm.client import LLMClient
 from app.models import DailyReport, User
+from scripts.manage_weekly_plan_full_rollout_20260821 import (
+    _batch_snapshot,
+    _exact_scope,
+    _expand_existing_batch,
+)
 from scripts.smoke_20260811_overnight_daily_rollback import _turn
 
 TARGET_WEEK_START = date(2026, 8, 24)
 RUN_ID = f"weekly-daily-rollback-{uuid4().hex[:12]}"
 CONVERSATION_ID = f"{RUN_ID}-conversation"
+FULL_ROSTER_MODE = os.getenv("WEEKLY_FULL_ROSTER_SMOKE", "").strip() == "1"
 
 
 def _stable_hash(value: object) -> str:
@@ -92,6 +99,31 @@ async def _select_empty_plan_user(
     tenant_id = str(settings.agent2_weekly_plan_tenant_allowlist or "")
     if not tenant_id:
         raise AssertionError("weekly-plan tenant canary is not configured")
+
+    original_user_ids = user_ids
+    if FULL_ROSTER_MODE:
+        exact_tenant_id, exact_user_ids, bindings = await _exact_scope(session)
+        if exact_tenant_id != tenant_id:
+            raise AssertionError("full-roster smoke tenant mismatch")
+        await _expand_existing_batch(
+            session,
+            tenant_id=tenant_id,
+            user_ids=exact_user_ids,
+            bindings=bindings,
+            target_week_start=TARGET_WEEK_START,
+        )
+        user_ids = tuple(
+            user_id for user_id in exact_user_ids if user_id not in original_user_ids
+        )
+        if not user_ids:
+            raise AssertionError("full-roster smoke requires a newly enabled user")
+        settings = settings.model_copy(
+            update={
+                "agent2_weekly_plan_user_allowlist": ",".join(exact_user_ids),
+                "agent2_weekly_plan_send_enabled": False,
+                "agent2_weekly_plan_send_user_allowlist": "",
+            }
+        )
 
     store = SqlWeeklyPlanStore(session)
     candidates: list[tuple[User, ToolCallCanaryControl]] = []
@@ -260,9 +292,18 @@ async def main() -> None:
     results: list[dict[str, object]] = []
     temporary_hash = ""
     final_plan_version = 0
+    baseline_batch: dict[str, object] = {}
     try:
         async with AsyncSessionLocal() as session:
             try:
+                initial_settings = get_settings()
+                baseline_batch = await _batch_snapshot(
+                    session,
+                    tenant_id=str(
+                        initial_settings.agent2_weekly_plan_tenant_allowlist
+                    ),
+                    target_week_start=TARGET_WEEK_START,
+                )
                 user, control, settings = await _select_empty_plan_user(session)
                 user_id = user.id
                 tenant_id = str(control.tenant_id)
@@ -541,6 +582,11 @@ async def main() -> None:
             )
         )
         restored_control = _control_snapshot(control)
+        restored_batch = await _batch_snapshot(
+            session,
+            tenant_id=tenant_id,
+            target_week_start=TARGET_WEEK_START,
+        )
         await session.rollback()
 
     residues = {
@@ -553,6 +599,8 @@ async def main() -> None:
         raise AssertionError("production state did not return to its baseline hash")
     if restored_control != baseline_control:
         raise AssertionError("Agent2 control did not return to its baseline")
+    if restored_batch != baseline_batch:
+        raise AssertionError("weekly-plan batch did not return to its baseline")
     if any(residues.values()):
         raise AssertionError({"rollback_residue": residues})
 
@@ -571,6 +619,7 @@ async def main() -> None:
                 "baseline_restored": True,
                 "rollback_residue": residues,
                 "dingtalk_send_calls": 0,
+                "full_roster_mode": FULL_ROSTER_MODE,
             },
             ensure_ascii=False,
             sort_keys=True,

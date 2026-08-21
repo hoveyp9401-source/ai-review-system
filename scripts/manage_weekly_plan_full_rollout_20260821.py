@@ -506,6 +506,20 @@ async def restore(path: Path, *, target_week_start: date) -> None:
                 )
                 removed = int(result.rowcount or 0)
             await session.commit()
+    else:
+        async with AsyncSessionLocal() as session:
+            new_batch_exists = (
+                await session.scalar(
+                    select(_batches.c.batch_id).where(
+                        _batches.c.tenant_id == tenant_id,
+                        _batches.c.target_week_start == target_week_start,
+                    )
+                )
+            ) is not None
+            await session.rollback()
+        # Never delete a batch created after rollout: it may already contain a
+        # real user's plan.  Disable Weekly Plan on rollback and preserve data.
+        fallback_disable = new_batch_exists
     replacements = dict(payload["env_values"])
     if fallback_disable:
         replacements["AGENT2_WEEKLY_PLAN_ENABLED"] = "false"

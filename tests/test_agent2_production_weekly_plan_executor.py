@@ -677,6 +677,75 @@ async def test_production_first_write_loads_both_configured_identity_bindings():
 
 
 @pytest.mark.asyncio
+async def test_production_first_write_loads_the_full_74_user_roster():
+    context = _context()
+    store = _FakeWeeklyPlanStore()
+    message = "next Monday prepare materials"
+    arguments = ApplyNextWeeklyPlanArgs.model_validate(
+        {
+            "plan_id": context.weekly_plan.plan_id,
+            "expected_version": 0,
+            "operations": [
+                {
+                    "operation_id": "configured-full-roster",
+                    "operation": "add",
+                    "plan_date": "2026-08-17",
+                    "content": "prepare materials",
+                    "source_evidence": {
+                        "source_message_index": 1,
+                        "exact_clause_quote": message,
+                    },
+                }
+            ],
+        }
+    )
+    request, bound_calls = _request("apply_next_weekly_plan", arguments)
+    user_ids = (str(USER_ID),) + tuple(
+        f"full-roster-user-{index:03d}" for index in range(1, 74)
+    )
+    bindings = tuple(
+        SimpleNamespace(
+            user_id=user_id,
+            display_name=f"测试成员{index:03d}",
+            department_id="department-authoritative",
+            team_id="team-authoritative",
+        )
+        for index, user_id in enumerate(user_ids)
+    )
+
+    class _Bindings:
+        def all(self):
+            return tuple(reversed(bindings))
+
+    class _Session:
+        async def scalars(self, _statement):
+            return _Bindings()
+
+    settings = SimpleNamespace(
+        agent2_weekly_plan_tenant_allowlist=TENANT_ID,
+        agent2_weekly_plan_user_allowlist=",".join(reversed(user_ids)),
+    )
+    executor = _executor(
+        store=store,
+        context=context,
+        bound_calls=bound_calls,
+        source=CurrentTurnSource((message,)),
+        authoritative_member=None,
+        session=_Session(),
+        settings=settings,
+    )
+
+    outcome = await executor.apply_next_weekly_plan(request)
+
+    assert outcome.safe_user_facts["actual_write"] is True
+    assert len(store.batch.roster) == 74
+    assert tuple(member.user_id for member in store.batch.roster) == tuple(
+        sorted(user_ids)
+    )
+    assert store.plan.owner_user_id == str(USER_ID)
+
+
+@pytest.mark.asyncio
 async def test_undated_next_week_statement_is_persisted_only_in_suggestion_zone():
     context = _context()
     store = _FakeWeeklyPlanStore()
