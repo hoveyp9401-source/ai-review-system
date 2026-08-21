@@ -20,7 +20,16 @@ from app.agent2.weekly_plan_access import (
     WeeklyPlanAccessPolicy,
 )
 from app.agent2.weekly_plan_domain import _stable_id
-from app.agent2.weekly_plan_store import _batches, _plans, _roster
+from app.agent2.weekly_plan_store import (
+    _audits,
+    _batches,
+    _days,
+    _items,
+    _plans,
+    _receipts,
+    _roster,
+    _suggestions,
+)
 from app.config import get_settings
 from app.db import AsyncSessionLocal, engine
 from app.legal_daily_roster import load_formal_legal_daily_roster
@@ -166,6 +175,7 @@ async def _batch_snapshot(session, *, tenant_id: str, target_week_start: date) -
             "batch_id": "",
             "roster_user_ids": [],
             "plan_owner_user_ids": [],
+            "plan_state_sha256": _sha256(b"[]"),
         }
     batch_id = batch["batch_id"]
     roster_user_ids = tuple(
@@ -192,10 +202,57 @@ async def _batch_snapshot(session, *, tenant_id: str, target_week_start: date) -
             )
         ).all()
     )
+    plan_ids = tuple(
+        (
+            await session.scalars(
+                select(_plans.c.plan_id)
+                .where(
+                    _plans.c.tenant_id == tenant_id,
+                    _plans.c.batch_id == batch_id,
+                )
+                .order_by(_plans.c.plan_id)
+            )
+        ).all()
+    )
+    state_rows: list[dict[str, object]] = []
+    table_specs = (
+        (_plans, _plans.c.plan_id, _plans.c.batch_id == batch_id),
+        (_days, _days.c.day_id, _days.c.plan_id.in_(plan_ids)),
+        (_items, _items.c.item_id, _items.c.plan_id.in_(plan_ids)),
+        (
+            _suggestions,
+            _suggestions.c.suggestion_id,
+            _suggestions.c.plan_id.in_(plan_ids),
+        ),
+        (_receipts, _receipts.c.receipt_id, _receipts.c.plan_id.in_(plan_ids)),
+        (_audits, _audits.c.audit_id, _audits.c.plan_id.in_(plan_ids)),
+    )
+    for table, order_column, condition in table_specs:
+        rows = (
+            await session.execute(
+                select(table)
+                .where(table.c.tenant_id == tenant_id, condition)
+                .order_by(order_column)
+            )
+        ).mappings().all()
+        state_rows.append(
+            {
+                "table": table.name,
+                "rows": [dict(row) for row in rows],
+            }
+        )
+    plan_state = json.dumps(
+        state_rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
     return {
         "batch_id": str(batch_id),
         "roster_user_ids": list(roster_user_ids),
         "plan_owner_user_ids": list(plan_owner_user_ids),
+        "plan_state_sha256": _sha256(plan_state),
     }
 
 
@@ -389,6 +446,8 @@ async def smoke(*, target_week_start: date) -> None:
         )
         if batch_id and len(during["roster_user_ids"]) != EXPECTED_USERS:
             raise RuntimeError("weekly-plan rollout smoke did not reach 74 users")
+        if during["plan_state_sha256"] != before["plan_state_sha256"]:
+            raise RuntimeError("weekly-plan rollout smoke changed an existing plan")
         await session.rollback()
     async with AsyncSessionLocal() as session:
         tenant_id, _user_ids, _bindings = await _exact_scope(session)
