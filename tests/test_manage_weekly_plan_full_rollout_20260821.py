@@ -75,9 +75,15 @@ def test_env_reader_fails_closed_on_a_duplicate_rollout_key(tmp_path: Path) -> N
         rollout._read_env(path)
 
 
-def test_apply_remains_blocked_until_reminder_copy_is_user_approved() -> None:
+def test_reminder_send_remains_blocked_until_copy_is_user_approved() -> None:
     with pytest.raises(RuntimeError, match="reminder copy is not user-approved"):
-        rollout._require_user_approved_reminder_template()
+        rollout._require_user_approved_reminder_template(send_enabled=True)
+
+
+def test_read_write_rollout_does_not_require_reminder_copy() -> None:
+    assert rollout.ROLLOUT_SEND_ENABLED is False
+
+    rollout._require_user_approved_reminder_template(send_enabled=False)
 
 
 def test_approved_reminder_copy_must_still_match_exactly(monkeypatch) -> None:
@@ -87,7 +93,7 @@ def test_approved_reminder_copy_must_still_match_exactly(monkeypatch) -> None:
         rollout._sha256(WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE.encode("utf-8")),
     )
 
-    rollout._require_user_approved_reminder_template()
+    rollout._require_user_approved_reminder_template(send_enabled=True)
 
     monkeypatch.setattr(
         rollout,
@@ -95,7 +101,7 @@ def test_approved_reminder_copy_must_still_match_exactly(monkeypatch) -> None:
         WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE + " changed",
     )
     with pytest.raises(RuntimeError, match="reminder copy changed after approval"):
-        rollout._require_user_approved_reminder_template()
+        rollout._require_user_approved_reminder_template(send_enabled=True)
 
 
 def test_switch_requires_config_restore_before_apply_can_partially_fail() -> None:

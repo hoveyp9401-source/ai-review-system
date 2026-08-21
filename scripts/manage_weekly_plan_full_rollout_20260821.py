@@ -39,8 +39,9 @@ from app.legal_daily_roster import load_formal_legal_daily_roster
 from app.scheduler.runner import register_weekly_plan_jobs
 
 EXPECTED_USERS = 74
-# Kept empty until the user approves the final reminder wording.  Apply and
-# verify both fail before changing production while this approval is absent.
+# The 74-person rollout opens read/write only.  Reminder delivery remains off
+# until the user explicitly approves both the wording and a later send rollout.
+ROLLOUT_SEND_ENABLED = False
 USER_APPROVED_REMINDER_TEMPLATE_SHA256 = ""
 ENV_PATH = Path("/home/ai_review_tunnel/ai-review-system/.env")
 ENV_KEYS = (
@@ -61,7 +62,9 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _require_user_approved_reminder_template() -> None:
+def _require_user_approved_reminder_template(*, send_enabled: bool) -> None:
+    if not send_enabled:
+        return
     actual = _sha256(WEEKLY_PLAN_REMINDER_TEXT_TEMPLATE.encode("utf-8"))
     if not USER_APPROVED_REMINDER_TEMPLATE_SHA256:
         raise RuntimeError("weekly-plan reminder copy is not user-approved")
@@ -400,7 +403,9 @@ async def backup(path: Path, *, target_week_start: date) -> None:
 
 
 async def apply(path: Path, *, target_week_start: date) -> None:
-    _require_user_approved_reminder_template()
+    _require_user_approved_reminder_template(
+        send_enabled=ROLLOUT_SEND_ENABLED
+    )
     backup_payload = _load_backup(path)
     if backup_payload["target_week_start"] != target_week_start.isoformat():
         raise RuntimeError("backup target week does not match")
@@ -426,10 +431,14 @@ async def apply(path: Path, *, target_week_start: date) -> None:
         {
             "AGENT2_WEEKLY_PLAN_ENABLED": "true",
             "AGENT2_WEEKLY_PLAN_WRITE_ENABLED": "true",
-            "AGENT2_WEEKLY_PLAN_SEND_ENABLED": "true",
+            "AGENT2_WEEKLY_PLAN_SEND_ENABLED": (
+                "true" if ROLLOUT_SEND_ENABLED else "false"
+            ),
             "AGENT2_WEEKLY_PLAN_TENANT_ALLOWLIST": tenant_id,
             "AGENT2_WEEKLY_PLAN_USER_ALLOWLIST": scope,
-            "AGENT2_WEEKLY_PLAN_SEND_USER_ALLOWLIST": scope,
+            "AGENT2_WEEKLY_PLAN_SEND_USER_ALLOWLIST": (
+                scope if ROLLOUT_SEND_ENABLED else ""
+            ),
             "WEEKLY_PLAN_COLLECTION_OPEN_HOUR": "15",
             "WEEKLY_PLAN_COLLECTION_OPEN_MINUTE": "0",
             "WEEKLY_PLAN_REMINDER_HOUR": "15",
@@ -550,7 +559,9 @@ async def restore(path: Path, *, target_week_start: date) -> None:
 
 
 async def verify(*, target_week_start: date) -> None:
-    _require_user_approved_reminder_template()
+    _require_user_approved_reminder_template(
+        send_enabled=ROLLOUT_SEND_ENABLED
+    )
     settings = get_settings()
     async with AsyncSessionLocal() as session:
         tenant_id, user_ids, _bindings = await _exact_scope(session)
@@ -576,9 +587,9 @@ async def verify(*, target_week_start: date) -> None:
     if (
         settings.agent2_weekly_plan_enabled is not True
         or settings.agent2_weekly_plan_write_enabled is not True
-        or settings.agent2_weekly_plan_send_enabled is not True
+        or settings.agent2_weekly_plan_send_enabled is not ROLLOUT_SEND_ENABLED
         or configured != user_ids
-        or send_configured != user_ids
+        or send_configured != ()
         or settings.weekly_plan_collection_open_hour != 15
         or settings.weekly_plan_collection_open_minute != 0
         or settings.weekly_plan_reminder_hour != 15
@@ -590,13 +601,16 @@ async def verify(*, target_week_start: date) -> None:
     policy = WeeklyPlanAccessPolicy(
         enabled=True,
         write_enabled=True,
-        send_enabled=True,
+        send_enabled=ROLLOUT_SEND_ENABLED,
         tenant_allowlist=frozenset({tenant_id}),
         user_allowlist=frozenset(user_ids),
-        send_user_allowlist=frozenset(user_ids),
+        send_user_allowlist=frozenset(),
     )
     for user_id in user_ids:
-        for action in WeeklyPlanAccessAction:
+        for action in (
+            WeeklyPlanAccessAction.READ,
+            WeeklyPlanAccessAction.WRITE,
+        ):
             decision = policy.decide(
                 action=action,
                 tenant_id=tenant_id,
@@ -605,6 +619,14 @@ async def verify(*, target_week_start: date) -> None:
             )
             if not decision.allowed:
                 raise RuntimeError(f"weekly-plan access denied: {action.value}")
+        send_decision = policy.decide(
+            action=WeeklyPlanAccessAction.SEND,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_kind="direct",
+        )
+        if send_decision.allowed:
+            raise RuntimeError("weekly-plan reminder send unexpectedly allowed")
     outsider = policy.decide(
         action=WeeklyPlanAccessAction.WRITE,
         tenant_id=tenant_id,
@@ -632,17 +654,14 @@ async def verify(*, target_week_start: date) -> None:
     )
     if registered != (
         "agent2_weekly_plan_collection_open",
-        "agent2_weekly_plan_reminder_enqueue",
-        "agent2_weekly_plan_reminder_reconcile",
         "agent2_weekly_plan_monday_snapshot",
     ):
         raise RuntimeError("weekly-plan scheduler jobs are incomplete")
-    if [str(job["trigger"]) for job in jobs[:2]] != [
-        "cron[day_of_week='fri', hour='15', minute='0']",
-        "cron[day_of_week='fri', hour='15', minute='0']",
+    if [str(job["trigger"]) for job in jobs[:1]] != [
+        "cron[day_of_week='fri', hour='15', minute='0']"
     ]:
         raise RuntimeError("weekly-plan Friday schedule is not 15:00")
-    print(json.dumps({"action": "verify", "user_count": len(user_ids), "read_write_send": "74/74", "batch_roster_count": len(batch["roster_user_ids"]), "batch_plan_count": len(batch["plan_owner_user_ids"]), "registered_jobs": len(registered), "friday_reminder": "15:00"}, sort_keys=True))
+    print(json.dumps({"action": "verify", "user_count": len(user_ids), "read_write": "74/74", "reminder_send": "disabled", "batch_roster_count": len(batch["roster_user_ids"]), "batch_plan_count": len(batch["plan_owner_user_ids"]), "registered_jobs": len(registered)}, sort_keys=True))
 
 
 async def main() -> None:
