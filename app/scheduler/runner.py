@@ -349,6 +349,37 @@ async def run_bounded_personal_weekly_brief_model_batch(
     return tuple(await asyncio.gather(*(run_one(row) for row in rows)))
 
 
+async def stage_personal_weekly_brief_target_batch(
+    *,
+    session,
+    targets,
+    snapshot_service,
+    week_start: date,
+    snapshot_at: datetime,
+) -> tuple[PersonalWeeklyBriefRecord, ...]:
+    """Freeze each owner behind a savepoint so one bad source cannot cancel 73."""
+
+    rows: list[PersonalWeeklyBriefRecord] = []
+    for target in targets:
+        try:
+            async with session.begin_nested():
+                row = await snapshot_service.stage_target(
+                    target=target,
+                    week_start=week_start,
+                    snapshot_at=snapshot_at,
+                )
+        except Exception as exc:
+            async with session.begin_nested():
+                row = await snapshot_service.stage_failure(
+                    target=target,
+                    week_start=week_start,
+                    snapshot_at=snapshot_at,
+                    error_code=f"snapshot_error:{type(exc).__name__}",
+                )
+        rows.append(row)
+    return tuple(rows)
+
+
 async def run_personal_weekly_brief_generation_job(
     settings,
     *,
@@ -365,7 +396,13 @@ async def run_personal_weekly_brief_generation_job(
         getattr(settings, "agent2_personal_weekly_brief_enabled", False) is not True
         or tenant_id is None
     ):
-        return {"staged": 0, "generated": 0, "generation_failed": 0, "dispatched": 0}
+        return {
+            "staged": 0,
+            "snapshot_failed": 0,
+            "generated": 0,
+            "generation_failed": 0,
+            "dispatched": 0,
+        }
     local_now = _personal_weekly_local_now(now)
     if local_now.weekday() != 5:
         raise ValueError("personal_weekly_brief_generation_requires_saturday")
@@ -391,15 +428,17 @@ async def run_personal_weekly_brief_generation_job(
             store=SqlPersonalWeeklyBriefStore(snapshot_session),
             source_loader=source_loader,
         )
-        staged = 0
-        for target in targets:
-            row = await snapshot_service.stage_target(
-                target=target,
-                week_start=window.week_start,
-                snapshot_at=window.snapshot_at,
-            )
-            if row.status == "snapshot_ready":
-                staged += 1
+        snapshot_rows = await stage_personal_weekly_brief_target_batch(
+            session=snapshot_session,
+            targets=targets,
+            snapshot_service=snapshot_service,
+            week_start=window.week_start,
+            snapshot_at=window.snapshot_at,
+        )
+        staged = sum(row.status == "snapshot_ready" for row in snapshot_rows)
+        snapshot_failed = sum(
+            row.status == "generation_failed" for row in snapshot_rows
+        )
         await snapshot_session.commit()
 
     target_by_user = {target.internal_user_id: target for target in targets}
@@ -533,6 +572,7 @@ async def run_personal_weekly_brief_generation_job(
         )
     return {
         "staged": staged,
+        "snapshot_failed": snapshot_failed,
         "generated": generated,
         "generation_failed": generation_failed,
         "dispatched": dispatched,

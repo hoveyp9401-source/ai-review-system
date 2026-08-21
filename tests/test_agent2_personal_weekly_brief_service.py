@@ -80,3 +80,25 @@ async def test_repeated_saturday_schedule_reuses_first_snapshot_and_does_not_reg
     assert first.status == "snapshot_ready"
     assert first.source_fingerprint == _snapshot().fingerprint
     assert first.content_json == {}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_is_recorded_without_source_content() -> None:
+    store = _Store()
+    service = PersonalWeeklyBriefSnapshotService(
+        store=store,
+        source_loader=_Sources(),
+    )
+
+    failed = await service.stage_failure(
+        target=TARGET,
+        week_start=date(2026, 8, 17),
+        snapshot_at=NOW,
+        error_code="snapshot_error:ValueError",
+    )
+
+    assert failed.status == "generation_failed"
+    assert failed.last_error == "snapshot_error:ValueError"
+    assert failed.source_snapshot["snapshot_failed"] is True
+    assert failed.source_snapshot["sources"] == []
+    assert failed.message_text == ""

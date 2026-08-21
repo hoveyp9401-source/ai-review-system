@@ -417,6 +417,72 @@ async def test_model_pipeline_stops_after_second_invalid_review_output() -> None
     assert len(llm.calls) == 4
 
 
+@pytest.mark.asyncio
+async def test_model_pipeline_repairs_an_overlong_rendered_message_once() -> None:
+    sources = tuple(
+        _source(
+            f"daily:long-render:{index}",
+            kind="daily_report",
+            on_date=date(2026, 8, 17 + index),
+            section="today_work",
+            text=f"脱敏事项{index}",
+        )
+        for index in range(4)
+    )
+    too_long = {
+        "intro": "本周简报。",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": f"long-{index}",
+                    "text": "甲" * 1000,
+                    "source_ids": [source.source_id],
+                }
+                for index, source in enumerate(sources)
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有重复提示。"),
+    }
+    repaired = {
+        **too_long,
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": f"long-{index}",
+                    "text": f"脱敏事项{index}。",
+                    "source_ids": [source.source_id],
+                }
+                for index, source in enumerate(sources)
+            ],
+        },
+    }
+    llm = _SequenceLLM(
+        too_long,
+        repaired,
+        {
+            "approved": True,
+            "reviewed_matter_keys": [f"long-{index}" for index in range(4)],
+            "issues": [],
+        },
+    )
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(*sources),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.model_calls == 3
+    assert len(outcome.content.message_text) < 3600
+
+
 def test_window_is_saturday_generation_with_monday_to_friday_report_dates() -> None:
     window = derive_personal_weekly_brief_window(
         SATURDAY_RUN,

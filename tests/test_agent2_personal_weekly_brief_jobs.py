@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -12,6 +12,7 @@ from app.scheduler import runner
 from app.scheduler.runner import (
     PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY,
     run_bounded_personal_weekly_brief_model_batch,
+    stage_personal_weekly_brief_target_batch,
     run_personal_weekly_brief_dispatch_job,
     run_personal_weekly_brief_generation_job,
     run_personal_weekly_brief_reconcile_job,
@@ -60,6 +61,7 @@ async def test_all_jobs_fail_closed_before_database_or_transport_access(monkeypa
 
     assert generated == {
         "staged": 0,
+        "snapshot_failed": 0,
         "generated": 0,
         "generation_failed": 0,
         "dispatched": 0,
@@ -134,3 +136,47 @@ async def test_model_batch_has_fixed_concurrency_and_isolates_one_user_failure()
     assert len(results) == 74
     assert isinstance(results[17], RuntimeError)
     assert len(completed) == 73
+
+
+@pytest.mark.asyncio
+async def test_snapshot_batch_isolates_one_owner_failure_and_continues_other_73() -> None:
+    class _Savepoint:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Session:
+        def begin_nested(self):
+            return _Savepoint()
+
+    class _Service:
+        def __init__(self) -> None:
+            self.staged: list[int] = []
+            self.failed: list[int] = []
+
+        async def stage_target(self, *, target, **_kwargs):
+            if target.index == 17:
+                raise ValueError("redacted owner source exceeded limit")
+            self.staged.append(target.index)
+            return SimpleNamespace(status="snapshot_ready", owner_user_id=target.index)
+
+        async def stage_failure(self, *, target, error_code, **_kwargs):
+            self.failed.append(target.index)
+            assert error_code == "snapshot_error:ValueError"
+            return SimpleNamespace(status="generation_failed", owner_user_id=target.index)
+
+    service = _Service()
+    rows = await stage_personal_weekly_brief_target_batch(
+        session=_Session(),
+        targets=tuple(SimpleNamespace(index=index) for index in range(74)),
+        snapshot_service=service,
+        week_start=date(2026, 8, 17),
+        snapshot_at=NOW,
+    )
+
+    assert len(rows) == 74
+    assert service.failed == [17]
+    assert len(service.staged) == 73
+    assert sum(row.status == "generation_failed" for row in rows) == 1

@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 import uuid
 
+from app.agent2.personal_weekly_brief import PersonalWeeklyBriefSnapshot
 from app.agent2.personal_weekly_brief_scope import PersonalWeeklyBriefTarget
 from app.agent2.personal_weekly_brief_store import PersonalWeeklyBriefRecord
 
@@ -78,6 +79,72 @@ class PersonalWeeklyBriefSnapshotService:
             updated_at=snapshot_at,
         )
         return await self._store.stage_snapshot(row)
+
+    async def stage_failure(
+        self,
+        *,
+        target: PersonalWeeklyBriefTarget,
+        week_start: date,
+        snapshot_at: datetime,
+        error_code: str,
+    ) -> PersonalWeeklyBriefRecord:
+        if (
+            not error_code.startswith("snapshot_error:")
+            or len(error_code) > 128
+            or not error_code.isascii()
+        ):
+            raise ValueError("personal weekly brief snapshot error code is invalid")
+        existing = await self._store.load_by_owner_week(
+            tenant_id=target.tenant_id,
+            owner_user_id=target.internal_user_id,
+            week_start=week_start,
+        )
+        if existing is not None:
+            return existing
+        snapshot = PersonalWeeklyBriefSnapshot(
+            tenant_id=target.tenant_id,
+            owner_user_id=target.internal_user_id,
+            week_start=week_start,
+            week_end=week_start + timedelta(days=4),
+            snapshot_at=snapshot_at,
+            daily_report_dates=(),
+            weekly_plan_found=False,
+            sources=(),
+        )
+        snapshot_payload = snapshot.as_payload()
+        snapshot_payload.update(
+            {
+                "snapshot_failed": True,
+                "failure_code": error_code,
+            }
+        )
+        key = (
+            f"personal-weekly:{target.tenant_id}:"
+            f"{target.internal_user_id}:{week_start.isoformat()}"
+        )
+        return await self._store.stage_snapshot(
+            PersonalWeeklyBriefRecord(
+                brief_id=str(uuid.uuid5(_BRIEF_NAMESPACE, key)),
+                tenant_id=target.tenant_id,
+                owner_user_id=target.internal_user_id,
+                conversation_id=target.conversation_id,
+                week_start=week_start,
+                week_end=week_start + timedelta(days=4),
+                snapshot_at=snapshot_at,
+                source_snapshot=snapshot_payload,
+                source_fingerprint=snapshot.fingerprint,
+                personal_memory_json={},
+                content_json={},
+                message_text="",
+                llm_model="",
+                status="generation_failed",
+                idempotency_key=key,
+                created_at=snapshot_at,
+                updated_at=snapshot_at,
+                failed_at=snapshot_at,
+                last_error=error_code,
+            )
+        )
 
 
 __all__ = ["PersonalWeeklyBriefSnapshotService"]

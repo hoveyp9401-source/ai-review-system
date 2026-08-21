@@ -324,12 +324,12 @@ class Agent2PersonalWeeklyBriefGenerator:
         try:
             payload = extract_json_object(response)
             content = _validated_content(payload, snapshot=snapshot)
+            message_text = _render_message(content, snapshot=snapshot)
         except (TypeError, ValueError) as exc:
             detail = str(exc)
             if "JSON" not in detail and "JSON object" not in detail:
                 detail = f"invalid output: {detail}"
             raise PersonalWeeklyBriefModelOutputInvalid(detail) from exc
-        message_text = _render_message(content, snapshot=snapshot)
         return PersonalWeeklyBriefContent(
             intro=content["intro"],
             completed=content["completed"],
