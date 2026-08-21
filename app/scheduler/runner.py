@@ -368,7 +368,7 @@ async def stage_personal_weekly_brief_target_batch(
                     week_start=week_start,
                     snapshot_at=snapshot_at,
                 )
-        except Exception as exc:
+        except ValueError as exc:
             async with session.begin_nested():
                 row = await snapshot_service.stage_failure(
                     target=target,

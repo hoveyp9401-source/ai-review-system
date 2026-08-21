@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.scheduler import runner
 from app.scheduler.runner import (
@@ -180,3 +181,33 @@ async def test_snapshot_batch_isolates_one_owner_failure_and_continues_other_73(
     assert service.failed == [17]
     assert len(service.staged) == 73
     assert sum(row.status == "generation_failed" for row in rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_snapshot_batch_propagates_database_failure_and_stops() -> None:
+    class _Savepoint:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Session:
+        def begin_nested(self):
+            return _Savepoint()
+
+    class _Service:
+        async def stage_target(self, **_kwargs):
+            raise SQLAlchemyError("isolated database failure")
+
+        async def stage_failure(self, **_kwargs):
+            raise AssertionError("database failure must not become an owner failure")
+
+    with pytest.raises(SQLAlchemyError, match="isolated database failure"):
+        await stage_personal_weekly_brief_target_batch(
+            session=_Session(),
+            targets=(SimpleNamespace(index=0), SimpleNamespace(index=1)),
+            snapshot_service=_Service(),
+            week_start=date(2026, 8, 17),
+            snapshot_at=NOW,
+        )
