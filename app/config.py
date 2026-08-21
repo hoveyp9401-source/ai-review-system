@@ -145,8 +145,6 @@ class Settings(BaseSettings):
     agent2_personal_weekly_brief_enabled: bool = False
     agent2_personal_weekly_brief_send_enabled: bool = False
     agent2_personal_weekly_brief_tenant_id: str = ""
-    personal_weekly_brief_hour: int = Field(default=9, ge=0, le=23)
-    personal_weekly_brief_minute: int = Field(default=0, ge=0, le=59)
     agent2_cognitive_core_v3_enabled: bool = False
     agent2_cognitive_core_v3_model: str = "deepseek-v4-pro"
     agent2_cognitive_core_v3_thinking: bool = True

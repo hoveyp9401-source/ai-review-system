@@ -152,13 +152,33 @@ async def test_cross_day_items_are_merged_once_without_losing_key_facts() -> Non
 
 @pytest.mark.asyncio
 async def test_five_plan_states_require_traceable_plan_and_progress_evidence() -> None:
+    plan_texts = (
+        "完成甲项目合同定稿。",
+        "持续推进乙案件证据整理。",
+        "周三参加丙案件开庭。",
+        "与丁公司沟通付款节点。",
+        "复核戊项目补充协议。",
+    )
+    update_texts = (
+        "甲项目合同定稿已完成并发给经办人。",
+        "乙案件证据整理持续推进，目前仍在补充送达材料。",
+        "丙案件原定周三开庭，因法院改期调整到周五。",
+        "已与丁公司沟通付款节点，后续安排下周一再确认发票条件。",
+    )
+    progress_texts = (
+        "甲项目合同定稿已完成并发给经办人。",
+        "乙案件证据整理持续推进，目前仍在补充送达材料。",
+        "丙案件开庭由周三调整到周五。",
+        "丁公司付款节点已沟通，后续安排下周一再确认发票条件。",
+        "戊项目补充协议暂时没有找到后续记录。",
+    )
     plans = [
         _source(
             f"plan:{index}",
             kind="weekly_plan",
             on_date=date(2026, 8, 17 + index),
             section="plan_item",
-            text=f"脱敏计划事项{index}",
+            text=plan_texts[index],
             record_id="plan-1",
         )
         for index in range(5)
@@ -169,7 +189,7 @@ async def test_five_plan_states_require_traceable_plan_and_progress_evidence() -
             kind="daily_report",
             on_date=date(2026, 8, 18 + index),
             section="today_work",
-            text=f"脱敏后续记录{index}",
+            text=update_texts[index],
             record_id=f"report-{index}",
         )
         for index in range(4)
@@ -189,7 +209,7 @@ async def test_five_plan_states_require_traceable_plan_and_progress_evidence() -
         items.append(
             {
                 "matter_key": f"matter-{index}",
-                "text": f"计划事项{index}的进展说明",
+                "text": progress_texts[index],
                 "status": status,
                 "source_ids": source_ids,
             }
@@ -215,6 +235,17 @@ async def test_five_plan_states_require_traceable_plan_and_progress_evidence() -
     assert tuple(item.status for item in result.plan_progress.items) == statuses
     assert result.plan_progress.items[-1].source_ids == (plans[-1].source_id,)
     assert "不等于未完成" in result.message_text
+    review = await Agent2PersonalWeeklyBriefReviewer(
+        _FakeLLM(
+            {
+                "approved": True,
+                "reviewed_matter_keys": [f"matter-{index}" for index in range(5)],
+                "issues": [],
+            }
+        ),
+        model="agent2-model",
+    ).review(snapshot=_snapshot(*plans, *updates), content=result)
+    assert review["approved"] is True
 
 
 @pytest.mark.asyncio
@@ -251,6 +282,44 @@ async def test_strong_plan_status_without_daily_evidence_is_rejected() -> None:
             model="agent2-model",
         ).generate(
             snapshot=_snapshot(plan),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+
+@pytest.mark.asyncio
+async def test_completed_item_must_be_anchored_in_today_work() -> None:
+    problem = _source(
+        "daily:problem:1",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="problems",
+        text="付款材料尚未齐全。",
+    )
+    llm = _FakeLLM(
+        {
+            "intro": "本周简报。",
+            "completed": {
+                "empty_note": "",
+                "items": [
+                    {
+                        "matter_key": "payment-material",
+                        "text": "付款材料尚未齐全。",
+                        "source_ids": [problem.source_id],
+                    }
+                ],
+            },
+            "plan_progress": _empty_section("没有周计划。"),
+            "possible_open_loops": _empty_section("暂不推测。"),
+        }
+    )
+
+    with pytest.raises(ValueError, match="completed item requires today_work evidence"):
+        await Agent2PersonalWeeklyBriefGenerator(
+            llm,
+            model="agent2-model",
+        ).generate(
+            snapshot=_snapshot(problem),
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )

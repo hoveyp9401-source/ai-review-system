@@ -77,6 +77,7 @@ class _Store:
             self.record,
             status="delivered",
             delivered_at=kwargs["changed_at"],
+            delivery_receipt_json=kwargs["delivery_receipt"],
         )
         return self.record
 
@@ -205,6 +206,15 @@ async def test_only_exact_recipient_delivery_is_recorded_as_delivered() -> None:
 
     assert delivered.status == "delivered"
     assert delivered.provider_message_id == "provider-1"
+    assert delivered.delivery_receipt_json == {
+        "schema_version": "agent2.personal_weekly_brief.delivery.v1",
+        "provider_reference": "provider-1",
+        "delivery_verified": True,
+        "delivery_status": "SUCCESS",
+        "delivered_dingtalk_user_ids": ["ding-user-a"],
+        "checked_at": NOW.isoformat(),
+        "evidence_source": "send_response",
+    }
     assert store.deliveries == 1
 
 

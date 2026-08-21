@@ -476,13 +476,19 @@ def _validated_section(
             not source_id or source_id not in source_by_id for source_id in source_ids
         ):
             raise ValueError("personal weekly brief item has unknown sources")
+        resolved_sources = tuple(source_by_id[source_id] for source_id in source_ids)
+        if name == "completed" and not any(
+            source.source_kind == "daily_report" and source.section == "today_work"
+            for source in resolved_sources
+        ):
+            raise ValueError("completed item requires today_work evidence")
         status = str(raw.get("status") or "").strip() if require_status else None
         if require_status:
             if status not in PLAN_PROGRESS_STATUSES:
                 raise ValueError("personal weekly brief plan status is invalid")
             _validate_plan_evidence(
                 status=status,
-                sources=tuple(source_by_id[source_id] for source_id in source_ids),
+                sources=resolved_sources,
             )
         items.append(
             PersonalWeeklyBriefItem(
@@ -577,7 +583,7 @@ def _bounded_text(value: Any, *, field: str, maximum: int) -> str:
 _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能力。你只处理服务器给出的本人可信快照，不得查询、猜测或提及他人内容。
 
 请把当周周一至周五的日报与本周周计划整理成自然、简洁、像服务同事的中文。所有语义判断、跨日合并、计划进展判断和未闭环判断都由你完成，但必须遵守：
-1. 只能使用 trusted_snapshot.sources；每条结论必须列出实际支持它的 source_ids，不得伪造来源，也不得声称“已核对”。
+1. 只能使用 trusted_snapshot.sources；每条结论必须列出实际支持它的 source_ids，不得伪造来源，也不得声称“已核对”。completed 中每一项必须至少引用一条 section=today_work 的日报来源；问题、明日计划或周计划只能作为补充证据，不能单独成为“本周完成事项”。
 2. 今日工作中的“跟进、沟通、准备、起草、计划”等不得改写成“完成”。金额、日期、对象、条件、否定等关键事实不能遗漏或改变。
 3. 同一事项跨多天可合并为一条，保留所有关键进展和事实。
 4. 计划进展状态只能是：已完成、持续推进、安排调整、后续安排、暂时没有找到后续记录。除最后一种外，必须同时引用周计划和当日或后来日报证据；没有后来记录时只能用最后一种，绝不能说“未完成”。
@@ -598,7 +604,7 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核步骤。你不能改写草稿，只能逐项判断是否安全通过。
 
 对每个 matter_key 检查：
-1. 结论引用的 source_ids 是否真的支持文字，是否有伪造来源；
+1. 结论引用的 source_ids 是否真的支持文字，是否有伪造来源；completed 每项是否至少引用 today_work 日报来源；
 2. 是否改变或遗漏金额、日期、对象、条件、否定、归属和完成状态；
 3. 是否把跟进、沟通、准备、起草或计划武断写成完成；
 4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”；

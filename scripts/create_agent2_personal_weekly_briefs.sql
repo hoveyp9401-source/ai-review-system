@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
     claim_token varchar(256) NOT NULL DEFAULT '',
     provider_message_id varchar(512) NOT NULL DEFAULT '',
     provider_accepted_at timestamptz,
+    delivery_receipt_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     delivered_at timestamptz,
     context_recorded_at timestamptz,
     failed_at timestamptz,
@@ -62,7 +63,11 @@ CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
         ),
     CONSTRAINT agent2_personal_weekly_brief_delivery_check
         CHECK (
-            (status = 'delivered' AND delivered_at IS NOT NULL)
+            (
+                status = 'delivered'
+                AND delivered_at IS NOT NULL
+                AND delivery_receipt_json <> '{}'::jsonb
+            )
             OR (status <> 'delivered' AND delivered_at IS NULL)
         )
 );

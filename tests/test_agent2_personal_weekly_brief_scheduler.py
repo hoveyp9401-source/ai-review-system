@@ -74,6 +74,27 @@ def test_generation_is_scheduled_for_saturday_0900_without_send_worker() -> None
     assert scheduler.jobs[0]["coalesce"] is True
 
 
+def test_schedule_is_fixed_to_shanghai_0900_even_if_unrelated_settings_differ() -> None:
+    scheduler = _Scheduler()
+
+    register_personal_weekly_brief_jobs(
+        scheduler,
+        settings=_settings(
+            timezone="UTC",
+            personal_weekly_brief_hour=18,
+            personal_weekly_brief_minute=45,
+            agent2_personal_weekly_brief_enabled=True,
+            agent2_personal_weekly_brief_tenant_id="tenant-a",
+        ),
+        generation_job=_noop,
+        reconciliation_job=_noop,
+    )
+
+    trigger = scheduler.jobs[0]["trigger"]
+    assert str(trigger) == "cron[day_of_week='sat', hour='9', minute='0']"
+    assert str(trigger.timezone) == "Asia/Shanghai"
+
+
 def test_send_worker_is_registered_only_with_separate_send_switch() -> None:
     scheduler = _Scheduler()
 

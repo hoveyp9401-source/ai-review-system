@@ -44,6 +44,7 @@ _briefs = Table(
     Column("claim_token", String(256), nullable=False),
     Column("provider_message_id", String(512), nullable=False),
     Column("provider_accepted_at", DateTime(timezone=True)),
+    Column("delivery_receipt_json", JSONB, nullable=False),
     Column("delivered_at", DateTime(timezone=True)),
     Column("context_recorded_at", DateTime(timezone=True)),
     Column("failed_at", DateTime(timezone=True)),
@@ -76,6 +77,7 @@ class PersonalWeeklyBriefRecord:
     claim_token: str = ""
     provider_message_id: str = ""
     provider_accepted_at: datetime | None = None
+    delivery_receipt_json: dict[str, Any] | None = None
     delivered_at: datetime | None = None
     context_recorded_at: datetime | None = None
     failed_at: datetime | None = None
@@ -250,14 +252,22 @@ class SqlPersonalWeeklyBriefStore:
         await self.session.commit()
 
     async def record_delivery(
-        self, *, tenant_id: str, brief_id: str, changed_at: datetime
+        self,
+        *,
+        tenant_id: str,
+        brief_id: str,
+        delivery_receipt: dict[str, Any],
+        changed_at: datetime,
     ) -> PersonalWeeklyBriefRecord:
+        if not delivery_receipt:
+            raise ValueError("personal_weekly_brief_delivery_receipt_missing")
         return await self._transition(
             tenant_id=tenant_id,
             brief_id=brief_id,
             from_status="delivery_pending",
             values={
                 "status": "delivered",
+                "delivery_receipt_json": delivery_receipt,
                 "delivered_at": changed_at,
                 "updated_at": changed_at,
             },
@@ -362,6 +372,7 @@ def _record_values(row: PersonalWeeklyBriefRecord) -> dict[str, Any]:
         "claim_token": row.claim_token,
         "provider_message_id": row.provider_message_id,
         "provider_accepted_at": row.provider_accepted_at,
+        "delivery_receipt_json": row.delivery_receipt_json or {},
         "delivered_at": row.delivered_at,
         "context_recorded_at": row.context_recorded_at,
         "failed_at": row.failed_at,
@@ -392,6 +403,7 @@ def _record_from_row(row: Any) -> PersonalWeeklyBriefRecord:
         claim_token=row["claim_token"],
         provider_message_id=row["provider_message_id"],
         provider_accepted_at=row["provider_accepted_at"],
+        delivery_receipt_json=dict(row["delivery_receipt_json"] or {}),
         delivered_at=row["delivered_at"],
         context_recorded_at=row["context_recorded_at"],
         failed_at=row["failed_at"],

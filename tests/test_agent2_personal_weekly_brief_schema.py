@@ -14,5 +14,7 @@ def test_personal_weekly_brief_migration_is_transactional_and_idempotent() -> No
     assert "length(source_fingerprint) = 64" in sql
     assert "'delivery_pending', 'delivered'" in sql
     assert "provider_accepted_at IS NOT NULL" in sql
-    assert "status = 'delivered' AND delivered_at IS NOT NULL" in sql
+    assert "status = 'delivered'" in sql
+    assert "AND delivered_at IS NOT NULL" in sql
+    assert "delivery_receipt_json <> '{}'::jsonb" in sql
     assert "context_recorded_at IS NULL" in sql

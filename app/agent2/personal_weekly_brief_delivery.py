@@ -190,6 +190,11 @@ class PersonalWeeklyBriefDispatcher:
         return await self._store.record_delivery(
             tenant_id=row.tenant_id,
             brief_id=row.brief_id,
+            delivery_receipt=_verified_delivery_receipt(
+                delivery,
+                checked_at=changed_at,
+                evidence_source="send_response",
+            ),
             changed_at=changed_at,
         )
 
@@ -231,6 +236,11 @@ class PersonalWeeklyBriefDispatcher:
         return await self._store.record_delivery(
             tenant_id=row.tenant_id,
             brief_id=row.brief_id,
+            delivery_receipt=_verified_delivery_receipt(
+                delivery,
+                checked_at=changed_at,
+                evidence_source="delivery_query",
+            ),
             changed_at=changed_at,
         )
 
@@ -254,6 +264,32 @@ class PersonalWeeklyBriefDispatcher:
             or not recipient.dingtalk_user_id.strip()
         ):
             raise ValueError("personal_weekly_brief_scope_invalid")
+
+
+def _verified_delivery_receipt(
+    delivery: PersonalWeeklyBriefDelivery,
+    *,
+    checked_at: datetime,
+    evidence_source: str,
+) -> dict[str, object]:
+    if (
+        checked_at.tzinfo is None
+        or checked_at.utcoffset() is None
+        or not delivery.provider_reference.strip()
+        or delivery.delivery_verified is not True
+        or not delivery.delivered_dingtalk_user_ids
+        or evidence_source not in {"send_response", "delivery_query"}
+    ):
+        raise ValueError("personal_weekly_brief_delivery_receipt_invalid")
+    return {
+        "schema_version": "agent2.personal_weekly_brief.delivery.v1",
+        "provider_reference": delivery.provider_reference,
+        "delivery_verified": True,
+        "delivery_status": "SUCCESS",
+        "delivered_dingtalk_user_ids": list(delivery.delivered_dingtalk_user_ids),
+        "checked_at": checked_at.isoformat(),
+        "evidence_source": evidence_source,
+    }
 
 
 __all__ = [

@@ -117,6 +117,7 @@ _DAILY_BRIEFING_EVENT_ACTIONS = frozenset(
         "daily_briefing_sent",
     }
 )
+PERSONAL_WEEKLY_BRIEF_TIMEZONE = "Asia/Shanghai"
 
 
 class DailyBriefingResumeConflict(RuntimeError):
@@ -296,9 +297,9 @@ def register_personal_weekly_brief_jobs(
         generation_job,
         CronTrigger(
             day_of_week="sat",
-            hour=settings.personal_weekly_brief_hour,
-            minute=settings.personal_weekly_brief_minute,
-            timezone=settings.timezone,
+            hour=9,
+            minute=0,
+            timezone=PERSONAL_WEEKLY_BRIEF_TIMEZONE,
         ),
         id="agent2_personal_weekly_brief_generate",
         replace_existing=True,
@@ -309,7 +310,10 @@ def register_personal_weekly_brief_jobs(
     if getattr(settings, "agent2_personal_weekly_brief_send_enabled", False) is True:
         scheduler.add_job(
             reconciliation_job,
-            IntervalTrigger(minutes=5, timezone=settings.timezone),
+            IntervalTrigger(
+                minutes=5,
+                timezone=PERSONAL_WEEKLY_BRIEF_TIMEZONE,
+            ),
             id="agent2_personal_weekly_brief_reconcile",
             replace_existing=True,
             max_instances=1,
@@ -336,12 +340,12 @@ async def run_personal_weekly_brief_generation_job(
         or tenant_id is None
     ):
         return {"staged": 0, "generated": 0, "generation_failed": 0, "dispatched": 0}
-    local_now = now.astimezone(ZoneInfo(settings.timezone))
+    local_now = _personal_weekly_local_now(now)
     if local_now.weekday() != 5:
         raise ValueError("personal_weekly_brief_generation_requires_saturday")
     window = derive_personal_weekly_brief_window(
         local_now,
-        timezone_name=settings.timezone,
+        timezone_name=PERSONAL_WEEKLY_BRIEF_TIMEZONE,
     )
 
     # Establish one repeatable database view before reading any of the 74
@@ -493,10 +497,10 @@ async def run_personal_weekly_brief_dispatch_job(
         or tenant_id is None
     ):
         return 0
-    local_now = now.astimezone(ZoneInfo(settings.timezone))
+    local_now = _personal_weekly_local_now(now)
     target_week_start = week_start or derive_personal_weekly_brief_window(
         local_now,
-        timezone_name=settings.timezone,
+        timezone_name=PERSONAL_WEEKLY_BRIEF_TIMEZONE,
     ).week_start
     if targets is None:
         async with AsyncSessionLocal() as scope_session:
@@ -560,7 +564,7 @@ async def run_personal_weekly_brief_reconcile_job(
         or tenant_id is None
     ):
         return 0
-    local_now = now.astimezone(ZoneInfo(settings.timezone))
+    local_now = _personal_weekly_local_now(now)
     async with AsyncSessionLocal() as scope_session:
         targets = await load_personal_weekly_brief_targets(
             scope_session,
@@ -628,6 +632,12 @@ def _personal_weekly_recipient(
     )
 
 
+def _personal_weekly_local_now(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("personal weekly brief time must be timezone-aware")
+    return value.astimezone(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE))
+
+
 async def _record_personal_weekly_brief_context(
     *,
     tenant_id: str,
@@ -647,6 +657,17 @@ async def _record_personal_weekly_brief_context(
         )
         if user is None:
             raise RuntimeError("personal weekly brief delivered user identity changed")
+        receipt = dict(row.delivery_receipt_json or {})
+        delivered_user_ids = receipt.get("delivered_dingtalk_user_ids")
+        if not (
+            receipt.get("schema_version")
+            == "agent2.personal_weekly_brief.delivery.v1"
+            and receipt.get("provider_reference") == row.provider_message_id
+            and receipt.get("delivery_verified") is True
+            and receipt.get("delivery_status") == "SUCCESS"
+            and delivered_user_ids == [target.dingtalk_user_id]
+        ):
+            raise RuntimeError("personal weekly brief stored delivery receipt is invalid")
         await record_verified_outbound_context_message(
             session,
             user=user,
@@ -656,11 +677,11 @@ async def _record_personal_weekly_brief_context(
             delivery_receipt={
                 "deliveryVerified": True,
                 "deliveryStatus": "SUCCESS",
-                "deliveryRecipientUserIds": [target.dingtalk_user_id],
+                "deliveryRecipientUserIds": delivered_user_ids,
                 "invalidStaffIdList": [],
                 "filteredStaffIdList": [],
                 "flowControlledStaffIdList": [],
-                "processQueryKey": row.provider_message_id,
+                "processQueryKey": receipt["provider_reference"],
             },
             sent_at=row.delivered_at or changed_at,
         )
@@ -1620,7 +1641,7 @@ async def run_scheduler() -> None:
             settings,
             llm_client=llm_client,
             robot=robot,
-            now=datetime.now(ZoneInfo(settings.timezone)),
+            now=datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)),
         )
         if any(result.values()):
             logger.info("Agent2 personal weekly brief result=%s", result)
@@ -1629,7 +1650,7 @@ async def run_scheduler() -> None:
         delivered = await run_personal_weekly_brief_reconcile_job(
             settings,
             robot=robot,
-            now=datetime.now(ZoneInfo(settings.timezone)),
+            now=datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)),
         )
         if delivered:
             logger.info(
