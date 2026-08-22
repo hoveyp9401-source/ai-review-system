@@ -1,0 +1,42 @@
+{
+  "schema_version": "agent2.personal_weekly_brief.real_model_rerun_failures.v1",
+  "status": "FAIL",
+  "recorded_at": "2026-08-22T12:22:33+08:00",
+  "model": "deepseek-v4-flash",
+  "matrix_attempts": 2,
+  "matrix_attempts_completed": 0,
+  "failures": [
+    {
+      "attempt": 1,
+      "case_id": "cross_day_five_statuses",
+      "stage": "generation",
+      "error_type": "httpx.RemoteProtocolError",
+      "configured_transport_attempts_exhausted": 2
+    },
+    {
+      "attempt": 2,
+      "case_id": "cross_day_five_statuses",
+      "stage": "independent_review",
+      "error_type": "httpx.RemoteProtocolError",
+      "configured_transport_attempts_exhausted": 2
+    }
+  ],
+  "previous_success_artifact": {
+    "path": "review-evidence/personal-weekly-brief-real-model-eval.json",
+    "last_success_at": "2026-08-22T11:35:34+08:00",
+    "preserved_by_atomic_output": true
+  },
+  "safety_attestation": {
+    "loaded_config_fields": [
+      "LLM_API_KEY",
+      "LLM_BASE_URL",
+      "LLM_MAX_RETRIES",
+      "LLM_TIMEOUT_SECONDS"
+    ],
+    "database_accessed": false,
+    "dingtalk_transport_called": false,
+    "real_user_data_used": false,
+    "secret_written_to_artifact": false
+  },
+  "release_impact": "BLOCKED_PENDING_MODEL_SERVICE_STABILITY_EVIDENCE"
+}

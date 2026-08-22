@@ -53,6 +53,7 @@ class _Store:
             self.record,
             status="claimed",
             claim_token=kwargs["claim_token"],
+            send_started_at=kwargs["changed_at"],
         )
         return self.record
 
@@ -78,6 +79,7 @@ class _Store:
             self.record,
             status="delivered",
             delivered_at=kwargs["changed_at"],
+            final_verified_at=kwargs["changed_at"],
             delivery_receipt_json=kwargs["delivery_receipt"],
         )
         return self.record
@@ -217,6 +219,46 @@ async def test_only_exact_recipient_delivery_is_recorded_as_delivered() -> None:
         "evidence_source": "send_response",
     }
     assert store.deliveries == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_records_distinct_observed_send_acceptance_and_verification_times() -> None:
+    store = _Store()
+    transport = _Transport(
+        PersonalWeeklyBriefDelivery(
+            provider_reference="provider-timeline",
+            delivery_verified=True,
+            delivered_dingtalk_user_ids=("ding-user-a",),
+        )
+    )
+    observed = iter(
+        (
+            NOW.replace(second=11),
+            NOW.replace(second=19),
+        )
+    )
+    dispatcher = PersonalWeeklyBriefDispatcher(
+        store=store,
+        transport=transport,
+        tenant_id="tenant-a",
+        allowed_user_ids=frozenset({"user-a"}),
+        clock=lambda: next(observed),
+    )
+
+    delivered = await dispatcher.dispatch(
+        row=_record(),
+        recipient=_recipient(),
+        changed_at=NOW.replace(second=3),
+        claim_token="claim-timeline",
+    )
+
+    assert delivered.send_started_at == NOW.replace(second=3)
+    assert delivered.provider_accepted_at == NOW.replace(second=11)
+    assert delivered.delivered_at == NOW.replace(second=19)
+    assert delivered.final_verified_at == NOW.replace(second=19)
+    assert delivered.delivery_receipt_json["checked_at"] == NOW.replace(
+        second=19
+    ).isoformat()
 
 
 @pytest.mark.asyncio

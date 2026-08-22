@@ -15,10 +15,10 @@
   "database_target": "ephemeral_local_postgresql_only",
   "dingtalk_messages_sent": 0,
   "failure": "",
-  "finished_at": "2026-08-22T03:39:33.370048+00:00",
+  "finished_at": "2026-08-22T04:15:04.469020+00:00",
   "listen_address": "127.0.0.1",
   "production_database_connections": 0,
   "schema_version": "agent2.personal_weekly_brief.postgres_isolated_gate.v1",
-  "started_at": "2026-08-22T03:38:41.297185+00:00",
+  "started_at": "2026-08-22T04:14:17.306053+00:00",
   "status": "PASS"
 }

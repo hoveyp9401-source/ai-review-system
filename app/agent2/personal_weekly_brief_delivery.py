@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -117,11 +118,13 @@ class PersonalWeeklyBriefDispatcher:
         transport: PersonalWeeklyBriefTransport,
         tenant_id: str,
         allowed_user_ids: frozenset[str],
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
         self._transport = transport
         self._tenant_id = tenant_id
         self._allowed_user_ids = allowed_user_ids
+        self._clock = clock
 
     async def dispatch(
         self,
@@ -161,7 +164,7 @@ class PersonalWeeklyBriefDispatcher:
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,
                 error=f"retry_safe_preacceptance:{type(exc).__name__}",
-                changed_at=changed_at,
+                changed_at=self._observed_at(changed_at),
                 expected_claim_token=claim_token,
             )
         except (OSError, RuntimeError, TimeoutError) as exc:
@@ -169,7 +172,7 @@ class PersonalWeeklyBriefDispatcher:
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,
                 error=f"transport_error:{type(exc).__name__}",
-                changed_at=changed_at,
+                changed_at=self._observed_at(changed_at),
                 expected_claim_token=claim_token,
             )
         if not delivery.provider_reference.strip():
@@ -177,15 +180,16 @@ class PersonalWeeklyBriefDispatcher:
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,
                 error="provider_reference_missing",
-                changed_at=changed_at,
+                changed_at=self._observed_at(changed_at),
                 expected_claim_token=claim_token,
             )
+        provider_accepted_at = self._observed_at(changed_at)
         pending = await self._store.record_provider_acceptance(
             tenant_id=row.tenant_id,
             brief_id=row.brief_id,
             provider_message_id=delivery.provider_reference,
             expected_claim_token=claim_token,
-            changed_at=changed_at,
+            changed_at=provider_accepted_at,
         )
         await self._store.persist_provider_acceptance()
         if not delivery.delivery_verified:
@@ -195,17 +199,18 @@ class PersonalWeeklyBriefDispatcher:
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,
                 error="delivery_recipient_mismatch",
-                changed_at=changed_at,
+                changed_at=self._observed_at(changed_at),
             )
+        verified_at = self._observed_at(changed_at)
         return await self._store.record_delivery(
             tenant_id=row.tenant_id,
             brief_id=row.brief_id,
             delivery_receipt=_verified_delivery_receipt(
                 delivery,
-                checked_at=changed_at,
+                checked_at=verified_at,
                 evidence_source="send_response",
             ),
-            changed_at=changed_at,
+            changed_at=verified_at,
         )
 
     async def reconcile_pending(
@@ -229,7 +234,7 @@ class PersonalWeeklyBriefDispatcher:
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,
                 error=f"delivery_query_terminal:{type(exc).__name__}",
-                changed_at=changed_at,
+                changed_at=self._observed_at(changed_at),
             )
         if not delivery.delivery_verified:
             return row
@@ -241,18 +246,25 @@ class PersonalWeeklyBriefDispatcher:
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,
                 error="delivery_recipient_mismatch",
-                changed_at=changed_at,
+                changed_at=self._observed_at(changed_at),
             )
+        verified_at = self._observed_at(changed_at)
         return await self._store.record_delivery(
             tenant_id=row.tenant_id,
             brief_id=row.brief_id,
             delivery_receipt=_verified_delivery_receipt(
                 delivery,
-                checked_at=changed_at,
+                checked_at=verified_at,
                 evidence_source="delivery_query",
             ),
-            changed_at=changed_at,
+            changed_at=verified_at,
         )
+
+    def _observed_at(self, fallback: datetime) -> datetime:
+        observed = self._clock() if self._clock is not None else fallback
+        if observed.tzinfo is None or observed.utcoffset() is None:
+            raise ValueError("personal_weekly_brief_clock_must_be_timezone_aware")
+        return observed
 
     def _validate_scope(
         self,

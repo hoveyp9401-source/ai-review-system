@@ -15,6 +15,7 @@ from app.scheduler.runner import (
     PERSONAL_WEEKLY_BRIEF_SEND_CONCURRENCY,
     recover_personal_weekly_brief_rows,
     run_bounded_personal_weekly_brief_model_batch,
+    run_bounded_personal_weekly_brief_send_batch,
     run_streaming_personal_weekly_brief_batch,
     stage_personal_weekly_brief_target_batch,
     run_personal_weekly_brief_dispatch_job,
@@ -135,7 +136,7 @@ def test_weekly_batch_is_not_wired_into_daily_chat_request_paths() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_batch_has_fixed_concurrency_and_isolates_one_user_failure() -> None:
+async def test_model_batch_has_fixed_concurrency_and_keeps_handled_owner_failure() -> None:
     active = 0
     maximum_active = 0
     completed: list[int] = []
@@ -147,7 +148,7 @@ async def test_model_batch_has_fixed_concurrency_and_isolates_one_user_failure()
         try:
             await asyncio.sleep(0.01)
             if value == 17:
-                raise RuntimeError("one redacted user failed")
+                return RuntimeError("one redacted user failed")
             completed.append(value)
             return value
         finally:
@@ -163,6 +164,92 @@ async def test_model_batch_has_fixed_concurrency_and_isolates_one_user_failure()
     assert len(results) == 74
     assert isinstance(results[17], RuntimeError)
     assert len(completed) == 73
+
+
+@pytest.mark.asyncio
+async def test_model_batch_propagates_unexpected_database_failure() -> None:
+    async def worker(value: int) -> int:
+        if value == 3:
+            raise SQLAlchemyError("isolated database unavailable")
+        await asyncio.sleep(0.01)
+        return value
+
+    with pytest.raises(SQLAlchemyError, match="database unavailable"):
+        await run_bounded_personal_weekly_brief_model_batch(
+            tuple(range(12)),
+            worker=worker,
+        )
+
+
+@pytest.mark.asyncio
+async def test_generation_start_database_failure_propagates_without_owner_failure_record(
+    monkeypatch,
+) -> None:
+    failure_recorded = False
+
+    class _Session:
+        async def commit(self):
+            raise AssertionError("generation start should fail before commit")
+
+    class _Sessions:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Store:
+        def __init__(self, _session):
+            pass
+
+        async def record_generation_started(self, **_kwargs):
+            raise SQLAlchemyError("generation database unavailable")
+
+        async def record_generation_failure(self, **_kwargs):
+            nonlocal failure_recorded
+            failure_recorded = True
+            raise AssertionError("system failure must not become an owner failure")
+
+    monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
+    monkeypatch.setattr(runner, "SqlPersonalWeeklyBriefStore", _Store)
+
+    with pytest.raises(SQLAlchemyError, match="database unavailable"):
+        await runner._generate_personal_weekly_brief_record(
+            row=_brief_record(1, status="snapshot_ready"),
+            target=SimpleNamespace(display_name="虚构用户甲"),
+            tenant_id="tenant-a",
+            model_pipeline=object(),
+            generator=object(),
+        )
+
+    assert failure_recorded is False
+
+
+@pytest.mark.asyncio
+async def test_send_batch_propagates_overall_scope_failure_and_cancels_remaining() -> None:
+    from app.agent2.personal_weekly_brief_scope import (
+        PersonalWeeklyBriefOverallScopeError,
+    )
+
+    started: list[int] = []
+
+    async def worker(value: int) -> int:
+        started.append(value)
+        if value == 1:
+            raise PersonalWeeklyBriefOverallScopeError("formal scope changed")
+        await asyncio.sleep(0.05)
+        return value
+
+    with pytest.raises(PersonalWeeklyBriefOverallScopeError, match="scope changed"):
+        await run_bounded_personal_weekly_brief_send_batch(
+            tuple(range(74)),
+            worker=worker,
+        )
+
+    assert len(started) < 74
 
 
 @pytest.mark.asyncio

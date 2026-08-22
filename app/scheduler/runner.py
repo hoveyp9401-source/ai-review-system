@@ -345,10 +345,7 @@ async def run_bounded_personal_weekly_brief_model_batch(
 
     async def run_one(row):
         async with semaphore:
-            try:
-                return await worker(row)
-            except Exception as exc:  # one owner must not cancel the other 73
-                return exc
+            return await worker(row)
 
     return tuple(await asyncio.gather(*(run_one(row) for row in rows)))
 
@@ -404,10 +401,16 @@ async def run_streaming_personal_weekly_brief_batch(
         asyncio.create_task(sender())
         for _ in range(PERSONAL_WEEKLY_BRIEF_SEND_CONCURRENCY)
     )
-    generated = await run_bounded_personal_weekly_brief_model_batch(
-        rows,
-        worker=generate_and_enqueue,
-    )
+    try:
+        generated = await run_bounded_personal_weekly_brief_model_batch(
+            rows,
+            worker=generate_and_enqueue,
+        )
+    except Exception:
+        for task in sender_tasks:
+            task.cancel()
+        await asyncio.gather(*sender_tasks, return_exceptions=True)
+        raise
     await queue.join()
     for _ in sender_tasks:
         await queue.put(None)
@@ -415,6 +418,26 @@ async def run_streaming_personal_weekly_brief_batch(
     if fatal_send_errors:
         raise fatal_send_errors[0]
     return generated, tuple(send_results)
+
+
+async def run_bounded_personal_weekly_brief_send_batch(rows, *, worker):
+    """Send with two workers; any unexpected/system error stops the batch."""
+
+    semaphore = asyncio.Semaphore(PERSONAL_WEEKLY_BRIEF_SEND_CONCURRENCY)
+
+    async def run_one(row):
+        async with semaphore:
+            return await worker(row)
+
+    tasks = tuple(asyncio.create_task(run_one(row)) for row in rows)
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except Exception:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def stage_personal_weekly_brief_target_batch(
@@ -455,20 +478,21 @@ async def _generate_personal_weekly_brief_record(
     tenant_id: str,
     model_pipeline: Agent2PersonalWeeklyBriefModelPipeline,
     generator: Agent2PersonalWeeklyBriefGenerator,
-    changed_at: datetime,
 ):
     loop = asyncio.get_running_loop()
     owner_started = loop.time()
+    async with AsyncSessionLocal() as start_session:
+        row = await SqlPersonalWeeklyBriefStore(
+            start_session
+        ).record_generation_started(
+            tenant_id=tenant_id,
+            brief_id=row.brief_id,
+            changed_at=datetime.now(
+                ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)
+            ),
+        )
+        await start_session.commit()
     try:
-        async with AsyncSessionLocal() as start_session:
-            row = await SqlPersonalWeeklyBriefStore(
-                start_session
-            ).record_generation_started(
-                tenant_id=tenant_id,
-                brief_id=row.brief_id,
-                changed_at=changed_at,
-            )
-            await start_session.commit()
         snapshot = PersonalWeeklyBriefSnapshot.from_payload(row.source_snapshot)
         if snapshot.fingerprint != row.source_fingerprint:
             raise ValueError("personal weekly brief source fingerprint mismatch")
@@ -490,43 +514,6 @@ async def _generate_personal_weekly_brief_record(
             salutation=salutation,
             authenticated_display_name=target.display_name,
         )
-        async with AsyncSessionLocal() as write_session:
-            generated_row = await SqlPersonalWeeklyBriefStore(
-                write_session
-            ).record_generation(
-                tenant_id=tenant_id,
-                brief_id=row.brief_id,
-                source_fingerprint=row.source_fingerprint,
-                content_json={
-                    **content.as_payload(),
-                    "trace": content.trace_payload(),
-                    "model_review": model_outcome.review,
-                    "model_metrics": {
-                        "model_calls": model_outcome.model_calls,
-                        "semantic_attempts": model_outcome.semantic_attempts,
-                        "generation_seconds": [
-                            round(value, 3)
-                            for value in model_outcome.generation_seconds
-                        ],
-                        "review_seconds": [
-                            round(value, 3)
-                            for value in model_outcome.review_seconds
-                        ],
-                        "model_pipeline_seconds": round(
-                            model_outcome.total_seconds, 3
-                        ),
-                        "total_seconds": round(loop.time() - owner_started, 3),
-                        "concurrency_limit": PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY,
-                        "timeout_seconds_per_attempt": CANARY_TIMEOUT_SECONDS,
-                        "max_attempts_per_call": CANARY_MAX_REQUEST_ATTEMPTS,
-                    },
-                },
-                message_text=message_text,
-                llm_model=generator.model,
-                changed_at=changed_at,
-            )
-            await write_session.commit()
-        return generated_row
     except (
         ValueError,
         TimeoutError,
@@ -547,12 +534,53 @@ async def _generate_personal_weekly_brief_record(
                     tenant_id=tenant_id,
                     brief_id=row.brief_id,
                     error=f"generation_error:{type(exc).__name__}",
-                    changed_at=changed_at,
+                    changed_at=datetime.now(
+                        ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)
+                    ),
                 )
                 await failure_session.commit()
             except ValueError:
                 await failure_session.rollback()
         return False
+    async with AsyncSessionLocal() as write_session:
+        generated_row = await SqlPersonalWeeklyBriefStore(
+            write_session
+        ).record_generation(
+            tenant_id=tenant_id,
+            brief_id=row.brief_id,
+            source_fingerprint=row.source_fingerprint,
+            content_json={
+                **content.as_payload(),
+                "trace": content.trace_payload(),
+                "model_review": model_outcome.review,
+                "model_metrics": {
+                    "model_calls": model_outcome.model_calls,
+                    "semantic_attempts": model_outcome.semantic_attempts,
+                    "generation_seconds": [
+                        round(value, 3)
+                        for value in model_outcome.generation_seconds
+                    ],
+                    "review_seconds": [
+                        round(value, 3)
+                        for value in model_outcome.review_seconds
+                    ],
+                    "model_pipeline_seconds": round(
+                        model_outcome.total_seconds, 3
+                    ),
+                    "total_seconds": round(loop.time() - owner_started, 3),
+                    "concurrency_limit": PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY,
+                    "timeout_seconds_per_attempt": CANARY_TIMEOUT_SECONDS,
+                    "max_attempts_per_call": CANARY_MAX_REQUEST_ATTEMPTS,
+                },
+            },
+            message_text=message_text,
+            llm_model=generator.model,
+            changed_at=datetime.now(
+                ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)
+            ),
+        )
+        await write_session.commit()
+    return generated_row
 
 
 async def run_personal_weekly_brief_generation_job(
@@ -654,7 +682,6 @@ async def run_personal_weekly_brief_generation_job(
             tenant_id=tenant_id,
             model_pipeline=model_pipeline,
             generator=generator,
-            changed_at=datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)),
         )
 
     async def send_one(row):
@@ -765,6 +792,9 @@ async def _dispatch_personal_weekly_brief_record(
             transport=DingTalkPersonalWeeklyBriefTransport(robot),
             tenant_id=tenant_id,
             allowed_user_ids=frozenset({row.owner_user_id}),
+            clock=lambda: datetime.now(
+                ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)
+            ),
         ).dispatch(
             row=row,
             recipient=_personal_weekly_recipient(target),
@@ -835,10 +865,9 @@ async def run_personal_weekly_brief_dispatch_job(
             now=datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)),
         )
 
-    results = await run_bounded_personal_weekly_brief_model_batch(
+    results = await run_bounded_personal_weekly_brief_send_batch(
         rows,
         worker=send_row,
-        concurrency_limit=PERSONAL_WEEKLY_BRIEF_SEND_CONCURRENCY,
     )
     return sum(
         isinstance(result, PersonalWeeklyBriefRecord)
@@ -918,9 +947,6 @@ async def run_personal_weekly_brief_reconcile_job(
                 tenant_id=tenant_id,
                 model_pipeline=model_pipeline,
                 generator=generator,
-                changed_at=datetime.now(
-                    ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)
-                ),
             )
 
         async def send_recovered(row):
@@ -999,6 +1025,9 @@ async def run_personal_weekly_brief_reconcile_job(
                 transport=DingTalkPersonalWeeklyBriefTransport(robot),
                 tenant_id=tenant_id,
                 allowed_user_ids=frozenset({row.owner_user_id}),
+                clock=lambda: datetime.now(
+                    ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)
+                ),
             ).reconcile_pending(
                 row=row,
                 recipient=_personal_weekly_recipient(target),
