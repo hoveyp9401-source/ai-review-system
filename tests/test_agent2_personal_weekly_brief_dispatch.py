@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 from app.services.dingtalk import DingTalkOutboundContentError
 
@@ -117,6 +118,38 @@ def _recipient(user_id: str = "user-a") -> PersonalWeeklyBriefRecipient:
         dingtalk_user_id=f"ding-{user_id}",
         conversation_id=f"conversation-{user_id[-1]}",
     )
+
+
+@pytest.mark.asyncio
+async def test_http_400_before_provider_acceptance_is_retry_safe_failure() -> None:
+    store = _Store()
+
+    class _RejectedTransport:
+        async def send_private_text_accepted(self, **_kwargs):
+            request = httpx.Request("POST", "https://api.dingtalk.invalid/send")
+            response = httpx.Response(400, request=request)
+            raise httpx.HTTPStatusError(
+                "rejected before acceptance",
+                request=request,
+                response=response,
+            )
+
+    failed = await PersonalWeeklyBriefDispatcher(
+        store=store,
+        transport=_RejectedTransport(),
+        tenant_id="tenant-a",
+        allowed_user_ids=frozenset({"user-a"}),
+    ).dispatch(
+        row=_record(),
+        recipient=_recipient(),
+        changed_at=NOW,
+        claim_token="claim-http-400",
+    )
+
+    assert failed.status == "failed"
+    assert failed.last_error == "retry_safe_preacceptance:HTTPStatusError:400"
+    assert store.acceptances == 0
+    assert store.deliveries == 0
 
 
 @pytest.mark.asyncio

@@ -200,6 +200,7 @@ class Settings(BaseSettings):
     dingtalk_agent_id: str = ""
     dingtalk_app_key: str = ""
     dingtalk_app_secret: str = ""
+    dingtalk_robot_code: str = ""
     dingtalk_api_base_url: str = "https://api.dingtalk.com"
     dingtalk_oapi_base_url: str = "https://oapi.dingtalk.com"
 

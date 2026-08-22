@@ -299,6 +299,12 @@ class DingTalkRobotClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    def direct_robot_code(self) -> str:
+        return str(
+            getattr(self.settings, "dingtalk_robot_code", "")
+            or self.settings.dingtalk_app_key
+        ).strip()
+
     def has_enterprise_app(self) -> bool:
         return bool(self.settings.dingtalk_app_key and self.settings.dingtalk_app_secret and self.settings.dingtalk_agent_id)
 
@@ -389,7 +395,8 @@ class DingTalkRobotClient:
         user_ids = [user_id for user_id in user_ids if user_id]
         if not user_ids:
             return {"processQueryKey": None, "invalidStaffIdList": [], "filteredStaffIdList": [], "flowControlledStaffIdList": []}
-        if not self.settings.dingtalk_app_key:
+        robot_code = self.direct_robot_code()
+        if not robot_code:
             raise ValueError("DingTalk app key is not configured.")
 
         access_token = await self.get_enterprise_access_token()
@@ -397,7 +404,7 @@ class DingTalkRobotClient:
             f"{self._api_base_url}/v1.0/robot/oToMessages/batchSend",
             headers={"x-acs-dingtalk-access-token": access_token},
             json={
-                "robotCode": self.settings.dingtalk_app_key,
+                "robotCode": robot_code,
                 "userIds": user_ids,
                 "msgKey": "sampleText",
                 "msgParam": json.dumps({"content": text}, ensure_ascii=False),
@@ -431,7 +438,8 @@ class DingTalkRobotClient:
         user_ids = [user_id for user_id in user_ids if user_id]
         if not user_ids:
             return {"processQueryKey": None, "invalidStaffIdList": [], "filteredStaffIdList": [], "flowControlledStaffIdList": []}
-        if not self.settings.dingtalk_app_key:
+        robot_code = self.direct_robot_code()
+        if not robot_code:
             raise ValueError("DingTalk app key is not configured.")
 
         access_token = await self.get_enterprise_access_token()
@@ -439,7 +447,7 @@ class DingTalkRobotClient:
             f"{self._api_base_url}/v1.0/robot/oToMessages/batchSend",
             headers={"x-acs-dingtalk-access-token": access_token},
             json={
-                "robotCode": self.settings.dingtalk_app_key,
+                "robotCode": robot_code,
                 "userIds": user_ids,
                 "msgKey": "sampleMarkdown",
                 "msgParam": json.dumps({"title": title, "text": text}, ensure_ascii=False),
@@ -512,7 +520,7 @@ class DingTalkRobotClient:
             f"{self._api_base_url}/v1.0/robot/oToMessages/readStatus",
             headers={"x-acs-dingtalk-access-token": access_token},
             params={
-                "robotCode": self.settings.dingtalk_app_key,
+                "robotCode": self.direct_robot_code(),
                 "processQueryKey": process_query_key,
             },
         )

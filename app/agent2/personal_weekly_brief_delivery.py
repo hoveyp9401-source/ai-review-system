@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+import httpx
+
 from app.agent2.personal_weekly_brief_store import PersonalWeeklyBriefRecord
 
 
@@ -152,7 +154,21 @@ class PersonalWeeklyBriefDispatcher:
                 changed_at=self._observed_at(changed_at),
                 expected_claim_token=claim_token,
             )
-        except (OSError, RuntimeError, TimeoutError) as exc:
+        except httpx.HTTPStatusError as exc:
+            status_code = int(exc.response.status_code)
+            prefix = (
+                "retry_safe_preacceptance"
+                if 400 <= status_code < 500
+                else "transport_error"
+            )
+            return await self._store.record_failure(
+                tenant_id=row.tenant_id,
+                brief_id=row.brief_id,
+                error=f"{prefix}:{type(exc).__name__}:{status_code}",
+                changed_at=self._observed_at(changed_at),
+                expected_claim_token=claim_token,
+            )
+        except (OSError, RuntimeError, TimeoutError, httpx.RequestError) as exc:
             return await self._store.record_failure(
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,

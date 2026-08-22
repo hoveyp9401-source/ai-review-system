@@ -111,6 +111,48 @@ def _settings():
     )
 
 
+@pytest.mark.asyncio
+async def test_direct_message_uses_robot_code_separate_from_app_key():
+    observed = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"processQueryKey": "accepted-separated-robot"}
+
+    settings = _settings()
+    settings.dingtalk_robot_code = "active-robot-code"
+    client = DingTalkRobotClient(settings)
+    client.get_enterprise_access_token = lambda: None
+
+    async def access_token():
+        return "token"
+
+    async def post(*args, **kwargs):
+        observed["send_json"] = kwargs["json"]
+        return Response()
+
+    async def get(*args, **kwargs):
+        observed["status_params"] = kwargs["params"]
+        return Response()
+
+    client.get_enterprise_access_token = access_token
+    client._client.post = post
+    client._client.get = get
+    try:
+        await client.send_robot_direct_text(user_ids=["staff-1"], text="hello")
+        await client.get_robot_direct_message_status(
+            process_query_key="accepted-separated-robot"
+        )
+    finally:
+        await client.close()
+
+    assert observed["send_json"]["robotCode"] == "active-robot-code"
+    assert observed["status_params"]["robotCode"] == "active-robot-code"
+
+
 @pytest.mark.parametrize(
     "text",
     [
