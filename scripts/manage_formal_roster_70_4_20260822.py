@@ -5,6 +5,8 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -62,6 +64,12 @@ def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _load_backup(path: Path) -> dict[str, Any]:
+    metadata = path.stat()
+    if os.name != "nt":
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise RuntimeError("roster backup must have mode 0600")
+        if metadata.st_uid != os.geteuid():
+            raise RuntimeError("roster backup owner mismatch")
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError("roster backup schema mismatch")
@@ -199,6 +207,114 @@ async def _center_team(session: Any, *, lock: bool) -> dict[str, Any]:
     }
 
 
+def _json_safe_row(row: Any) -> dict[str, Any]:
+    return {
+        key: value.isoformat() if isinstance(value, (date, datetime)) else value
+        for key, value in row.items()
+    }
+
+
+async def _table_exists(session: Any, table_name: str) -> bool:
+    return bool(
+        await session.scalar(
+            text("SELECT to_regclass(:table_name) IS NOT NULL"),
+            {"table_name": f"public.{table_name}"},
+        )
+    )
+
+
+async def _snapshot_query(
+    session: Any,
+    *,
+    sql: str,
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    rows = [
+        _json_safe_row(row)
+        for row in (await session.execute(text(sql), parameters)).mappings().all()
+    ]
+    return {"count": len(rows), "sha256": _digest({"rows": rows})}
+
+
+async def _dependency_snapshot(
+    session: Any,
+    *,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    user_ids = [str(row["user_id"]) for row in rows]
+    if len(user_ids) != 2:
+        raise RuntimeError("dependency snapshot requires exactly two target users")
+    parameters = {
+        "first_user_id": user_ids[0],
+        "second_user_id": user_ids[1],
+        "effective_date": EFFECTIVE_DATE,
+    }
+    snapshots: dict[str, Any] = {
+        "daily_reports": await _snapshot_query(
+            session,
+            sql="""
+                SELECT id::text AS id, user_id::text AS user_id,
+                       team_id::text AS team_id, date
+                FROM daily_reports
+                WHERE user_id IN (
+                    CAST(:first_user_id AS uuid), CAST(:second_user_id AS uuid)
+                )
+                  AND date >= :effective_date
+                ORDER BY id
+            """,
+            parameters=parameters,
+        ),
+        "access_assignments": await _snapshot_query(
+            session,
+            sql="""
+                SELECT assignment_id::text AS assignment_id,
+                       principal_user_id, dashboard_role,
+                       team_id::text AS team_id, effective_from,
+                       effective_to, active, source
+                FROM legal_daily_access_assignments
+                WHERE principal_user_id IN (:first_user_id, :second_user_id)
+                ORDER BY assignment_id
+            """,
+            parameters=parameters,
+        ),
+    }
+    if await _table_exists(session, "agent2_weekly_plan_roster_members"):
+        snapshots["weekly_plan_roster_members"] = await _snapshot_query(
+            session,
+            sql="""
+                SELECT roster_member_id::text AS roster_member_id,
+                       user_id, team_id, team_name, created_at
+                FROM agent2_weekly_plan_roster_members
+                WHERE user_id IN (:first_user_id, :second_user_id)
+                ORDER BY roster_member_id
+            """,
+            parameters=parameters,
+        )
+    else:
+        snapshots["weekly_plan_roster_members"] = {
+            "count": 0,
+            "sha256": _digest({"rows": []}),
+        }
+    if await _table_exists(session, "agent2_personal_weekly_briefs"):
+        snapshots["personal_weekly_briefs"] = await _snapshot_query(
+            session,
+            sql="""
+                SELECT brief_id::text AS brief_id, owner_user_id,
+                       week_start, status, created_at
+                FROM agent2_personal_weekly_briefs
+                WHERE owner_user_id IN (:first_user_id, :second_user_id)
+                ORDER BY brief_id
+            """,
+            parameters=parameters,
+        )
+    else:
+        snapshots["personal_weekly_briefs"] = {
+            "count": 0,
+            "sha256": _digest({"rows": []}),
+        }
+    return snapshots
+
+
 def _validate_before(
     *,
     counts: dict[str, int],
@@ -236,6 +352,7 @@ async def backup(path: Path) -> None:
         counts = await _global_counts(session, on_date=EFFECTIVE_DATE)
         rows = await _target_rows(session, lock=False)
         center_team = await _center_team(session, lock=False)
+        dependencies = await _dependency_snapshot(session, rows=rows)
     _validate_before(counts=counts, rows=rows, center_team=center_team)
     unsigned: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -245,6 +362,7 @@ async def backup(path: Path) -> None:
         "before_counts": counts,
         "center_team": center_team,
         "memberships": rows,
+        "dependencies": dependencies,
         "new_membership_ids": {
             row["user_name"]: str(uuid4()) for row in rows
         },
@@ -264,6 +382,7 @@ async def apply(path: Path) -> None:
     async with AsyncSessionLocal() as session:
         async with session.begin():
             await _apply_in_transaction(session, payload)
+            await _verify_in_session(session, expected="after", payload=payload)
     await verify(expected="after")
     print(json.dumps({"action": "apply", "target_count": 2, "effective_date": EFFECTIVE_DATE.isoformat()}))
 
@@ -275,6 +394,8 @@ async def _apply_in_transaction(session: Any, payload: dict[str, Any]) -> None:
     _validate_before(counts=counts, rows=rows, center_team=center_team)
     if rows != _expected_before_from_backup(payload) or center_team != payload["center_team"]:
         raise RuntimeError("production roster changed after backup; refusing apply")
+    if await _dependency_snapshot(session, rows=rows) != payload.get("dependencies"):
+        raise RuntimeError("related production records changed after backup; refusing apply")
     for row in rows:
         closed = await session.execute(
             text(
@@ -338,7 +459,8 @@ async def _apply_in_transaction(session: Any, payload: dict[str, Any]) -> None:
             raise RuntimeError("user team changed during apply")
 
 
-async def _after_rows(session: Any) -> list[dict[str, Any]]:
+async def _after_rows(session: Any, *, lock: bool = False) -> list[dict[str, Any]]:
+    suffix = " FOR UPDATE OF memberships, users, teams" if lock else ""
     rows = (
         (
             await session.execute(
@@ -346,6 +468,7 @@ async def _after_rows(session: Any) -> list[dict[str, Any]]:
                     """
                     SELECT
                         memberships.membership_id::text AS membership_id,
+                        memberships.tenant_id,
                         memberships.user_id::text AS user_id,
                         memberships.team_id::text AS team_id,
                         memberships.member_role,
@@ -355,7 +478,8 @@ async def _after_rows(session: Any) -> list[dict[str, Any]]:
                         memberships.data_complete,
                         users.name AS user_name,
                         users.team_id::text AS user_team_id,
-                        teams.code AS team_code
+                        teams.code AS team_code,
+                        teams.name AS team_name
                     FROM legal_daily_team_memberships memberships
                     JOIN users ON users.id = memberships.user_id
                     JOIN teams ON teams.id = memberships.team_id
@@ -367,6 +491,7 @@ async def _after_rows(session: Any) -> list[dict[str, Any]]:
                       )
                     ORDER BY users.name, memberships.membership_id
                     """
+                    + suffix
                 ),
                 {
                     "effective_date": EFFECTIVE_DATE,
@@ -378,7 +503,88 @@ async def _after_rows(session: Any) -> list[dict[str, Any]]:
         .mappings()
         .all()
     )
-    return [dict(row) for row in rows]
+    return [_json_safe_row(row) for row in rows]
+
+
+def _expected_after_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    center_team = payload["center_team"]
+    expected = []
+    for row in _expected_before_from_backup(payload):
+        expected.append(
+            {
+                "membership_id": payload["new_membership_ids"][row["user_name"]],
+                "tenant_id": row["tenant_id"],
+                "user_id": row["user_id"],
+                "team_id": center_team["team_id"],
+                "member_role": row["member_role"],
+                "effective_from": EFFECTIVE_DATE.isoformat(),
+                "effective_to": None,
+                "source": SOURCE,
+                "data_complete": True,
+                "user_name": row["user_name"],
+                "user_team_id": center_team["team_id"],
+                "team_code": center_team["code"],
+                "team_name": center_team["name"],
+            }
+        )
+    return sorted(expected, key=lambda item: (item["user_name"], item["membership_id"]))
+
+
+async def _closed_original_rows(
+    session: Any,
+    *,
+    payload: dict[str, Any],
+    lock: bool,
+) -> list[dict[str, Any]]:
+    backup_rows = _expected_before_from_backup(payload)
+    suffix = " FOR UPDATE" if lock else ""
+    rows = (
+        (
+            await session.execute(
+                text(
+                    """
+                    SELECT membership_id::text AS membership_id, tenant_id,
+                           user_id::text AS user_id, team_id::text AS team_id,
+                           member_role, effective_from, effective_to,
+                           source, data_complete
+                    FROM legal_daily_team_memberships
+                    WHERE membership_id IN (
+                        CAST(:first_membership_id AS uuid),
+                        CAST(:second_membership_id AS uuid)
+                    )
+                    ORDER BY membership_id
+                    """
+                    + suffix
+                ),
+                {
+                    "first_membership_id": backup_rows[0]["membership_id"],
+                    "second_membership_id": backup_rows[1]["membership_id"],
+                },
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return [_json_safe_row(row) for row in rows]
+
+
+def _expected_closed_original_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    expected = []
+    for row in _expected_before_from_backup(payload):
+        expected.append(
+            {
+                "membership_id": row["membership_id"],
+                "tenant_id": row["tenant_id"],
+                "user_id": row["user_id"],
+                "team_id": row["team_id"],
+                "member_role": row["member_role"],
+                "effective_from": row["effective_from"],
+                "effective_to": (EFFECTIVE_DATE - timedelta(days=1)).isoformat(),
+                "source": row["source"],
+                "data_complete": row["data_complete"],
+            }
+        )
+    return sorted(expected, key=lambda item: item["membership_id"])
 
 
 async def verify(*, expected: str) -> None:
@@ -387,7 +593,12 @@ async def verify(*, expected: str) -> None:
     print(json.dumps({"action": "verify", "expected": expected, **counts}))
 
 
-async def _verify_in_session(session: Any, *, expected: str) -> dict[str, int]:
+async def _verify_in_session(
+    session: Any,
+    *,
+    expected: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, int]:
     counts = await _global_counts(session, on_date=EFFECTIVE_DATE)
     if expected == "before":
         rows = await _target_rows(session, lock=False)
@@ -404,6 +615,12 @@ async def _verify_in_session(session: Any, *, expected: str) -> dict[str, int]:
         raise RuntimeError(f"unexpected post-migration roster counts: {counts}")
     if len(rows) != 2:
         raise RuntimeError("target users do not each have one post-migration membership")
+    if payload is not None:
+        if rows != _expected_after_rows(payload):
+            raise RuntimeError("post-migration membership snapshot is not exact")
+        closed = await _closed_original_rows(session, payload=payload, lock=False)
+        if closed != _expected_closed_original_rows(payload):
+            raise RuntimeError("original membership history is not exact")
     for row in rows:
         if (
             row["team_code"] != CENTER_TEAM_CODE
@@ -421,7 +638,7 @@ async def smoke(path: Path) -> None:
         transaction = await session.begin()
         try:
             await _apply_in_transaction(session, payload)
-            counts = await _verify_in_session(session, expected="after")
+            counts = await _verify_in_session(session, expected="after", payload=payload)
         finally:
             await transaction.rollback()
     await verify(expected="before")
@@ -440,8 +657,15 @@ async def restore(path: Path) -> None:
                 "target_center_count": 2,
             }:
                 raise RuntimeError("post-migration roster changed; refusing restore")
+            backup_rows = _expected_before_from_backup(payload)
+            if await _dependency_snapshot(session, rows=backup_rows) != payload.get("dependencies"):
+                raise RuntimeError("related production records changed; refusing restore")
             center_team = await _center_team(session, lock=True)
-            for row in _expected_before_from_backup(payload):
+            if await _after_rows(session, lock=True) != _expected_after_rows(payload):
+                raise RuntimeError("new memberships changed; refusing restore")
+            if await _closed_original_rows(session, payload=payload, lock=True) != _expected_closed_original_rows(payload):
+                raise RuntimeError("original membership history changed; refusing restore")
+            for row in backup_rows:
                 new_membership_id = payload["new_membership_ids"][row["user_name"]]
                 deleted = await session.execute(
                     text(
@@ -503,6 +727,7 @@ async def restore(path: Path) -> None:
                 )
                 if user_restored.rowcount != 1:
                     raise RuntimeError("user team changed; refusing restore")
+            await _verify_in_session(session, expected="before")
     await verify(expected="before")
     print(json.dumps({"action": "restore", "target_count": 2}))
 
@@ -530,6 +755,20 @@ async def main() -> None:
             await verify(expected="before")
         else:
             await verify(expected="after")
+    except Exception as exc:
+        error_text = str(exc)
+        print(
+            json.dumps(
+                {
+                    "action": args.action,
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "error_sha256": hashlib.sha256(error_text.encode("utf-8")).hexdigest(),
+                }
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
     finally:
         await engine.dispose()
 

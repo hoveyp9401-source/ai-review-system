@@ -124,3 +124,54 @@ def test_private_backup_rejects_tampering(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="checksum mismatch"):
         migration._load_backup(path)
+
+
+def test_expected_after_snapshot_preserves_roles_and_separates_current_team() -> None:
+    payload = {
+        "memberships": _rows(),
+        "center_team": _center_team(),
+        "new_membership_ids": {
+            "丁益明": "new-membership-ding",
+            "薛旭": "new-membership-xue",
+        },
+    }
+
+    after = migration._expected_after_rows(payload)
+    assert {row["member_role"] for row in after} == {"team_lead"}
+    assert {row["team_code"] for row in after} == {"legal-center"}
+    assert all(row["team_id"] == row["user_team_id"] for row in after)
+    closed = migration._expected_closed_original_rows(payload)
+    assert {row["team_id"] for row in closed} == {"team-2", "team-4"}
+    assert {row["effective_to"] for row in closed} == {"2026-08-21"}
+
+
+def test_apply_and_restore_validate_inside_their_transactions() -> None:
+    source = Path("scripts/manage_formal_roster_70_4_20260822.py").read_text(
+        encoding="utf-8"
+    )
+    apply_body = source.split("async def apply(", 1)[1].split(
+        "async def _apply_in_transaction", 1
+    )[0]
+    restore_body = source.split("async def restore(", 1)[1].split(
+        "async def main", 1
+    )[0]
+
+    assert apply_body.index("_apply_in_transaction") < apply_body.index(
+        '_verify_in_session(session, expected="after", payload=payload)'
+    )
+    assert restore_body.index("_expected_after_rows") < restore_body.index(
+        'await _verify_in_session(session, expected="before")'
+    )
+
+
+def test_restore_requires_related_record_and_full_membership_snapshots() -> None:
+    source = Path("scripts/manage_formal_roster_70_4_20260822.py").read_text(
+        encoding="utf-8"
+    )
+    restore_body = source.split("async def restore(", 1)[1].split(
+        "async def main", 1
+    )[0]
+
+    assert "_dependency_snapshot" in restore_body
+    assert "_expected_after_rows" in restore_body
+    assert "_expected_closed_original_rows" in restore_body
