@@ -34,11 +34,11 @@
   "real_model_matrix": {
     "status": "PASS",
     "case_count": 12,
-    "observed_owner_seconds_average": 6.135,
-    "observed_owner_seconds_max": 13.634,
+    "observed_owner_seconds_average": 6.803,
+    "observed_owner_seconds_max": 10.46,
     "maximum_fifteen_call_exercise_status": "PASS",
-    "maximum_fifteen_call_exercise_seconds": 11.668,
-    "sha256": "5f3ac44dd8f7cee00af214cfce8c47b4507f0bb29ce1146844df023bd3d14fbd"
+    "maximum_fifteen_call_exercise_seconds": 28.729,
+    "sha256": "552b89afa1cae11198c87959bc5098fb4ea8b8bad70e7a0fcb1880f23fa4f75c"
   },
   "sustained_complex_concurrency": {
     "waves": 19,
