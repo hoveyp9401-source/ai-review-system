@@ -24,7 +24,7 @@ class PersonalWeeklyBriefDelivery:
 
 
 class PersonalWeeklyBriefTransport(Protocol):
-    async def send_private_text_verified(
+    async def send_private_text_accepted(
         self, *, dingtalk_user_id: str, text: str
     ) -> PersonalWeeklyBriefDelivery: ...
 
@@ -37,32 +37,17 @@ class DingTalkPersonalWeeklyBriefTransport:
     def __init__(self, robot) -> None:
         self._robot = robot
 
-    async def send_private_text_verified(
+    async def send_private_text_accepted(
         self, *, dingtalk_user_id: str, text: str
     ) -> PersonalWeeklyBriefDelivery:
-        from app.services.dingtalk import DingTalkDeliveryError
-
-        try:
-            payload = await self._robot.send_robot_direct_text_verified(
-                user_ids=[dingtalk_user_id],
-                text=text,
-            )
-        except DingTalkDeliveryError as exc:
-            if exc.provider_reference and not exc.terminal_failure:
-                return PersonalWeeklyBriefDelivery(
-                    provider_reference=exc.provider_reference,
-                    delivery_verified=False,
-                )
-            raise
+        payload = await self._robot.send_robot_direct_text(
+            user_ids=[dingtalk_user_id],
+            text=text,
+        )
         result = payload if isinstance(payload, dict) else {}
         return PersonalWeeklyBriefDelivery(
             provider_reference=str(result.get("processQueryKey") or "").strip(),
-            delivery_verified=result.get("deliveryVerified") is True,
-            delivered_dingtalk_user_ids=tuple(
-                str(value).strip()
-                for value in result.get("deliveryRecipientUserIds", ())
-                if str(value).strip()
-            ),
+            delivery_verified=False,
         )
 
     async def query_private_delivery(
@@ -155,7 +140,7 @@ class PersonalWeeklyBriefDispatcher:
         from app.services.dingtalk import DingTalkOutboundContentError
 
         try:
-            delivery = await self._transport.send_private_text_verified(
+            accepted = await self._transport.send_private_text_accepted(
                 dingtalk_user_id=recipient.dingtalk_user_id,
                 text=claimed.message_text,
             )
@@ -175,7 +160,7 @@ class PersonalWeeklyBriefDispatcher:
                 changed_at=self._observed_at(changed_at),
                 expected_claim_token=claim_token,
             )
-        if not delivery.provider_reference.strip():
+        if not accepted.provider_reference.strip():
             return await self._store.record_failure(
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,
@@ -187,14 +172,29 @@ class PersonalWeeklyBriefDispatcher:
         pending = await self._store.record_provider_acceptance(
             tenant_id=row.tenant_id,
             brief_id=row.brief_id,
-            provider_message_id=delivery.provider_reference,
+            provider_message_id=accepted.provider_reference,
             expected_claim_token=claim_token,
             changed_at=provider_accepted_at,
         )
         await self._store.persist_provider_acceptance()
-        if not delivery.delivery_verified:
-            return pending
-        if set(delivery.delivered_dingtalk_user_ids) != {recipient.dingtalk_user_id}:
+        if accepted.delivery_verified:
+            delivery = accepted
+            evidence_source = "send_response"
+        else:
+            try:
+                delivery = await self._transport.query_private_delivery(
+                    provider_reference=accepted.provider_reference,
+                )
+            except (OSError, RuntimeError, TimeoutError):
+                return pending
+            if not delivery.delivery_verified:
+                return pending
+            evidence_source = "delivery_query"
+        if (
+            delivery.provider_reference != accepted.provider_reference
+            or set(delivery.delivered_dingtalk_user_ids)
+            != {recipient.dingtalk_user_id}
+        ):
             return await self._store.record_failure(
                 tenant_id=row.tenant_id,
                 brief_id=row.brief_id,
@@ -208,7 +208,7 @@ class PersonalWeeklyBriefDispatcher:
             delivery_receipt=_verified_delivery_receipt(
                 delivery,
                 checked_at=verified_at,
-                evidence_source="send_response",
+                evidence_source=evidence_source,
             ),
             changed_at=verified_at,
         )

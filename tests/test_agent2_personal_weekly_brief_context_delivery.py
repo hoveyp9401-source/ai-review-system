@@ -80,6 +80,7 @@ async def test_provider_acceptance_does_not_enter_conversation_context(monkeypat
 @pytest.mark.asyncio
 async def test_only_verified_exact_recipient_delivery_enters_context(monkeypatch) -> None:
     observed: dict[str, object] = {}
+    context_recorded_at = NOW.replace(minute=47)
 
     class _Session:
         async def scalar(self, _statement):
@@ -120,12 +121,16 @@ async def test_only_verified_exact_recipient_delivery_enters_context(monkeypatch
         _record_outbound,
     )
     monkeypatch.setattr(runner, "SqlPersonalWeeklyBriefStore", _Store)
+    monkeypatch.setattr(
+        runner,
+        "_personal_weekly_observed_now",
+        lambda: context_recorded_at,
+    )
 
     await runner._record_personal_weekly_brief_context(
         tenant_id="tenant-a",
         row=_row("delivered"),
         target=TARGET,
-        changed_at=NOW,
     )
 
     receipt = observed["outbound"]["delivery_receipt"]
@@ -133,6 +138,7 @@ async def test_only_verified_exact_recipient_delivery_enters_context(monkeypatch
     assert receipt["deliveryRecipientUserIds"] == ["ding-user-a"]
     assert observed["outbound"]["conversation_id"] == "conversation-a"
     assert observed["context"]["brief_id"] == _row("delivered").brief_id
+    assert observed["context"]["changed_at"] == context_recorded_at
     assert observed["committed"] is True
 
 

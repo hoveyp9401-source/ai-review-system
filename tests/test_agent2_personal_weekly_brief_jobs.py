@@ -182,6 +182,38 @@ async def test_model_batch_propagates_unexpected_database_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_batch_cancels_remaining_work_after_system_failure() -> None:
+    started: list[int] = []
+    completed: list[int] = []
+    cancelled: list[int] = []
+
+    async def worker(value: int) -> int:
+        started.append(value)
+        if value == 0:
+            await asyncio.sleep(0.01)
+            raise SQLAlchemyError("whole database unavailable")
+        try:
+            await asyncio.sleep(0.2)
+            completed.append(value)
+            return value
+        except asyncio.CancelledError:
+            cancelled.append(value)
+            raise
+
+    with pytest.raises(SQLAlchemyError, match="database unavailable"):
+        await run_bounded_personal_weekly_brief_model_batch(
+            tuple(range(74)),
+            worker=worker,
+        )
+
+    await asyncio.sleep(0.02)
+    assert {0, 1, 2, 3}.issubset(set(started))
+    assert len(started) <= 5
+    assert completed == []
+    assert set(cancelled) == set(started) - {0}
+
+
+@pytest.mark.asyncio
 async def test_generation_start_database_failure_propagates_without_owner_failure_record(
     monkeypatch,
 ) -> None:

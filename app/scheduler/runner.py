@@ -347,7 +347,15 @@ async def run_bounded_personal_weekly_brief_model_batch(
         async with semaphore:
             return await worker(row)
 
-    return tuple(await asyncio.gather(*(run_one(row) for row in rows)))
+    tasks = tuple(asyncio.create_task(run_one(row)) for row in rows)
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def run_streaming_personal_weekly_brief_batch(
@@ -406,7 +414,7 @@ async def run_streaming_personal_weekly_brief_batch(
             rows,
             worker=generate_and_enqueue,
         )
-    except Exception:
+    except BaseException:
         for task in sender_tasks:
             task.cancel()
         await asyncio.gather(*sender_tasks, return_exceptions=True)
@@ -432,7 +440,7 @@ async def run_bounded_personal_weekly_brief_send_batch(rows, *, worker):
     tasks = tuple(asyncio.create_task(run_one(row)) for row in rows)
     try:
         return tuple(await asyncio.gather(*tasks))
-    except Exception:
+    except BaseException:
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -772,6 +780,7 @@ async def _dispatch_personal_weekly_brief_record(
         )
     reason = revalidation.blocked_reasons.get(row.owner_user_id)
     if reason:
+        blocked_at = _personal_weekly_observed_now()
         async with AsyncSessionLocal() as blocked_session:
             blocked = await SqlPersonalWeeklyBriefStore(
                 blocked_session
@@ -779,13 +788,14 @@ async def _dispatch_personal_weekly_brief_record(
                 tenant_id=tenant_id,
                 brief_id=row.brief_id,
                 reason=reason,
-                changed_at=local_now,
+                changed_at=blocked_at,
             )
             await blocked_session.commit()
         return blocked
     target = revalidation.valid_targets.get(row.owner_user_id)
     if target is None:
         raise RuntimeError("personal weekly brief latest recipient is missing")
+    send_started_at = _personal_weekly_observed_now()
     async with AsyncSessionLocal() as delivery_session:
         delivered = await PersonalWeeklyBriefDispatcher(
             store=SqlPersonalWeeklyBriefStore(delivery_session),
@@ -798,8 +808,10 @@ async def _dispatch_personal_weekly_brief_record(
         ).dispatch(
             row=row,
             recipient=_personal_weekly_recipient(target),
-            changed_at=local_now,
-            claim_token=f"personal-weekly:{row.brief_id}:{local_now.isoformat()}",
+            changed_at=send_started_at,
+            claim_token=(
+                f"personal-weekly:{row.brief_id}:{send_started_at.isoformat()}"
+            ),
         )
         await delivery_session.commit()
     if delivered.status == "delivered":
@@ -807,7 +819,6 @@ async def _dispatch_personal_weekly_brief_record(
             tenant_id=tenant_id,
             row=delivered,
             target=target,
-            changed_at=local_now,
         )
     return delivered
 
@@ -1019,6 +1030,7 @@ async def run_personal_weekly_brief_reconcile_job(
             for target in frozen_targets
             if target.internal_user_id == row.owner_user_id
         )
+        reconciliation_started_at = _personal_weekly_observed_now()
         async with AsyncSessionLocal() as delivery_session:
             delivered = await PersonalWeeklyBriefDispatcher(
                 store=SqlPersonalWeeklyBriefStore(delivery_session),
@@ -1031,7 +1043,7 @@ async def run_personal_weekly_brief_reconcile_job(
             ).reconcile_pending(
                 row=row,
                 recipient=_personal_weekly_recipient(target),
-                changed_at=local_now,
+                changed_at=reconciliation_started_at,
             )
             await delivery_session.commit()
         if delivered.status == "delivered":
@@ -1040,7 +1052,6 @@ async def run_personal_weekly_brief_reconcile_job(
                 tenant_id=tenant_id,
                 row=delivered,
                 target=target,
-                changed_at=local_now,
             )
     for row in context_pending:
         frozen_targets = await frozen_for(row)
@@ -1058,7 +1069,6 @@ async def run_personal_weekly_brief_reconcile_job(
                 tenant_id=tenant_id,
                 row=row,
                 target=target,
-                changed_at=local_now,
             )
     return delivered_count
 
@@ -1135,12 +1145,16 @@ def _personal_weekly_local_now(value: datetime) -> datetime:
     return value.astimezone(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE))
 
 
+def _personal_weekly_observed_now() -> datetime:
+    return datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE))
+
+
 async def _record_personal_weekly_brief_context(
     *,
     tenant_id: str,
     row: PersonalWeeklyBriefRecord,
     target: PersonalWeeklyBriefTarget,
-    changed_at: datetime,
+    changed_at: datetime | None = None,
 ) -> None:
     if row.status != "delivered" or not row.provider_message_id:
         return
@@ -1165,6 +1179,7 @@ async def _record_personal_weekly_brief_context(
             and delivered_user_ids == [target.dingtalk_user_id]
         ):
             raise RuntimeError("personal weekly brief stored delivery receipt is invalid")
+        context_recorded_at = changed_at or _personal_weekly_observed_now()
         await record_verified_outbound_context_message(
             session,
             user=user,
@@ -1180,12 +1195,12 @@ async def _record_personal_weekly_brief_context(
                 "flowControlledStaffIdList": [],
                 "processQueryKey": receipt["provider_reference"],
             },
-            sent_at=row.delivered_at or changed_at,
+            sent_at=row.delivered_at or context_recorded_at,
         )
         await SqlPersonalWeeklyBriefStore(session).record_context(
             tenant_id=tenant_id,
             brief_id=row.brief_id,
-            changed_at=changed_at,
+            changed_at=context_recorded_at,
         )
         await session.commit()
 

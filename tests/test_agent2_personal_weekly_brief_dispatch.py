@@ -8,6 +8,7 @@ import pytest
 from app.services.dingtalk import DingTalkOutboundContentError
 
 from app.agent2.personal_weekly_brief_delivery import (
+    DingTalkPersonalWeeklyBriefTransport,
     PersonalWeeklyBriefDelivery,
     PersonalWeeklyBriefDispatcher,
     PersonalWeeklyBriefRecipient,
@@ -99,7 +100,7 @@ class _Transport:
         self.delivery = delivery
         self.sent_to: list[str] = []
 
-    async def send_private_text_verified(self, *, dingtalk_user_id, text):
+    async def send_private_text_accepted(self, *, dingtalk_user_id, text):
         assert text == "个人本周工作简报"
         self.sent_to.append(dingtalk_user_id)
         return self.delivery
@@ -116,6 +117,42 @@ def _recipient(user_id: str = "user-a") -> PersonalWeeklyBriefRecipient:
         dingtalk_user_id=f"ding-{user_id}",
         conversation_id=f"conversation-{user_id[-1]}",
     )
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_transport_records_acceptance_before_separate_delivery_query() -> None:
+    calls: list[str] = []
+
+    class _Robot:
+        async def send_robot_direct_text(self, **_kwargs):
+            calls.append("accepted")
+            return {"processQueryKey": "provider-two-phase"}
+
+        async def send_robot_direct_text_verified(self, **_kwargs):
+            raise AssertionError("weekly brief must not hide acceptance behind polling")
+
+        async def get_robot_direct_message_status(self, **_kwargs):
+                calls.append("verified")
+                return {
+                    "sendStatus": "SUCCESS",
+                    "messageReadInfoList": [{"userId": "ding-user-a"}],
+                }
+
+    transport = DingTalkPersonalWeeklyBriefTransport(_Robot())
+    accepted = await transport.send_private_text_accepted(
+        dingtalk_user_id="ding-user-a",
+        text="个人本周工作简报",
+    )
+    assert accepted.provider_reference == "provider-two-phase"
+    assert accepted.delivery_verified is False
+    assert calls == ["accepted"]
+
+    delivered = await transport.query_private_delivery(
+        provider_reference=accepted.provider_reference,
+    )
+    assert delivered.delivery_verified is True
+    assert delivered.delivered_dingtalk_user_ids == ("ding-user-a",)
+    assert calls == ["accepted", "verified"]
 
 
 @pytest.mark.asyncio
@@ -224,13 +261,23 @@ async def test_only_exact_recipient_delivery_is_recorded_as_delivered() -> None:
 @pytest.mark.asyncio
 async def test_dispatch_records_distinct_observed_send_acceptance_and_verification_times() -> None:
     store = _Store()
-    transport = _Transport(
-        PersonalWeeklyBriefDelivery(
-            provider_reference="provider-timeline",
-            delivery_verified=True,
-            delivered_dingtalk_user_ids=("ding-user-a",),
-        )
-    )
+
+    class _TwoPhaseTransport:
+        async def send_private_text_accepted(self, **_kwargs):
+            return PersonalWeeklyBriefDelivery(
+                provider_reference="provider-timeline",
+                delivery_verified=False,
+            )
+
+        async def query_private_delivery(self, *, provider_reference):
+            assert provider_reference == "provider-timeline"
+            return PersonalWeeklyBriefDelivery(
+                provider_reference=provider_reference,
+                delivery_verified=True,
+                delivered_dingtalk_user_ids=("ding-user-a",),
+            )
+
+    transport = _TwoPhaseTransport()
     observed = iter(
         (
             NOW.replace(second=11),
@@ -259,6 +306,7 @@ async def test_dispatch_records_distinct_observed_send_acceptance_and_verificati
     assert delivered.delivery_receipt_json["checked_at"] == NOW.replace(
         second=19
     ).isoformat()
+    assert delivered.delivery_receipt_json["evidence_source"] == "delivery_query"
 
 
 @pytest.mark.asyncio
@@ -295,7 +343,7 @@ async def test_local_pre_send_content_failure_is_marked_retry_safe() -> None:
     store = _Store()
 
     class _LocalFailureTransport:
-        async def send_private_text_verified(self, **_kwargs):
+        async def send_private_text_accepted(self, **_kwargs):
             raise DingTalkOutboundContentError("local validation blocked send")
 
     dispatcher = PersonalWeeklyBriefDispatcher(
