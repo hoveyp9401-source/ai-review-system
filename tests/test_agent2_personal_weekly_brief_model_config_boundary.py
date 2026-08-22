@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent2.personal_weekly_brief import (
+    PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED,
     PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
     PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
     PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
@@ -57,8 +59,10 @@ def test_real_model_gate_loads_only_allowlisted_llm_fields(tmp_path) -> None:
 def test_production_weekly_brief_uses_fast_independent_flash_calls() -> None:
     assert PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED is False
     assert PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED is False
+    assert PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED is True
     assert PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS == 4000
     assert PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS == 2000
+    assert PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS == 4000
 
     runner = Path("app/scheduler/runner.py").read_text(encoding="utf-8")
     assert runner.count(
@@ -66,11 +70,17 @@ def test_production_weekly_brief_uses_fast_independent_flash_calls() -> None:
     ) == 2
     assert runner.count(
         "thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED"
-    ) == 4
+    ) == 2
+    assert runner.count(
+        "thinking_enabled=PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED"
+    ) == 2
     assert runner.count(
         "max_tokens=PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS"
     ) == 2
-    assert runner.count("max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS") == 4
+    assert runner.count("max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS") == 2
+    assert runner.count(
+        "max_tokens=PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS"
+    ) == 2
     assert PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS == 3
     assert PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES == 3
     assert runner.count(

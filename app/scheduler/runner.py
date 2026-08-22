@@ -38,6 +38,8 @@ from app.agent2.personal_weekly_brief import (
     Agent2PersonalWeeklyBriefGenerator,
     Agent2PersonalWeeklyBriefModelPipeline,
     Agent2PersonalWeeklyBriefReviewer,
+    PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED,
     PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
     PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
     PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
@@ -703,10 +705,10 @@ async def run_personal_weekly_brief_generation_job(
     critical_reviewer = Agent2PersonalWeeklyBriefReviewer(
         llm_client,
         model=CANARY_MODEL_NAME,
-        thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+        thinking_enabled=PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED,
         timeout_seconds=CANARY_TIMEOUT_SECONDS,
         max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
-        max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+        max_tokens=PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS,
         review_mode="critical_facts",
     )
     model_pipeline = Agent2PersonalWeeklyBriefModelPipeline(
@@ -991,10 +993,10 @@ async def run_personal_weekly_brief_reconcile_job(
         critical_reviewer=Agent2PersonalWeeklyBriefReviewer(
             llm_client,
             model=CANARY_MODEL_NAME,
-            thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+            thinking_enabled=PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
             max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
-            max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+            max_tokens=PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS,
             review_mode="critical_facts",
         ),
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,

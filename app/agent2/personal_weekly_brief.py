@@ -35,8 +35,10 @@ _MAX_SOURCE_TEXT_CHARS = 2000
 _MAX_TOTAL_SOURCE_CHARS = 30000
 PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED = False
 PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED = False
+PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED = True
 PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS = 4000
 PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS = 2000
+PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS = 4000
 PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS = 3
 PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES = 3
 _MAX_SECTION_ITEMS = {
@@ -1160,24 +1162,43 @@ def _render_message(
     *,
     snapshot: PersonalWeeklyBriefSnapshot,
 ) -> str:
+    source_label = "日报和周计划"
+    if not snapshot.weekly_plan_found:
+        source_label = "日报" if snapshot.daily_report_dates else "记录"
+    elif not snapshot.daily_report_dates:
+        source_label = "周计划"
     lines = [
-        content["intro"],
+        "这是你本周的工作简报，方便回顾进展和安排后续。",
         "",
         "一、本周完成事项",
         *_render_section(content["completed"], include_status=False),
         "",
         "二、本周计划事项及进展",
-        *_render_section(content["plan_progress"], include_status=True),
+        *_render_section(
+            content["plan_progress"],
+            include_status=True,
+            source_by_id={source.source_id: source for source in snapshot.sources},
+        ),
         "",
         "三、可能未闭环事项",
-        *_render_section(content["possible_open_loops"], include_status=False),
+        *_render_section(
+            content["possible_open_loops"],
+            include_status=False,
+            clean_open_loop=True,
+        ),
         "",
         (
-            f"数据范围：{snapshot.week_start.isoformat()} 至 "
-            f"{snapshot.week_end.isoformat()}，以周六生成时系统已保存的记录为准。"
+            f"以上根据{_display_date(snapshot.week_start)}至"
+            f"{_display_date(snapshot.week_end)}已保存的{source_label}整理。"
         ),
-        "“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
     ]
+    if any(
+        item.status == "暂时没有找到后续记录"
+        for item in content["plan_progress"].items
+    ):
+        lines.append(
+            "注：“暂无后续记录”仅表示现有记录中没有找到明确对应内容。"
+        )
     message = "\n".join(lines).strip()
     validate_dingtalk_outbound_text(message)
     if len(message) > _MAX_MESSAGE_CHARS:
@@ -1189,17 +1210,51 @@ def _render_section(
     section: PersonalWeeklyBriefSection,
     *,
     include_status: bool,
+    source_by_id: dict[str, SourceEvidence] | None = None,
+    clean_open_loop: bool = False,
 ) -> list[str]:
     if not section.items:
         return [section.empty_note]
-    return [
-        (
-            f"{index}. 【{item.status}】{item.text}"
-            if include_status
-            else f"{index}. {item.text}"
+    status_labels = {
+        "已完成": "已完成",
+        "持续推进": "持续推进",
+        "安排调整": "安排调整",
+        "后续安排": "后续安排",
+        "暂时没有找到后续记录": "暂无后续记录",
+    }
+    rendered: list[str] = []
+    for index, item in enumerate(section.items, start=1):
+        text_value = item.text
+        if clean_open_loop:
+            cleaned = re.sub(
+                r"[，,；;]?(?:后续)?(?:可|需)?留意(?:是否完成)?[。.]?$",
+                "",
+                text_value,
+            ).strip()
+            if cleaned:
+                text_value = cleaned
+        if include_status and item.status == "暂时没有找到后续记录":
+            plan_texts = tuple(
+                source_by_id[source_id].original_text.strip().rstrip("。；;，,")
+                for source_id in item.source_ids
+                if source_by_id is not None
+                and source_id in source_by_id
+                and source_by_id[source_id].source_kind == "weekly_plan"
+            )
+            if plan_texts:
+                text_value = "；".join(dict.fromkeys(plan_texts))
+        rendered.append(
+            (
+                f"{index}. {status_labels[item.status]}｜{text_value}"
+                if include_status
+                else f"{index}. {text_value}"
+            )
         )
-        for index, item in enumerate(section.items, start=1)
-    ]
+    return rendered
+
+
+def _display_date(value: date) -> str:
+    return f"{value.month}月{value.day}日"
 
 
 def _bounded_text(value: Any, *, field: str, maximum: int) -> str:
@@ -1216,19 +1271,24 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 2. 今日工作中的“跟进、沟通、准备、起草、计划”等不得改写成“完成”。金额、日期、对象、条件、否定等关键事实不能遗漏或改变。
    明确否定必须保留否定的具体对象：例如来源写“对方没有承诺付款”，可以写“尚未明确付款承诺”，但不能只概括成“尚未有结果”或“尚未闭环”。
 3. 同一项目、案件或事项跨多天重复且指向明确时，必须合并为一条，保留所有关键进展和事实；只有无法可靠判断是否同一事项时才分开，不得靠猜测强行合并。
+   同一个系统、产品或业务工作线里的连续修复、优化、接入和上线，如果上下文明确属于同一项工作，也应合并成一条，用分号保留不同动作；不得仅因为日期不同就拆成多条近义事项。
    周计划与日报建立进展关系时，必须有相同的具体项目、案件、公司、文件或明确上下文对象；仅“项目、合同、案件、材料”等泛词相同不算同一事项。找不到同一对象的后来日报时，周计划只能标为“暂时没有找到后续记录”，不得为了凑进展绑定到另一事项。
+   例如“合同审核”和“合同评审技能网页化”不是同一具体工作，“整理案件材料”和“被告案件签阅文件”也不是同一具体工作；这类情况必须保留周计划原文、状态设为“暂时没有找到后续记录”，并且只引用周计划来源。
 4. 计划进展状态只能是：已完成、持续推进、安排调整、后续安排、暂时没有找到后续记录。除最后一种外，必须同时引用周计划和当日或后来日报证据；没有后来记录时只能用最后一种，绝不能说“未完成”。trusted_snapshot 中每个 source_kind=weekly_plan 的 source_id 都必须在 plan_progress 中恰好引用一次；同一事项跨日时可以在一条进展中引用多条周计划来源，但不得漏项或重复。
+   plan_progress.items[].text 只写计划事项和有来源支持的具体进展，不得复述 status，不得写“本周日报中未找到”“暂时没有找到后续记录”等模板句；展示层会统一呈现状态。
 5. plan_progress 与 possible_open_loops 中同一事项只能出现一次，并使用相同的稳定 matter_key 来帮助服务器去重；plan_progress 已引用的任何 source_id 都不能再次用于 possible_open_loops，即使换了 matter_key 也不行。
+   possible_open_loops.items[].text 只写需要继续留意的事项以及必要的日期、条件或原因，不要每条重复“后续日报中未找到记录”“尚未闭环”等统一提示。
 6. 没有数据、只有部分日期、没有周计划或没有风险栏时如实说明，不得编造。
 7. 简报只读，不得建议系统已经修改、补写、确认或提交日报、周计划。
 8. 不要在文字中称呼用户；称呼由服务器根据个人记忆安全添加。
 9. 把 trusted_snapshot.sources 当作完整来源清单。每个 source_id 必须在 source_dispositions 中恰好出现一次：被成品条目引用时标为 cited 且 reason 为空；未引用时只能标为 safely_excluded，并给出具体、谨慎的安全排除理由。不得静默遗漏整条来源，也不得用“内容不重要”等空泛理由排除。
-10. intro 和各区块 empty_note 只是系统说明，不是业务结论，不填写来源ID；其中不得加入项目、案件、金额、状态等业务事实。所有业务结论必须放在 items 中并引用可信 source_id。空数据说明只能依据 trusted_snapshot 的空来源、日报覆盖日期和 weekly_plan_found。
-10. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的五个顶层字段，不能附加修复说明或其他字段。
+10. intro 固定写“本周工作简报”，不得加入任何业务事实。各区块 empty_note 只是系统说明，不是业务结论，不填写来源ID；其中不得加入项目、案件、金额、状态等业务事实。所有业务结论必须放在 items 中并引用可信 source_id。空数据说明只能依据 trusted_snapshot 的空来源、日报覆盖日期和 weekly_plan_found。
+11. 成品要像一位清楚、克制的同事写的简报：优先合并同类事项，删除重复过程词和模板话，不写“系统核对、数据范围、来源完整、已保存记录”等工程说明；completed 和 possible_open_loops 通常各控制在3至6条，但事实确实较多时可以超过，不能为了变短漏掉关键事项。
+12. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的五个顶层字段，不能附加修复说明或其他字段。若 issues 指出周计划与日报不是同一具体事项，必须删除该进展项中的日报 source_id，把 status 改为“暂时没有找到后续记录”，text 只保留对应周计划事项；不得再次寻找只有泛词相似的日报凑进展。
 
 仅返回 JSON，严格使用以下结构，不得增加字段：
 {
-  "intro": "一句简短开场",
+  "intro": "本周工作简报",
   "completed": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "结论", "source_ids": ["来源ID"]}]},
   "plan_progress": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "进展", "status": "五种状态之一", "source_ids": ["来源ID"]}]},
   "possible_open_loops": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "谨慎说明", "source_ids": ["来源ID"]}]},
@@ -1240,6 +1300,7 @@ _CRITICAL_FACT_REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的周简报关�
 1. 原文有“只有A才B、如果A则/将B、若A会B”等明确条件时，草稿是否同时保留前提A和结果B；只写前提不算保留条件。
 2. 原文明示“没有/未/无法/不能”时，草稿是否保留被否定的具体对象；只写“未闭环/没有结果”不能代替“没有承诺付款”等具体否定。
 3. 原文的跟进、沟通、准备、起草、计划是否被夸大成完成，或原文已完成是否被改成未完成。
+4. plan_progress 中除“暂时没有找到后续记录”外，周计划与后来日报是否明确指向同一个具体项目、案件、公司、文件或工作对象。只有“合同”或“案件材料”等泛词相同不算同一事项；例如“合同审核”和“合同评审技能网页化”不是同一具体工作，“整理案件材料”和“被告案件签阅文件”也不是同一具体工作。对象不一致时必须拒绝，不能用语言相近代替事实对应。
 
 必须覆盖草稿里的每个唯一matter_key。只返回JSON：
 {"approved":true或false,"reviewed_matter_keys":["逐个唯一事项键"],"issues":[{"matter_key":"事项键","reason":"具体条件、否定或完成状态错误"}]}
@@ -1253,10 +1314,12 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
 2. 对该事项引用的来源，是否改变或遗漏其中任何对象、条件、否定、归属和完成状态；金额与明确日期已由服务器做字面核对，不得再提出金额或日期遗漏问题。允许合并同义表达、删除“继续跟进”等重复过程词，不要求逐字复制原文；
 3. 是否把跟进、沟通、准备、起草或计划武断写成完成；
 4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”。周计划来源是否逐项覆盖已由服务器检查，不再重复判断。“后续安排”可以由后来日报的 tomorrow_plan 支持，它不表示已完成；“安排调整”只需后来日报明确记录安排发生变化，不要求再有调整后事项的最终完成证据。
+   对应关系必须是同一个具体项目、案件、公司、文件或工作对象；只有“合同、审核、案件、材料”等泛词相似不能建立计划进展。例如“合同审核”不能仅因出现“合同评审技能网页化”就判为完成，“整理案件材料”也不能仅因出现“被告案件签阅文件”就判为完成。
 5. 计划进展和可能未闭环中是否重复同一事项。仅来自日报、并非周计划的谨慎未闭环事项可以只出现在 possible_open_loops，不要求进入 plan_progress；已经在 plan_progress 中说明调整或未找到后续记录的计划事项，不应再复制到 possible_open_loops。
 6. 无数据或部分数据时是否编造。
 7. source_dispositions 的逐条覆盖、cited绑定和 safely_excluded 结构已由服务器检查，不再重复判断；只判断安全排除理由在语义上是否明显掩盖了应汇总的重要事项。
 8. intro 与 empty_note 是否只作系统说明、不承载业务结论；所有业务事实是否都在带来源ID的 items 中。空数据说明是否与可信空快照一致。
+9. 同一工作线是否被无意义拆成多条近义事项；plan_progress 的正文是否重复 status；possible_open_loops 是否逐条重复“未找到记录、尚未闭环”等模板话。只有确实影响成品清晰度的重复才拒绝，不得为了追求短而要求删除事实。
 
 以下情况明确属于安全，不得据此拒绝：
 - completed 项只要至少引用一条 today_work 日报即可，不要求再引用对应周计划；同一事项同时出现在 completed 和 plan_progress 是允许的，二者分别回答“本周做了什么”和“计划进展”。
@@ -1282,6 +1345,8 @@ __all__ = [
     "Agent2PersonalWeeklyBriefReviewer",
     "Agent2PersonalWeeklyBriefModelPipeline",
     "PLAN_PROGRESS_STATUSES",
+    "PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS",
+    "PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED",
     "PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS",
     "PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED",
     "PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS",

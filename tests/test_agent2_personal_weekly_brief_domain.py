@@ -435,7 +435,7 @@ async def test_server_supplies_safe_note_for_an_empty_section() -> None:
                     "items": [
                         {
                             "matter_key": "case-a",
-                            "text": "准备甲案件庭审材料，暂时没有找到后续记录。",
+                            "text": "准备甲案件庭审材料。",
                             "status": "暂时没有找到后续记录",
                             "source_ids": [plan.source_id],
                         }
@@ -1351,7 +1351,7 @@ async def test_five_plan_states_require_traceable_plan_and_progress_evidence() -
         "乙案件证据整理持续推进，目前仍在补充送达材料。",
         "丙案件开庭由周三调整到周五。",
         "丁公司付款节点已沟通，后续安排下周一再确认发票条件。",
-        "戊项目补充协议暂时没有找到后续记录。",
+        "戊项目补充协议。",
     )
     plans = [
         _source(
@@ -1415,7 +1415,7 @@ async def test_five_plan_states_require_traceable_plan_and_progress_evidence() -
 
     assert tuple(item.status for item in result.plan_progress.items) == statuses
     assert result.plan_progress.items[-1].source_ids == (plans[-1].source_id,)
-    assert "不等于未完成" in result.message_text
+    assert "仅表示现有记录中没有找到明确对应内容" in result.message_text
     review = await Agent2PersonalWeeklyBriefReviewer(
         _FakeLLM(
             {
@@ -1427,6 +1427,137 @@ async def test_five_plan_states_require_traceable_plan_and_progress_evidence() -
         model="agent2-model",
     ).review(snapshot=_snapshot(*plans, *updates), content=result)
     assert review["approved"] is True
+
+
+@pytest.mark.asyncio
+async def test_rendered_brief_is_clean_and_does_not_repeat_system_language() -> None:
+    plan = _source(
+        "plan:clean-display",
+        kind="weekly_plan",
+        on_date=date(2026, 8, 17),
+        section="plan_item",
+        text="合同审核。",
+    )
+    result = await Agent2PersonalWeeklyBriefGenerator(
+        _FakeLLM(
+            {
+                "intro": "围绕合同、案件和系统优化开展了多项工作。",
+                "completed": _empty_section("本周没有完成事项。"),
+                "plan_progress": {
+                    "empty_note": "",
+                    "items": [
+                        {
+                            "matter_key": "contract-review",
+                            "text": "合同审核",
+                            "status": "暂时没有找到后续记录",
+                            "source_ids": [plan.source_id],
+                        }
+                    ],
+                },
+                "possible_open_loops": _empty_section("没有其他需要留意的事项。"),
+            }
+        ),
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(plan),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    message = result.message_text
+    assert message.startswith("这是你本周的工作简报，方便回顾进展和安排后续。")
+    assert "1. 暂无后续记录｜合同审核" in message
+    assert "【" not in message
+    assert "数据范围：" not in message
+    assert "2026-08-17" not in message
+    assert "以上根据8月17日至8月21日已保存的周计划整理。" in message
+    assert "仅表示现有记录中没有找到明确对应内容" in message
+    assert "不等于未完成" not in message
+
+
+@pytest.mark.asyncio
+async def test_no_followup_display_uses_trusted_plan_text_once() -> None:
+    plan = _source(
+        "plan:no-followup-copy",
+        kind="weekly_plan",
+        on_date=date(2026, 8, 17),
+        section="plan_item",
+        text="日常用印审核。",
+    )
+    result = await Agent2PersonalWeeklyBriefGenerator(
+            _FakeLLM(
+                {
+                    "intro": "本周工作简报",
+                    "completed": _empty_section("没有完成事项。"),
+                    "plan_progress": {
+                        "empty_note": "",
+                        "items": [
+                            {
+                                "matter_key": "seal-review",
+                                "text": "日常用印审核：日报中未找到对应记录。",
+                                "status": "暂时没有找到后续记录",
+                                "source_ids": [plan.source_id],
+                            }
+                        ],
+                    },
+                    "possible_open_loops": _empty_section("没有其他事项。"),
+                }
+            ),
+            model="agent2-model",
+        ).generate(
+        snapshot=_snapshot(plan),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert "1. 暂无后续记录｜日常用印审核" in result.message_text
+    assert "日报中未找到对应记录" not in result.message_text
+
+
+def test_critical_reviewer_requires_same_specific_plan_object() -> None:
+    source = Path("app/agent2/personal_weekly_brief.py").read_text(encoding="utf-8")
+
+    assert "只有“合同”或“案件材料”等泛词相同不算同一事项" in source
+    assert "“合同审核”和“合同评审技能网页化”不是同一具体工作" in source
+
+
+@pytest.mark.asyncio
+async def test_open_loop_display_does_not_repeat_attention_prompt() -> None:
+    source = _source(
+        "daily:open-loop-display",
+        kind="daily_report",
+        on_date=date(2026, 8, 20),
+        section="tomorrow_plan",
+        text="计划通报新增被告案件。",
+    )
+    result = await Agent2PersonalWeeklyBriefGenerator(
+        _FakeLLM(
+            {
+                "intro": "本周工作简报",
+                "completed": _empty_section("没有完成事项。"),
+                "plan_progress": _empty_section("没有周计划。"),
+                "possible_open_loops": {
+                    "empty_note": "",
+                    "items": [
+                        {
+                            "matter_key": "defendant-case-notice",
+                            "text": "计划通报新增被告案件，后续需留意是否完成。",
+                            "source_ids": [source.source_id],
+                        }
+                    ],
+                },
+            }
+        ),
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(source),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert "三、可能未闭环事项" in result.message_text
+    assert "计划通报新增被告案件" in result.message_text
+    assert "后续需留意" not in result.message_text
 
 
 @pytest.mark.asyncio
@@ -1533,7 +1664,7 @@ async def test_every_weekly_plan_source_must_appear_once_in_plan_progress() -> N
                 "items": [
                     {
                         "matter_key": "matter-first",
-                        "text": "复核甲项目合同，暂时没有找到后续记录。",
+                        "text": "复核甲项目合同。",
                         "status": "暂时没有找到后续记录",
                         "source_ids": [first.source_id],
                     }
@@ -1680,7 +1811,7 @@ async def test_more_than_twelve_distinct_plan_items_can_be_reported_one_by_one()
                 "items": [
                     {
                         "matter_key": f"matter-{index}",
-                        "text": f"脱敏周计划事项{index}暂时没有找到后续记录。",
+                        "text": f"脱敏周计划事项{index}。",
                         "status": "暂时没有找到后续记录",
                         "source_ids": [plan.source_id],
                     }
