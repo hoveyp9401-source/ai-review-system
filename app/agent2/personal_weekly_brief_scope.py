@@ -43,11 +43,15 @@ def validate_personal_weekly_brief_targets(
     controls: tuple[Any, ...] | list[Any],
     conversation_states: tuple[Any, ...] | list[Any],
     expected_model_name: str,
+    runtime_tenant_id: str | None = None,
 ) -> tuple[PersonalWeeklyBriefTarget, ...]:
     if roster.member_count != FORMAL_ROSTER_MEMBER_COUNT:
         raise RuntimeError("personal weekly brief scope must contain exactly 74 members")
     if not expected_model_name.strip():
         raise RuntimeError("personal weekly brief Agent2 model is missing")
+    runtime_tenant = str(runtime_tenant_id or roster.tenant_id).strip()
+    if not runtime_tenant:
+        raise RuntimeError("personal weekly brief runtime tenant is missing")
 
     binding_by_user = _unique_by(
         bindings,
@@ -74,7 +78,7 @@ def validate_personal_weekly_brief_targets(
         binding = binding_by_user[member.user_id]
         if not (
             getattr(binding, "active", False) is True
-            and str(getattr(binding, "tenant_id", "")) == roster.tenant_id
+            and str(getattr(binding, "tenant_id", "")) == runtime_tenant
             and str(getattr(binding, "user_id", "")) == member.user_id
             and str(getattr(binding, "dingtalk_user_id", ""))
             == member.dingtalk_user_id
@@ -82,14 +86,14 @@ def validate_personal_weekly_brief_targets(
             raise RuntimeError("personal weekly brief identity binding mismatch")
         control = control_by_user[member.user_id]
         if not (
-            str(getattr(control, "tenant_id", "")) == roster.tenant_id
+            str(getattr(control, "tenant_id", "")) == runtime_tenant
             and getattr(control, "enabled", False) is True
             and getattr(control, "messages_enabled", False) is True
             and str(getattr(control, "runtime", "")) == "canary_execute"
             and str(getattr(control, "model_name", "")) == expected_model_name
         ):
             raise RuntimeError("personal weekly brief Agent2 control mismatch")
-        user_key = f"{roster.tenant_id}:{member.user_id}"
+        user_key = f"{runtime_tenant}:{member.user_id}"
         states = states_by_user_key.get(user_key, [])
         conversations = {
             str(getattr(state, "conversation_id", "")).strip()
@@ -100,7 +104,7 @@ def validate_personal_weekly_brief_targets(
             raise RuntimeError("personal weekly brief conversation context is not unique")
         targets.append(
             PersonalWeeklyBriefTarget(
-                tenant_id=roster.tenant_id,
+                tenant_id=runtime_tenant,
                 internal_user_id=member.user_id,
                 dingtalk_user_id=member.dingtalk_user_id,
                 display_name=member.user_name,
@@ -118,7 +122,11 @@ def revalidate_personal_weekly_brief_targets(
     controls: tuple[Any, ...] | list[Any],
     conversation_states: tuple[Any, ...] | list[Any],
     expected_model_name: str,
+    runtime_tenant_id: str | None = None,
 ) -> PersonalWeeklyBriefTargetRevalidation:
+    runtime_tenant = str(runtime_tenant_id or roster.tenant_id).strip()
+    if not runtime_tenant:
+        raise RuntimeError("personal weekly brief runtime tenant is missing")
     frozen_by_user = {target.internal_user_id: target for target in frozen_targets}
     if len(frozen_by_user) != FORMAL_ROSTER_MEMBER_COUNT:
         raise PersonalWeeklyBriefOverallScopeError(
@@ -149,7 +157,7 @@ def revalidate_personal_weekly_brief_targets(
         binding = binding_rows[0]
         if not (
             getattr(binding, "active", False) is True
-            and str(getattr(binding, "tenant_id", "")) == roster.tenant_id
+            and str(getattr(binding, "tenant_id", "")) == runtime_tenant
             and str(getattr(binding, "dingtalk_user_id", ""))
             == member.dingtalk_user_id
         ):
@@ -161,7 +169,7 @@ def revalidate_personal_weekly_brief_targets(
             continue
         control = control_rows[0]
         if not (
-            str(getattr(control, "tenant_id", "")) == roster.tenant_id
+            str(getattr(control, "tenant_id", "")) == runtime_tenant
             and getattr(control, "enabled", False) is True
             and getattr(control, "messages_enabled", False) is True
             and str(getattr(control, "runtime", "")) == "canary_execute"
@@ -169,7 +177,7 @@ def revalidate_personal_weekly_brief_targets(
         ):
             blocked[user_id] = "agent2_control_changed"
             continue
-        state_rows = states_by_user.get(f"{roster.tenant_id}:{user_id}", ())
+        state_rows = states_by_user.get(f"{runtime_tenant}:{user_id}", ())
         conversation_ids = {
             str(getattr(row, "conversation_id", "")).strip()
             for row in state_rows
@@ -179,7 +187,7 @@ def revalidate_personal_weekly_brief_targets(
             blocked[user_id] = "conversation_context_not_unique"
             continue
         latest = PersonalWeeklyBriefTarget(
-            tenant_id=roster.tenant_id,
+            tenant_id=runtime_tenant,
             internal_user_id=user_id,
             dingtalk_user_id=member.dingtalk_user_id,
             display_name=member.user_name,
@@ -209,12 +217,13 @@ async def load_personal_weekly_brief_targets(
     session: Any,
     *,
     tenant_id: str,
+    roster_tenant_id: str | None = None,
     on_date: date,
     expected_model_name: str,
 ) -> tuple[PersonalWeeklyBriefTarget, ...]:
     roster = await load_formal_legal_daily_roster(
         session,
-        tenant_id=tenant_id,
+        tenant_id=roster_tenant_id or tenant_id,
         on_date=on_date,
     )
     user_ids = roster.user_ids
@@ -255,6 +264,7 @@ async def load_personal_weekly_brief_targets(
         controls=controls,
         conversation_states=states,
         expected_model_name=expected_model_name,
+        runtime_tenant_id=tenant_id,
     )
 
 
@@ -262,13 +272,14 @@ async def load_personal_weekly_brief_target_revalidation(
     session: Any,
     *,
     tenant_id: str,
+    roster_tenant_id: str | None = None,
     on_date: date,
     expected_model_name: str,
     frozen_targets: tuple[PersonalWeeklyBriefTarget, ...],
 ) -> PersonalWeeklyBriefTargetRevalidation:
     roster = await load_formal_legal_daily_roster(
         session,
-        tenant_id=tenant_id,
+        tenant_id=roster_tenant_id or tenant_id,
         on_date=on_date,
     )
     user_ids = roster.user_ids
@@ -309,6 +320,7 @@ async def load_personal_weekly_brief_target_revalidation(
         controls=controls,
         conversation_states=states,
         expected_model_name=expected_model_name,
+        runtime_tenant_id=tenant_id,
     )
 
 

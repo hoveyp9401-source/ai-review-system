@@ -89,6 +89,54 @@ def test_exact_74_agent2_users_resolve_to_private_self_only_targets() -> None:
     assert all(target.tenant_id == "tenant-a" for target in targets)
 
 
+def test_formal_roster_and_agent2_runtime_can_use_separate_tenants() -> None:
+    roster, bindings, controls, states = _scope()
+    roster = FormalLegalDailyRoster(
+        tenant_id="formal-roster-tenant",
+        on_date=roster.on_date,
+        members=roster.members,
+    )
+    runtime_tenant = "agent2-runtime-tenant"
+    bindings = tuple(
+        SimpleNamespace(**{**row.__dict__, "tenant_id": runtime_tenant})
+        for row in bindings
+    )
+    controls = tuple(
+        SimpleNamespace(**{**row.__dict__, "tenant_id": runtime_tenant})
+        for row in controls
+    )
+    states = tuple(
+        SimpleNamespace(
+            user_key=f"{runtime_tenant}:{member.user_id}",
+            conversation_id=f"runtime-conversation-{index:02d}",
+        )
+        for index, member in enumerate(roster.members)
+    )
+
+    targets = validate_personal_weekly_brief_targets(
+        roster=roster,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+        runtime_tenant_id=runtime_tenant,
+    )
+    revalidated = revalidate_personal_weekly_brief_targets(
+        roster=roster,
+        frozen_targets=targets,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+        runtime_tenant_id=runtime_tenant,
+    )
+
+    assert len(targets) == 74
+    assert all(target.tenant_id == runtime_tenant for target in targets)
+    assert len(revalidated.valid_targets) == 74
+    assert revalidated.blocked_reasons == {}
+
+
 def test_scope_rejects_73_members_instead_of_silently_sending_partial_batch() -> None:
     roster, bindings, controls, states = _scope(73)
 

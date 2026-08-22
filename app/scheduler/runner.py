@@ -291,6 +291,17 @@ def _strict_personal_weekly_brief_tenant(value: object) -> str | None:
     return value
 
 
+def _personal_weekly_brief_roster_tenant(settings, *, runtime_tenant_id: str) -> str:
+    """Keep the formal-roster namespace separate from the Agent2 runtime."""
+
+    return (
+        _strict_personal_weekly_brief_tenant(
+            getattr(settings, "legal_daily_dashboard_tenant_id", "")
+        )
+        or runtime_tenant_id
+    )
+
+
 def register_personal_weekly_brief_jobs(
     scheduler,
     *,
@@ -628,6 +639,10 @@ async def run_personal_weekly_brief_generation_job(
         local_now,
         timezone_name=PERSONAL_WEEKLY_BRIEF_TIMEZONE,
     )
+    roster_tenant_id = _personal_weekly_brief_roster_tenant(
+        settings,
+        runtime_tenant_id=tenant_id,
+    )
 
     # Establish one repeatable database view before reading any of the 74
     # owners.  Model calls happen only after these source snapshots commit.
@@ -638,6 +653,7 @@ async def run_personal_weekly_brief_generation_job(
         targets = await load_personal_weekly_brief_targets(
             snapshot_session,
             tenant_id=tenant_id,
+            roster_tenant_id=roster_tenant_id,
             on_date=local_now.date(),
             expected_model_name=CANARY_MODEL_NAME,
         )
@@ -791,10 +807,15 @@ async def _dispatch_personal_weekly_brief_record(
 ) -> PersonalWeeklyBriefRecord:
     tenant_id = row.tenant_id
     local_now = _personal_weekly_local_now(now)
+    roster_tenant_id = _personal_weekly_brief_roster_tenant(
+        settings,
+        runtime_tenant_id=tenant_id,
+    )
     async with AsyncSessionLocal() as scope_session:
         revalidation = await load_personal_weekly_brief_target_revalidation(
             scope_session,
             tenant_id=tenant_id,
+            roster_tenant_id=roster_tenant_id,
             on_date=local_now.date(),
             expected_model_name=CANARY_MODEL_NAME,
             frozen_targets=frozen_targets,
@@ -840,6 +861,7 @@ async def _dispatch_personal_weekly_brief_record(
     if delivered.status == "delivered":
         await _record_personal_weekly_brief_context(
             tenant_id=tenant_id,
+            roster_tenant_id=roster_tenant_id,
             row=delivered,
             frozen_targets=frozen_targets,
         )
@@ -864,6 +886,10 @@ async def run_personal_weekly_brief_dispatch_job(
     ):
         return 0
     local_now = _personal_weekly_local_now(now)
+    roster_tenant_id = _personal_weekly_brief_roster_tenant(
+        settings,
+        runtime_tenant_id=tenant_id,
+    )
     target_week_start = week_start or derive_personal_weekly_brief_window(
         local_now,
         timezone_name=PERSONAL_WEEKLY_BRIEF_TIMEZONE,
@@ -885,6 +911,7 @@ async def run_personal_weekly_brief_dispatch_job(
         await load_personal_weekly_brief_target_revalidation(
             preflight_session,
             tenant_id=tenant_id,
+            roster_tenant_id=roster_tenant_id,
             on_date=local_now.date(),
             expected_model_name=CANARY_MODEL_NAME,
             frozen_targets=frozen_targets,
@@ -926,6 +953,10 @@ async def run_personal_weekly_brief_reconcile_job(
     ):
         return 0
     local_now = _personal_weekly_local_now(now)
+    roster_tenant_id = _personal_weekly_brief_roster_tenant(
+        settings,
+        runtime_tenant_id=tenant_id,
+    )
     send_enabled = bool(
         getattr(settings, "agent2_personal_weekly_brief_send_enabled", False)
     )
@@ -1085,6 +1116,7 @@ async def run_personal_weekly_brief_reconcile_job(
             delivered_count += 1
             await _record_personal_weekly_brief_context(
                 tenant_id=tenant_id,
+                roster_tenant_id=roster_tenant_id,
                 row=delivered,
                 frozen_targets=frozen_targets,
             )
@@ -1092,6 +1124,7 @@ async def run_personal_weekly_brief_reconcile_job(
         frozen_targets = await frozen_for(row)
         await _record_personal_weekly_brief_context(
             tenant_id=tenant_id,
+            roster_tenant_id=roster_tenant_id,
             row=row,
             frozen_targets=frozen_targets,
         )
@@ -1190,6 +1223,7 @@ def _personal_weekly_brief_send_switch_enabled() -> bool:
 async def _record_personal_weekly_brief_context(
     *,
     tenant_id: str,
+    roster_tenant_id: str | None = None,
     row: PersonalWeeklyBriefRecord,
     frozen_targets: tuple[PersonalWeeklyBriefTarget, ...],
     changed_at: datetime | None = None,
@@ -1224,6 +1258,7 @@ async def _record_personal_weekly_brief_context(
         revalidation = await load_personal_weekly_brief_target_revalidation(
             session,
             tenant_id=tenant_id,
+            roster_tenant_id=roster_tenant_id or tenant_id,
             on_date=context_recorded_at.date(),
             expected_model_name=CANARY_MODEL_NAME,
             frozen_targets=frozen_targets,
