@@ -927,14 +927,28 @@ def _validate_critical_literal_coverage(
             }
             for source_id in sorted(excluded_critical_sources)
         ]
-        raise ValueError(
-            "personal weekly brief sources with critical facts cannot be "
-            "excluded: "
-            + json.dumps(
-                excluded_details,
+        encoded_excluded = json.dumps(
+            excluded_details,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(encoded_excluded) > 9000:
+            encoded_excluded = json.dumps(
+                [
+                    {
+                        "source_id": item["source_id"],
+                        "excluded_context_count": len(
+                            item["excluded_contexts"]
+                        ),
+                    }
+                    for item in excluded_details
+                ],
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        raise ValueError(
+            "personal weekly brief sources with critical facts cannot be "
+            "excluded: " + encoded_excluded
         )
     texts_by_source: dict[str, list[str]] = {
         source_id: [] for source_id in cited_source_ids

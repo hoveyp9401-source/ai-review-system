@@ -695,6 +695,49 @@ async def test_all_excluded_critical_sources_are_reported_in_one_repair() -> Non
     assert "甲项目" not in str(caught.value)
 
 
+@pytest.mark.asyncio
+async def test_many_excluded_critical_sources_keep_all_ids_within_repair_limit() -> None:
+    sources = tuple(
+        _source(
+            f"daily:excluded:large:{index}",
+            kind="daily_report",
+            on_date=date(2026, 8, 17 + index % 5),
+            section="today_work",
+            text=f"事项{index}金额100万" + "补充说明" * 300 + "。",
+        )
+        for index in range(10)
+    )
+    payload = {
+        "intro": "本周简报。",
+        "completed": _empty_section("没有需要展示的工作。"),
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有未闭环事项。"),
+        "source_dispositions": [
+            {
+                "source_id": source.source_id,
+                "disposition": "safely_excluded",
+                "reason": "模型误判无需展示。",
+            }
+            for source in sources
+        ],
+    }
+
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
+        await Agent2PersonalWeeklyBriefGenerator(
+            _FakeLLM(payload),
+            model="agent2-model",
+        ).generate(
+            snapshot=_snapshot(*sources),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+    error = caught.value.repair_detail
+    assert len(error) < 12000
+    assert "excluded_context_count" in error
+    assert all(source.source_id in error for source in sources)
+
+
 def test_reviewer_prompt_does_not_duplicate_source_trace() -> None:
     source = Path("app/agent2/personal_weekly_brief.py").read_text(encoding="utf-8")
     review_body = source.split("class Agent2PersonalWeeklyBriefReviewer", 1)[1].split(
