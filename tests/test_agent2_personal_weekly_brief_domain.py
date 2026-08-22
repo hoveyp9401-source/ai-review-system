@@ -739,6 +739,91 @@ async def test_maximum_excluded_critical_sources_fit_within_repair_limit() -> No
     assert "trusted_snapshot" in error
 
 
+@pytest.mark.asyncio
+async def test_excluded_critical_source_is_cited_on_second_model_attempt() -> None:
+    sources = tuple(
+        _source(
+            f"daily:{index:03d}:" + "b" * 110,
+            kind="daily_report",
+            on_date=date(2026, 8, 17 + index % 5),
+            section="today_work",
+            text=f"事项{index}金额100万。",
+        )
+        for index in range(120)
+    )
+    first_invalid = {
+        "intro": "本周简报。",
+        "completed": _empty_section("没有需要展示的工作。"),
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有未闭环事项。"),
+        "source_dispositions": [
+            {
+                "source_id": source.source_id,
+                "disposition": "safely_excluded",
+                "reason": "模型误判无需展示。",
+            }
+            for source in sources
+        ],
+    }
+    source_groups = tuple(
+        sources[start : start + 30] for start in range(0, len(sources), 30)
+    )
+    second_valid = {
+        "intro": "本周简报。",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": f"project-{index}",
+                    "text": f"第{index + 1}组事项金额100万。",
+                    "source_ids": [source.source_id for source in group],
+                }
+                for index, group in enumerate(source_groups)
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有未闭环事项。"),
+        "source_dispositions": [
+            {
+                "source_id": source.source_id,
+                "disposition": "cited",
+                "reason": "",
+            }
+            for source in sources
+        ],
+    }
+    review_approved = {
+        "approved": True,
+        "reviewed_matter_keys": [
+            f"project-{index}" for index in range(len(source_groups))
+        ],
+        "issues": [],
+    }
+    llm = _SequenceLLM(first_invalid, second_valid, review_approved)
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(*sources),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.semantic_attempts == 2
+    assert len(outcome.content.source_dispositions) == 120
+    assert all(
+        disposition.disposition == "cited"
+        for disposition in outcome.content.source_dispositions
+    )
+    second_prompt = json.loads(llm.calls[1]["user_prompt"])
+    issue_reason = second_prompt["repair_context"]["issues"][0]["reason"]
+    assert "逐项检查 trusted_snapshot" in issue_reason
+    assert "不得标为 safely_excluded" in issue_reason
+    assert "上一版 source_dispositions" not in issue_reason
+
+
 def test_reviewer_prompt_does_not_duplicate_source_trace() -> None:
     source = Path("app/agent2/personal_weekly_brief.py").read_text(encoding="utf-8")
     review_body = source.split("class Agent2PersonalWeeklyBriefReviewer", 1)[1].split(

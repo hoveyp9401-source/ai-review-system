@@ -938,9 +938,9 @@ def _validate_critical_literal_coverage(
                     "all_excluded_critical_sources_must_be_reprocessed": True,
                     "excluded_source_count": len(excluded_details),
                     "instruction": (
-                        "逐项检查 trusted_snapshot 与上一版 "
-                        "source_dispositions；所有含金额或日期且被标为 "
-                        "safely_excluded 的来源都必须重新处理。"
+                        "逐项检查 trusted_snapshot；其中所有含金额或日期的"
+                        "来源本轮都不得标为 safely_excluded，必须引用到"
+                        "对应事项。"
                     ),
                 },
                 ensure_ascii=False,
