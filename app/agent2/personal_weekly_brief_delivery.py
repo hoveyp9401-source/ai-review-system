@@ -158,7 +158,7 @@ class PersonalWeeklyBriefDispatcher:
             status_code = int(exc.response.status_code)
             prefix = (
                 "retry_safe_preacceptance"
-                if 400 <= status_code < 500
+                if status_code == 400
                 else "transport_error"
             )
             return await self._store.record_failure(

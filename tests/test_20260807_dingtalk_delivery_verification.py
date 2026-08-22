@@ -108,6 +108,7 @@ def _settings():
         dingtalk_api_base_url="https://api.example.invalid",
         dingtalk_oapi_base_url="https://oapi.example.invalid",
         dingtalk_app_key="robot-code",
+        dingtalk_robot_code="robot-code",
     )
 
 
@@ -151,6 +152,26 @@ async def test_direct_message_uses_robot_code_separate_from_app_key():
 
     assert observed["send_json"]["robotCode"] == "active-robot-code"
     assert observed["status_params"]["robotCode"] == "active-robot-code"
+
+
+@pytest.mark.asyncio
+async def test_direct_message_does_not_fall_back_to_app_key_as_robot_code():
+    settings = _settings()
+    settings.dingtalk_robot_code = ""
+    client = DingTalkRobotClient(settings)
+
+    async def unexpected_token():
+        raise AssertionError("missing robot code must fail before token or provider call")
+
+    client.get_enterprise_access_token = unexpected_token
+    try:
+        with pytest.raises(ValueError, match="robot code"):
+            await client.send_robot_direct_text(
+                user_ids=["staff-1"],
+                text="hello",
+            )
+    finally:
+        await client.close()
 
 
 @pytest.mark.parametrize(

@@ -300,10 +300,7 @@ class DingTalkRobotClient:
         await self._client.aclose()
 
     def direct_robot_code(self) -> str:
-        return str(
-            getattr(self.settings, "dingtalk_robot_code", "")
-            or self.settings.dingtalk_app_key
-        ).strip()
+        return str(getattr(self.settings, "dingtalk_robot_code", "") or "").strip()
 
     def has_enterprise_app(self) -> bool:
         return bool(self.settings.dingtalk_app_key and self.settings.dingtalk_app_secret and self.settings.dingtalk_agent_id)
@@ -397,7 +394,7 @@ class DingTalkRobotClient:
             return {"processQueryKey": None, "invalidStaffIdList": [], "filteredStaffIdList": [], "flowControlledStaffIdList": []}
         robot_code = self.direct_robot_code()
         if not robot_code:
-            raise ValueError("DingTalk app key is not configured.")
+            raise ValueError("DingTalk robot code is not configured.")
 
         access_token = await self.get_enterprise_access_token()
         response = await self._client.post(
@@ -440,7 +437,7 @@ class DingTalkRobotClient:
             return {"processQueryKey": None, "invalidStaffIdList": [], "filteredStaffIdList": [], "flowControlledStaffIdList": []}
         robot_code = self.direct_robot_code()
         if not robot_code:
-            raise ValueError("DingTalk app key is not configured.")
+            raise ValueError("DingTalk robot code is not configured.")
 
         access_token = await self.get_enterprise_access_token()
         response = await self._client.post(
@@ -515,12 +512,15 @@ class DingTalkRobotClient:
     ) -> dict[str, Any]:
         if not process_query_key:
             raise ValueError("process_query_key is required")
+        robot_code = self.direct_robot_code()
+        if not robot_code:
+            raise ValueError("DingTalk robot code is not configured.")
         access_token = await self.get_enterprise_access_token()
         response = await self._client.get(
             f"{self._api_base_url}/v1.0/robot/oToMessages/readStatus",
             headers={"x-acs-dingtalk-access-token": access_token},
             params={
-                "robotCode": self.direct_robot_code(),
+                "robotCode": robot_code,
                 "processQueryKey": process_query_key,
             },
         )

@@ -153,6 +153,36 @@ async def test_http_400_before_provider_acceptance_is_retry_safe_failure() -> No
 
 
 @pytest.mark.asyncio
+async def test_other_http_4xx_is_not_marked_retry_safe() -> None:
+    store = _Store()
+
+    class _AmbiguousTransport:
+        async def send_private_text_accepted(self, **_kwargs):
+            request = httpx.Request("POST", "https://api.dingtalk.invalid/send")
+            response = httpx.Response(409, request=request)
+            raise httpx.HTTPStatusError(
+                "conflict",
+                request=request,
+                response=response,
+            )
+
+    failed = await PersonalWeeklyBriefDispatcher(
+        store=store,
+        transport=_AmbiguousTransport(),
+        tenant_id="tenant-a",
+        allowed_user_ids=frozenset({"user-a"}),
+    ).dispatch(
+        row=_record(),
+        recipient=_recipient(),
+        changed_at=NOW,
+        claim_token="claim-http-409",
+    )
+
+    assert failed.status == "failed"
+    assert failed.last_error == "transport_error:HTTPStatusError:409"
+
+
+@pytest.mark.asyncio
 async def test_dingtalk_transport_records_acceptance_before_separate_delivery_query() -> None:
     calls: list[str] = []
 
