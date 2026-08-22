@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from app.agent2.personal_weekly_brief_store import personal_weekly_brief_metadata
+
 
 def test_personal_weekly_brief_migration_is_transactional_and_idempotent() -> None:
     sql = Path("scripts/create_agent2_personal_weekly_briefs.sql").read_text(
@@ -8,7 +10,8 @@ def test_personal_weekly_brief_migration_is_transactional_and_idempotent() -> No
 
     assert not sql.lstrip().startswith("BEGIN;")
     assert not sql.rstrip().endswith("COMMIT;")
-    assert "CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs" in sql
+    assert "CREATE TABLE IF NOT EXISTS public.agent2_personal_weekly_briefs" in sql
+    assert "ON public.agent2_personal_weekly_briefs" in sql
     assert "UNIQUE (tenant_id, owner_user_id, week_start)" in sql
     assert "UNIQUE (tenant_id, idempotency_key)" in sql
     assert "length(source_fingerprint) = 64" in sql
@@ -25,6 +28,9 @@ def test_personal_weekly_brief_migration_is_transactional_and_idempotent() -> No
     assert "recovery_json jsonb" in sql
     assert "jsonb_typeof(recovery_json) = 'array'" in sql
     assert "context_recorded_at IS NULL" in sql
+    assert personal_weekly_brief_metadata.tables[
+        "public.agent2_personal_weekly_briefs"
+    ].schema == "public"
 
 
 def test_personal_weekly_brief_rollback_refuses_nonempty_table() -> None:

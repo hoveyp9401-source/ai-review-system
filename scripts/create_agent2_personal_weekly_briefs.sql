@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
+CREATE TABLE IF NOT EXISTS public.agent2_personal_weekly_briefs (
     brief_id uuid PRIMARY KEY,
     tenant_id varchar(128) NOT NULL,
     owner_user_id varchar(128) NOT NULL,
@@ -91,10 +91,10 @@ CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
 );
 
 CREATE INDEX IF NOT EXISTS agent2_personal_weekly_brief_status_idx
-    ON agent2_personal_weekly_briefs
+    ON public.agent2_personal_weekly_briefs
     (tenant_id, status, week_start, owner_user_id);
 
 CREATE INDEX IF NOT EXISTS agent2_personal_weekly_brief_context_idx
-    ON agent2_personal_weekly_briefs
+    ON public.agent2_personal_weekly_briefs
     (tenant_id, delivered_at, owner_user_id)
     WHERE status = 'delivered' AND context_recorded_at IS NULL;

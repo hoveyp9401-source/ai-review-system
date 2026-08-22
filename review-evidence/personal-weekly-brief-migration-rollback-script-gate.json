@@ -1,12 +1,13 @@
 {
   "schema_version": "agent2.personal_weekly_brief.migration_rollback_script_gate.v1",
   "status": "PASS_STATIC_ONLY",
-  "migration_sha256": "fbb11fb43efd455b5c757459f8e95dd7fba8bad1620c6eb5095aeb2b20e7dc41",
+  "migration_sha256": "81f13205826e8d11a8deb6371a9e477ba5aeb13de79402c0474f71463b08945c",
   "rollback_sha256": "2a16ae92342b72e8ba1ecf91f23f2c6a93a3f54b308bde5c224d8ec614b2ee04",
   "checks": {
     "outer_transaction_embeddable_without_internal_commit": "PASS",
     "standalone_verifier_wraps_each_step_in_a_transaction": "PASS",
     "rollback_schema_qualified_to_public": "PASS",
+    "create_and_runtime_schema_qualified_to_public": "PASS",
     "generating_status_and_constraint_present": "PASS",
     "empty_table_drop_path_present": "PASS",
     "nonempty_table_refusal_present": "PASS",

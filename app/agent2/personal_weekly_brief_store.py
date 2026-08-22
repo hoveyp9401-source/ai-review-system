@@ -58,6 +58,7 @@ _briefs = Table(
     Column("recovery_json", JSONB, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    schema="public",
 )
 
 

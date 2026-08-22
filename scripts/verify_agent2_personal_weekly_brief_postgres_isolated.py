@@ -334,7 +334,7 @@ def main() -> int:
 
         brief_id = str(uuid4())
         insert_sql = f"""
-        INSERT INTO agent2_personal_weekly_briefs (
+        INSERT INTO public.agent2_personal_weekly_briefs (
             brief_id, tenant_id, owner_user_id, conversation_id,
             week_start, week_end, snapshot_at, source_snapshot,
             source_fingerprint, personal_memory_json, content_json,
@@ -362,7 +362,7 @@ def main() -> int:
                 *database_args,
                 "-Atc",
                 (
-                    "SELECT count(*) FROM agent2_personal_weekly_briefs "
+                    "SELECT count(*) FROM public.agent2_personal_weekly_briefs "
                     f"WHERE brief_id='{brief_id}'"
                 ),
             ]
@@ -382,30 +382,30 @@ def main() -> int:
         checks["owner_week_duplicate_guard"] = "PASS"
         print(json.dumps({"event": "postgres_duplicate_guard_passed"}), flush=True)
         transitions = f"""
-        UPDATE agent2_personal_weekly_briefs
+        UPDATE public.agent2_personal_weekly_briefs
         SET status='generating', generation_started_at=now(),
             recovery_json=recovery_json || '[{{"kind":"generation_started"}}]'::jsonb,
             updated_at=now()
         WHERE brief_id='{brief_id}' AND status='snapshot_ready';
-        UPDATE agent2_personal_weekly_briefs
+        UPDATE public.agent2_personal_weekly_briefs
         SET status='generated', content_json='{{"trace":{{}}}}'::jsonb,
             message_text='脱敏简报', llm_model='deepseek-v4-flash',
             generated_at=now(),
             recovery_json=recovery_json || '[{{"kind":"generation_completed"}}]'::jsonb,
             updated_at=now()
         WHERE brief_id='{brief_id}' AND status='generating';
-        UPDATE agent2_personal_weekly_briefs
+        UPDATE public.agent2_personal_weekly_briefs
         SET status='claimed', claim_token='isolated-claim', send_started_at=now(),
             recovery_json=recovery_json || '[{{"kind":"send_claimed"}}]'::jsonb,
             updated_at=now()
         WHERE brief_id='{brief_id}' AND status='generated';
-        UPDATE agent2_personal_weekly_briefs
+        UPDATE public.agent2_personal_weekly_briefs
         SET status='delivery_pending', provider_message_id='isolated-provider',
             provider_accepted_at=now(),
             recovery_json=recovery_json || '[{{"kind":"provider_accepted"}}]'::jsonb,
             updated_at=now()
         WHERE brief_id='{brief_id}' AND status='claimed';
-        UPDATE agent2_personal_weekly_briefs
+        UPDATE public.agent2_personal_weekly_briefs
         SET status='delivered', delivered_at=now(), final_verified_at=now(),
             delivery_receipt_json='{{"delivery_verified":true,"delivered_dingtalk_user_ids":["ding-isolated"]}}'::jsonb,
             recovery_json=recovery_json || '[{{"kind":"delivery_verified"}}]'::jsonb,
@@ -423,7 +423,7 @@ def main() -> int:
                     "jsonb_array_length(recovery_json)::text || '|' || "
                     "((generation_started_at IS NOT NULL AND generated_at IS NOT NULL "
                     "AND send_started_at IS NOT NULL AND final_verified_at IS NOT NULL)::text) "
-                    "FROM agent2_personal_weekly_briefs "
+                    "FROM public.agent2_personal_weekly_briefs "
                     f"WHERE brief_id='{brief_id}'"
                 ),
             ]
@@ -435,7 +435,7 @@ def main() -> int:
         _run(
             database_args,
             input_text=(
-                "DELETE FROM agent2_personal_weekly_briefs "
+                "DELETE FROM public.agent2_personal_weekly_briefs "
                 f"WHERE brief_id='{brief_id}';"
             ),
         )
