@@ -5,6 +5,7 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from app.services.dingtalk import DingTalkOutboundContentError
 
 from app.agent2.personal_weekly_brief_delivery import (
     PersonalWeeklyBriefDelivery,
@@ -245,3 +246,31 @@ async def test_claimed_row_is_never_automatically_sent_again() -> None:
 
     assert result == claimed
     assert transport.sent_to == []
+
+
+@pytest.mark.asyncio
+async def test_local_pre_send_content_failure_is_marked_retry_safe() -> None:
+    store = _Store()
+
+    class _LocalFailureTransport:
+        async def send_private_text_verified(self, **_kwargs):
+            raise DingTalkOutboundContentError("local validation blocked send")
+
+    dispatcher = PersonalWeeklyBriefDispatcher(
+        store=store,
+        transport=_LocalFailureTransport(),
+        tenant_id="tenant-a",
+        allowed_user_ids=frozenset({"user-a"}),
+    )
+
+    failed = await dispatcher.dispatch(
+        row=_record(),
+        recipient=_recipient(),
+        changed_at=NOW,
+        claim_token="claim-safe-local-failure",
+    )
+
+    assert failed.status == "failed"
+    assert failed.last_error == (
+        "retry_safe_preacceptance:DingTalkOutboundContentError"
+    )

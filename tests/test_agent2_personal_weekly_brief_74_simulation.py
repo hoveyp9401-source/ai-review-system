@@ -11,8 +11,8 @@ async def test_all_74_formal_targets_are_owner_isolated_without_send() -> None:
 
     assert result["status"] == "PASS"
     assert result["formal_target_count"] == 74
-    assert result["child_member_count"] == 72
-    assert result["center_member_count"] == 2
+    assert result["child_member_count"] == 70
+    assert result["center_member_count"] == 4
     assert result["child_department_count"] == 7
     assert result["own_scope_passed"] == 74
     assert result["cross_scope_rejected"] == 74

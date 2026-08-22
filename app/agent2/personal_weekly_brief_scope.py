@@ -25,6 +25,17 @@ class PersonalWeeklyBriefTarget:
     conversation_id: str
 
 
+@dataclass(frozen=True)
+class PersonalWeeklyBriefTargetRevalidation:
+    valid_targets: dict[str, PersonalWeeklyBriefTarget]
+    blocked_reasons: dict[str, str]
+    roster_user_ids: tuple[str, ...]
+
+
+class PersonalWeeklyBriefOverallScopeError(RuntimeError):
+    """The latest formal identity set is unsafe for every outbound send."""
+
+
 def validate_personal_weekly_brief_targets(
     *,
     roster: FormalLegalDailyRoster,
@@ -99,6 +110,101 @@ def validate_personal_weekly_brief_targets(
     return tuple(targets)
 
 
+def revalidate_personal_weekly_brief_targets(
+    *,
+    roster: FormalLegalDailyRoster,
+    frozen_targets: tuple[PersonalWeeklyBriefTarget, ...],
+    bindings: tuple[Any, ...] | list[Any],
+    controls: tuple[Any, ...] | list[Any],
+    conversation_states: tuple[Any, ...] | list[Any],
+    expected_model_name: str,
+) -> PersonalWeeklyBriefTargetRevalidation:
+    frozen_by_user = {target.internal_user_id: target for target in frozen_targets}
+    if len(frozen_by_user) != FORMAL_ROSTER_MEMBER_COUNT:
+        raise PersonalWeeklyBriefOverallScopeError(
+            "personal weekly brief frozen target set is not exactly 74"
+        )
+    roster_ids = set(roster.user_ids)
+    if roster.member_count != FORMAL_ROSTER_MEMBER_COUNT or roster_ids != set(
+        frozen_by_user
+    ):
+        raise PersonalWeeklyBriefOverallScopeError(
+            "personal weekly brief formal roster set changed after snapshot"
+        )
+
+    bindings_by_user = _group_by(bindings, key=lambda row: str(getattr(row, "user_id", "")))
+    controls_by_user = _group_by(controls, key=lambda row: str(getattr(row, "user_id", "")))
+    states_by_user = _group_by(
+        conversation_states,
+        key=lambda row: str(getattr(row, "user_key", "")),
+    )
+    valid: dict[str, PersonalWeeklyBriefTarget] = {}
+    blocked: dict[str, str] = {}
+    for member in roster.members:
+        user_id = member.user_id
+        binding_rows = bindings_by_user.get(user_id, ())
+        if len(binding_rows) != 1:
+            blocked[user_id] = "identity_binding_not_unique"
+            continue
+        binding = binding_rows[0]
+        if not (
+            getattr(binding, "active", False) is True
+            and str(getattr(binding, "tenant_id", "")) == roster.tenant_id
+            and str(getattr(binding, "dingtalk_user_id", ""))
+            == member.dingtalk_user_id
+        ):
+            blocked[user_id] = "identity_binding_changed"
+            continue
+        control_rows = controls_by_user.get(user_id, ())
+        if len(control_rows) != 1:
+            blocked[user_id] = "agent2_control_not_unique"
+            continue
+        control = control_rows[0]
+        if not (
+            str(getattr(control, "tenant_id", "")) == roster.tenant_id
+            and getattr(control, "enabled", False) is True
+            and getattr(control, "messages_enabled", False) is True
+            and str(getattr(control, "runtime", "")) == "canary_execute"
+            and str(getattr(control, "model_name", "")) == expected_model_name
+        ):
+            blocked[user_id] = "agent2_control_changed"
+            continue
+        state_rows = states_by_user.get(f"{roster.tenant_id}:{user_id}", ())
+        conversation_ids = {
+            str(getattr(row, "conversation_id", "")).strip()
+            for row in state_rows
+            if str(getattr(row, "conversation_id", "")).strip()
+        }
+        if len(state_rows) != 1 or len(conversation_ids) != 1:
+            blocked[user_id] = "conversation_context_not_unique"
+            continue
+        latest = PersonalWeeklyBriefTarget(
+            tenant_id=roster.tenant_id,
+            internal_user_id=user_id,
+            dingtalk_user_id=member.dingtalk_user_id,
+            display_name=member.user_name,
+            conversation_id=next(iter(conversation_ids)),
+        )
+        if latest != frozen_by_user[user_id]:
+            blocked[user_id] = "target_changed_after_snapshot"
+            continue
+        valid[user_id] = latest
+
+    dingtalk_ids = [target.dingtalk_user_id for target in valid.values()]
+    conversations = [target.conversation_id for target in valid.values()]
+    if len(dingtalk_ids) != len(set(dingtalk_ids)) or len(conversations) != len(
+        set(conversations)
+    ):
+        raise PersonalWeeklyBriefOverallScopeError(
+            "personal weekly brief latest identity set is ambiguous"
+        )
+    return PersonalWeeklyBriefTargetRevalidation(
+        valid_targets=valid,
+        blocked_reasons=blocked,
+        roster_user_ids=roster.user_ids,
+    )
+
+
 async def load_personal_weekly_brief_targets(
     session: Any,
     *,
@@ -152,6 +258,60 @@ async def load_personal_weekly_brief_targets(
     )
 
 
+async def load_personal_weekly_brief_target_revalidation(
+    session: Any,
+    *,
+    tenant_id: str,
+    on_date: date,
+    expected_model_name: str,
+    frozen_targets: tuple[PersonalWeeklyBriefTarget, ...],
+) -> PersonalWeeklyBriefTargetRevalidation:
+    roster = await load_formal_legal_daily_roster(
+        session,
+        tenant_id=tenant_id,
+        on_date=on_date,
+    )
+    user_ids = roster.user_ids
+    bindings = tuple(
+        (
+            await session.scalars(
+                select(Agent2IdentityBinding).where(
+                    Agent2IdentityBinding.tenant_id == tenant_id,
+                    Agent2IdentityBinding.user_id.in_(user_ids),
+                )
+            )
+        ).all()
+    )
+    controls = tuple(
+        (
+            await session.scalars(
+                select(ToolCallCanaryControl).where(
+                    ToolCallCanaryControl.tenant_id == tenant_id,
+                    ToolCallCanaryControl.user_id.in_(user_ids),
+                )
+            )
+        ).all()
+    )
+    user_keys = tuple(f"{tenant_id}:{user_id}" for user_id in user_ids)
+    states = tuple(
+        (
+            await session.scalars(
+                select(Agent2ConversationState).where(
+                    Agent2ConversationState.user_key.in_(user_keys)
+                )
+            )
+        ).all()
+    )
+    return revalidate_personal_weekly_brief_targets(
+        roster=roster,
+        frozen_targets=frozen_targets,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=expected_model_name,
+    )
+
+
 def _unique_by(rows, *, key, label: str) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for row in rows:
@@ -162,8 +322,19 @@ def _unique_by(rows, *, key, label: str) -> dict[str, Any]:
     return result
 
 
+def _group_by(rows, *, key) -> dict[str, tuple[Any, ...]]:
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(key(row), []).append(row)
+    return {identifier: tuple(values) for identifier, values in grouped.items()}
+
+
 __all__ = [
     "PersonalWeeklyBriefTarget",
+    "PersonalWeeklyBriefTargetRevalidation",
+    "PersonalWeeklyBriefOverallScopeError",
     "load_personal_weekly_brief_targets",
+    "load_personal_weekly_brief_target_revalidation",
+    "revalidate_personal_weekly_brief_targets",
     "validate_personal_weekly_brief_targets",
 ]

@@ -102,7 +102,7 @@ def _download(url: str, target: Path) -> None:
         raise ValueError("PostgreSQL archive URL is not the allow-listed EDB host")
     downloaded = 0
     next_notice = 25 * 1024 * 1024
-    with urlopen(url, timeout=60) as response, target.open("xb") as output:
+    with urlopen(url, timeout=180) as response, target.open("xb") as output:
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
@@ -301,18 +301,26 @@ def main() -> int:
         transitions = f"""
         UPDATE agent2_personal_weekly_briefs
         SET status='generated', content_json='{{"trace":{{}}}}'::jsonb,
-            message_text='脱敏简报', llm_model='deepseek-v4-flash', updated_at=now()
+            message_text='脱敏简报', llm_model='deepseek-v4-flash',
+            generation_started_at=now(), generated_at=now(),
+            recovery_json=recovery_json || '[{{"kind":"generation_completed"}}]'::jsonb,
+            updated_at=now()
         WHERE brief_id='{brief_id}' AND status='snapshot_ready';
         UPDATE agent2_personal_weekly_briefs
-        SET status='claimed', claim_token='isolated-claim', updated_at=now()
+        SET status='claimed', claim_token='isolated-claim', send_started_at=now(),
+            recovery_json=recovery_json || '[{{"kind":"send_claimed"}}]'::jsonb,
+            updated_at=now()
         WHERE brief_id='{brief_id}' AND status='generated';
         UPDATE agent2_personal_weekly_briefs
         SET status='delivery_pending', provider_message_id='isolated-provider',
-            provider_accepted_at=now(), updated_at=now()
+            provider_accepted_at=now(),
+            recovery_json=recovery_json || '[{{"kind":"provider_accepted"}}]'::jsonb,
+            updated_at=now()
         WHERE brief_id='{brief_id}' AND status='claimed';
         UPDATE agent2_personal_weekly_briefs
-        SET status='delivered', delivered_at=now(),
+        SET status='delivered', delivered_at=now(), final_verified_at=now(),
             delivery_receipt_json='{{"delivery_verified":true,"delivered_dingtalk_user_ids":["ding-isolated"]}}'::jsonb,
+            recovery_json=recovery_json || '[{{"kind":"delivery_verified"}}]'::jsonb,
             updated_at=now()
         WHERE brief_id='{brief_id}' AND status='delivery_pending';
         """
@@ -323,13 +331,16 @@ def main() -> int:
                 "-Atc",
                 (
                     "SELECT status || '|' || "
-                    "(delivery_receipt_json->>'delivery_verified') "
+                    "(delivery_receipt_json->>'delivery_verified') || '|' || "
+                    "jsonb_array_length(recovery_json)::text || '|' || "
+                    "((generation_started_at IS NOT NULL AND generated_at IS NOT NULL "
+                    "AND send_started_at IS NOT NULL AND final_verified_at IS NOT NULL)::text) "
                     "FROM agent2_personal_weekly_briefs "
                     f"WHERE brief_id='{brief_id}'"
                 ),
             ]
         ).stdout.strip()
-        if delivered != "delivered|true":
+        if delivered != "delivered|true|4|true":
             raise AssertionError("delivery transition was not persisted")
         checks["snapshot_to_delivered_transitions"] = "PASS"
         print(json.dumps({"event": "postgres_transitions_passed"}), flush=True)

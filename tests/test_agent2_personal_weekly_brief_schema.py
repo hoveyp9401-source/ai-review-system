@@ -17,4 +17,10 @@ def test_personal_weekly_brief_migration_is_transactional_and_idempotent() -> No
     assert "status = 'delivered'" in sql
     assert "AND delivered_at IS NOT NULL" in sql
     assert "delivery_receipt_json <> '{}'::jsonb" in sql
+    assert "generation_started_at timestamptz" in sql
+    assert "generated_at timestamptz" in sql
+    assert "send_started_at timestamptz" in sql
+    assert "final_verified_at timestamptz" in sql
+    assert "recovery_json jsonb" in sql
+    assert "jsonb_typeof(recovery_json) = 'array'" in sql
     assert "context_recorded_at IS NULL" in sql

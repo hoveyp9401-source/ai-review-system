@@ -13,8 +13,9 @@ from app.agent2.tool_calling.canary_control import (
 )
 from app.config import Settings
 from scripts.manage_full_rollout import (
+    CENTER_ROSTER_COUNT,
     CENTER_LEVEL_TEAM_CODE,
-    EXPECTED_CENTER_LEVEL_MEMBERS,
+    FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES,
     EXPECTED_CHILD_TEAMS,
     ROLLOUT_COUNT,
     _validate_roster,
@@ -28,13 +29,13 @@ from scripts.simulate_full_rollout_readonly import (
 
 
 CHILD_TEAM_COUNTS = {
-    "法务一部": 14,
-    "法务二部": 12,
-    "法务三部": 9,
-    "法务四部": 12,
-    "法务五部": 8,
-    "法务六部": 6,
-    "综合管理部": 11,
+    "法务一部": 10,
+    "法务二部": 10,
+    "法务三部": 10,
+    "法务四部": 10,
+    "法务五部": 10,
+    "法务六部": 10,
+    "综合管理部": 10,
 }
 
 
@@ -48,9 +49,6 @@ def _rollout_rows() -> list[dict[str, object]]:
         for member_index in range(count):
             index += 1
             member_name = f"子部门成员{index}"
-            confirmed_lead = EXPECTED_CONFIRMED_TEAM_LEADS.get(team_name)
-            if member_index == 0 and confirmed_lead:
-                member_name = confirmed_lead
             rows.append(
                 {
                     "user_id": f"user-{index}",
@@ -68,7 +66,12 @@ def _rollout_rows() -> list[dict[str, object]]:
                 }
             )
     center_team_id = "center-team"
-    for name in sorted(EXPECTED_CENTER_LEVEL_MEMBERS):
+    center_names = (
+        *sorted(FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES),
+        "中心直属甲",
+        "中心直属乙",
+    )
+    for name in center_names:
         index += 1
         rows.append(
             {
@@ -89,13 +92,14 @@ def _rollout_rows() -> list[dict[str, object]]:
     return rows
 
 
-def test_full_rollout_roster_is_seven_departments_plus_two_center_members() -> None:
+def test_full_rollout_roster_is_seven_departments_plus_four_center_members() -> None:
     rows = _rollout_rows()
 
     _validate_roster(rows)
 
     assert len(rows) == ROLLOUT_COUNT == 74
-    assert sum(bool(row["team_active"]) for row in rows) == 72
+    assert sum(bool(row["team_active"]) for row in rows) == 70
+    assert sum(not bool(row["team_active"]) for row in rows) == CENTER_ROSTER_COUNT == 4
     assert {
         str(row["team_name"]) for row in rows if bool(row["team_active"])
     } == EXPECTED_CHILD_TEAMS
@@ -104,7 +108,7 @@ def test_full_rollout_roster_is_seven_departments_plus_two_center_members() -> N
 def test_child_department_only_roster_is_rejected_as_not_full_rollout() -> None:
     child_rows = [row for row in _rollout_rows() if bool(row["team_active"])]
 
-    with pytest.raises(RuntimeError, match="expected 74 roster members, got 72"):
+    with pytest.raises(RuntimeError, match="expected 74 roster members, got 70"):
         _validate_roster(child_rows)
 
 

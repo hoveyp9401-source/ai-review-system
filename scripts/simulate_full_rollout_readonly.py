@@ -17,7 +17,8 @@ from app.legal_daily_dashboard.domain import (
 )
 from app.legal_daily_dashboard.sql_repository import SqlDashboardRepository
 from app.legal_daily_roster import (
-    FORMAL_CENTER_MEMBER_NAMES as EXPECTED_CENTER_LEVEL_MEMBERS,
+    FORMAL_CENTER_MEMBER_COUNT as CENTER_ROSTER_COUNT,
+    FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES,
     FORMAL_CENTER_TEAM_CODE as CENTER_LEVEL_TEAM_CODE,
     FORMAL_CHILD_MEMBER_COUNT as CHILD_ROSTER_COUNT,
     FORMAL_CHILD_TEAM_NAMES as EXPECTED_TEAMS,
@@ -296,8 +297,11 @@ def _assert_roster(teams, roster_rows) -> None:
         raise AssertionError("child-department names do not match the seven-team structure")
     if len({str(row["team_id"]) for row in child_rows}) != len(EXPECTED_TEAMS):
         raise AssertionError("child-department roster does not resolve to seven teams")
-    if {str(row["user_name"]) for row in center_rows} != EXPECTED_CENTER_LEVEL_MEMBERS:
-        raise AssertionError("center-level roster does not match the expected two people")
+    center_names = {str(row["user_name"]) for row in center_rows}
+    if len(center_rows) != CENTER_ROSTER_COUNT or not (
+        FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES <= center_names
+    ):
+        raise AssertionError("center-level roster does not match the trusted 4-person scope")
 
 
 def _simulated_recipients(*, assignment_rows, roster_rows, configured_cc: str):
@@ -473,11 +477,14 @@ def _assert_briefings(briefings: dict[str, object]) -> dict[str, object]:
         for row in department_snapshot_rows
         if str(row.get("member_ref") or "") not in team_snapshot_refs
     ]
-    if {
+    center_snapshot_names = {
         str(row.get("member_name") or "") for row in center_snapshot_members
-    } != EXPECTED_CENTER_LEVEL_MEMBERS:
+    }
+    if len(center_snapshot_members) != CENTER_ROSTER_COUNT or not (
+        FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES <= center_snapshot_names
+    ):
         raise AssertionError(
-            "the department snapshot does not contain the expected center direct members"
+            "the department snapshot does not contain the trusted center direct scope"
         )
 
     messages = [*team_messages, department_message]

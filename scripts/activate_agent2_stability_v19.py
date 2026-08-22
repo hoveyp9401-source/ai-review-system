@@ -22,10 +22,10 @@ from app.agent2.tool_calling.registry import runtime_registry_contract_digest
 from app.config import get_settings
 from app.db import AsyncSessionLocal, engine
 from app.legal_daily_roster import (
-    FORMAL_CENTER_MEMBER_NAMES,
+    FORMAL_CENTER_MEMBER_COUNT,
     FORMAL_CENTER_TEAM_CODE,
     FORMAL_CHILD_TEAM_NAMES as EXPECTED_CHILD_TEAMS,
-    FORMAL_CONFIRMED_CHILD_PLACEMENTS,
+    FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES,
     FORMAL_ROSTER_MEMBER_COUNT as EXPECTED_ROSTER_COUNT,
 )
 
@@ -137,18 +137,11 @@ async def _roster_user_ids(session, tenant_id: str) -> set[str]:
         if str(row["team_code"] or "") == FORMAL_CENTER_TEAM_CODE
         and not bool(row["team_active"])
     ]
-    if {str(row["user_name"]) for row in center_direct} != FORMAL_CENTER_MEMBER_NAMES:
-        raise AssertionError("center-direct members changed")
-    team_by_member_name = {
-        str(row["user_name"]): str(row["team_name"])
-        for row in rows
-        if bool(row["team_active"])
-    }
-    if any(
-        team_by_member_name.get(member_name) != expected_team_name
-        for member_name, expected_team_name in FORMAL_CONFIRMED_CHILD_PLACEMENTS.items()
+    center_names = {str(row["user_name"]) for row in center_direct}
+    if len(center_direct) != FORMAL_CENTER_MEMBER_COUNT or not (
+        FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES <= center_names
     ):
-        raise AssertionError("confirmed child-department placements changed")
+        raise AssertionError("center-direct roster changed")
     return user_ids
 
 

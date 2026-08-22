@@ -53,7 +53,7 @@ def test_closed_feature_registers_no_job() -> None:
     assert scheduler.jobs == []
 
 
-def test_generation_is_scheduled_for_saturday_0900_without_send_worker() -> None:
+def test_generation_and_recovery_are_scheduled_while_send_stays_closed() -> None:
     scheduler = _Scheduler()
 
     registered = register_personal_weekly_brief_jobs(
@@ -66,12 +66,16 @@ def test_generation_is_scheduled_for_saturday_0900_without_send_worker() -> None
         reconciliation_job=_noop,
     )
 
-    assert registered == ("agent2_personal_weekly_brief_generate",)
+    assert registered == (
+        "agent2_personal_weekly_brief_generate",
+        "agent2_personal_weekly_brief_reconcile",
+    )
     assert str(scheduler.jobs[0]["trigger"]) == (
         "cron[day_of_week='sat', hour='9', minute='0']"
     )
     assert scheduler.jobs[0]["max_instances"] == 1
     assert scheduler.jobs[0]["coalesce"] is True
+    assert str(scheduler.jobs[1]["trigger"]) == "interval[0:05:00]"
 
 
 def test_schedule_is_fixed_to_shanghai_0900_even_if_unrelated_settings_differ() -> None:
@@ -95,7 +99,7 @@ def test_schedule_is_fixed_to_shanghai_0900_even_if_unrelated_settings_differ() 
     assert str(trigger.timezone) == "Asia/Shanghai"
 
 
-def test_send_worker_is_registered_only_with_separate_send_switch() -> None:
+def test_send_switch_does_not_change_the_always_registered_recovery_worker() -> None:
     scheduler = _Scheduler()
 
     registered = register_personal_weekly_brief_jobs(

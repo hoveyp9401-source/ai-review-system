@@ -5,7 +5,7 @@ from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import Column, Date, DateTime, Integer, MetaData, String, Table, Text, and_, select, update
+from sqlalchemy import Column, Date, DateTime, Integer, MetaData, String, Table, Text, and_, cast, func, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -39,17 +39,22 @@ _briefs = Table(
     Column("content_json", JSONB, nullable=False),
     Column("message_text", Text, nullable=False),
     Column("llm_model", String(128), nullable=False),
+    Column("generation_started_at", DateTime(timezone=True)),
+    Column("generated_at", DateTime(timezone=True)),
     Column("status", String(32), nullable=False),
     Column("idempotency_key", String(512), nullable=False),
     Column("claim_token", String(256), nullable=False),
+    Column("send_started_at", DateTime(timezone=True)),
     Column("provider_message_id", String(512), nullable=False),
     Column("provider_accepted_at", DateTime(timezone=True)),
     Column("delivery_receipt_json", JSONB, nullable=False),
     Column("delivered_at", DateTime(timezone=True)),
+    Column("final_verified_at", DateTime(timezone=True)),
     Column("context_recorded_at", DateTime(timezone=True)),
     Column("failed_at", DateTime(timezone=True)),
     Column("last_error", Text, nullable=False),
     Column("retry_count", Integer, nullable=False),
+    Column("recovery_json", JSONB, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
 )
@@ -74,15 +79,20 @@ class PersonalWeeklyBriefRecord:
     created_at: datetime
     updated_at: datetime
     personal_memory_json: dict[str, Any] | None = None
+    generation_started_at: datetime | None = None
+    generated_at: datetime | None = None
     claim_token: str = ""
+    send_started_at: datetime | None = None
     provider_message_id: str = ""
     provider_accepted_at: datetime | None = None
     delivery_receipt_json: dict[str, Any] | None = None
     delivered_at: datetime | None = None
+    final_verified_at: datetime | None = None
     context_recorded_at: datetime | None = None
     failed_at: datetime | None = None
     last_error: str = ""
     retry_count: int = 0
+    recovery_json: list[dict[str, Any]] | None = None
 
 
 class SqlPersonalWeeklyBriefStore:
@@ -143,6 +153,26 @@ class SqlPersonalWeeklyBriefStore:
         ).mappings().all()
         return tuple(_record_from_row(row) for row in rows)
 
+    async def load_for_week(
+        self,
+        *,
+        tenant_id: str,
+        week_start: date,
+        limit: int = 100,
+    ) -> tuple[PersonalWeeklyBriefRecord, ...]:
+        rows = (
+            await self.session.execute(
+                select(_briefs)
+                .where(
+                    _briefs.c.tenant_id == tenant_id,
+                    _briefs.c.week_start == week_start,
+                )
+                .order_by(_briefs.c.owner_user_id)
+                .limit(limit)
+            )
+        ).mappings().all()
+        return tuple(_record_from_row(row) for row in rows)
+
     async def load_delivered_without_context(
         self,
         *,
@@ -186,6 +216,33 @@ class SqlPersonalWeeklyBriefStore:
                 "content_json": content_json,
                 "message_text": message_text,
                 "llm_model": llm_model,
+                "generated_at": changed_at,
+                "recovery_json": _recovery_append(
+                    kind="generation_completed",
+                    reason="model_and_independent_review_passed",
+                    changed_at=changed_at,
+                ),
+                "updated_at": changed_at,
+            },
+        )
+
+    async def record_generation_started(
+        self, *, tenant_id: str, brief_id: str, changed_at: datetime
+    ) -> PersonalWeeklyBriefRecord:
+        return await self._transition(
+            tenant_id=tenant_id,
+            brief_id=brief_id,
+            from_status="snapshot_ready",
+            values={
+                "generation_started_at": func.coalesce(
+                    _briefs.c.generation_started_at,
+                    changed_at,
+                ),
+                "recovery_json": _recovery_append(
+                    kind="generation_started",
+                    reason="frozen_snapshot",
+                    changed_at=changed_at,
+                ),
                 "updated_at": changed_at,
             },
         )
@@ -201,6 +258,63 @@ class SqlPersonalWeeklyBriefStore:
                 "status": "generation_failed",
                 "last_error": error,
                 "failed_at": changed_at,
+                "retry_count": _briefs.c.retry_count + 1,
+                "recovery_json": _recovery_append(
+                    kind="generation_failed",
+                    reason=error,
+                    changed_at=changed_at,
+                ),
+                "updated_at": changed_at,
+            },
+        )
+
+    async def requeue_generation_failure(
+        self, *, tenant_id: str, brief_id: str, changed_at: datetime
+    ) -> PersonalWeeklyBriefRecord:
+        return await self._transition(
+            tenant_id=tenant_id,
+            brief_id=brief_id,
+            from_status="generation_failed",
+            extra_where=and_(
+                _briefs.c.retry_count < 2,
+                _briefs.c.source_snapshot["snapshot_failed"].astext.is_(None),
+            ),
+            values={
+                "status": "snapshot_ready",
+                "failed_at": None,
+                "last_error": "",
+                "recovery_json": _recovery_append(
+                    kind="generation_requeued",
+                    reason="reuse_frozen_snapshot",
+                    changed_at=changed_at,
+                ),
+                "updated_at": changed_at,
+            },
+        )
+
+    async def record_pre_send_block(
+        self,
+        *,
+        tenant_id: str,
+        brief_id: str,
+        reason: str,
+        changed_at: datetime,
+    ) -> PersonalWeeklyBriefRecord:
+        error = f"pre_send_scope:{reason}"
+        return await self._transition(
+            tenant_id=tenant_id,
+            brief_id=brief_id,
+            from_status="generated",
+            values={
+                "status": "failed",
+                "last_error": error,
+                "failed_at": changed_at,
+                "retry_count": _briefs.c.retry_count + 1,
+                "recovery_json": _recovery_append(
+                    kind="pre_send_blocked",
+                    reason=error,
+                    changed_at=changed_at,
+                ),
                 "updated_at": changed_at,
             },
         )
@@ -217,6 +331,15 @@ class SqlPersonalWeeklyBriefStore:
             values={
                 "status": "claimed",
                 "claim_token": claim_token,
+                "send_started_at": func.coalesce(
+                    _briefs.c.send_started_at,
+                    changed_at,
+                ),
+                "recovery_json": _recovery_append(
+                    kind="send_claimed",
+                    reason="pre_send_scope_revalidated",
+                    changed_at=changed_at,
+                ),
                 "updated_at": changed_at,
             },
         )
@@ -244,6 +367,11 @@ class SqlPersonalWeeklyBriefStore:
                 "status": "delivery_pending",
                 "provider_message_id": provider_message_id,
                 "provider_accepted_at": changed_at,
+                "recovery_json": _recovery_append(
+                    kind="provider_accepted",
+                    reason="awaiting_final_delivery_verification",
+                    changed_at=changed_at,
+                ),
                 "updated_at": changed_at,
             },
         )
@@ -269,6 +397,12 @@ class SqlPersonalWeeklyBriefStore:
                 "status": "delivered",
                 "delivery_receipt_json": delivery_receipt,
                 "delivered_at": changed_at,
+                "final_verified_at": changed_at,
+                "recovery_json": _recovery_append(
+                    kind="delivery_verified",
+                    reason="exact_recipient_confirmed",
+                    changed_at=changed_at,
+                ),
                 "updated_at": changed_at,
             },
         )
@@ -281,7 +415,15 @@ class SqlPersonalWeeklyBriefStore:
             brief_id=brief_id,
             from_status="delivered",
             extra_where=(_briefs.c.context_recorded_at.is_(None)),
-            values={"context_recorded_at": changed_at, "updated_at": changed_at},
+            values={
+                "context_recorded_at": changed_at,
+                "recovery_json": _recovery_append(
+                    kind="context_recorded",
+                    reason="verified_delivery_only",
+                    changed_at=changed_at,
+                ),
+                "updated_at": changed_at,
+            },
         )
 
     async def record_failure(
@@ -314,6 +456,11 @@ class SqlPersonalWeeklyBriefStore:
                     last_error=error,
                     failed_at=changed_at,
                     retry_count=_briefs.c.retry_count + 1,
+                    recovery_json=_recovery_append(
+                        kind="delivery_failed",
+                        reason=error,
+                        changed_at=changed_at,
+                    ),
                     updated_at=changed_at,
                 )
                 .returning(*_briefs.c)
@@ -322,6 +469,95 @@ class SqlPersonalWeeklyBriefStore:
         if persisted is None:
             raise ValueError("personal_weekly_brief_transition_conflict")
         return _record_from_row(persisted)
+
+    async def requeue_recoverable_failure(
+        self, *, tenant_id: str, brief_id: str, changed_at: datetime
+    ) -> PersonalWeeklyBriefRecord:
+        persisted = (
+            await self.session.execute(
+                update(_briefs)
+                .where(
+                    _briefs.c.tenant_id == tenant_id,
+                    _briefs.c.brief_id == UUID(brief_id),
+                    _briefs.c.status == "failed",
+                    _briefs.c.retry_count < 2,
+                    _briefs.c.provider_message_id == "",
+                    or_(
+                        _briefs.c.last_error.like("retry_safe_preacceptance:%"),
+                        _briefs.c.last_error.like("pre_send_scope:%"),
+                    ),
+                )
+                .values(
+                    status="generated",
+                    claim_token="",
+                    send_started_at=None,
+                    failed_at=None,
+                    last_error="",
+                    recovery_json=_recovery_append(
+                        kind="delivery_requeued",
+                        reason="retry_safe_or_scope_revalidated",
+                        changed_at=changed_at,
+                    ),
+                    updated_at=changed_at,
+                )
+                .returning(*_briefs.c)
+            )
+        ).mappings().one_or_none()
+        if persisted is None:
+            raise ValueError("personal_weekly_brief_transition_conflict")
+        return _record_from_row(persisted)
+
+    async def fail_stale_claims(
+        self,
+        *,
+        tenant_id: str,
+        stale_before: datetime,
+        changed_at: datetime,
+        limit: int = 100,
+    ) -> tuple[PersonalWeeklyBriefRecord, ...]:
+        rows = (
+            await self.session.execute(
+                select(_briefs.c.brief_id)
+                .where(
+                    _briefs.c.tenant_id == tenant_id,
+                    _briefs.c.status == "claimed",
+                    _briefs.c.provider_message_id == "",
+                    _briefs.c.updated_at <= stale_before,
+                )
+                .order_by(_briefs.c.updated_at)
+                .limit(limit)
+            )
+        ).scalars().all()
+        failed: list[PersonalWeeklyBriefRecord] = []
+        for brief_id in rows:
+            persisted = (
+                await self.session.execute(
+                    update(_briefs)
+                    .where(
+                        _briefs.c.tenant_id == tenant_id,
+                        _briefs.c.brief_id == brief_id,
+                        _briefs.c.status == "claimed",
+                        _briefs.c.provider_message_id == "",
+                        _briefs.c.updated_at <= stale_before,
+                    )
+                    .values(
+                        status="failed",
+                        last_error="claimed_timeout_ambiguous",
+                        failed_at=changed_at,
+                        retry_count=_briefs.c.retry_count + 1,
+                        recovery_json=_recovery_append(
+                            kind="claimed_timeout_failed",
+                            reason="ambiguous_after_claim_no_resend",
+                            changed_at=changed_at,
+                        ),
+                        updated_at=changed_at,
+                    )
+                    .returning(*_briefs.c)
+                )
+            ).mappings().one_or_none()
+            if persisted is not None:
+                failed.append(_record_from_row(persisted))
+        return tuple(failed)
 
     async def _transition(
         self,
@@ -367,17 +603,22 @@ def _record_values(row: PersonalWeeklyBriefRecord) -> dict[str, Any]:
         "content_json": row.content_json,
         "message_text": row.message_text,
         "llm_model": row.llm_model,
+        "generation_started_at": row.generation_started_at,
+        "generated_at": row.generated_at,
         "status": row.status,
         "idempotency_key": row.idempotency_key,
         "claim_token": row.claim_token,
+        "send_started_at": row.send_started_at,
         "provider_message_id": row.provider_message_id,
         "provider_accepted_at": row.provider_accepted_at,
         "delivery_receipt_json": row.delivery_receipt_json or {},
         "delivered_at": row.delivered_at,
+        "final_verified_at": row.final_verified_at,
         "context_recorded_at": row.context_recorded_at,
         "failed_at": row.failed_at,
         "last_error": row.last_error,
         "retry_count": row.retry_count,
+        "recovery_json": row.recovery_json or [],
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -398,20 +639,39 @@ def _record_from_row(row: Any) -> PersonalWeeklyBriefRecord:
         content_json=dict(row["content_json"] or {}),
         message_text=row["message_text"],
         llm_model=row["llm_model"],
+        generation_started_at=row["generation_started_at"],
+        generated_at=row["generated_at"],
         status=row["status"],
         idempotency_key=row["idempotency_key"],
         claim_token=row["claim_token"],
+        send_started_at=row["send_started_at"],
         provider_message_id=row["provider_message_id"],
         provider_accepted_at=row["provider_accepted_at"],
         delivery_receipt_json=dict(row["delivery_receipt_json"] or {}),
         delivered_at=row["delivered_at"],
+        final_verified_at=row["final_verified_at"],
         context_recorded_at=row["context_recorded_at"],
         failed_at=row["failed_at"],
         last_error=row["last_error"],
         retry_count=row["retry_count"],
+        recovery_json=list(row["recovery_json"] or []),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _recovery_append(
+    *, kind: str, reason: str, changed_at: datetime
+):
+    event = {
+        "kind": kind,
+        "reason": reason,
+        "changed_at": changed_at.isoformat(),
+    }
+    return func.coalesce(
+        _briefs.c.recovery_json,
+        cast([], JSONB),
+    ).op("||")(cast([event], JSONB))
 
 
 __all__ = [

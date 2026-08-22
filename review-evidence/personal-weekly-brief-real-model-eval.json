@@ -19,25 +19,25 @@
     "maximum_model_calls_per_owner": 4,
     "normal_model_calls_per_owner": 2,
     "normal_two_call_owner_seconds": [
-      79.1,
-      47.345,
-      14.12,
-      7.527,
-      114.993,
-      35.201,
-      11.63,
-      9.492
+      41.341,
+      17.758,
+      7.501,
+      181.775,
+      34.897,
+      10.736,
+      4.948
     ],
-    "observed_owner_seconds_average": 39.926,
-    "observed_owner_seconds_max": 114.993,
-    "observed_owner_seconds_min": 7.527,
+    "observed_owner_seconds_average": 58.507,
+    "observed_owner_seconds_max": 181.775,
+    "observed_owner_seconds_min": 4.948,
     "production_concurrency_limit": 4,
-    "projected_74_normal_minutes_using_observed_max": 36.414,
-    "projected_74_owner_minutes_using_observed_max": 36.414,
-    "projected_74_owner_seconds_using_observed_max": 2184.867,
-    "projected_74_repair_minutes_using_observed_max": 68.959,
+    "projected_74_normal_minutes_using_observed_max": 57.562,
+    "projected_74_owner_minutes_using_observed_max": 57.562,
+    "projected_74_owner_seconds_using_observed_max": 3453.725,
+    "projected_74_repair_minutes_using_observed_max": 53.549,
     "repair_four_call_owner_seconds": [
-      217.766
+      169.101,
+      169.101
     ]
   },
   "repair_performance_exercise": {
@@ -51,27 +51,28 @@
         "plan:ongoing": "持续推进"
       }
     },
+    "case_id": "cross_day_five_statuses",
     "combined_worst_path_model_calls": 4,
-    "combined_worst_path_seconds": 217.766,
+    "combined_worst_path_seconds": 169.101,
     "content": {
       "completed": {
         "empty_note": "",
         "items": [
           {
-            "matter_key": "project-a-contract-finalization",
+            "matter_key": "contract-a-finalization",
             "source_ids": [
               "daily:completed"
             ],
-            "text": "甲项目合同定稿已完成，并已发给经办人。"
+            "text": "甲项目合同定稿已完成并发给经办人。"
           }
         ]
       },
-      "intro": "本周共5个工作日，主要完成甲项目合同定稿，并跟进星河项目合同争议等事项。",
+      "intro": "本周（8月17日至21日）工作简报如下：",
       "plan_progress": {
         "empty_note": "",
         "items": [
           {
-            "matter_key": "project-a-contract-finalization",
+            "matter_key": "contract-a-finalization",
             "source_ids": [
               "plan:completed",
               "daily:completed"
@@ -104,15 +105,15 @@
               "daily:future"
             ],
             "status": "后续安排",
-            "text": "确认丁公司发票条件，后续安排下周一进行。"
+            "text": "丁公司发票条件确认安排在下周一进行。"
           },
           {
-            "matter_key": "project-e-supplement-review",
+            "matter_key": "project-e-agreement",
             "source_ids": [
               "plan:no-followup"
             ],
             "status": "暂时没有找到后续记录",
-            "text": "周计划中的“复核戊项目补充协议”本周暂时没有找到后续记录。"
+            "text": "戊项目补充协议复核原列入本周计划，暂未找到本周内的后续记录。"
           }
         ]
       },
@@ -120,24 +121,86 @@
         "empty_note": "",
         "items": [
           {
-            "matter_key": "xinghe-contract-dispute",
+            "matter_key": "star-contract-dispute",
             "source_ids": [
               "daily:star:mon",
               "daily:star:thu"
             ],
-            "text": "星河项目合同争议仍在跟进：涉案金额120万元，对方原定8月20日前回复；8月20日继续跟时时对方仍未承诺付款，表示只有付款条件确认后才答复。"
+            "text": "星河项目合同争议（涉案金额120万元）仍在跟进，对方原定8月20日前回复；截至8月20日对方未承诺付款，表示付款条件确认后才答复。"
           },
           {
-            "matter_key": "payment-authorization-risk",
+            "matter_key": "payment-approval-authorization",
             "source_ids": [
               "daily:risk"
             ],
-            "text": "付款审批存在风险：如果8月25日前仍未收到授权文件，将无法按原计划发起付款审批。"
+            "text": "付款审批存在风险：如8月25日前仍未收到授权文件，付款审批将无法按原计划发起。"
           }
         ]
-      }
+      },
+      "source_dispositions": [
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:star:mon"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:star:thu"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:completed"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:completed"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:ongoing"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:ongoing"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:adjusted"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:adjusted"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:future"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:future"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:no-followup"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:risk"
+        }
+      ]
     },
-    "exercise_kind": "forced_repair_with_real_generation_and_real_review",
+    "exercise_kind": "natural_bounded_repair_from_real_matrix",
     "independent_model_review": {
       "approved": true,
       "issues": [],
@@ -146,23 +209,18 @@
         "case-b-evidence",
         "case-c-hearing",
         "company-d-invoice",
-        "payment-authorization-risk",
-        "project-a-contract-finalization",
-        "project-e-supplement-review",
-        "xinghe-contract-dispute"
+        "contract-a-finalization",
+        "payment-approval-authorization",
+        "project-e-agreement",
+        "star-contract-dispute"
       ]
     },
-    "normal_phase_model_calls": 2,
-    "normal_phase_seconds": 114.993,
-    "repair_generation_seconds": 64.169,
-    "repair_phase_model_calls": 2,
-    "repair_phase_seconds": 102.773,
-    "repair_review_seconds": 38.604,
+    "round": 1,
     "status": "PASS",
     "trace": {
       "completed": [
         {
-          "matter_key": "project-a-contract-finalization",
+          "matter_key": "contract-a-finalization",
           "source_ids": [
             "daily:completed"
           ],
@@ -176,12 +234,12 @@
               "source_record_id": "report-tue"
             }
           ],
-          "text": "甲项目合同定稿已完成，并已发给经办人。"
+          "text": "甲项目合同定稿已完成并发给经办人。"
         }
       ],
       "plan_progress": [
         {
-          "matter_key": "project-a-contract-finalization",
+          "matter_key": "contract-a-finalization",
           "source_ids": [
             "plan:completed",
             "daily:completed"
@@ -286,10 +344,10 @@
             }
           ],
           "status": "后续安排",
-          "text": "确认丁公司发票条件，后续安排下周一进行。"
+          "text": "丁公司发票条件确认安排在下周一进行。"
         },
         {
-          "matter_key": "project-e-supplement-review",
+          "matter_key": "project-e-agreement",
           "source_ids": [
             "plan:no-followup"
           ],
@@ -304,12 +362,12 @@
             }
           ],
           "status": "暂时没有找到后续记录",
-          "text": "周计划中的“复核戊项目补充协议”本周暂时没有找到后续记录。"
+          "text": "戊项目补充协议复核原列入本周计划，暂未找到本周内的后续记录。"
         }
       ],
       "possible_open_loops": [
         {
-          "matter_key": "xinghe-contract-dispute",
+          "matter_key": "star-contract-dispute",
           "source_ids": [
             "daily:star:mon",
             "daily:star:thu"
@@ -332,10 +390,10 @@
               "source_record_id": "report-thu"
             }
           ],
-          "text": "星河项目合同争议仍在跟进：涉案金额120万元，对方原定8月20日前回复；8月20日继续跟时时对方仍未承诺付款，表示只有付款条件确认后才答复。"
+          "text": "星河项目合同争议（涉案金额120万元）仍在跟进，对方原定8月20日前回复；截至8月20日对方未承诺付款，表示付款条件确认后才答复。"
         },
         {
-          "matter_key": "payment-authorization-risk",
+          "matter_key": "payment-approval-authorization",
           "source_ids": [
             "daily:risk"
           ],
@@ -349,10 +407,72 @@
               "source_record_id": "report-fri"
             }
           ],
-          "text": "付款审批存在风险：如果8月25日前仍未收到授权文件，将无法按原计划发起付款审批。"
+          "text": "付款审批存在风险：如8月25日前仍未收到授权文件，付款审批将无法按原计划发起。"
         }
       ],
-      "snapshot_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c"
+      "snapshot_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c",
+      "source_dispositions": [
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:star:mon"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:star:thu"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:completed"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:completed"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:ongoing"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:ongoing"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:adjusted"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:adjusted"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:future"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:future"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "plan:no-followup"
+        },
+        {
+          "disposition": "cited",
+          "reason": "",
+          "source_id": "daily:risk"
+        }
+      ]
     }
   },
   "results": [
@@ -373,627 +493,20 @@
           "empty_note": "",
           "items": [
             {
-              "matter_key": "甲项目合同定稿",
+              "matter_key": "contract-a-finalization",
               "source_ids": [
                 "daily:completed"
               ],
-              "text": "完成甲项目合同定稿，并已发给经办人。"
+              "text": "甲项目合同定稿已完成并发给经办人。"
             }
           ]
         },
-        "intro": "以下是本周（8月17日—21日）的工作简报。",
+        "intro": "本周（8月17日至21日）工作简报如下：",
         "plan_progress": {
           "empty_note": "",
           "items": [
             {
-              "matter_key": "甲项目合同定稿",
-              "source_ids": [
-                "plan:completed",
-                "daily:completed"
-              ],
-              "status": "已完成",
-              "text": "甲项目合同定稿已完成并已发给经办人。"
-            },
-            {
-              "matter_key": "乙案件证据材料",
-              "source_ids": [
-                "plan:ongoing",
-                "daily:ongoing"
-              ],
-              "status": "持续推进",
-              "text": "乙案件证据材料持续推进，目前仍在补充送达证明。"
-            },
-            {
-              "matter_key": "丙案件开庭",
-              "source_ids": [
-                "plan:adjusted",
-                "daily:adjusted"
-              ],
-              "status": "安排调整",
-              "text": "丙案件原定周三开庭，因法院通知改期到周五。"
-            },
-            {
-              "matter_key": "丁公司发票条件",
-              "source_ids": [
-                "plan:future",
-                "daily:future"
-              ],
-              "status": "后续安排",
-              "text": "确认丁公司发票条件安排到下周一进行。"
-            },
-            {
-              "matter_key": "戊项目补充协议复核",
-              "source_ids": [
-                "plan:no-followup"
-              ],
-              "status": "暂时没有找到后续记录",
-              "text": "本周计划复核戊项目补充协议，暂时没有找到后续记录。"
-            }
-          ]
-        },
-        "possible_open_loops": {
-          "empty_note": "",
-          "items": [
-            {
-              "matter_key": "星河项目合同争议",
-              "source_ids": [
-                "daily:star:mon",
-                "daily:star:thu"
-              ],
-              "text": "星河项目合同争议仍在跟进，涉案金额120万元；对方未承诺付款，表示付款条件确认后才答复，原定8月20日前回复，需继续跟进。"
-            },
-            {
-              "matter_key": "付款审批授权文件",
-              "source_ids": [
-                "daily:risk"
-              ],
-              "text": "如8月25日前仍未收到授权文件，付款审批将无法按原计划发起，需关注。"
-            }
-          ]
-        }
-      },
-      "daily_report_dates": [
-        "2026-08-17",
-        "2026-08-18",
-        "2026-08-19",
-        "2026-08-20",
-        "2026-08-21"
-      ],
-      "independent_model_review": {
-        "approved": true,
-        "issues": [],
-        "model": "deepseek-v4-flash",
-        "reviewed_matter_keys": [
-          "丁公司发票条件",
-          "丙案件开庭",
-          "乙案件证据材料",
-          "付款审批授权文件",
-          "戊项目补充协议复核",
-          "星河项目合同争议",
-          "甲项目合同定稿"
-        ]
-      },
-      "message_sha256": "a3d784de43af8bc271fa1acad4ff333b4ee8ac7ac213bcb994d7740877225c3a",
-      "message_text": "以下是本周（8月17日—21日）的工作简报。\n\n一、本周完成事项\n1. 完成甲项目合同定稿，并已发给经办人。\n\n二、本周计划事项及进展\n1. 【已完成】甲项目合同定稿已完成并已发给经办人。\n2. 【持续推进】乙案件证据材料持续推进，目前仍在补充送达证明。\n3. 【安排调整】丙案件原定周三开庭，因法院通知改期到周五。\n4. 【后续安排】确认丁公司发票条件安排到下周一进行。\n5. 【暂时没有找到后续记录】本周计划复核戊项目补充协议，暂时没有找到后续记录。\n\n三、可能未闭环事项\n1. 星河项目合同争议仍在跟进，涉案金额120万元；对方未承诺付款，表示付款条件确认后才答复，原定8月20日前回复，需继续跟进。\n2. 如8月25日前仍未收到授权文件，付款审批将无法按原计划发起，需关注。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
-      "model_metrics": {
-        "generation_seconds": [
-          34.813
-        ],
-        "max_attempts_per_call": 2,
-        "model_calls": 2,
-        "review_seconds": [
-          44.287
-        ],
-        "semantic_attempts": 1,
-        "timeout_seconds_per_attempt": 60.0,
-        "total_seconds": 79.1
-      },
-      "round": 1,
-      "source_count": 12,
-      "source_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c",
-      "status": "PASS",
-      "trace": {
-        "completed": [
-          {
-            "matter_key": "甲项目合同定稿",
-            "source_ids": [
-              "daily:completed"
-            ],
-            "sources": [
-              {
-                "original_text": "甲项目合同定稿已完成并发给经办人。",
-                "section": "today_work",
-                "source_date": "2026-08-18",
-                "source_id": "daily:completed",
-                "source_kind": "daily_report",
-                "source_record_id": "report-tue"
-              }
-            ],
-            "text": "完成甲项目合同定稿，并已发给经办人。"
-          }
-        ],
-        "plan_progress": [
-          {
-            "matter_key": "甲项目合同定稿",
-            "source_ids": [
-              "plan:completed",
-              "daily:completed"
-            ],
-            "sources": [
-              {
-                "original_text": "完成甲项目合同定稿并发给经办人。",
-                "section": "plan_item",
-                "source_date": "2026-08-17",
-                "source_id": "plan:completed",
-                "source_kind": "weekly_plan",
-                "source_record_id": "plan-current"
-              },
-              {
-                "original_text": "甲项目合同定稿已完成并发给经办人。",
-                "section": "today_work",
-                "source_date": "2026-08-18",
-                "source_id": "daily:completed",
-                "source_kind": "daily_report",
-                "source_record_id": "report-tue"
-              }
-            ],
-            "status": "已完成",
-            "text": "甲项目合同定稿已完成并已发给经办人。"
-          },
-          {
-            "matter_key": "乙案件证据材料",
-            "source_ids": [
-              "plan:ongoing",
-              "daily:ongoing"
-            ],
-            "sources": [
-              {
-                "original_text": "整理乙案件证据材料。",
-                "section": "plan_item",
-                "source_date": "2026-08-18",
-                "source_id": "plan:ongoing",
-                "source_kind": "weekly_plan",
-                "source_record_id": "plan-current"
-              },
-              {
-                "original_text": "乙案件证据材料持续推进，目前仍在补充送达证明。",
-                "section": "today_work",
-                "source_date": "2026-08-19",
-                "source_id": "daily:ongoing",
-                "source_kind": "daily_report",
-                "source_record_id": "report-wed"
-              }
-            ],
-            "status": "持续推进",
-            "text": "乙案件证据材料持续推进，目前仍在补充送达证明。"
-          },
-          {
-            "matter_key": "丙案件开庭",
-            "source_ids": [
-              "plan:adjusted",
-              "daily:adjusted"
-            ],
-            "sources": [
-              {
-                "original_text": "周三参加丙案件开庭。",
-                "section": "plan_item",
-                "source_date": "2026-08-19",
-                "source_id": "plan:adjusted",
-                "source_kind": "weekly_plan",
-                "source_record_id": "plan-current"
-              },
-              {
-                "original_text": "丙案件原定周三开庭，因法院通知改期到周五。",
-                "section": "today_work",
-                "source_date": "2026-08-19",
-                "source_id": "daily:adjusted",
-                "source_kind": "daily_report",
-                "source_record_id": "report-wed"
-              }
-            ],
-            "status": "安排调整",
-            "text": "丙案件原定周三开庭，因法院通知改期到周五。"
-          },
-          {
-            "matter_key": "丁公司发票条件",
-            "source_ids": [
-              "plan:future",
-              "daily:future"
-            ],
-            "sources": [
-              {
-                "original_text": "确认丁公司发票条件。",
-                "section": "plan_item",
-                "source_date": "2026-08-20",
-                "source_id": "plan:future",
-                "source_kind": "weekly_plan",
-                "source_record_id": "plan-current"
-              },
-              {
-                "original_text": "后续安排下周一确认丁公司发票条件。",
-                "section": "tomorrow_plan",
-                "source_date": "2026-08-21",
-                "source_id": "daily:future",
-                "source_kind": "daily_report",
-                "source_record_id": "report-fri"
-              }
-            ],
-            "status": "后续安排",
-            "text": "确认丁公司发票条件安排到下周一进行。"
-          },
-          {
-            "matter_key": "戊项目补充协议复核",
-            "source_ids": [
-              "plan:no-followup"
-            ],
-            "sources": [
-              {
-                "original_text": "复核戊项目补充协议。",
-                "section": "plan_item",
-                "source_date": "2026-08-21",
-                "source_id": "plan:no-followup",
-                "source_kind": "weekly_plan",
-                "source_record_id": "plan-current"
-              }
-            ],
-            "status": "暂时没有找到后续记录",
-            "text": "本周计划复核戊项目补充协议，暂时没有找到后续记录。"
-          }
-        ],
-        "possible_open_loops": [
-          {
-            "matter_key": "星河项目合同争议",
-            "source_ids": [
-              "daily:star:mon",
-              "daily:star:thu"
-            ],
-            "sources": [
-              {
-                "original_text": "跟进星河项目合同争议，涉案金额120万元，对方原定8月20日前回复。",
-                "section": "today_work",
-                "source_date": "2026-08-17",
-                "source_id": "daily:star:mon",
-                "source_kind": "daily_report",
-                "source_record_id": "report-mon"
-              },
-              {
-                "original_text": "继续跟进星河项目合同争议；对方没有承诺付款，表示只有付款条件确认后才答复。",
-                "section": "today_work",
-                "source_date": "2026-08-20",
-                "source_id": "daily:star:thu",
-                "source_kind": "daily_report",
-                "source_record_id": "report-thu"
-              }
-            ],
-            "text": "星河项目合同争议仍在跟进，涉案金额120万元；对方未承诺付款，表示付款条件确认后才答复，原定8月20日前回复，需继续跟进。"
-          },
-          {
-            "matter_key": "付款审批授权文件",
-            "source_ids": [
-              "daily:risk"
-            ],
-            "sources": [
-              {
-                "original_text": "如果8月25日前仍未收到授权文件，付款审批将无法按原计划发起。",
-                "section": "problems",
-                "source_date": "2026-08-21",
-                "source_id": "daily:risk",
-                "source_kind": "daily_report",
-                "source_record_id": "report-fri"
-              }
-            ],
-            "text": "如8月25日前仍未收到授权文件，付款审批将无法按原计划发起，需关注。"
-          }
-        ],
-        "snapshot_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c"
-      },
-      "weekly_plan_found": true
-    },
-    {
-      "assertions": {
-        "daily_dates": [
-          "2026-08-17",
-          "2026-08-20"
-        ],
-        "plan_items": 0
-      },
-      "case_id": "partial_dates_without_weekly_plan",
-      "content": {
-        "completed": {
-          "empty_note": "",
-          "items": [
-            {
-              "matter_key": "己项目补充协议",
-              "source_ids": [
-                "daily:partial:mon",
-                "daily:partial:thu"
-              ],
-              "text": "起草了己项目补充协议，等待业务部门确认付款条件；周四继续与业务部门沟通付款条件，尚未形成最终意见。"
-            }
-          ]
-        },
-        "intro": "本周（8月17日-21日）共记录两条日报，工作集中在己项目补充协议的起草及付款条件沟通。",
-        "plan_progress": {
-          "empty_note": "本周未找到周计划记录，因此没有周计划进展可汇报。",
-          "items": []
-        },
-        "possible_open_loops": {
-          "empty_note": "",
-          "items": [
-            {
-              "matter_key": "己项目补充协议付款条件确认",
-              "source_ids": [
-                "daily:partial:mon",
-                "daily:partial:thu"
-              ],
-              "text": "付款条件尚未形成最终意见，仍需业务部门确认并持续跟进。"
-            }
-          ]
-        }
-      },
-      "daily_report_dates": [
-        "2026-08-17",
-        "2026-08-20"
-      ],
-      "independent_model_review": {
-        "approved": true,
-        "issues": [],
-        "model": "deepseek-v4-flash",
-        "reviewed_matter_keys": [
-          "己项目补充协议",
-          "己项目补充协议付款条件确认"
-        ]
-      },
-      "message_sha256": "72c70bb0acff51d045286038ab9d25aeaa9ad82e42cd883ab132cb4eeb9d7c06",
-      "message_text": "本周（8月17日-21日）共记录两条日报，工作集中在己项目补充协议的起草及付款条件沟通。\n\n一、本周完成事项\n1. 起草了己项目补充协议，等待业务部门确认付款条件；周四继续与业务部门沟通付款条件，尚未形成最终意见。\n\n二、本周计划事项及进展\n本周未找到周计划记录，因此没有周计划进展可汇报。\n\n三、可能未闭环事项\n1. 付款条件尚未形成最终意见，仍需业务部门确认并持续跟进。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
-      "model_metrics": {
-        "generation_seconds": [
-          37.247
-        ],
-        "max_attempts_per_call": 2,
-        "model_calls": 2,
-        "review_seconds": [
-          10.099
-        ],
-        "semantic_attempts": 1,
-        "timeout_seconds_per_attempt": 60.0,
-        "total_seconds": 47.345
-      },
-      "round": 1,
-      "source_count": 2,
-      "source_fingerprint": "4e2042a21223d30f0e61c242e2253dabac8c9573a5540062a72a9e75ccd5ee0f",
-      "status": "PASS",
-      "trace": {
-        "completed": [
-          {
-            "matter_key": "己项目补充协议",
-            "source_ids": [
-              "daily:partial:mon",
-              "daily:partial:thu"
-            ],
-            "sources": [
-              {
-                "original_text": "起草己项目补充协议，等待业务部门确认付款条件。",
-                "section": "today_work",
-                "source_date": "2026-08-17",
-                "source_id": "daily:partial:mon",
-                "source_kind": "daily_report",
-                "source_record_id": "partial-mon"
-              },
-              {
-                "original_text": "继续与业务部门沟通己项目付款条件，尚未形成最终意见。",
-                "section": "today_work",
-                "source_date": "2026-08-20",
-                "source_id": "daily:partial:thu",
-                "source_kind": "daily_report",
-                "source_record_id": "partial-thu"
-              }
-            ],
-            "text": "起草了己项目补充协议，等待业务部门确认付款条件；周四继续与业务部门沟通付款条件，尚未形成最终意见。"
-          }
-        ],
-        "plan_progress": [],
-        "possible_open_loops": [
-          {
-            "matter_key": "己项目补充协议付款条件确认",
-            "source_ids": [
-              "daily:partial:mon",
-              "daily:partial:thu"
-            ],
-            "sources": [
-              {
-                "original_text": "起草己项目补充协议，等待业务部门确认付款条件。",
-                "section": "today_work",
-                "source_date": "2026-08-17",
-                "source_id": "daily:partial:mon",
-                "source_kind": "daily_report",
-                "source_record_id": "partial-mon"
-              },
-              {
-                "original_text": "继续与业务部门沟通己项目付款条件，尚未形成最终意见。",
-                "section": "today_work",
-                "source_date": "2026-08-20",
-                "source_id": "daily:partial:thu",
-                "source_kind": "daily_report",
-                "source_record_id": "partial-thu"
-              }
-            ],
-            "text": "付款条件尚未形成最终意见，仍需业务部门确认并持续跟进。"
-          }
-        ],
-        "snapshot_fingerprint": "4e2042a21223d30f0e61c242e2253dabac8c9573a5540062a72a9e75ccd5ee0f"
-      },
-      "weekly_plan_found": false
-    },
-    {
-      "assertions": {
-        "status": "暂时没有找到后续记录"
-      },
-      "case_id": "weekly_plan_without_daily_reports",
-      "content": {
-        "completed": {
-          "empty_note": "可信快照中没有本周日报记录，因此未整理出可确认的完成事项。",
-          "items": []
-        },
-        "intro": "本周没有日报记录可汇总，仅有一条周计划安排。",
-        "plan_progress": {
-          "empty_note": "",
-          "items": [
-            {
-              "matter_key": "庚案件庭审材料准备",
-              "source_ids": [
-                "plan:only"
-              ],
-              "status": "暂时没有找到后续记录",
-              "text": "周计划中安排了“准备庚案件庭审材料”，但快照中没有后续日报记录，暂时没有找到后续记录确认进展。"
-            }
-          ]
-        },
-        "possible_open_loops": {
-          "empty_note": "快照中没有日报或风险记录，未识别出需要特别提示的未闭环事项。",
-          "items": []
-        }
-      },
-      "daily_report_dates": [],
-      "independent_model_review": {
-        "approved": true,
-        "issues": [],
-        "model": "deepseek-v4-flash",
-        "reviewed_matter_keys": [
-          "庚案件庭审材料准备"
-        ]
-      },
-      "message_sha256": "7de049fa6aa656115f40df1f47f8ee395d0138d91424c225228830b957d201d1",
-      "message_text": "本周没有日报记录可汇总，仅有一条周计划安排。\n\n一、本周完成事项\n可信快照中没有本周日报记录，因此未整理出可确认的完成事项。\n\n二、本周计划事项及进展\n1. 【暂时没有找到后续记录】周计划中安排了“准备庚案件庭审材料”，但快照中没有后续日报记录，暂时没有找到后续记录确认进展。\n\n三、可能未闭环事项\n快照中没有日报或风险记录，未识别出需要特别提示的未闭环事项。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
-      "model_metrics": {
-        "generation_seconds": [
-          7.769
-        ],
-        "max_attempts_per_call": 2,
-        "model_calls": 2,
-        "review_seconds": [
-          6.351
-        ],
-        "semantic_attempts": 1,
-        "timeout_seconds_per_attempt": 60.0,
-        "total_seconds": 14.12
-      },
-      "round": 1,
-      "source_count": 1,
-      "source_fingerprint": "c93fc3f7badda2d7103043c97e79202ee8fae8f82377d375340704e2d37907e9",
-      "status": "PASS",
-      "trace": {
-        "completed": [],
-        "plan_progress": [
-          {
-            "matter_key": "庚案件庭审材料准备",
-            "source_ids": [
-              "plan:only"
-            ],
-            "sources": [
-              {
-                "original_text": "准备庚案件庭审材料。",
-                "section": "plan_item",
-                "source_date": "2026-08-18",
-                "source_id": "plan:only",
-                "source_kind": "weekly_plan",
-                "source_record_id": "plan-only"
-              }
-            ],
-            "status": "暂时没有找到后续记录",
-            "text": "周计划中安排了“准备庚案件庭审材料”，但快照中没有后续日报记录，暂时没有找到后续记录确认进展。"
-          }
-        ],
-        "possible_open_loops": [],
-        "snapshot_fingerprint": "c93fc3f7badda2d7103043c97e79202ee8fae8f82377d375340704e2d37907e9"
-      },
-      "weekly_plan_found": true
-    },
-    {
-      "assertions": {
-        "item_count": 0
-      },
-      "case_id": "no_daily_no_weekly_plan",
-      "content": {
-        "completed": {
-          "empty_note": "本周没有找到可用的日报记录，因此无本周完成事项。",
-          "items": []
-        },
-        "intro": "本周暂无可用工作记录，以下简报为空。",
-        "plan_progress": {
-          "empty_note": "本周没有找到周计划记录，因此无计划进展可汇报。",
-          "items": []
-        },
-        "possible_open_loops": {
-          "empty_note": "本周没有找到日报或周计划记录，因此暂未识别出待跟进事项。",
-          "items": []
-        }
-      },
-      "daily_report_dates": [],
-      "independent_model_review": {
-        "approved": true,
-        "issues": [],
-        "model": "deepseek-v4-flash",
-        "reviewed_matter_keys": []
-      },
-      "message_sha256": "1b7da8cfd57386123aec9eb89b326306287943de62039c3f31e78d4459845c24",
-      "message_text": "本周暂无可用工作记录，以下简报为空。\n\n一、本周完成事项\n本周没有找到可用的日报记录，因此无本周完成事项。\n\n二、本周计划事项及进展\n本周没有找到周计划记录，因此无计划进展可汇报。\n\n三、可能未闭环事项\n本周没有找到日报或周计划记录，因此暂未识别出待跟进事项。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
-      "model_metrics": {
-        "generation_seconds": [
-          3.431
-        ],
-        "max_attempts_per_call": 2,
-        "model_calls": 2,
-        "review_seconds": [
-          4.096
-        ],
-        "semantic_attempts": 1,
-        "timeout_seconds_per_attempt": 60.0,
-        "total_seconds": 7.527
-      },
-      "round": 1,
-      "source_count": 0,
-      "source_fingerprint": "cf89f3316eb645250d4e0834e8bff76e1f61b3f4574756091c8fd86c218c2c4d",
-      "status": "PASS",
-      "trace": {
-        "completed": [],
-        "plan_progress": [],
-        "possible_open_loops": [],
-        "snapshot_fingerprint": "cf89f3316eb645250d4e0834e8bff76e1f61b3f4574756091c8fd86c218c2c4d"
-      },
-      "weekly_plan_found": false
-    },
-    {
-      "assertions": {
-        "merged_source_count": 2,
-        "plan_statuses": {
-          "plan:adjusted": "安排调整",
-          "plan:completed": "已完成",
-          "plan:future": "后续安排",
-          "plan:no-followup": "暂时没有找到后续记录",
-          "plan:ongoing": "持续推进"
-        }
-      },
-      "case_id": "cross_day_five_statuses",
-      "content": {
-        "completed": {
-          "empty_note": "",
-          "items": [
-            {
-              "matter_key": "project-a-contract-finalization",
-              "source_ids": [
-                "daily:completed"
-              ],
-              "text": "甲项目合同定稿已完成，并已发给经办人。"
-            }
-          ]
-        },
-        "intro": "本周共5个工作日，主要完成甲项目合同定稿，并跟进星河项目合同争议等事项。",
-        "plan_progress": {
-          "empty_note": "",
-          "items": [
-            {
-              "matter_key": "project-a-contract-finalization",
+              "matter_key": "contract-a-finalization",
               "source_ids": [
                 "plan:completed",
                 "daily:completed"
@@ -1017,7 +530,7 @@
                 "daily:adjusted"
               ],
               "status": "安排调整",
-              "text": "丙案件开庭原定周三，因法院通知改期到周五。"
+              "text": "丙案件原定周三开庭，因法院通知改期到周五。"
             },
             {
               "matter_key": "company-d-invoice",
@@ -1026,15 +539,15 @@
                 "daily:future"
               ],
               "status": "后续安排",
-              "text": "确认丁公司发票条件，后续安排下周一进行。"
+              "text": "丁公司发票条件确认安排在下周一进行。"
             },
             {
-              "matter_key": "project-e-supplement-review",
+              "matter_key": "project-e-agreement",
               "source_ids": [
                 "plan:no-followup"
               ],
               "status": "暂时没有找到后续记录",
-              "text": "周计划中的“复核戊项目补充协议”本周暂时没有找到后续记录。"
+              "text": "戊项目补充协议复核原列入本周计划，暂未找到本周内的后续记录。"
             }
           ]
         },
@@ -1042,22 +555,84 @@
           "empty_note": "",
           "items": [
             {
-              "matter_key": "xinghe-contract-dispute",
+              "matter_key": "star-contract-dispute",
               "source_ids": [
                 "daily:star:mon",
                 "daily:star:thu"
               ],
-              "text": "星河项目合同争议仍在跟进，涉案金额120万元；对方原定8月20日前回复，但截至8月20日仍未承诺付款，表示只有付款条件确认后才答复。"
+              "text": "星河项目合同争议（涉案金额120万元）仍在跟进，对方原定8月20日前回复；截至8月20日对方未承诺付款，表示付款条件确认后才答复。"
             },
             {
-              "matter_key": "payment-authorization-risk",
+              "matter_key": "payment-approval-authorization",
               "source_ids": [
                 "daily:risk"
               ],
-              "text": "付款审批存在风险：如果8月25日前仍未收到授权文件，将无法按原计划发起付款审批。"
+              "text": "付款审批存在风险：如8月25日前仍未收到授权文件，付款审批将无法按原计划发起。"
             }
           ]
-        }
+        },
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:star:mon"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:star:thu"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:completed"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:completed"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:ongoing"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:ongoing"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:adjusted"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:adjusted"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:future"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:future"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:no-followup"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:risk"
+          }
+        ]
       },
       "daily_report_dates": [
         "2026-08-17",
@@ -1074,35 +649,37 @@
           "case-b-evidence",
           "case-c-hearing",
           "company-d-invoice",
-          "payment-authorization-risk",
-          "project-a-contract-finalization",
-          "project-e-supplement-review",
-          "xinghe-contract-dispute"
+          "contract-a-finalization",
+          "payment-approval-authorization",
+          "project-e-agreement",
+          "star-contract-dispute"
         ]
       },
-      "message_sha256": "ca277570605dc1dd7a016f126322693b368fd07906614ebf438fdfc7e4773a1e",
-      "message_text": "本周共5个工作日，主要完成甲项目合同定稿，并跟进星河项目合同争议等事项。\n\n一、本周完成事项\n1. 甲项目合同定稿已完成，并已发给经办人。\n\n二、本周计划事项及进展\n1. 【已完成】甲项目合同定稿已完成并发给经办人。\n2. 【持续推进】乙案件证据材料整理持续推进，目前仍在补充送达证明。\n3. 【安排调整】丙案件开庭原定周三，因法院通知改期到周五。\n4. 【后续安排】确认丁公司发票条件，后续安排下周一进行。\n5. 【暂时没有找到后续记录】周计划中的“复核戊项目补充协议”本周暂时没有找到后续记录。\n\n三、可能未闭环事项\n1. 星河项目合同争议仍在跟进，涉案金额120万元；对方原定8月20日前回复，但截至8月20日仍未承诺付款，表示只有付款条件确认后才答复。\n2. 付款审批存在风险：如果8月25日前仍未收到授权文件，将无法按原计划发起付款审批。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
+      "message_sha256": "717b2145f2343ed0f6b7090167aeeedf9b2f2adcc014d4bb33f73ea92a177de0",
+      "message_text": "本周（8月17日至21日）工作简报如下：\n\n一、本周完成事项\n1. 甲项目合同定稿已完成并发给经办人。\n\n二、本周计划事项及进展\n1. 【已完成】甲项目合同定稿已完成并发给经办人。\n2. 【持续推进】乙案件证据材料整理持续推进，目前仍在补充送达证明。\n3. 【安排调整】丙案件原定周三开庭，因法院通知改期到周五。\n4. 【后续安排】丁公司发票条件确认安排在下周一进行。\n5. 【暂时没有找到后续记录】戊项目补充协议复核原列入本周计划，暂未找到本周内的后续记录。\n\n三、可能未闭环事项\n1. 星河项目合同争议（涉案金额120万元）仍在跟进，对方原定8月20日前回复；截至8月20日对方未承诺付款，表示付款条件确认后才答复。\n2. 付款审批存在风险：如8月25日前仍未收到授权文件，付款审批将无法按原计划发起。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
       "model_metrics": {
         "generation_seconds": [
-          87.758
+          54.779,
+          65.909
         ],
         "max_attempts_per_call": 2,
-        "model_calls": 2,
+        "model_calls": 4,
         "review_seconds": [
-          27.235
+          4.167,
+          44.247
         ],
-        "semantic_attempts": 1,
+        "semantic_attempts": 2,
         "timeout_seconds_per_attempt": 60.0,
-        "total_seconds": 114.993
+        "total_seconds": 169.101
       },
-      "round": 2,
+      "round": 1,
       "source_count": 12,
       "source_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c",
       "status": "PASS",
       "trace": {
         "completed": [
           {
-            "matter_key": "project-a-contract-finalization",
+            "matter_key": "contract-a-finalization",
             "source_ids": [
               "daily:completed"
             ],
@@ -1116,12 +693,12 @@
                 "source_record_id": "report-tue"
               }
             ],
-            "text": "甲项目合同定稿已完成，并已发给经办人。"
+            "text": "甲项目合同定稿已完成并发给经办人。"
           }
         ],
         "plan_progress": [
           {
-            "matter_key": "project-a-contract-finalization",
+            "matter_key": "contract-a-finalization",
             "source_ids": [
               "plan:completed",
               "daily:completed"
@@ -1199,7 +776,7 @@
               }
             ],
             "status": "安排调整",
-            "text": "丙案件开庭原定周三，因法院通知改期到周五。"
+            "text": "丙案件原定周三开庭，因法院通知改期到周五。"
           },
           {
             "matter_key": "company-d-invoice",
@@ -1226,10 +803,10 @@
               }
             ],
             "status": "后续安排",
-            "text": "确认丁公司发票条件，后续安排下周一进行。"
+            "text": "丁公司发票条件确认安排在下周一进行。"
           },
           {
-            "matter_key": "project-e-supplement-review",
+            "matter_key": "project-e-agreement",
             "source_ids": [
               "plan:no-followup"
             ],
@@ -1244,12 +821,12 @@
               }
             ],
             "status": "暂时没有找到后续记录",
-            "text": "周计划中的“复核戊项目补充协议”本周暂时没有找到后续记录。"
+            "text": "戊项目补充协议复核原列入本周计划，暂未找到本周内的后续记录。"
           }
         ],
         "possible_open_loops": [
           {
-            "matter_key": "xinghe-contract-dispute",
+            "matter_key": "star-contract-dispute",
             "source_ids": [
               "daily:star:mon",
               "daily:star:thu"
@@ -1272,10 +849,10 @@
                 "source_record_id": "report-thu"
               }
             ],
-            "text": "星河项目合同争议仍在跟进，涉案金额120万元；对方原定8月20日前回复，但截至8月20日仍未承诺付款，表示只有付款条件确认后才答复。"
+            "text": "星河项目合同争议（涉案金额120万元）仍在跟进，对方原定8月20日前回复；截至8月20日对方未承诺付款，表示付款条件确认后才答复。"
           },
           {
-            "matter_key": "payment-authorization-risk",
+            "matter_key": "payment-approval-authorization",
             "source_ids": [
               "daily:risk"
             ],
@@ -1289,10 +866,72 @@
                 "source_record_id": "report-fri"
               }
             ],
-            "text": "付款审批存在风险：如果8月25日前仍未收到授权文件，将无法按原计划发起付款审批。"
+            "text": "付款审批存在风险：如8月25日前仍未收到授权文件，付款审批将无法按原计划发起。"
           }
         ],
-        "snapshot_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c"
+        "snapshot_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c",
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:star:mon"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:star:thu"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:completed"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:completed"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:ongoing"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:ongoing"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:adjusted"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:adjusted"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:future"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:future"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:no-followup"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:risk"
+          }
+        ]
       },
       "weekly_plan_found": true
     },
@@ -1310,33 +949,45 @@
           "empty_note": "",
           "items": [
             {
-              "matter_key": "ji-project-supplement-payment",
+              "matter_key": "ji-project-supplemental-agreement",
               "source_ids": [
                 "daily:partial:mon",
                 "daily:partial:thu"
               ],
-              "text": "己项目补充协议：本周一起草补充协议，等待业务部门确认付款条件；周四继续与业务部门沟通付款条件，尚未形成最终意见。"
+              "text": "8月17日起草己项目补充协议，等待业务部门确认付款条件；8月20日继续与业务部门沟通付款条件，尚未形成最终意见。"
             }
           ]
         },
-        "intro": "本周仅记录到8月17日、20日两天日报，且未找到周计划或风险栏；工作主要围绕己项目补充协议及付款条件沟通展开。",
+        "intro": "本周工作主要围绕己项目补充协议，进行了协议起草和付款条件沟通。",
         "plan_progress": {
-          "empty_note": "本周没有找到周计划，无法核对计划进展。",
+          "empty_note": "本周未找到周计划，因此没有可对照的计划进展。",
           "items": []
         },
         "possible_open_loops": {
           "empty_note": "",
           "items": [
             {
-              "matter_key": "ji-project-supplement-payment",
+              "matter_key": "ji-project-supplemental-agreement",
               "source_ids": [
                 "daily:partial:mon",
                 "daily:partial:thu"
               ],
-              "text": "己项目补充协议的付款条件仍在等待业务部门确认，截至8月20日尚未形成最终意见，后续需继续跟进。"
+              "text": "己项目补充协议的付款条件截至8月20日尚未确认，仍需业务部门形成最终意见后跟进。"
             }
           ]
-        }
+        },
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:partial:mon"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:partial:thu"
+          }
+        ]
       },
       "daily_report_dates": [
         "2026-08-17",
@@ -1347,32 +998,32 @@
         "issues": [],
         "model": "deepseek-v4-flash",
         "reviewed_matter_keys": [
-          "ji-project-supplement-payment"
+          "ji-project-supplemental-agreement"
         ]
       },
-      "message_sha256": "277509f9e98124b24546b31d4cc7c7d746515ab37f2495360eda92548bb72e1a",
-      "message_text": "本周仅记录到8月17日、20日两天日报，且未找到周计划或风险栏；工作主要围绕己项目补充协议及付款条件沟通展开。\n\n一、本周完成事项\n1. 己项目补充协议：本周一起草补充协议，等待业务部门确认付款条件；周四继续与业务部门沟通付款条件，尚未形成最终意见。\n\n二、本周计划事项及进展\n本周没有找到周计划，无法核对计划进展。\n\n三、可能未闭环事项\n1. 己项目补充协议的付款条件仍在等待业务部门确认，截至8月20日尚未形成最终意见，后续需继续跟进。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
+      "message_sha256": "433bb589b20dcf56bb2076dec8f8e8db5fcb5270b25c1bba4bfc0b126e9b3551",
+      "message_text": "本周工作主要围绕己项目补充协议，进行了协议起草和付款条件沟通。\n\n一、本周完成事项\n1. 8月17日起草己项目补充协议，等待业务部门确认付款条件；8月20日继续与业务部门沟通付款条件，尚未形成最终意见。\n\n二、本周计划事项及进展\n本周未找到周计划，因此没有可对照的计划进展。\n\n三、可能未闭环事项\n1. 己项目补充协议的付款条件截至8月20日尚未确认，仍需业务部门形成最终意见后跟进。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
       "model_metrics": {
         "generation_seconds": [
-          21.886
+          34.172
         ],
         "max_attempts_per_call": 2,
         "model_calls": 2,
         "review_seconds": [
-          13.315
+          7.169
         ],
         "semantic_attempts": 1,
         "timeout_seconds_per_attempt": 60.0,
-        "total_seconds": 35.201
+        "total_seconds": 41.341
       },
-      "round": 2,
+      "round": 1,
       "source_count": 2,
       "source_fingerprint": "4e2042a21223d30f0e61c242e2253dabac8c9573a5540062a72a9e75ccd5ee0f",
       "status": "PASS",
       "trace": {
         "completed": [
           {
-            "matter_key": "ji-project-supplement-payment",
+            "matter_key": "ji-project-supplemental-agreement",
             "source_ids": [
               "daily:partial:mon",
               "daily:partial:thu"
@@ -1395,13 +1046,13 @@
                 "source_record_id": "partial-thu"
               }
             ],
-            "text": "己项目补充协议：本周一起草补充协议，等待业务部门确认付款条件；周四继续与业务部门沟通付款条件，尚未形成最终意见。"
+            "text": "8月17日起草己项目补充协议，等待业务部门确认付款条件；8月20日继续与业务部门沟通付款条件，尚未形成最终意见。"
           }
         ],
         "plan_progress": [],
         "possible_open_loops": [
           {
-            "matter_key": "ji-project-supplement-payment",
+            "matter_key": "ji-project-supplemental-agreement",
             "source_ids": [
               "daily:partial:mon",
               "daily:partial:thu"
@@ -1424,10 +1075,22 @@
                 "source_record_id": "partial-thu"
               }
             ],
-            "text": "己项目补充协议的付款条件仍在等待业务部门确认，截至8月20日尚未形成最终意见，后续需继续跟进。"
+            "text": "己项目补充协议的付款条件截至8月20日尚未确认，仍需业务部门形成最终意见后跟进。"
           }
         ],
-        "snapshot_fingerprint": "4e2042a21223d30f0e61c242e2253dabac8c9573a5540062a72a9e75ccd5ee0f"
+        "snapshot_fingerprint": "4e2042a21223d30f0e61c242e2253dabac8c9573a5540062a72a9e75ccd5ee0f",
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:partial:mon"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:partial:thu"
+          }
+        ]
       },
       "weekly_plan_found": false
     },
@@ -1438,27 +1101,34 @@
       "case_id": "weekly_plan_without_daily_reports",
       "content": {
         "completed": {
-          "empty_note": "本周没有任何日报记录，因此没有可确认的完成事项。",
+          "empty_note": "本周没有日报记录，无法确认具体完成事项。",
           "items": []
         },
-        "intro": "本周没有日报记录，仅有一条周计划，暂无法形成完成事项简报。",
+        "intro": "本周有周计划但暂无日报记录，以下为基于现有可信来源的简报。",
         "plan_progress": {
           "empty_note": "",
           "items": [
             {
-              "matter_key": "geng-case-trial-prep",
+              "matter_key": "case-geng-trial-prep",
               "source_ids": [
                 "plan:only"
               ],
               "status": "暂时没有找到后续记录",
-              "text": "周计划为准备庚案件庭审材料；本周没有后续日报记录，暂时没有找到后续记录。"
+              "text": "周计划为准备庚案件庭审材料，但快照中未包含之后的日报或后续记录，暂未找到该事项的后续进展记录。"
             }
           ]
         },
         "possible_open_loops": {
-          "empty_note": "暂无未闭环事项。",
+          "empty_note": "除周计划外没有日报等额外信息，暂无未闭环事项。",
           "items": []
-        }
+        },
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:only"
+          }
+        ]
       },
       "daily_report_dates": [],
       "independent_model_review": {
@@ -1466,25 +1136,25 @@
         "issues": [],
         "model": "deepseek-v4-flash",
         "reviewed_matter_keys": [
-          "geng-case-trial-prep"
+          "case-geng-trial-prep"
         ]
       },
-      "message_sha256": "585c637cf8909509fabb6208fbefaeedf1dfb3750ab3420c46e7d0bb0d5ff360",
-      "message_text": "本周没有日报记录，仅有一条周计划，暂无法形成完成事项简报。\n\n一、本周完成事项\n本周没有任何日报记录，因此没有可确认的完成事项。\n\n二、本周计划事项及进展\n1. 【暂时没有找到后续记录】周计划为准备庚案件庭审材料；本周没有后续日报记录，暂时没有找到后续记录。\n\n三、可能未闭环事项\n暂无未闭环事项。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
+      "message_sha256": "539bdeba9f31a210e9424d1c82cdb4f2a95c4bb44a1ca0da03809ec0ca3e7fa7",
+      "message_text": "本周有周计划但暂无日报记录，以下为基于现有可信来源的简报。\n\n一、本周完成事项\n本周没有日报记录，无法确认具体完成事项。\n\n二、本周计划事项及进展\n1. 【暂时没有找到后续记录】周计划为准备庚案件庭审材料，但快照中未包含之后的日报或后续记录，暂未找到该事项的后续进展记录。\n\n三、可能未闭环事项\n除周计划外没有日报等额外信息，暂无未闭环事项。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
       "model_metrics": {
         "generation_seconds": [
-          5.825
+          7.746
         ],
         "max_attempts_per_call": 2,
         "model_calls": 2,
         "review_seconds": [
-          5.805
+          10.012
         ],
         "semantic_attempts": 1,
         "timeout_seconds_per_attempt": 60.0,
-        "total_seconds": 11.63
+        "total_seconds": 17.758
       },
-      "round": 2,
+      "round": 1,
       "source_count": 1,
       "source_fingerprint": "c93fc3f7badda2d7103043c97e79202ee8fae8f82377d375340704e2d37907e9",
       "status": "PASS",
@@ -1492,7 +1162,7 @@
         "completed": [],
         "plan_progress": [
           {
-            "matter_key": "geng-case-trial-prep",
+            "matter_key": "case-geng-trial-prep",
             "source_ids": [
               "plan:only"
             ],
@@ -1507,11 +1177,18 @@
               }
             ],
             "status": "暂时没有找到后续记录",
-            "text": "周计划为准备庚案件庭审材料；本周没有后续日报记录，暂时没有找到后续记录。"
+            "text": "周计划为准备庚案件庭审材料，但快照中未包含之后的日报或后续记录，暂未找到该事项的后续进展记录。"
           }
         ],
         "possible_open_loops": [],
-        "snapshot_fingerprint": "c93fc3f7badda2d7103043c97e79202ee8fae8f82377d375340704e2d37907e9"
+        "snapshot_fingerprint": "c93fc3f7badda2d7103043c97e79202ee8fae8f82377d375340704e2d37907e9",
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:only"
+          }
+        ]
       },
       "weekly_plan_found": true
     },
@@ -1522,18 +1199,19 @@
       "case_id": "no_daily_no_weekly_plan",
       "content": {
         "completed": {
-          "empty_note": "本周没有日报记录，因此没有可确认的完成事项。",
+          "empty_note": "本周没有找到日报数据，因此没有可确认的完成事项。",
           "items": []
         },
-        "intro": "本周暂无日报与周计划记录，未能形成可汇总的工作简报。",
+        "intro": "本周（8月17日—8月21日）未找到日报和周计划记录，暂无工作内容可汇总。",
         "plan_progress": {
-          "empty_note": "未找到本周周计划，无法评估计划进展。",
+          "empty_note": "本周没有找到周计划，无法核对计划进展。",
           "items": []
         },
         "possible_open_loops": {
-          "empty_note": "本周没有日报或周计划记录，无法识别待跟进事项。",
+          "empty_note": "本周没有日报和周计划数据，无法判断是否存在未闭环的事项。",
           "items": []
-        }
+        },
+        "source_dispositions": []
       },
       "daily_report_dates": [],
       "independent_model_review": {
@@ -1542,20 +1220,801 @@
         "model": "deepseek-v4-flash",
         "reviewed_matter_keys": []
       },
-      "message_sha256": "10f40c37550dbfec8a66ddc8c053f7830f9b1584c9b145ab8b96a93e7a49ae46",
-      "message_text": "本周暂无日报与周计划记录，未能形成可汇总的工作简报。\n\n一、本周完成事项\n本周没有日报记录，因此没有可确认的完成事项。\n\n二、本周计划事项及进展\n未找到本周周计划，无法评估计划进展。\n\n三、可能未闭环事项\n本周没有日报或周计划记录，无法识别待跟进事项。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
+      "message_sha256": "6141f53fba18a2361d4e1bdbf31d60504d2140364b244821f4972b7aa97aaa2c",
+      "message_text": "本周（8月17日—8月21日）未找到日报和周计划记录，暂无工作内容可汇总。\n\n一、本周完成事项\n本周没有找到日报数据，因此没有可确认的完成事项。\n\n二、本周计划事项及进展\n本周没有找到周计划，无法核对计划进展。\n\n三、可能未闭环事项\n本周没有日报和周计划数据，无法判断是否存在未闭环的事项。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
       "model_metrics": {
         "generation_seconds": [
-          4.536
+          5.286
         ],
         "max_attempts_per_call": 2,
         "model_calls": 2,
         "review_seconds": [
-          4.955
+          2.215
         ],
         "semantic_attempts": 1,
         "timeout_seconds_per_attempt": 60.0,
-        "total_seconds": 9.492
+        "total_seconds": 7.501
+      },
+      "round": 1,
+      "source_count": 0,
+      "source_fingerprint": "cf89f3316eb645250d4e0834e8bff76e1f61b3f4574756091c8fd86c218c2c4d",
+      "status": "PASS",
+      "trace": {
+        "completed": [],
+        "plan_progress": [],
+        "possible_open_loops": [],
+        "snapshot_fingerprint": "cf89f3316eb645250d4e0834e8bff76e1f61b3f4574756091c8fd86c218c2c4d",
+        "source_dispositions": []
+      },
+      "weekly_plan_found": false
+    },
+    {
+      "assertions": {
+        "merged_source_count": 2,
+        "plan_statuses": {
+          "plan:adjusted": "安排调整",
+          "plan:completed": "已完成",
+          "plan:future": "后续安排",
+          "plan:no-followup": "暂时没有找到后续记录",
+          "plan:ongoing": "持续推进"
+        }
+      },
+      "case_id": "cross_day_five_statuses",
+      "content": {
+        "completed": {
+          "empty_note": "",
+          "items": [
+            {
+              "matter_key": "project-a_contract_finalize",
+              "source_ids": [
+                "daily:completed",
+                "plan:completed"
+              ],
+              "text": "甲项目合同定稿已完成，并已发给经办人。"
+            }
+          ]
+        },
+        "intro": "本周（8月17日-21日）工作以合同、案件和付款事项为主，甲项目合同定稿已完成，其余事项按计划推进或存在后续安排。",
+        "plan_progress": {
+          "empty_note": "",
+          "items": [
+            {
+              "matter_key": "project-a_contract_finalize",
+              "source_ids": [
+                "plan:completed",
+                "daily:completed"
+              ],
+              "status": "已完成",
+              "text": "周计划中的甲项目合同定稿已完成并已发给经办人。"
+            },
+            {
+              "matter_key": "case-b_evidence_materials",
+              "source_ids": [
+                "plan:ongoing",
+                "daily:ongoing"
+              ],
+              "status": "持续推进",
+              "text": "乙案件证据材料整理持续推进，目前仍在补充送达证明。"
+            },
+            {
+              "matter_key": "case-c_court_hearing",
+              "source_ids": [
+                "plan:adjusted",
+                "daily:adjusted"
+              ],
+              "status": "安排调整",
+              "text": "丙案件开庭原定周三，因法院通知改期至周五。"
+            },
+            {
+              "matter_key": "company-d_invoice_conditions",
+              "source_ids": [
+                "plan:future",
+                "daily:future"
+              ],
+              "status": "后续安排",
+              "text": "丁公司发票条件确认已安排至下周一进行。"
+            },
+            {
+              "matter_key": "project-e_supplement_agreement",
+              "source_ids": [
+                "plan:no-followup"
+              ],
+              "status": "暂时没有找到后续记录",
+              "text": "周计划中列有复核戊项目补充协议，但在本周日报中未找到后续执行或调整记录。"
+            }
+          ]
+        },
+        "possible_open_loops": {
+          "empty_note": "",
+          "items": [
+            {
+              "matter_key": "star-project_dispute",
+              "source_ids": [
+                "daily:star:mon",
+                "daily:star:thu"
+              ],
+              "text": "星河项目合同争议仍在跟进，涉案金额120万元；原定8月20日前回复，8月20日继续跟进时，对方未承诺付款，仅表示付款条件确认后才答复。"
+            },
+            {
+              "matter_key": "payment_approval_risk",
+              "source_ids": [
+                "daily:risk"
+              ],
+              "text": "若8月25日前仍未收到授权文件，付款审批将无法按原计划发起。"
+            }
+          ]
+        },
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:star:mon"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:star:thu"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:completed"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:completed"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:ongoing"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:ongoing"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:adjusted"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:adjusted"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:future"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:future"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:no-followup"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:risk"
+          }
+        ]
+      },
+      "daily_report_dates": [
+        "2026-08-17",
+        "2026-08-18",
+        "2026-08-19",
+        "2026-08-20",
+        "2026-08-21"
+      ],
+      "independent_model_review": {
+        "approved": true,
+        "issues": [],
+        "model": "deepseek-v4-flash",
+        "reviewed_matter_keys": [
+          "case-b_evidence_materials",
+          "case-c_court_hearing",
+          "company-d_invoice_conditions",
+          "payment_approval_risk",
+          "project-a_contract_finalize",
+          "project-e_supplement_agreement",
+          "star-project_dispute"
+        ]
+      },
+      "message_sha256": "697bfec7c7470b3538a4178d608d1fa684008cc91c9db5e09d0157ad0a867981",
+      "message_text": "本周（8月17日-21日）工作以合同、案件和付款事项为主，甲项目合同定稿已完成，其余事项按计划推进或存在后续安排。\n\n一、本周完成事项\n1. 甲项目合同定稿已完成，并已发给经办人。\n\n二、本周计划事项及进展\n1. 【已完成】周计划中的甲项目合同定稿已完成并已发给经办人。\n2. 【持续推进】乙案件证据材料整理持续推进，目前仍在补充送达证明。\n3. 【安排调整】丙案件开庭原定周三，因法院通知改期至周五。\n4. 【后续安排】丁公司发票条件确认已安排至下周一进行。\n5. 【暂时没有找到后续记录】周计划中列有复核戊项目补充协议，但在本周日报中未找到后续执行或调整记录。\n\n三、可能未闭环事项\n1. 星河项目合同争议仍在跟进，涉案金额120万元；原定8月20日前回复，8月20日继续跟进时，对方未承诺付款，仅表示付款条件确认后才答复。\n2. 若8月25日前仍未收到授权文件，付款审批将无法按原计划发起。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
+      "model_metrics": {
+        "generation_seconds": [
+          93.075
+        ],
+        "max_attempts_per_call": 2,
+        "model_calls": 2,
+        "review_seconds": [
+          88.699
+        ],
+        "semantic_attempts": 1,
+        "timeout_seconds_per_attempt": 60.0,
+        "total_seconds": 181.775
+      },
+      "round": 2,
+      "source_count": 12,
+      "source_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c",
+      "status": "PASS",
+      "trace": {
+        "completed": [
+          {
+            "matter_key": "project-a_contract_finalize",
+            "source_ids": [
+              "daily:completed",
+              "plan:completed"
+            ],
+            "sources": [
+              {
+                "original_text": "甲项目合同定稿已完成并发给经办人。",
+                "section": "today_work",
+                "source_date": "2026-08-18",
+                "source_id": "daily:completed",
+                "source_kind": "daily_report",
+                "source_record_id": "report-tue"
+              },
+              {
+                "original_text": "完成甲项目合同定稿并发给经办人。",
+                "section": "plan_item",
+                "source_date": "2026-08-17",
+                "source_id": "plan:completed",
+                "source_kind": "weekly_plan",
+                "source_record_id": "plan-current"
+              }
+            ],
+            "text": "甲项目合同定稿已完成，并已发给经办人。"
+          }
+        ],
+        "plan_progress": [
+          {
+            "matter_key": "project-a_contract_finalize",
+            "source_ids": [
+              "plan:completed",
+              "daily:completed"
+            ],
+            "sources": [
+              {
+                "original_text": "完成甲项目合同定稿并发给经办人。",
+                "section": "plan_item",
+                "source_date": "2026-08-17",
+                "source_id": "plan:completed",
+                "source_kind": "weekly_plan",
+                "source_record_id": "plan-current"
+              },
+              {
+                "original_text": "甲项目合同定稿已完成并发给经办人。",
+                "section": "today_work",
+                "source_date": "2026-08-18",
+                "source_id": "daily:completed",
+                "source_kind": "daily_report",
+                "source_record_id": "report-tue"
+              }
+            ],
+            "status": "已完成",
+            "text": "周计划中的甲项目合同定稿已完成并已发给经办人。"
+          },
+          {
+            "matter_key": "case-b_evidence_materials",
+            "source_ids": [
+              "plan:ongoing",
+              "daily:ongoing"
+            ],
+            "sources": [
+              {
+                "original_text": "整理乙案件证据材料。",
+                "section": "plan_item",
+                "source_date": "2026-08-18",
+                "source_id": "plan:ongoing",
+                "source_kind": "weekly_plan",
+                "source_record_id": "plan-current"
+              },
+              {
+                "original_text": "乙案件证据材料持续推进，目前仍在补充送达证明。",
+                "section": "today_work",
+                "source_date": "2026-08-19",
+                "source_id": "daily:ongoing",
+                "source_kind": "daily_report",
+                "source_record_id": "report-wed"
+              }
+            ],
+            "status": "持续推进",
+            "text": "乙案件证据材料整理持续推进，目前仍在补充送达证明。"
+          },
+          {
+            "matter_key": "case-c_court_hearing",
+            "source_ids": [
+              "plan:adjusted",
+              "daily:adjusted"
+            ],
+            "sources": [
+              {
+                "original_text": "周三参加丙案件开庭。",
+                "section": "plan_item",
+                "source_date": "2026-08-19",
+                "source_id": "plan:adjusted",
+                "source_kind": "weekly_plan",
+                "source_record_id": "plan-current"
+              },
+              {
+                "original_text": "丙案件原定周三开庭，因法院通知改期到周五。",
+                "section": "today_work",
+                "source_date": "2026-08-19",
+                "source_id": "daily:adjusted",
+                "source_kind": "daily_report",
+                "source_record_id": "report-wed"
+              }
+            ],
+            "status": "安排调整",
+            "text": "丙案件开庭原定周三，因法院通知改期至周五。"
+          },
+          {
+            "matter_key": "company-d_invoice_conditions",
+            "source_ids": [
+              "plan:future",
+              "daily:future"
+            ],
+            "sources": [
+              {
+                "original_text": "确认丁公司发票条件。",
+                "section": "plan_item",
+                "source_date": "2026-08-20",
+                "source_id": "plan:future",
+                "source_kind": "weekly_plan",
+                "source_record_id": "plan-current"
+              },
+              {
+                "original_text": "后续安排下周一确认丁公司发票条件。",
+                "section": "tomorrow_plan",
+                "source_date": "2026-08-21",
+                "source_id": "daily:future",
+                "source_kind": "daily_report",
+                "source_record_id": "report-fri"
+              }
+            ],
+            "status": "后续安排",
+            "text": "丁公司发票条件确认已安排至下周一进行。"
+          },
+          {
+            "matter_key": "project-e_supplement_agreement",
+            "source_ids": [
+              "plan:no-followup"
+            ],
+            "sources": [
+              {
+                "original_text": "复核戊项目补充协议。",
+                "section": "plan_item",
+                "source_date": "2026-08-21",
+                "source_id": "plan:no-followup",
+                "source_kind": "weekly_plan",
+                "source_record_id": "plan-current"
+              }
+            ],
+            "status": "暂时没有找到后续记录",
+            "text": "周计划中列有复核戊项目补充协议，但在本周日报中未找到后续执行或调整记录。"
+          }
+        ],
+        "possible_open_loops": [
+          {
+            "matter_key": "star-project_dispute",
+            "source_ids": [
+              "daily:star:mon",
+              "daily:star:thu"
+            ],
+            "sources": [
+              {
+                "original_text": "跟进星河项目合同争议，涉案金额120万元，对方原定8月20日前回复。",
+                "section": "today_work",
+                "source_date": "2026-08-17",
+                "source_id": "daily:star:mon",
+                "source_kind": "daily_report",
+                "source_record_id": "report-mon"
+              },
+              {
+                "original_text": "继续跟进星河项目合同争议；对方没有承诺付款，表示只有付款条件确认后才答复。",
+                "section": "today_work",
+                "source_date": "2026-08-20",
+                "source_id": "daily:star:thu",
+                "source_kind": "daily_report",
+                "source_record_id": "report-thu"
+              }
+            ],
+            "text": "星河项目合同争议仍在跟进，涉案金额120万元；原定8月20日前回复，8月20日继续跟进时，对方未承诺付款，仅表示付款条件确认后才答复。"
+          },
+          {
+            "matter_key": "payment_approval_risk",
+            "source_ids": [
+              "daily:risk"
+            ],
+            "sources": [
+              {
+                "original_text": "如果8月25日前仍未收到授权文件，付款审批将无法按原计划发起。",
+                "section": "problems",
+                "source_date": "2026-08-21",
+                "source_id": "daily:risk",
+                "source_kind": "daily_report",
+                "source_record_id": "report-fri"
+              }
+            ],
+            "text": "若8月25日前仍未收到授权文件，付款审批将无法按原计划发起。"
+          }
+        ],
+        "snapshot_fingerprint": "4670a1962549b07723108cba596750172475d5cf1cfad6982eed4daa452e7c4c",
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:star:mon"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:star:thu"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:completed"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:completed"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:ongoing"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:ongoing"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:adjusted"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:adjusted"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:future"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:future"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:no-followup"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:risk"
+          }
+        ]
+      },
+      "weekly_plan_found": true
+    },
+    {
+      "assertions": {
+        "daily_dates": [
+          "2026-08-17",
+          "2026-08-20"
+        ],
+        "plan_items": 0
+      },
+      "case_id": "partial_dates_without_weekly_plan",
+      "content": {
+        "completed": {
+          "empty_note": "",
+          "items": [
+            {
+              "matter_key": "ji-project-supplemental-agreement",
+              "source_ids": [
+                "daily:partial:mon",
+                "daily:partial:thu"
+              ],
+              "text": "起草己项目补充协议，等待业务部门确认付款条件；8月20日继续与业务部门沟通付款条件，尚未形成最终意见。"
+            }
+          ]
+        },
+        "intro": "本周有8月17日、20日两天日报，工作集中在己项目补充协议起草与付款条件沟通。",
+        "plan_progress": {
+          "empty_note": "本周未找到周计划来源，无法判断计划进展。",
+          "items": []
+        },
+        "possible_open_loops": {
+          "empty_note": "",
+          "items": [
+            {
+              "matter_key": "ji-project-payment-terms-pending",
+              "source_ids": [
+                "daily:partial:mon",
+                "daily:partial:thu"
+              ],
+              "text": "己项目补充协议的付款条件仍在等待业务部门确认，后续需要继续跟进以形成最终意见。"
+            }
+          ]
+        },
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:partial:mon"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:partial:thu"
+          }
+        ]
+      },
+      "daily_report_dates": [
+        "2026-08-17",
+        "2026-08-20"
+      ],
+      "independent_model_review": {
+        "approved": true,
+        "issues": [],
+        "model": "deepseek-v4-flash",
+        "reviewed_matter_keys": [
+          "ji-project-payment-terms-pending",
+          "ji-project-supplemental-agreement"
+        ]
+      },
+      "message_sha256": "c219171efd3b454660f83051d1699b057bef32c61bfbcb98169495fcf9f6bb41",
+      "message_text": "本周有8月17日、20日两天日报，工作集中在己项目补充协议起草与付款条件沟通。\n\n一、本周完成事项\n1. 起草己项目补充协议，等待业务部门确认付款条件；8月20日继续与业务部门沟通付款条件，尚未形成最终意见。\n\n二、本周计划事项及进展\n本周未找到周计划来源，无法判断计划进展。\n\n三、可能未闭环事项\n1. 己项目补充协议的付款条件仍在等待业务部门确认，后续需要继续跟进以形成最终意见。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
+      "model_metrics": {
+        "generation_seconds": [
+          10.864
+        ],
+        "max_attempts_per_call": 2,
+        "model_calls": 2,
+        "review_seconds": [
+          24.033
+        ],
+        "semantic_attempts": 1,
+        "timeout_seconds_per_attempt": 60.0,
+        "total_seconds": 34.897
+      },
+      "round": 2,
+      "source_count": 2,
+      "source_fingerprint": "4e2042a21223d30f0e61c242e2253dabac8c9573a5540062a72a9e75ccd5ee0f",
+      "status": "PASS",
+      "trace": {
+        "completed": [
+          {
+            "matter_key": "ji-project-supplemental-agreement",
+            "source_ids": [
+              "daily:partial:mon",
+              "daily:partial:thu"
+            ],
+            "sources": [
+              {
+                "original_text": "起草己项目补充协议，等待业务部门确认付款条件。",
+                "section": "today_work",
+                "source_date": "2026-08-17",
+                "source_id": "daily:partial:mon",
+                "source_kind": "daily_report",
+                "source_record_id": "partial-mon"
+              },
+              {
+                "original_text": "继续与业务部门沟通己项目付款条件，尚未形成最终意见。",
+                "section": "today_work",
+                "source_date": "2026-08-20",
+                "source_id": "daily:partial:thu",
+                "source_kind": "daily_report",
+                "source_record_id": "partial-thu"
+              }
+            ],
+            "text": "起草己项目补充协议，等待业务部门确认付款条件；8月20日继续与业务部门沟通付款条件，尚未形成最终意见。"
+          }
+        ],
+        "plan_progress": [],
+        "possible_open_loops": [
+          {
+            "matter_key": "ji-project-payment-terms-pending",
+            "source_ids": [
+              "daily:partial:mon",
+              "daily:partial:thu"
+            ],
+            "sources": [
+              {
+                "original_text": "起草己项目补充协议，等待业务部门确认付款条件。",
+                "section": "today_work",
+                "source_date": "2026-08-17",
+                "source_id": "daily:partial:mon",
+                "source_kind": "daily_report",
+                "source_record_id": "partial-mon"
+              },
+              {
+                "original_text": "继续与业务部门沟通己项目付款条件，尚未形成最终意见。",
+                "section": "today_work",
+                "source_date": "2026-08-20",
+                "source_id": "daily:partial:thu",
+                "source_kind": "daily_report",
+                "source_record_id": "partial-thu"
+              }
+            ],
+            "text": "己项目补充协议的付款条件仍在等待业务部门确认，后续需要继续跟进以形成最终意见。"
+          }
+        ],
+        "snapshot_fingerprint": "4e2042a21223d30f0e61c242e2253dabac8c9573a5540062a72a9e75ccd5ee0f",
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:partial:mon"
+          },
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "daily:partial:thu"
+          }
+        ]
+      },
+      "weekly_plan_found": false
+    },
+    {
+      "assertions": {
+        "status": "暂时没有找到后续记录"
+      },
+      "case_id": "weekly_plan_without_daily_reports",
+      "content": {
+        "completed": {
+          "empty_note": "本周没有可用的日报，因此没有可归入本周完成的事项。",
+          "items": []
+        },
+        "intro": "本周快照中只有一条周计划，没有日报，无法确定具体完成情况。",
+        "plan_progress": {
+          "empty_note": "",
+          "items": [
+            {
+              "matter_key": "庚案件庭审材料准备",
+              "source_ids": [
+                "plan:only"
+              ],
+              "status": "暂时没有找到后续记录",
+              "text": "周计划安排了准备庚案件庭审材料，但之后没有找到任何日报或后续记录，暂时无法确认进展。"
+            }
+          ]
+        },
+        "possible_open_loops": {
+          "empty_note": "本周没有发现需要继续跟进且未在计划进展中反映的事项。",
+          "items": []
+        },
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:only"
+          }
+        ]
+      },
+      "daily_report_dates": [],
+      "independent_model_review": {
+        "approved": true,
+        "issues": [],
+        "model": "deepseek-v4-flash",
+        "reviewed_matter_keys": [
+          "庚案件庭审材料准备"
+        ]
+      },
+      "message_sha256": "5ffc5845f7ca42e937202d906c4a151b89a95c2805def4c03c2a1c711859724d",
+      "message_text": "本周快照中只有一条周计划，没有日报，无法确定具体完成情况。\n\n一、本周完成事项\n本周没有可用的日报，因此没有可归入本周完成的事项。\n\n二、本周计划事项及进展\n1. 【暂时没有找到后续记录】周计划安排了准备庚案件庭审材料，但之后没有找到任何日报或后续记录，暂时无法确认进展。\n\n三、可能未闭环事项\n本周没有发现需要继续跟进且未在计划进展中反映的事项。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
+      "model_metrics": {
+        "generation_seconds": [
+          5.53
+        ],
+        "max_attempts_per_call": 2,
+        "model_calls": 2,
+        "review_seconds": [
+          5.207
+        ],
+        "semantic_attempts": 1,
+        "timeout_seconds_per_attempt": 60.0,
+        "total_seconds": 10.736
+      },
+      "round": 2,
+      "source_count": 1,
+      "source_fingerprint": "c93fc3f7badda2d7103043c97e79202ee8fae8f82377d375340704e2d37907e9",
+      "status": "PASS",
+      "trace": {
+        "completed": [],
+        "plan_progress": [
+          {
+            "matter_key": "庚案件庭审材料准备",
+            "source_ids": [
+              "plan:only"
+            ],
+            "sources": [
+              {
+                "original_text": "准备庚案件庭审材料。",
+                "section": "plan_item",
+                "source_date": "2026-08-18",
+                "source_id": "plan:only",
+                "source_kind": "weekly_plan",
+                "source_record_id": "plan-only"
+              }
+            ],
+            "status": "暂时没有找到后续记录",
+            "text": "周计划安排了准备庚案件庭审材料，但之后没有找到任何日报或后续记录，暂时无法确认进展。"
+          }
+        ],
+        "possible_open_loops": [],
+        "snapshot_fingerprint": "c93fc3f7badda2d7103043c97e79202ee8fae8f82377d375340704e2d37907e9",
+        "source_dispositions": [
+          {
+            "disposition": "cited",
+            "reason": "",
+            "source_id": "plan:only"
+          }
+        ]
+      },
+      "weekly_plan_found": true
+    },
+    {
+      "assertions": {
+        "item_count": 0
+      },
+      "case_id": "no_daily_no_weekly_plan",
+      "content": {
+        "completed": {
+          "empty_note": "本周没有找到任何可引用的日报记录，故没有可汇总的完成事项。",
+          "items": []
+        },
+        "intro": "本周没有找到可用的日报或周计划数据，因此无法生成具体的工作简报。",
+        "plan_progress": {
+          "empty_note": "本周没有找到周计划记录，因此无法判断任何计划进展。",
+          "items": []
+        },
+        "possible_open_loops": {
+          "empty_note": "本周没有可引用的风险或后续跟踪记录，故没有需要提示的未闭环事项。",
+          "items": []
+        },
+        "source_dispositions": []
+      },
+      "daily_report_dates": [],
+      "independent_model_review": {
+        "approved": true,
+        "issues": [],
+        "model": "deepseek-v4-flash",
+        "reviewed_matter_keys": []
+      },
+      "message_sha256": "b0c0875b375e1b0090614730036aa1df8b2b773a0de9679092c219c5ff0c4331",
+      "message_text": "本周没有找到可用的日报或周计划数据，因此无法生成具体的工作简报。\n\n一、本周完成事项\n本周没有找到任何可引用的日报记录，故没有可汇总的完成事项。\n\n二、本周计划事项及进展\n本周没有找到周计划记录，因此无法判断任何计划进展。\n\n三、可能未闭环事项\n本周没有可引用的风险或后续跟踪记录，故没有需要提示的未闭环事项。\n\n数据范围：2026-08-17 至 2026-08-21，以周六生成时系统已保存的记录为准。\n“暂时没有找到后续记录”只表示系统没有找到后来记录，不等于未完成。",
+      "model_metrics": {
+        "generation_seconds": [
+          3.22
+        ],
+        "max_attempts_per_call": 2,
+        "model_calls": 2,
+        "review_seconds": [
+          1.728
+        ],
+        "semantic_attempts": 1,
+        "timeout_seconds_per_attempt": 60.0,
+        "total_seconds": 4.948
       },
       "round": 2,
       "source_count": 0,
@@ -1565,7 +2024,8 @@
         "completed": [],
         "plan_progress": [],
         "possible_open_loops": [],
-        "snapshot_fingerprint": "cf89f3316eb645250d4e0834e8bff76e1f61b3f4574756091c8fd86c218c2c4d"
+        "snapshot_fingerprint": "cf89f3316eb645250d4e0834e8bff76e1f61b3f4574756091c8fd86c218c2c4d",
+        "source_dispositions": []
       },
       "weekly_plan_found": false
     }

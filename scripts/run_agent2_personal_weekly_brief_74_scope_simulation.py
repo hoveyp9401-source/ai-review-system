@@ -50,7 +50,7 @@ def _args() -> argparse.Namespace:
 
 def _formal_roster() -> FormalLegalDailyRoster:
     team_names = tuple(sorted(FORMAL_CHILD_TEAM_NAMES))
-    counts = (11, 11, 10, 10, 10, 10, 10)
+    counts = (10, 10, 10, 10, 10, 10, 10)
     members: list[FormalRosterMember] = []
     index = 0
     for team_index, (team_name, count) in enumerate(zip(team_names, counts, strict=True)):
@@ -70,7 +70,9 @@ def _formal_roster() -> FormalLegalDailyRoster:
                 )
             )
             index += 1
-    for center_index, name in enumerate(("赵卫中", "朱佳佳")):
+    for center_index, name in enumerate(
+        ("中心直属甲", "中心直属乙", "中心直属丙", "中心直属丁")
+    ):
         user_id = str(uuid5(NAMESPACE_URL, f"pwb-formal-center-{center_index}"))
         members.append(
             FormalRosterMember(

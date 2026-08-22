@@ -12,7 +12,7 @@ from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.legal_daily_dashboard.sql_repository import SqlDashboardRepository
 from app.legal_daily_roster import (
-    FORMAL_CENTER_MEMBER_NAMES,
+    FORMAL_CENTER_BRIEFING_RECIPIENT_NAMES,
     FORMAL_CHILD_MEMBER_COUNT,
     FORMAL_CHILD_TEAM_NAMES,
     FORMAL_CONFIRMED_TEAM_LEADS,
@@ -134,7 +134,7 @@ async def audit(report_date: date) -> dict[str, object]:
         for team_name, expected_lead in FORMAL_CONFIRMED_TEAM_LEADS.items()
     ):
         raise RuntimeError("confirmed team briefing recipient changed")
-    if department_recipients != FORMAL_CENTER_MEMBER_NAMES:
+    if department_recipients != FORMAL_CENTER_BRIEFING_RECIPIENT_NAMES:
         raise RuntimeError("department briefing recipients changed")
 
     return {

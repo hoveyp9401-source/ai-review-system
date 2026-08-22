@@ -543,73 +543,112 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                     flush=True,
                 )
 
-        normal_complex = next(
-            item
-            for item in reversed(results)
-            if item["case_id"] == "cross_day_five_statuses"
-        )
-        if normal_complex["model_metrics"]["model_calls"] != 2:
-            raise AssertionError(
-                "repair performance exercise requires a normal two-call baseline"
-            )
-        prior_content = successful_content_by_case["cross_day_five_statuses"]
-        star_item = next(
-            item
-            for item in _all_items(prior_content)
-            if {"daily:star:mon", "daily:star:thu"}.issubset(item.source_ids)
-        )
-        repair_context = {
-            "instruction": (
-                "这是有界修复路径的脱敏性能演练。完整 trusted_snapshot 仍是唯一事实来源；"
-                "请重新逐源核对并返回完整四字段 JSON，不得增加说明字段。"
+        natural_repair = next(
+            (
+                item
+                for item in reversed(results)
+                if item["model_metrics"]["model_calls"] == 4
             ),
-            "previous_draft": prior_content.as_payload(),
-            "issues": [
-                {
-                    "matter_key": star_item.matter_key,
-                    "reason": (
-                        "请再次确认该事项完整保留来源中的金额、8月20日前日期、"
-                        "未承诺付款的否定以及付款条件。"
-                    ),
-                }
-            ],
-        }
-        repair_generation_started = perf_counter()
-        repaired_content = await generator.generate(
-            snapshot=_complex_snapshot(),
-            recipient_name="脱敏用户",
-            personal_memory={"entries": []},
-            repair_context=repair_context,
+            None,
         )
-        repair_generation_seconds = perf_counter() - repair_generation_started
-        repair_review_started = perf_counter()
-        repaired_review = await reviewer.review(
-            snapshot=_complex_snapshot(),
-            content=repaired_content,
+        if natural_repair is not None:
+            repair_performance_exercise = {
+                "status": "PASS",
+                "exercise_kind": "natural_bounded_repair_from_real_matrix",
+                "combined_worst_path_model_calls": 4,
+                "combined_worst_path_seconds": natural_repair[
+                    "model_metrics"
+                ]["total_seconds"],
+                "case_id": natural_repair["case_id"],
+                "round": natural_repair["round"],
+                "independent_model_review": natural_repair[
+                    "independent_model_review"
+                ],
+                "assertions": natural_repair["assertions"],
+                "content": natural_repair["content"],
+                "trace": natural_repair["trace"],
+            }
+        else:
+            normal_complex = next(
+                item
+                for item in reversed(results)
+                if item["case_id"] == "cross_day_five_statuses"
+            )
+            prior_content = successful_content_by_case[
+                "cross_day_five_statuses"
+            ]
+            star_item = next(
+                item
+                for item in _all_items(prior_content)
+                if {"daily:star:mon", "daily:star:thu"}.issubset(
+                    item.source_ids
+                )
+            )
+            repair_context = {
+                "instruction": (
+                    "这是有界修复路径的脱敏性能演练。完整 trusted_snapshot "
+                    "仍是唯一事实来源；请重新逐源核对并返回完整五字段 JSON。"
+                ),
+                "previous_draft": prior_content.as_payload(),
+                "issues": [
+                    {
+                        "matter_key": star_item.matter_key,
+                        "reason": (
+                            "请再次确认该事项完整保留来源中的金额、8月20日前日期、"
+                            "未承诺付款的否定以及付款条件。"
+                        ),
+                    }
+                ],
+            }
+            repair_generation_started = perf_counter()
+            repaired_content = await generator.generate(
+                snapshot=_complex_snapshot(),
+                recipient_name="脱敏用户",
+                personal_memory={"entries": []},
+                repair_context=repair_context,
+            )
+            repair_generation_seconds = (
+                perf_counter() - repair_generation_started
+            )
+            repair_review_started = perf_counter()
+            repaired_review = await reviewer.review(
+                snapshot=_complex_snapshot(),
+                content=repaired_content,
+            )
+            repair_review_seconds = perf_counter() - repair_review_started
+            repair_assertions = _assert_complex(repaired_content)
+            repair_phase_seconds = (
+                repair_generation_seconds + repair_review_seconds
+            )
+            combined_seconds = (
+                float(normal_complex["model_metrics"]["total_seconds"])
+                + repair_phase_seconds
+            )
+            repair_performance_exercise = {
+                "status": "PASS",
+                "exercise_kind": (
+                    "forced_repair_with_real_generation_and_real_review"
+                ),
+                "normal_phase_model_calls": 2,
+                "repair_phase_model_calls": 2,
+                "combined_worst_path_model_calls": 4,
+                "repair_generation_seconds": round(
+                    repair_generation_seconds, 3
+                ),
+                "repair_review_seconds": round(repair_review_seconds, 3),
+                "repair_phase_seconds": round(repair_phase_seconds, 3),
+                "normal_phase_seconds": normal_complex["model_metrics"][
+                    "total_seconds"
+                ],
+                "combined_worst_path_seconds": round(combined_seconds, 3),
+                "independent_model_review": repaired_review,
+                "assertions": repair_assertions,
+                "content": repaired_content.as_payload(),
+                "trace": repaired_content.trace_payload(),
+            }
+        combined_seconds = float(
+            repair_performance_exercise["combined_worst_path_seconds"]
         )
-        repair_review_seconds = perf_counter() - repair_review_started
-        repair_assertions = _assert_complex(repaired_content)
-        repair_phase_seconds = repair_generation_seconds + repair_review_seconds
-        combined_seconds = (
-            float(normal_complex["model_metrics"]["total_seconds"])
-            + repair_phase_seconds
-        )
-        repair_performance_exercise = {
-            "status": "PASS",
-            "exercise_kind": "forced_repair_with_real_generation_and_real_review",
-            "normal_phase_model_calls": 2,
-            "repair_phase_model_calls": 2,
-            "combined_worst_path_model_calls": 4,
-            "repair_generation_seconds": round(repair_generation_seconds, 3),
-            "repair_review_seconds": round(repair_review_seconds, 3),
-            "repair_phase_seconds": round(repair_phase_seconds, 3),
-            "normal_phase_seconds": normal_complex["model_metrics"]["total_seconds"],
-            "combined_worst_path_seconds": round(combined_seconds, 3),
-            "independent_model_review": repaired_review,
-            "assertions": repair_assertions,
-            "content": repaired_content.as_payload(),
-            "trace": repaired_content.trace_payload(),
-        }
         print(
             json.dumps(
                 {

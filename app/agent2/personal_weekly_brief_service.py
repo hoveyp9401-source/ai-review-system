@@ -59,6 +59,14 @@ class PersonalWeeklyBriefSnapshotService:
             f"personal-weekly:{target.tenant_id}:"
             f"{target.internal_user_id}:{week_start.isoformat()}"
         )
+        snapshot_payload = snapshot.as_payload()
+        snapshot_payload["recipient_snapshot"] = {
+            "tenant_id": target.tenant_id,
+            "internal_user_id": target.internal_user_id,
+            "dingtalk_user_id": target.dingtalk_user_id,
+            "display_name": target.display_name,
+            "conversation_id": target.conversation_id,
+        }
         row = PersonalWeeklyBriefRecord(
             brief_id=str(uuid.uuid5(_BRIEF_NAMESPACE, key)),
             tenant_id=target.tenant_id,
@@ -67,7 +75,7 @@ class PersonalWeeklyBriefSnapshotService:
             week_start=week_start,
             week_end=week_start + timedelta(days=4),
             snapshot_at=snapshot_at,
-            source_snapshot=snapshot.as_payload(),
+            source_snapshot=snapshot_payload,
             source_fingerprint=snapshot.fingerprint,
             personal_memory_json=personal_memory,
             content_json={},
@@ -116,6 +124,13 @@ class PersonalWeeklyBriefSnapshotService:
             {
                 "snapshot_failed": True,
                 "failure_code": error_code,
+                "recipient_snapshot": {
+                    "tenant_id": target.tenant_id,
+                    "internal_user_id": target.internal_user_id,
+                    "dingtalk_user_id": target.dingtalk_user_id,
+                    "display_name": target.display_name,
+                    "conversation_id": target.conversation_id,
+                },
             }
         )
         key = (

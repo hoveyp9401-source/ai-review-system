@@ -11,18 +11,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 FORMAL_ROSTER_EFFECTIVE_DATE = date(2026, 8, 3)
 FORMAL_ROSTER_MEMBER_COUNT = 74
-FORMAL_CHILD_MEMBER_COUNT = 72
-FORMAL_CENTER_MEMBER_COUNT = 2
+FORMAL_CHILD_MEMBER_COUNT = 70
+FORMAL_CENTER_MEMBER_COUNT = 4
 FORMAL_PARENT_DEPARTMENT = "法务合约中心"
 FORMAL_CENTER_TEAM_CODE = "legal-center"
-FORMAL_CENTER_MEMBER_NAMES = frozenset({"赵卫中", "朱佳佳"})
+# These two people remain management-briefing recipients, but are not the
+# complete center-direct roster. Formal membership is always loaded from the
+# current effective membership records and is never hard-coded by name.
+FORMAL_CENTER_BRIEFING_RECIPIENT_NAMES = frozenset({"赵卫中", "朱佳佳"})
 FORMAL_CONFIRMED_TEAM_LEADS = {
     "法务二部": "丁益明",
     "法务四部": "薛旭",
 }
-FORMAL_CONFIRMED_CHILD_PLACEMENTS = {
-    member_name: team_name for team_name, member_name in FORMAL_CONFIRMED_TEAM_LEADS.items()
-}
+FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES = frozenset(
+    FORMAL_CONFIRMED_TEAM_LEADS.values()
+)
 FORMAL_CHILD_TEAM_NAMES = frozenset(
     {
         "法务一部",
@@ -70,6 +73,10 @@ class FormalLegalDailyRoster:
     @property
     def center_members(self) -> tuple[FormalRosterMember, ...]:
         return tuple(member for member in self.members if member.center_direct)
+
+    @property
+    def center_member_names(self) -> frozenset[str]:
+        return frozenset(member.user_name for member in self.center_members)
 
     @property
     def user_ids(self) -> tuple[str, ...]:
@@ -199,6 +206,12 @@ def _validate_roster(
         return
     if roster.member_count != FORMAL_ROSTER_MEMBER_COUNT:
         raise RuntimeError(f"expected {FORMAL_ROSTER_MEMBER_COUNT} formal roster members, got {roster.member_count}")
+    for member_name in FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES:
+        matches = tuple(member for member in roster.members if member.user_name == member_name)
+        if len(matches) != 1 or not matches[0].center_direct:
+            raise RuntimeError(
+                f"formal roster placement changed: {member_name} must be center-direct"
+            )
     if len(roster.child_members) != FORMAL_CHILD_MEMBER_COUNT:
         raise RuntimeError(f"expected {FORMAL_CHILD_MEMBER_COUNT} child members, got {len(roster.child_members)}")
     if len(roster.center_members) != FORMAL_CENTER_MEMBER_COUNT:
@@ -210,13 +223,6 @@ def _validate_roster(
         raise RuntimeError(f"formal child departments changed: {sorted(child_team_names)!r}")
     if len({member.team_id for member in roster.child_members}) != len(FORMAL_CHILD_TEAM_NAMES):
         raise RuntimeError("formal roster does not resolve to exactly seven child teams")
-    center_names = {member.user_name for member in roster.center_members}
-    if center_names != FORMAL_CENTER_MEMBER_NAMES:
-        raise RuntimeError(f"formal center-direct members changed: {sorted(center_names)!r}")
-    for member_name, expected_team_name in FORMAL_CONFIRMED_CHILD_PLACEMENTS.items():
-        matches = tuple(member for member in roster.members if member.user_name == member_name)
-        if len(matches) != 1 or matches[0].team_name != expected_team_name:
-            raise RuntimeError(f"formal roster placement changed: {member_name} must belong to {expected_team_name}")
 
 
 def formal_roster_user_ids_for_exact_scope(

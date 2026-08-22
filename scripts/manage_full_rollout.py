@@ -21,11 +21,11 @@ from app.agent2.tool_calling.registry import runtime_registry_contract_digest
 from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.legal_daily_roster import (
-    FORMAL_CENTER_MEMBER_NAMES as EXPECTED_CENTER_LEVEL_MEMBERS,
+    FORMAL_CENTER_MEMBER_COUNT as CENTER_ROSTER_COUNT,
     FORMAL_CENTER_TEAM_CODE as CENTER_LEVEL_TEAM_CODE,
     FORMAL_CHILD_MEMBER_COUNT as CHILD_ROSTER_COUNT,
     FORMAL_CHILD_TEAM_NAMES as EXPECTED_CHILD_TEAMS,
-    FORMAL_CONFIRMED_CHILD_PLACEMENTS,
+    FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES,
     FORMAL_PARENT_DEPARTMENT as PARENT_DEPARTMENT,
     FORMAL_ROSTER_MEMBER_COUNT as ROLLOUT_COUNT,
 )
@@ -392,21 +392,10 @@ def _validate_roster(rows) -> None:
     ):
         raise RuntimeError("child-department roster must resolve to seven teams")
     center_names = {str(row["name"]) for row in center_rows}
-    if center_names != EXPECTED_CENTER_LEVEL_MEMBERS:
-        raise RuntimeError(
-            f"unexpected center-level members: {sorted(center_names)!r}"
-        )
-    if len(center_rows) != len(EXPECTED_CENTER_LEVEL_MEMBERS):
-        raise RuntimeError("center-level roster contains duplicate memberships")
-    team_by_member_name = {
-        str(row["name"]): str(row["team_name"])
-        for row in child_rows
-    }
-    if any(
-        team_by_member_name.get(member_name) != expected_team_name
-        for member_name, expected_team_name in FORMAL_CONFIRMED_CHILD_PLACEMENTS.items()
+    if len(center_rows) != CENTER_ROSTER_COUNT or not (
+        FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES <= center_names
     ):
-        raise RuntimeError("confirmed child-department placements changed")
+        raise RuntimeError("center-level roster contains duplicate memberships")
 
 
 async def main() -> None:

@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.legal_daily_roster import (
-    FORMAL_CENTER_MEMBER_NAMES,
+    FORMAL_CENTER_MEMBER_COUNT,
+    FORMAL_CHILD_MEMBER_COUNT,
     FORMAL_CHILD_TEAM_NAMES,
     formal_roster_user_ids_for_exact_scope,
     load_formal_legal_daily_roster,
@@ -21,13 +22,13 @@ from app.services.management_daily_briefing import _validate_briefing_roster
 
 def _formal_rows() -> list[dict[str, object]]:
     team_counts = {
-        "法务一部": 14,
-        "法务二部": 12,
-        "法务三部": 9,
-        "法务四部": 12,
-        "法务五部": 8,
-        "法务六部": 6,
-        "综合管理部": 11,
+        "法务一部": 10,
+        "法务二部": 10,
+        "法务三部": 10,
+        "法务四部": 10,
+        "法务五部": 10,
+        "法务六部": 10,
+        "综合管理部": 10,
     }
     rows: list[dict[str, object]] = []
     index = 0
@@ -35,10 +36,6 @@ def _formal_rows() -> list[dict[str, object]]:
         for member_index in range(count):
             index += 1
             member_name = f"成员{index}"
-            if team_name == "法务二部" and member_index == 0:
-                member_name = "丁益明"
-            if team_name == "法务四部" and member_index == 0:
-                member_name = "薛旭"
             rows.append(
                 {
                     "user_id": f"user-{index}",
@@ -53,7 +50,7 @@ def _formal_rows() -> list[dict[str, object]]:
                     "data_complete": True,
                 }
             )
-    for center_name in sorted(FORMAL_CENTER_MEMBER_NAMES):
+    for center_name in ("丁益明", "薛旭", "中心直属甲", "中心直属乙"):
         index += 1
         rows.append(
             {
@@ -101,7 +98,7 @@ class _Session:
 
 
 @pytest.mark.asyncio
-async def test_formal_roster_is_one_validated_72_plus_2_snapshot():
+async def test_formal_roster_is_one_validated_70_plus_4_snapshot():
     session = _Session(_formal_rows())
 
     roster = await load_formal_legal_daily_roster(
@@ -111,12 +108,17 @@ async def test_formal_roster_is_one_validated_72_plus_2_snapshot():
     )
 
     assert roster.member_count == 74
-    assert len(roster.child_members) == 72
-    assert len(roster.center_members) == 2
+    assert len(roster.child_members) == FORMAL_CHILD_MEMBER_COUNT == 70
+    assert len(roster.center_members) == FORMAL_CENTER_MEMBER_COUNT == 4
     assert {member.team_name for member in roster.child_members} == FORMAL_CHILD_TEAM_NAMES
-    assert {member.user_name for member in roster.center_members} == FORMAL_CENTER_MEMBER_NAMES
-    assert roster.member_by_name("丁益明").team_name == "法务二部"
-    assert roster.member_by_name("薛旭").team_name == "法务四部"
+    assert {member.user_name for member in roster.center_members} == {
+        "丁益明",
+        "薛旭",
+        "中心直属甲",
+        "中心直属乙",
+    }
+    assert roster.member_by_name("丁益明").center_direct is True
+    assert roster.member_by_name("薛旭").center_direct is True
     assert session.parameters == {
         "tenant_id": "legal-daily-production-v1",
         "on_date": date(2026, 8, 9),
@@ -139,30 +141,30 @@ async def test_formal_roster_rejects_duplicate_membership_instead_of_guessing():
 
 
 @pytest.mark.asyncio
-async def test_formal_roster_rejects_70_plus_4_drift():
+async def test_formal_roster_rejects_72_plus_2_drift():
     rows = _formal_rows()
-    moved_to_center = rows[14]
-    moved_to_center.update(
+    moved_to_child = rows[-1]
+    moved_to_child.update(
         {
-            "user_team_id": "legal-center-team",
-            "team_id": "legal-center-team",
-            "team_code": "legal-center",
-            "team_name": "法务合约中心（中心层级）",
-            "team_active": False,
+            "user_team_id": "team-1",
+            "team_id": "team-1",
+            "team_code": "monthly-law-1",
+            "team_name": "法务一部",
+            "team_active": True,
         }
     )
-    moved_to_center = rows[35]
-    moved_to_center.update(
+    moved_to_child = rows[-2]
+    moved_to_child.update(
         {
-            "user_team_id": "legal-center-team",
-            "team_id": "legal-center-team",
-            "team_code": "legal-center",
-            "team_name": "法务合约中心（中心层级）",
-            "team_active": False,
+            "user_team_id": "team-1",
+            "team_id": "team-1",
+            "team_code": "monthly-law-1",
+            "team_name": "法务一部",
+            "team_active": True,
         }
     )
 
-    with pytest.raises(RuntimeError, match="expected 72 child members"):
+    with pytest.raises(RuntimeError, match="expected 70 child members"):
         await load_formal_legal_daily_roster(
             _Session(rows),  # type: ignore[arg-type]
             tenant_id="legal-daily-production-v1",
@@ -171,7 +173,7 @@ async def test_formal_roster_rejects_70_plus_4_drift():
 
 
 @pytest.mark.asyncio
-async def test_formal_roster_rejects_confirmed_member_in_the_wrong_child_team():
+async def test_formal_roster_rejects_confirmed_manager_moved_into_child_team():
     rows = _formal_rows()
     ding_yiming = next(row for row in rows if row["user_name"] == "丁益明")
     ding_yiming.update(
@@ -183,7 +185,7 @@ async def test_formal_roster_rejects_confirmed_member_in_the_wrong_child_team():
         }
     )
 
-    with pytest.raises(RuntimeError, match="丁益明 must belong to 法务二部"):
+    with pytest.raises(RuntimeError, match="丁益明 must be center-direct"):
         await load_formal_legal_daily_roster(
             _Session(rows),  # type: ignore[arg-type]
             tenant_id="legal-daily-production-v1",

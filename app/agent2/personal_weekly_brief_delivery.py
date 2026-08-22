@@ -149,10 +149,20 @@ class PersonalWeeklyBriefDispatcher:
             changed_at=changed_at,
         )
         await self._store.persist_claim()
+        from app.services.dingtalk import DingTalkOutboundContentError
+
         try:
             delivery = await self._transport.send_private_text_verified(
                 dingtalk_user_id=recipient.dingtalk_user_id,
                 text=claimed.message_text,
+            )
+        except DingTalkOutboundContentError as exc:
+            return await self._store.record_failure(
+                tenant_id=row.tenant_id,
+                brief_id=row.brief_id,
+                error=f"retry_safe_preacceptance:{type(exc).__name__}",
+                changed_at=changed_at,
+                expected_claim_token=claim_token,
             )
         except (OSError, RuntimeError, TimeoutError) as exc:
             return await self._store.record_failure(

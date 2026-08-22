@@ -225,11 +225,26 @@ class PersonalWeeklyBriefSection:
 
 
 @dataclass(frozen=True)
+class PersonalWeeklyBriefSourceDisposition:
+    source_id: str
+    disposition: Literal["cited", "safely_excluded"]
+    reason: str = ""
+
+    def as_payload(self) -> dict[str, str]:
+        return {
+            "source_id": self.source_id,
+            "disposition": self.disposition,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class PersonalWeeklyBriefContent:
     intro: str
     completed: PersonalWeeklyBriefSection
     plan_progress: PersonalWeeklyBriefSection
     possible_open_loops: PersonalWeeklyBriefSection
+    source_dispositions: tuple[PersonalWeeklyBriefSourceDisposition, ...]
     message_text: str
     snapshot: PersonalWeeklyBriefSnapshot
 
@@ -239,6 +254,9 @@ class PersonalWeeklyBriefContent:
             "completed": self.completed.as_payload(),
             "plan_progress": self.plan_progress.as_payload(),
             "possible_open_loops": self.possible_open_loops.as_payload(),
+            "source_dispositions": [
+                disposition.as_payload() for disposition in self.source_dispositions
+            ],
         }
 
     def trace_payload(self) -> dict[str, Any]:
@@ -258,6 +276,9 @@ class PersonalWeeklyBriefContent:
             "completed": traced(self.completed),
             "plan_progress": traced(self.plan_progress),
             "possible_open_loops": traced(self.possible_open_loops),
+            "source_dispositions": [
+                disposition.as_payload() for disposition in self.source_dispositions
+            ],
         }
 
 
@@ -335,6 +356,7 @@ class Agent2PersonalWeeklyBriefGenerator:
             completed=content["completed"],
             plan_progress=content["plan_progress"],
             possible_open_loops=content["possible_open_loops"],
+            source_dispositions=content["source_dispositions"],
             message_text=message_text,
             snapshot=snapshot,
         )
@@ -423,7 +445,9 @@ class Agent2PersonalWeeklyBriefReviewer:
                 issue["matter_key"], field="review.matter_key", maximum=128
             )
             reason = _bounded_text(issue["reason"], field="review.reason", maximum=500)
-            if matter_key not in expected_keys:
+            if matter_key not in expected_keys and matter_key not in {
+                source.source_id for source in snapshot.sources
+            }:
                 raise ValueError("independent model review issue has unknown matter")
             normalized_issues.append({"matter_key": matter_key, "reason": reason})
         if payload["approved"] is not True or normalized_issues:
@@ -505,7 +529,7 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                     "instruction": (
                         "上一版模型输出未通过服务器结构或来源校验。"
                         "保持完整 trusted_snapshot，重新返回严格的完整 JSON；"
-                        "只能包含规定的四个顶层字段。"
+                        "只能包含规定的五个顶层字段。"
                     ),
                     "issues": [
                         {
@@ -531,8 +555,8 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                     "instruction": (
                         "上一版未通过独立事实复核。保持同一可信快照，"
                         "逐项修复下列问题并重新返回完整 JSON；不得删除未被指出的关键事实。"
-                        "只能返回 intro、completed、plan_progress、possible_open_loops "
-                        "四个顶层字段，不得增加 repair_notes、说明或其他字段。"
+                        "只能返回 intro、completed、plan_progress、possible_open_loops、"
+                        "source_dispositions 五个顶层字段，不得增加说明或其他字段。"
                     ),
                     "previous_draft": content.as_payload(),
                     "issues": list(exc.issues)[:20],
@@ -545,7 +569,7 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                 repair_context = {
                     "instruction": (
                         "上一轮独立复核输出未通过服务器 JSON/结构校验。"
-                        "保持完整 trusted_snapshot，重新生成完整四字段 JSON，"
+                        "保持完整 trusted_snapshot，重新生成完整五字段 JSON，"
                         "随后服务器会重新执行独立复核。"
                     ),
                     "previous_draft": content.as_payload(),
@@ -575,10 +599,11 @@ def _validated_content(
     *,
     snapshot: PersonalWeeklyBriefSnapshot,
 ) -> dict[str, Any]:
-    expected = {"intro", "completed", "plan_progress", "possible_open_loops"}
-    if set(payload) != expected:
-        missing = sorted(expected - set(payload))
-        unexpected = sorted(set(payload) - expected)
+    required = {"intro", "completed", "plan_progress", "possible_open_loops"}
+    allowed = required | {"source_dispositions"}
+    if not required.issubset(payload) or not set(payload).issubset(allowed):
+        missing = sorted(required - set(payload))
+        unexpected = sorted(set(payload) - allowed)
         raise ValueError(
             "personal weekly brief model payload keys are invalid "
             f"missing={missing!r} unexpected={unexpected!r}"
@@ -637,12 +662,78 @@ def _validated_content(
         raise ValueError("weekly plan source cannot repeat in open loops")
     if plan_progress_source_ids & open_source_ids:
         raise ValueError("plan progress source cannot repeat in open loops")
+    all_cited_source_ids = {
+        source_id
+        for section in (completed, plan_progress, possible_open_loops)
+        for item in section.items
+        for source_id in item.source_ids
+    }
+    source_dispositions = _validated_source_dispositions(
+        payload.get("source_dispositions"),
+        source_by_id=source_by_id,
+        cited_source_ids=all_cited_source_ids,
+    )
     return {
         "intro": intro,
         "completed": completed,
         "plan_progress": plan_progress,
         "possible_open_loops": possible_open_loops,
+        "source_dispositions": source_dispositions,
     }
+
+
+def _validated_source_dispositions(
+    value: Any,
+    *,
+    source_by_id: dict[str, SourceEvidence],
+    cited_source_ids: set[str],
+) -> tuple[PersonalWeeklyBriefSourceDisposition, ...]:
+    expected_source_ids = set(source_by_id)
+    if value is None:
+        if cited_source_ids != expected_source_ids:
+            raise ValueError("personal weekly brief frozen source universe is incomplete")
+        return tuple(
+            PersonalWeeklyBriefSourceDisposition(
+                source_id=source_id,
+                disposition="cited",
+            )
+            for source_id in source_by_id
+        )
+    if not isinstance(value, list) or len(value) != len(expected_source_ids):
+        raise ValueError("personal weekly brief source dispositions are incomplete")
+    dispositions: list[PersonalWeeklyBriefSourceDisposition] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict) or set(raw) != {
+            "source_id",
+            "disposition",
+            "reason",
+        }:
+            raise ValueError("personal weekly brief source disposition is invalid")
+        source_id = str(raw["source_id"] or "").strip()
+        disposition = str(raw["disposition"] or "").strip()
+        reason = str(raw["reason"] or "").strip()
+        if source_id not in expected_source_ids or source_id in seen:
+            raise ValueError("personal weekly brief source disposition identity is invalid")
+        seen.add(source_id)
+        if disposition == "cited":
+            if source_id not in cited_source_ids or reason:
+                raise ValueError("cited source disposition does not match the brief")
+        elif disposition == "safely_excluded":
+            if source_id in cited_source_ids or not reason or len(reason) > 500:
+                raise ValueError("excluded source requires one safe reason")
+        else:
+            raise ValueError("personal weekly brief source disposition type is invalid")
+        dispositions.append(
+            PersonalWeeklyBriefSourceDisposition(
+                source_id=source_id,
+                disposition=disposition,
+                reason=reason,
+            )
+        )
+    if seen != expected_source_ids:
+        raise ValueError("personal weekly brief frozen source universe is incomplete")
+    return tuple(dispositions)
 
 
 def _validated_section(
@@ -804,14 +895,16 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 6. 没有数据、只有部分日期、没有周计划或没有风险栏时如实说明，不得编造。
 7. 简报只读，不得建议系统已经修改、补写、确认或提交日报、周计划。
 8. 不要在文字中称呼用户；称呼由服务器根据个人记忆安全添加。
-9. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的四个顶层字段，不能附加修复说明或其他字段。
+9. 把 trusted_snapshot.sources 当作完整来源清单。每个 source_id 必须在 source_dispositions 中恰好出现一次：被成品条目引用时标为 cited 且 reason 为空；未引用时只能标为 safely_excluded，并给出具体、谨慎的安全排除理由。不得静默遗漏整条来源，也不得用“内容不重要”等空泛理由排除。
+10. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的五个顶层字段，不能附加修复说明或其他字段。
 
 仅返回 JSON，严格使用以下结构，不得增加字段：
 {
   "intro": "一句简短开场",
   "completed": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "结论", "source_ids": ["来源ID"]}]},
   "plan_progress": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "进展", "status": "五种状态之一", "source_ids": ["来源ID"]}]},
-  "possible_open_loops": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "谨慎说明", "source_ids": ["来源ID"]}]}
+  "possible_open_loops": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "谨慎说明", "source_ids": ["来源ID"]}]},
+  "source_dispositions": [{"source_id": "来源ID", "disposition": "cited或safely_excluded", "reason": "cited时为空；安全排除时写具体理由"}]
 }"""
 
 
@@ -824,6 +917,7 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
 4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”；每条 weekly_plan 来源是否在计划进展中恰好出现一次。“后续安排”可以由后来日报的 tomorrow_plan 支持，它不表示已完成；“安排调整”只需后来日报明确记录安排发生变化，不要求再有调整后事项的最终完成证据。
 5. 计划进展和可能未闭环中是否重复同一事项。仅来自日报、并非周计划的谨慎未闭环事项可以只出现在 possible_open_loops，不要求进入 plan_progress；已经在 plan_progress 中说明调整或未找到后续记录的计划事项，不应再复制到 possible_open_loops。
 6. 无数据或部分数据时是否编造。
+7. source_dispositions 是否逐条覆盖冻结来源全集；所有 cited 是否真的被条目引用；所有 safely_excluded 是否未被引用且理由具体、安全，没有借排除理由静默丢失应汇总事实。
 
 必须覆盖草稿里的每个唯一 matter_key。只返回 JSON：
 {
@@ -845,6 +939,7 @@ __all__ = [
     "PersonalWeeklyBriefModelOutputInvalid",
     "PersonalWeeklyBriefSection",
     "PersonalWeeklyBriefSnapshot",
+    "PersonalWeeklyBriefSourceDisposition",
     "PersonalWeeklyBriefReviewRejected",
     "PersonalWeeklyBriefWindow",
     "SourceEvidence",

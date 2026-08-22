@@ -780,6 +780,108 @@ async def test_every_weekly_plan_source_must_appear_once_in_plan_progress() -> N
 
 
 @pytest.mark.asyncio
+async def test_frozen_source_universe_cannot_be_silently_omitted() -> None:
+    first = _source(
+        "daily:universe:first",
+        kind="daily_report",
+        on_date=date(2026, 8, 17),
+        section="today_work",
+        text="完成甲事项。",
+    )
+    omitted = _source(
+        "daily:universe:omitted",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="problems",
+        text="乙事项仍待补充授权文件。",
+    )
+    payload = {
+        "intro": "本周简报。",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "matter-first",
+                    "text": "完成甲事项。",
+                    "source_ids": [first.source_id],
+                }
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有需要提示的事项。"),
+    }
+
+    with pytest.raises(ValueError, match="frozen source universe is incomplete"):
+        await Agent2PersonalWeeklyBriefGenerator(
+            _FakeLLM(payload),
+            model="agent2-model",
+        ).generate(
+            snapshot=_snapshot(first, omitted),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+
+@pytest.mark.asyncio
+async def test_uncited_source_requires_one_explicit_safe_exclusion_reason() -> None:
+    first = _source(
+        "daily:disposition:first",
+        kind="daily_report",
+        on_date=date(2026, 8, 17),
+        section="today_work",
+        text="完成甲事项。",
+    )
+    duplicate = _source(
+        "daily:disposition:duplicate",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="today_work",
+        text="甲事项与前一日记录完全重复，没有新增事实。",
+    )
+    payload = {
+        "intro": "本周简报。",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "matter-first",
+                    "text": "完成甲事项。",
+                    "source_ids": [first.source_id],
+                }
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有需要提示的事项。"),
+        "source_dispositions": [
+            {
+                "source_id": first.source_id,
+                "disposition": "cited",
+                "reason": "",
+            },
+            {
+                "source_id": duplicate.source_id,
+                "disposition": "safely_excluded",
+                "reason": "与已引用的甲事项完全重复且没有新增事实。",
+            },
+        ],
+    }
+
+    result = await Agent2PersonalWeeklyBriefGenerator(
+        _FakeLLM(payload),
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(first, duplicate),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert result.source_dispositions[1].disposition == "safely_excluded"
+    assert result.trace_payload()["source_dispositions"][1]["source_id"] == (
+        duplicate.source_id
+    )
+
+
+@pytest.mark.asyncio
 async def test_more_than_twelve_distinct_plan_items_can_be_reported_one_by_one() -> None:
     plans = tuple(
         _source(

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from types import SimpleNamespace
 
 import pytest
 
 from app.agent2.personal_weekly_brief_scope import (
+    revalidate_personal_weekly_brief_targets,
     validate_personal_weekly_brief_targets,
 )
 from app.agent2.tool_calling.canary_config import CANARY_MODEL_NAME
@@ -155,6 +157,98 @@ def test_scope_rejects_ambiguous_conversation_context() -> None:
     with pytest.raises(RuntimeError, match="conversation context"):
         validate_personal_weekly_brief_targets(
             roster=roster,
+            bindings=bindings,
+            controls=controls,
+            conversation_states=states,
+            expected_model_name=CANARY_MODEL_NAME,
+        )
+
+
+def test_pre_send_revalidation_blocks_only_changed_control_owner() -> None:
+    roster, bindings, controls, states = _scope()
+    frozen = validate_personal_weekly_brief_targets(
+        roster=roster,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+    controls = (
+        SimpleNamespace(**{**controls[0].__dict__, "messages_enabled": False}),
+        *controls[1:],
+    )
+
+    result = revalidate_personal_weekly_brief_targets(
+        roster=roster,
+        frozen_targets=frozen,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+
+    assert result.blocked_reasons == {
+        roster.members[0].user_id: "agent2_control_changed"
+    }
+    assert len(result.valid_targets) == 73
+
+
+def test_pre_send_revalidation_blocks_only_changed_conversation_owner() -> None:
+    roster, bindings, controls, states = _scope()
+    frozen = validate_personal_weekly_brief_targets(
+        roster=roster,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+    states = (
+        SimpleNamespace(
+            user_key=states[0].user_key,
+            conversation_id="conversation-changed-after-0900",
+        ),
+        *states[1:],
+    )
+
+    result = revalidate_personal_weekly_brief_targets(
+        roster=roster,
+        frozen_targets=frozen,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+
+    assert result.blocked_reasons == {
+        roster.members[0].user_id: "target_changed_after_snapshot"
+    }
+    assert len(result.valid_targets) == 73
+
+
+def test_pre_send_revalidation_stops_when_formal_roster_set_changes() -> None:
+    roster, bindings, controls, states = _scope()
+    frozen = validate_personal_weekly_brief_targets(
+        roster=roster,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+    changed_member = replace(
+        roster.members[0],
+        user_id="99999999-9999-4999-8999-999999999999",
+        dingtalk_user_id="ding-new-formal-member",
+    )
+    changed_roster = FormalLegalDailyRoster(
+        tenant_id=roster.tenant_id,
+        on_date=roster.on_date,
+        members=(changed_member, *roster.members[1:]),
+    )
+
+    with pytest.raises(RuntimeError, match="formal roster set changed"):
+        revalidate_personal_weekly_brief_targets(
+            roster=changed_roster,
+            frozen_targets=frozen,
             bindings=bindings,
             controls=controls,
             conversation_states=states,

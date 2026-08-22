@@ -14,17 +14,22 @@ CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
     content_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     message_text text NOT NULL DEFAULT '',
     llm_model varchar(128) NOT NULL DEFAULT '',
+    generation_started_at timestamptz,
+    generated_at timestamptz,
     status varchar(32) NOT NULL,
     idempotency_key varchar(512) NOT NULL,
     claim_token varchar(256) NOT NULL DEFAULT '',
+    send_started_at timestamptz,
     provider_message_id varchar(512) NOT NULL DEFAULT '',
     provider_accepted_at timestamptz,
     delivery_receipt_json jsonb NOT NULL DEFAULT '{}'::jsonb,
     delivered_at timestamptz,
+    final_verified_at timestamptz,
     context_recorded_at timestamptz,
     failed_at timestamptz,
     last_error text NOT NULL DEFAULT '',
     retry_count integer NOT NULL DEFAULT 0,
+    recovery_json jsonb NOT NULL DEFAULT '[]'::jsonb,
     created_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL,
     CONSTRAINT agent2_personal_weekly_brief_owner_week_key
@@ -39,6 +44,8 @@ CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
         CHECK (length(source_fingerprint) = 64),
     CONSTRAINT agent2_personal_weekly_brief_retry_check
         CHECK (retry_count >= 0),
+    CONSTRAINT agent2_personal_weekly_brief_recovery_check
+        CHECK (jsonb_typeof(recovery_json) = 'array'),
     CONSTRAINT agent2_personal_weekly_brief_status_check
         CHECK (status IN (
             'snapshot_ready', 'generation_failed', 'generated', 'claimed',
@@ -66,9 +73,14 @@ CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
             (
                 status = 'delivered'
                 AND delivered_at IS NOT NULL
+                AND final_verified_at IS NOT NULL
                 AND delivery_receipt_json <> '{}'::jsonb
             )
-            OR (status <> 'delivered' AND delivered_at IS NULL)
+            OR (
+                status <> 'delivered'
+                AND delivered_at IS NULL
+                AND final_verified_at IS NULL
+            )
         )
 );
 

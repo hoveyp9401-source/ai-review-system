@@ -1,9 +1,9 @@
 {
   "ambiguous_context_rejected": true,
   "ambiguous_identity_rejected": true,
-  "center_member_count": 2,
+  "center_member_count": 4,
   "child_department_count": 7,
-  "child_member_count": 72,
+  "child_member_count": 70,
   "cross_scope_rejected": 74,
   "database_accessed": false,
   "formal_target_count": 74,
