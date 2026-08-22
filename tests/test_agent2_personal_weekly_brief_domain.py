@@ -535,7 +535,7 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
-    assert "source with critical fact" in excluded.value.repair_detail
+    assert "sources with critical facts" in excluded.value.repair_detail
     assert "甲项目" not in str(excluded.value)
 
 
@@ -625,6 +625,57 @@ async def test_all_missing_critical_sources_are_reported_in_one_repair() -> None
         "source_dispositions": [
             {"source_id": first.source_id, "disposition": "cited", "reason": ""},
             {"source_id": second.source_id, "disposition": "cited", "reason": ""},
+        ],
+    }
+
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
+        await Agent2PersonalWeeklyBriefGenerator(
+            _FakeLLM(payload),
+            model="agent2-model",
+        ).generate(
+            snapshot=_snapshot(first, second),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+    error = caught.value.repair_detail
+    assert first.source_id in error and "甲项目金额100万" in error
+    assert second.source_id in error and "乙项目金额￥1,000,000" in error
+    assert "甲项目" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_all_excluded_critical_sources_are_reported_in_one_repair() -> None:
+    first = _source(
+        "daily:excluded:first",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="today_work",
+        text="甲项目金额100万，9/1前回复。",
+    )
+    second = _source(
+        "daily:excluded:second",
+        kind="daily_report",
+        on_date=date(2026, 8, 19),
+        section="today_work",
+        text="乙项目金额￥1,000,000，截止2026-09-01。",
+    )
+    payload = {
+        "intro": "本周简报。",
+        "completed": _empty_section("没有需要展示的工作。"),
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有未闭环事项。"),
+        "source_dispositions": [
+            {
+                "source_id": first.source_id,
+                "disposition": "safely_excluded",
+                "reason": "模型误判无需展示。",
+            },
+            {
+                "source_id": second.source_id,
+                "disposition": "safely_excluded",
+                "reason": "模型误判无需展示。",
+            },
         ],
     }
 

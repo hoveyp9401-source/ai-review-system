@@ -916,9 +916,25 @@ def _validate_critical_literal_coverage(
         and source_id not in cited_source_ids
     ]
     if excluded_critical_sources:
+        excluded_details = [
+            {
+                "source_id": source_id,
+                "excluded_contexts": list(
+                    _critical_literal_contexts(
+                        source_by_id[source_id].original_text
+                    )
+                ),
+            }
+            for source_id in sorted(excluded_critical_sources)
+        ]
         raise ValueError(
-            "personal weekly brief source with critical fact "
-            f"cannot be excluded: {excluded_critical_sources[0]}"
+            "personal weekly brief sources with critical facts cannot be "
+            "excluded: "
+            + json.dumps(
+                excluded_details,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         )
     texts_by_source: dict[str, list[str]] = {
         source_id: [] for source_id in cited_source_ids
