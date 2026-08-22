@@ -37,6 +37,7 @@ from app.agent2.tool_calling.deepseek_adapter import (
     _CompletionResponse,
     _parse_focused_daily_completion,
     _parse_native_tool_call,
+    _should_run_bounded_daily_probe,
 )
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
 from app.agent2.tool_calling.production_runtime import _prepare_call
@@ -68,6 +69,29 @@ LONG_DAILY_TEXT = (
     "问题风险：当前仍有一项关键数据等待业务部门确认，在确认前不能形成最终结论。"
     "明日计划：明天继续跟进C案件证据清单，并按实际回复更新处理进展。"
 )
+
+
+def test_explicit_calendar_date_skips_default_date_fast_path() -> None:
+    context = _context()
+
+    assert _should_run_bounded_daily_probe(
+        user_text="补写2026年1月5日日报：完成合同审核。",
+        user_messages=(),
+        context=context,
+        thinking_enabled=True,
+    ) is False
+    assert _should_run_bounded_daily_probe(
+        user_text="补写8月21日日报：完成合同审核。",
+        user_messages=(),
+        context=context,
+        thinking_enabled=True,
+    ) is False
+    assert _should_run_bounded_daily_probe(
+        user_text="今天完成合同审核。",
+        user_messages=(),
+        context=context,
+        thinking_enabled=True,
+    ) is True
 
 
 def _context(

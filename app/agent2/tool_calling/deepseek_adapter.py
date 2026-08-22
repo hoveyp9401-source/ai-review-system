@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, replace
 from datetime import date
 from time import perf_counter
@@ -4215,13 +4216,25 @@ def _should_run_bounded_daily_probe(
 ) -> bool:
     """Let one semantic planner admit every pure Daily add, regardless of length."""
 
-    del user_text, user_messages
+    ordered_messages = user_messages or (user_text,)
+    if any(_contains_explicit_calendar_date(value) for value in ordered_messages):
+        return False
     return bool(
         thinking_enabled
         and "add_daily_items" in context.allowed_tool_names
         and context.today_report is None
         and not context.historical_reports
         and not _has_daily_replacement_followup_context(context)
+    )
+
+
+def _contains_explicit_calendar_date(value: str) -> bool:
+    return bool(
+        re.search(
+            r"(?<!\d)(?:(?:\d{4}年)?\d{1,2}月\d{1,2}日|"
+            r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2})(?!\d)",
+            str(value or ""),
+        )
     )
 
 

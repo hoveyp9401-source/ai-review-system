@@ -142,10 +142,12 @@ async def _select_empty_plan_user(
             owner_user_id=raw_user_id,
             target_week_start=TARGET_WEEK_START,
         )
-        if plan is None:
+        if plan is None or plan.status == "collecting":
             candidates.append((user, control))
     if not candidates:
-        raise AssertionError("rollback requires one enabled user without a next-week plan")
+        raise AssertionError(
+            "rollback requires one enabled user with an editable next-week plan"
+        )
     user, control = candidates[0]
     return user, control, settings
 
