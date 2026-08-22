@@ -983,8 +983,6 @@ async def run_personal_weekly_brief_reconcile_job(
             for result in recovered_sends
         )
 
-    if not send_enabled:
-        return delivered_count
     async with AsyncSessionLocal() as read_session:
         store = SqlPersonalWeeklyBriefStore(read_session)
         generated = await store.load_for_status(
@@ -1002,13 +1000,14 @@ async def run_personal_weekly_brief_reconcile_job(
             limit=100,
         )
 
-    for week_start in sorted({row.week_start for row in generated}):
-        delivered_count += await run_personal_weekly_brief_dispatch_job(
-            settings,
-            robot=robot,
-            now=local_now,
-            week_start=week_start,
-        )
+    if send_enabled:
+        for week_start in sorted({row.week_start for row in generated}):
+            delivered_count += await run_personal_weekly_brief_dispatch_job(
+                settings,
+                robot=robot,
+                now=local_now,
+                week_start=week_start,
+            )
 
     frozen_cache: dict[date, tuple[PersonalWeeklyBriefTarget, ...]] = {}
     async def frozen_for(row):

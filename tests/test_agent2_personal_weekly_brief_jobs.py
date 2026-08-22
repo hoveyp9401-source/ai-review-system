@@ -623,3 +623,117 @@ def test_live_send_switch_reader_does_not_reuse_cached_settings(monkeypatch) -> 
     assert runner._personal_weekly_brief_send_switch_enabled() is False
     assert runner._personal_weekly_brief_send_switch_enabled() is True
     assert loads == 2
+
+
+@pytest.mark.asyncio
+async def test_send_switch_off_still_reconciles_already_accepted_delivery(
+    monkeypatch,
+) -> None:
+    pending = PersonalWeeklyBriefRecord(
+        **{
+            **_brief_record(1, status="delivery_pending").__dict__,
+            "provider_message_id": "provider-accepted-before-switch-off",
+            "provider_accepted_at": NOW,
+        }
+    )
+    delivered = PersonalWeeklyBriefRecord(
+        **{
+            **pending.__dict__,
+            "status": "delivered",
+            "delivered_at": NOW,
+            "final_verified_at": NOW,
+            "delivery_receipt_json": {
+                "schema_version": "agent2.personal_weekly_brief.delivery.v1",
+                "provider_reference": pending.provider_message_id,
+                "delivery_verified": True,
+                "delivery_status": "SUCCESS",
+                "delivered_dingtalk_user_ids": ["ding-owner-1"],
+            },
+        }
+    )
+    target = SimpleNamespace(
+        tenant_id="tenant-a",
+        internal_user_id=pending.owner_user_id,
+        dingtalk_user_id="ding-owner-1",
+        display_name="虚构用户甲",
+        conversation_id=pending.conversation_id,
+    )
+    observed = {"queried": 0, "context": 0}
+
+    class _Session:
+        async def commit(self):
+            return None
+
+    class _Sessions:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Store:
+        def __init__(self, _session):
+            pass
+
+        async def load_for_status(self, *, status, **_kwargs):
+            return {
+                "generated": (),
+                "delivery_pending": (pending,),
+            }[status]
+
+        async def load_delivered_without_context(self, **_kwargs):
+            return ()
+
+        async def load_for_week(self, **_kwargs):
+            return ()
+
+    class _Dispatcher:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def reconcile_pending(self, **_kwargs):
+            observed["queried"] += 1
+            return delivered
+
+    async def _recover(**_kwargs):
+        return {
+            "generation_requeued": (),
+            "delivery_requeued": (),
+            "stale_claims_failed": (),
+            "stale_generations_failed": (),
+        }
+
+    async def _record_context(**_kwargs):
+        observed["context"] += 1
+
+    monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
+    monkeypatch.setattr(runner, "SqlPersonalWeeklyBriefStore", _Store)
+    monkeypatch.setattr(runner, "PersonalWeeklyBriefDispatcher", _Dispatcher)
+    monkeypatch.setattr(runner, "recover_personal_weekly_brief_rows", _recover)
+    monkeypatch.setattr(
+        runner,
+        "_frozen_personal_weekly_brief_targets",
+        lambda _rows: (target,),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_record_personal_weekly_brief_context",
+        _record_context,
+    )
+
+    result = await run_personal_weekly_brief_reconcile_job(
+        _settings(
+            agent2_personal_weekly_brief_enabled=True,
+            agent2_personal_weekly_brief_send_enabled=False,
+            agent2_personal_weekly_brief_tenant_id="tenant-a",
+        ),
+        llm_client=object(),
+        robot=object(),
+        now=NOW,
+    )
+
+    assert result == 1
+    assert observed == {"queried": 1, "context": 1}
