@@ -315,6 +315,54 @@ async def _dependency_snapshot(
     return snapshots
 
 
+async def _obligation_rows(
+    session: Any,
+    *,
+    rows: list[dict[str, Any]],
+    lock: bool,
+) -> list[dict[str, Any]]:
+    user_ids = [str(row["user_id"]) for row in rows]
+    suffix = " FOR UPDATE" if lock else ""
+    obligations = (
+        (
+            await session.execute(
+                text(
+                    """
+                    SELECT obligation_id::text AS obligation_id, tenant_id,
+                           user_id::text AS user_id, team_id::text AS team_id,
+                           report_date, required, exemption_reason,
+                           deadline_at, source, data_complete
+                    FROM legal_daily_submission_obligations
+                    WHERE user_id IN (
+                        CAST(:first_user_id AS uuid),
+                        CAST(:second_user_id AS uuid)
+                    )
+                      AND report_date >= :effective_date
+                    ORDER BY obligation_id
+                    """
+                    + suffix
+                ),
+                {
+                    "first_user_id": user_ids[0],
+                    "second_user_id": user_ids[1],
+                    "effective_date": EFFECTIVE_DATE,
+                },
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return [_json_safe_row(row) for row in obligations]
+
+
+def _expected_after_obligations(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    center_team_id = payload["center_team"]["team_id"]
+    return [
+        {**dict(row), "team_id": center_team_id}
+        for row in payload.get("obligations", [])
+    ]
+
+
 def _validate_before(
     *,
     counts: dict[str, int],
@@ -353,6 +401,7 @@ async def backup(path: Path) -> None:
         rows = await _target_rows(session, lock=False)
         center_team = await _center_team(session, lock=False)
         dependencies = await _dependency_snapshot(session, rows=rows)
+        obligations = await _obligation_rows(session, rows=rows, lock=False)
     _validate_before(counts=counts, rows=rows, center_team=center_team)
     unsigned: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -363,6 +412,7 @@ async def backup(path: Path) -> None:
         "center_team": center_team,
         "memberships": rows,
         "dependencies": dependencies,
+        "obligations": obligations,
         "new_membership_ids": {
             row["user_name"]: str(uuid4()) for row in rows
         },
@@ -396,6 +446,8 @@ async def _apply_in_transaction(session: Any, payload: dict[str, Any]) -> None:
         raise RuntimeError("production roster changed after backup; refusing apply")
     if await _dependency_snapshot(session, rows=rows) != payload.get("dependencies"):
         raise RuntimeError("related production records changed after backup; refusing apply")
+    if await _obligation_rows(session, rows=rows, lock=True) != payload.get("obligations"):
+        raise RuntimeError("submission obligations changed after backup; refusing apply")
     for row in rows:
         closed = await session.execute(
             text(
@@ -457,6 +509,28 @@ async def _apply_in_transaction(session: Any, payload: dict[str, Any]) -> None:
         )
         if moved.rowcount != 1:
             raise RuntimeError("user team changed during apply")
+    for obligation in payload.get("obligations", []):
+        moved_obligation = await session.execute(
+            text(
+                """
+                UPDATE legal_daily_submission_obligations
+                SET team_id = CAST(:center_team_id AS uuid), updated_at = now()
+                WHERE obligation_id = CAST(:obligation_id AS uuid)
+                  AND user_id = CAST(:user_id AS uuid)
+                  AND team_id = CAST(:old_team_id AS uuid)
+                  AND report_date >= :effective_date
+                """
+            ),
+            {
+                "center_team_id": center_team["team_id"],
+                "obligation_id": obligation["obligation_id"],
+                "user_id": obligation["user_id"],
+                "old_team_id": obligation["team_id"],
+                "effective_date": EFFECTIVE_DATE,
+            },
+        )
+        if moved_obligation.rowcount != 1:
+            raise RuntimeError("submission obligation changed during apply")
 
 
 async def _after_rows(session: Any, *, lock: bool = False) -> list[dict[str, Any]]:
@@ -621,6 +695,12 @@ async def _verify_in_session(
         closed = await _closed_original_rows(session, payload=payload, lock=False)
         if closed != _expected_closed_original_rows(payload):
             raise RuntimeError("original membership history is not exact")
+        if await _obligation_rows(
+            session,
+            rows=_expected_before_from_backup(payload),
+            lock=False,
+        ) != _expected_after_obligations(payload):
+            raise RuntimeError("post-migration submission obligations are not exact")
     for row in rows:
         if (
             row["team_code"] != CENTER_TEAM_CODE
@@ -660,6 +740,12 @@ async def restore(path: Path) -> None:
             backup_rows = _expected_before_from_backup(payload)
             if await _dependency_snapshot(session, rows=backup_rows) != payload.get("dependencies"):
                 raise RuntimeError("related production records changed; refusing restore")
+            if await _obligation_rows(
+                session,
+                rows=backup_rows,
+                lock=True,
+            ) != _expected_after_obligations(payload):
+                raise RuntimeError("submission obligations changed; refusing restore")
             center_team = await _center_team(session, lock=True)
             if await _after_rows(session, lock=True) != _expected_after_rows(payload):
                 raise RuntimeError("new memberships changed; refusing restore")
@@ -727,6 +813,34 @@ async def restore(path: Path) -> None:
                 )
                 if user_restored.rowcount != 1:
                     raise RuntimeError("user team changed; refusing restore")
+            for obligation in payload.get("obligations", []):
+                restored_obligation = await session.execute(
+                    text(
+                        """
+                        UPDATE legal_daily_submission_obligations
+                        SET team_id = CAST(:old_team_id AS uuid), updated_at = now()
+                        WHERE obligation_id = CAST(:obligation_id AS uuid)
+                          AND user_id = CAST(:user_id AS uuid)
+                          AND team_id = CAST(:center_team_id AS uuid)
+                          AND report_date >= :effective_date
+                        """
+                    ),
+                    {
+                        "old_team_id": obligation["team_id"],
+                        "obligation_id": obligation["obligation_id"],
+                        "user_id": obligation["user_id"],
+                        "center_team_id": center_team["team_id"],
+                        "effective_date": EFFECTIVE_DATE,
+                    },
+                )
+                if restored_obligation.rowcount != 1:
+                    raise RuntimeError("submission obligation changed during restore")
+            if await _obligation_rows(
+                session,
+                rows=backup_rows,
+                lock=False,
+            ) != payload.get("obligations"):
+                raise RuntimeError("submission obligations were not restored exactly")
             await _verify_in_session(session, expected="before")
     await verify(expected="before")
     print(json.dumps({"action": "restore", "target_count": 2}))

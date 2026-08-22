@@ -1,6 +1,6 @@
 {
   "schema_version": "legal.formal_roster_70_4.production_rollback_smoke.v1",
-  "executed_at": "2026-08-22T13:28:33+08:00",
+  "executed_at": "2026-08-22T14:16:08+08:00",
   "effective_date": "2026-08-22",
   "production_connection_used": true,
   "real_message_sent": false,
@@ -25,20 +25,21 @@
   "reports_for_targets_on_or_after_effective_date": 0,
   "backup": {
     "mode": "0600",
-    "sha256": "776adae27a2f0d1ebebbc6d8f4824d81ab97dddbf8031d64689a690335f98416",
+    "sha256": "fc6a809d364b5f3c31d6d8588802ebe685fc1cffc2b2a9d4d2fb619c6bf952a7",
     "contains_private_identifiers": true,
     "content_copied_into_evidence": false
   },
-  "migration_script_sha256": "74ddea842c4d7f8cd4c8bea8bae64810f5abad898a938e1e47f5fa02206e3fa4",
+  "migration_script_sha256": "f5c6808b5a09ffdba029c50444eea7301fffc89dcfaf8715926f23bb63940a81",
   "dependency_snapshots_verified": [
     "daily_reports",
+    "legal_daily_submission_obligations",
     "legal_daily_access_assignments",
     "agent2_weekly_plan_roster_members",
     "agent2_personal_weekly_briefs"
   ],
   "result": "pass",
   "committed_roundtrip_restore": {
-    "executed_at": "2026-08-22T14:00:15+08:00",
+    "executed_at": "2026-08-22T14:16:36+08:00",
     "services_frozen": 3,
     "apply_verified": "70+4",
     "restore_verified": "72+2",

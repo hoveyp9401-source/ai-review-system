@@ -5,7 +5,7 @@ root=/home/ai_review_tunnel
 current="$root/releases/current"
 python="$root/ai-review-system/venv/bin/python"
 migration="$root/manage_formal_roster_70_4_20260822.py.tmp"
-backup="$root/deploy_backups/formal-roster-70-4-20260822-v2.json"
+backup="$root/deploy_backups/formal-roster-70-4-20260822-v3.json"
 services=(
   ai-review-api.service
   ai-review-stream.service

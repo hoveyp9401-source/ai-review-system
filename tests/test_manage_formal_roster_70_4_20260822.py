@@ -175,3 +175,33 @@ def test_restore_requires_related_record_and_full_membership_snapshots() -> None
     assert "_dependency_snapshot" in restore_body
     assert "_expected_after_rows" in restore_body
     assert "_expected_closed_original_rows" in restore_body
+
+
+def test_submission_obligations_move_with_membership_and_restore_exactly() -> None:
+    payload = {
+        "center_team": _center_team(),
+        "obligations": [
+            {
+                "obligation_id": "obligation-ding",
+                "tenant_id": "tenant-formal",
+                "user_id": "user-ding",
+                "team_id": "team-2",
+                "report_date": "2026-08-22",
+                "required": True,
+                "exemption_reason": "",
+                "deadline_at": None,
+                "source": "scheduler",
+                "data_complete": True,
+            }
+        ],
+    }
+    after = migration._expected_after_obligations(payload)
+    assert after[0]["team_id"] == "team-center"
+    assert payload["obligations"][0]["team_id"] == "team-2"
+
+    source = Path("scripts/manage_formal_roster_70_4_20260822.py").read_text(
+        encoding="utf-8"
+    )
+    assert source.count("UPDATE legal_daily_submission_obligations") == 2
+    assert "submission obligations changed after backup" in source
+    assert "submission obligations were not restored exactly" in source
