@@ -1022,27 +1022,17 @@ class DeepSeekToolCallingAdapter:
             nonlocal iterations
             if _recent_record_focus_domain(context) != "daily":
                 return reviewed
-            original_domain_calls = tuple(
-                call
-                for call in original.tool_calls
-                if _daily_weekly_write_domain(call.tool_name) is not None
-            )
             reviewed_domain_calls = tuple(
                 call
                 for call in reviewed.tool_calls
                 if _daily_weekly_write_domain(call.tool_name) is not None
             )
-            if (
-                not original_domain_calls
-                or not reviewed_domain_calls
-                or any(
-                    call.tool_name != "submit_next_weekly_plan"
-                    for call in (
-                        *original_domain_calls,
-                        *reviewed_domain_calls,
-                    )
-                )
-            ):
+            reviewed_weekly_submissions = tuple(
+                call
+                for call in reviewed_domain_calls
+                if call.tool_name == "submit_next_weekly_plan"
+            )
+            if not reviewed_weekly_submissions:
                 return reviewed
             daily_tool_names = frozenset(
                 name
@@ -1061,6 +1051,114 @@ class DeepSeekToolCallingAdapter:
                     audits=audits,
                     model_turns=model_turns,
                 )
+
+            async def verify_weekly_scope_quote(
+                exact_quote: str,
+            ) -> bool:
+                nonlocal iterations
+                expected_sha256 = hashlib.sha256(
+                    exact_quote.encode("utf-8")
+                ).hexdigest()
+                for quote_attempt in range(1, 3):
+                    completion = await complete_model(
+                        _weekly_focus_quote_verification_messages(
+                            exact_quote=exact_quote,
+                        ),
+                        tool_schemas=[],
+                        thinking_enabled=True,
+                    )
+                    iterations += 1
+                    model_turns.append(
+                        _model_turn_audit(
+                            iterations,
+                            completion.message,
+                            response_metadata={
+                                **completion.metadata,
+                                "weekly_focus_quote_verification": True,
+                                "weekly_focus_quote_verification_attempt": (
+                                    quote_attempt
+                                ),
+                                "draft_executed": False,
+                            },
+                        )
+                    )
+                    content = completion.message.get("content")
+                    try:
+                        payload = (
+                            json.loads(content)
+                            if isinstance(content, str)
+                            else None
+                        )
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            "weekly focus quote verifier returned invalid JSON"
+                        ) from exc
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload) != {"decision", "quote_sha256"}
+                        or payload.get("quote_sha256") != expected_sha256
+                        or payload.get("decision")
+                        not in {"approve", "reject"}
+                    ):
+                        raise ValueError(
+                            "weekly focus quote verifier returned invalid evidence"
+                        )
+                    if payload["decision"] == "reject":
+                        return False
+                return True
+
+            async def recover_recent_daily_focus() -> _ParsedAssistantTurn:
+                nonlocal iterations
+                recovery_messages = (
+                    _recent_focus_conflict_adjudication_messages(
+                        user_text=user_text,
+                        user_messages=user_messages,
+                        context=context,
+                    )
+                )
+                recovery_messages[0] = {
+                    **recovery_messages[0],
+                    "content": (
+                        recovery_messages[0]["content"]
+                        + " An independent quote-only verifier rejected Weekly "
+                        "Work Plan scope. Do not return explicit_weekly_switch. "
+                        "Return the correct Daily tool call when the current message "
+                        "continues the recent Daily Report; otherwise return a "
+                        "clarification."
+                    ),
+                }
+                completion = await complete_model(
+                    recovery_messages,
+                    tool_schemas=deepseek_tool_schemas(
+                        daily_tool_names
+                    ),
+                    thinking_enabled=True,
+                )
+                iterations += 1
+                model_turns.append(
+                    _model_turn_audit(
+                        iterations,
+                        completion.message,
+                        response_metadata={
+                            **completion.metadata,
+                            "recent_daily_focus_recovery": True,
+                            "draft_executed": False,
+                        },
+                    )
+                )
+                recovered = _parse_assistant_turn(
+                    completion.message,
+                    allow_review_arguments_envelope=True,
+                )
+                _validate_completion_protocol(completion, recovered)
+                audits.extend(recovered.audit)
+                _validate_daily_weekly_write_review(
+                    reviewed=recovered,
+                    allowed_tool_names=daily_tool_names,
+                    original_has_domain_writes=True,
+                )
+                return recovered
+
             adjudication_messages = _recent_focus_conflict_adjudication_messages(
                 user_text=user_text,
                 user_messages=user_messages,
@@ -1069,7 +1167,7 @@ class DeepSeekToolCallingAdapter:
             ordered_current_messages = user_messages or (user_text,)
             reviewed_plan_ids = {
                 str(call.arguments.get("plan_id") or "")
-                for call in reviewed_domain_calls
+                for call in reviewed_weekly_submissions
             }
             approved_switch_evidence: dict[str, object] | None = None
             for attempt in range(1, 3):
@@ -1162,6 +1260,10 @@ class DeepSeekToolCallingAdapter:
                                 "scope_basis": "explicit_record_name",
                             }
                             if attempt == 1:
+                                if not await verify_weekly_scope_quote(
+                                    exact_quote
+                                ):
+                                    return await recover_recent_daily_focus()
                                 approved_switch_evidence = (
                                     current_switch_evidence
                                 )
@@ -5596,6 +5698,43 @@ def _recent_focus_conflict_adjudication_messages(
                         "selected_domain": "weekly_plan",
                         "recent_record_focus": "daily_report",
                     },
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+
+def _weekly_focus_quote_verification_messages(
+    *,
+    exact_quote: str,
+) -> list[dict[str, str]]:
+    quote_sha256 = hashlib.sha256(
+        exact_quote.encode("utf-8")
+    ).hexdigest()
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an isolated semantic verifier. You receive only one exact "
+                "current-user quote and no conversation, plan, report, or pending state. "
+                "Decide whether the quote itself explicitly identifies the Monday-to-"
+                "Saturday Weekly Work Plan record as the record to submit. A generic "
+                "acknowledgement, approval, statement that there is no problem, or bare "
+                "submission instruction does not identify that record. Never infer an "
+                "omitted target. Return exactly one JSON object with keys decision and "
+                "quote_sha256. decision must be approve or reject; copy quote_sha256 "
+                "exactly. No markdown or explanation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "exact_quote": exact_quote,
+                    "quote_sha256": quote_sha256,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
