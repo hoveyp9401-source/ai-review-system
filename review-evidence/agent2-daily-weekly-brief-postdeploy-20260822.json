@@ -1,0 +1,59 @@
+{
+  "schema_version": "agent2.daily_weekly_brief.postdeploy.v1",
+  "verified_at": "2026-08-22T14:32:49+08:00",
+  "release": {
+    "path": "/home/ai_review_tunnel/releases/ai-review-system-agent2-daily-weekly-brief-20260822-v1",
+    "commit": "7b2d11b1c50e3e02df16e3602146ebbaad6d19d9",
+    "tree_read_only": true
+  },
+  "services": {
+    "active": 3,
+    "candidate_cwd": 3,
+    "health": "ok",
+    "current_error_lines": 0
+  },
+  "formal_roster": {
+    "total": 74,
+    "child_departments": 70,
+    "center_direct": 4,
+    "confirmed_center_direct_managers": 2,
+    "historical_2026_08_21": "72+2",
+    "current_2026_08_22": "70+4",
+    "team_lead_assignments_preserved": 2
+  },
+  "personal_weekly_brief": {
+    "table_exists": true,
+    "record_count": 0,
+    "generation_enabled": false,
+    "send_enabled": false,
+    "registered_jobs": [],
+    "real_send_calls": 0
+  },
+  "weekly_plan": {
+    "send_enabled": false,
+    "registered_jobs": [
+      "agent2_weekly_plan_collection_open",
+      "agent2_weekly_plan_monday_snapshot"
+    ]
+  },
+  "daily_focus_smoke": {
+    "status": "pass",
+    "passed": 5,
+    "failed": 0,
+    "dingtalk_send_calls": 0,
+    "rollback_residue": 0,
+    "production_state_changes": 0,
+    "sha256": "cfda1689c3ee42392158f1850485aa4a8bb8aaca527eb861ea396aa9e578db22"
+  },
+  "agent2_alignment": {
+    "status": "pass",
+    "control_count": 74,
+    "sha256": "5f93d0f56ad5b0a758f61a31ae6bbc2e902ef729dab2e872295a30cc135d934f"
+  },
+  "roster_backup": {
+    "mode": "0600",
+    "sha256": "0e68c32fa0e7a6bfd226828f527a4bc1de96bbeb7c3aa87e18e4964e05141c4b"
+  },
+  "production_daily_or_weekly_content_changed_by_tests": false,
+  "result": "pass"
+}
