@@ -177,7 +177,6 @@ elif [[ "$action" == "rollback" ]]; then
     echo "current release is not the Daily focus candidate" >&2
     exit 1
   fi
-  freeze_all_services
   rollback 0
 else
   echo "usage: $0 deploy|rollback" >&2
