@@ -48,12 +48,12 @@ CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
         CHECK (jsonb_typeof(recovery_json) = 'array'),
     CONSTRAINT agent2_personal_weekly_brief_status_check
         CHECK (status IN (
-            'snapshot_ready', 'generation_failed', 'generated', 'claimed',
+            'snapshot_ready', 'generating', 'generation_failed', 'generated', 'claimed',
             'delivery_pending', 'delivered', 'failed', 'cancelled'
         )),
     CONSTRAINT agent2_personal_weekly_brief_generated_content_check
         CHECK (
-            status IN ('snapshot_ready', 'generation_failed', 'cancelled')
+            status IN ('snapshot_ready', 'generating', 'generation_failed', 'cancelled')
             OR (
                 length(btrim(message_text)) > 0
                 AND length(btrim(llm_model)) > 0
@@ -80,6 +80,14 @@ CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
                 status <> 'delivered'
                 AND delivered_at IS NULL
                 AND final_verified_at IS NULL
+            )
+        ),
+    CONSTRAINT agent2_personal_weekly_brief_generating_check
+        CHECK (
+            status <> 'generating'
+            OR (
+                generation_started_at IS NOT NULL
+                AND generated_at IS NULL
             )
         )
 );

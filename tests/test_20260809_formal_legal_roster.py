@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,9 @@ from app.legal_daily_roster import (
     FORMAL_CENTER_MEMBER_COUNT,
     FORMAL_CHILD_MEMBER_COUNT,
     FORMAL_CHILD_TEAM_NAMES,
+    FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES,
+    FORMAL_CONFIRMED_TEAM_LEADS,
+    FORMAL_ROSTER_EFFECTIVE_DATE,
     formal_roster_user_ids_for_exact_scope,
     load_formal_legal_daily_roster,
 )
@@ -69,6 +73,25 @@ def _formal_rows() -> list[dict[str, object]]:
     return rows
 
 
+def _legacy_72_plus_2_rows() -> list[dict[str, object]]:
+    rows = _formal_rows()
+    for name, team_index, team_name in (
+        ("丁益明", 2, "法务二部"),
+        ("薛旭", 4, "法务四部"),
+    ):
+        member = next(row for row in rows if row["user_name"] == name)
+        member.update(
+            {
+                "user_team_id": f"team-{team_index}",
+                "team_id": f"team-{team_index}",
+                "team_code": f"monthly-law-{team_index}",
+                "team_name": team_name,
+                "team_active": True,
+            }
+        )
+    return rows
+
+
 class _Mappings:
     def __init__(self, rows):
         self._rows = rows
@@ -104,7 +127,7 @@ async def test_formal_roster_is_one_validated_70_plus_4_snapshot():
     roster = await load_formal_legal_daily_roster(
         session,  # type: ignore[arg-type]
         tenant_id="legal-daily-production-v1",
-        on_date=date(2026, 8, 9),
+        on_date=date(2026, 8, 22),
     )
 
     assert roster.member_count == 74
@@ -121,10 +144,59 @@ async def test_formal_roster_is_one_validated_70_plus_4_snapshot():
     assert roster.member_by_name("薛旭").center_direct is True
     assert session.parameters == {
         "tenant_id": "legal-daily-production-v1",
-        "on_date": date(2026, 8, 9),
+        "on_date": date(2026, 8, 22),
         "parent_department": "法务合约中心",
         "center_team_code": "legal-center",
     }
+
+
+def test_center_direct_membership_and_team_lead_duties_are_independent_facts():
+    source = Path("app/legal_daily_roster.py").read_text(encoding="utf-8")
+
+    assert FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES == {"丁益明", "薛旭"}
+    assert FORMAL_CONFIRMED_TEAM_LEADS == {
+        "法务二部": "丁益明",
+        "法务四部": "薛旭",
+    }
+    assert "FORMAL_CONFIRMED_TEAM_LEADS.values()" not in source
+
+
+@pytest.mark.asyncio
+async def test_70_plus_4_effective_date_does_not_rewrite_older_72_plus_2_history():
+    assert FORMAL_ROSTER_EFFECTIVE_DATE == date(2026, 8, 22)
+
+    historical = await load_formal_legal_daily_roster(
+        _Session(_legacy_72_plus_2_rows()),  # type: ignore[arg-type]
+        tenant_id="legal-daily-production-v1",
+        on_date=date(2026, 8, 21),
+    )
+    assert len(historical.child_members) == 72
+    assert len(historical.center_members) == 2
+
+    with pytest.raises(RuntimeError, match="expected 70 child members"):
+        await load_formal_legal_daily_roster(
+            _Session(_legacy_72_plus_2_rows()),  # type: ignore[arg-type]
+            tenant_id="legal-daily-production-v1",
+            on_date=date(2026, 8, 22),
+        )
+
+
+@pytest.mark.asyncio
+async def test_historical_membership_allows_users_current_team_after_migration():
+    rows = _legacy_72_plus_2_rows()
+    for name in ("丁益明", "薛旭"):
+        member = next(row for row in rows if row["user_name"] == name)
+        member["user_team_id"] = "legal-center-team"
+
+    historical = await load_formal_legal_daily_roster(
+        _Session(rows),  # type: ignore[arg-type]
+        tenant_id="legal-daily-production-v1",
+        on_date=date(2026, 8, 21),
+    )
+
+    assert historical.member_by_name("丁益明").team_name == "法务二部"
+    assert historical.member_by_name("薛旭").team_name == "法务四部"
+    assert len(historical.child_members) == 72
 
 
 @pytest.mark.asyncio
@@ -136,7 +208,7 @@ async def test_formal_roster_rejects_duplicate_membership_instead_of_guessing():
         await load_formal_legal_daily_roster(
             _Session(rows),  # type: ignore[arg-type]
             tenant_id="legal-daily-production-v1",
-            on_date=date(2026, 8, 9),
+            on_date=date(2026, 8, 22),
         )
 
 
@@ -168,7 +240,7 @@ async def test_formal_roster_rejects_72_plus_2_drift():
         await load_formal_legal_daily_roster(
             _Session(rows),  # type: ignore[arg-type]
             tenant_id="legal-daily-production-v1",
-            on_date=date(2026, 8, 9),
+            on_date=date(2026, 8, 22),
         )
 
 
@@ -184,17 +256,27 @@ async def test_formal_roster_rejects_confirmed_manager_moved_into_child_team():
             "team_name": "法务一部",
         }
     )
+    replacement = next(row for row in rows if row["user_name"] == "成员1")
+    replacement.update(
+        {
+            "user_team_id": "legal-center-team",
+            "team_id": "legal-center-team",
+            "team_code": "legal-center",
+            "team_name": "法务合约中心（中心层级）",
+            "team_active": False,
+        }
+    )
 
     with pytest.raises(RuntimeError, match="丁益明 must be center-direct"):
         await load_formal_legal_daily_roster(
             _Session(rows),  # type: ignore[arg-type]
             tenant_id="legal-daily-production-v1",
-            on_date=date(2026, 8, 9),
+            on_date=date(2026, 8, 22),
         )
 
 
 def test_management_briefing_must_use_the_exact_formal_roster():
-    report_date = date(2026, 8, 9)
+    report_date = date(2026, 8, 22)
     records = DashboardRecords(
         members=(
             MemberRecord(ref="user-1", name="成员1", team_ref="team-1"),

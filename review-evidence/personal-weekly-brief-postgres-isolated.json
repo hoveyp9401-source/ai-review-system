@@ -1,24 +1,14 @@
 {
   "checks": {
-    "archive_sha256": "25e6fcdfb8caec38691bf461125e7564508760666f7b8e5dc6a5f0818f58f81e",
-    "archive_size_bytes": 332441502,
-    "archive_zip_crc": "PASS",
-    "database_cleanup_zero_residual": "PASS",
-    "first_apply": "PASS",
-    "idempotent_second_apply": "PASS",
-    "migration_sha256": "acbc16dad6d4acc700b7b85fa65098c25b92032a92ce4ed936884e21bb2e645f",
-    "owner_week_duplicate_guard": "PASS",
-    "postgresql_version": "16.15",
-    "snapshot_to_delivered_transitions": "PASS",
     "temporary_directory_removed": "PASS"
   },
   "database_target": "ephemeral_local_postgresql_only",
   "dingtalk_messages_sent": 0,
-  "failure": "",
-  "finished_at": "2026-08-22T04:15:04.469020+00:00",
+  "failure": "RuntimeError: downloaded PostgreSQL archive is incomplete",
+  "finished_at": "2026-08-22T05:15:26.877258+00:00",
   "listen_address": "127.0.0.1",
   "production_database_connections": 0,
   "schema_version": "agent2.personal_weekly_brief.postgres_isolated_gate.v1",
-  "started_at": "2026-08-22T04:14:17.306053+00:00",
-  "status": "PASS"
+  "started_at": "2026-08-22T05:09:05.403416+00:00",
+  "status": "FAIL"
 }

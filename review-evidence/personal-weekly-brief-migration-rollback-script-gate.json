@@ -1,0 +1,21 @@
+{
+  "schema_version": "agent2.personal_weekly_brief.migration_rollback_script_gate.v1",
+  "status": "PASS_STATIC_ONLY",
+  "migration_sha256": "a1985b4ea845922836a93c75c4aca99543f96b4a2cd292359fd3e2c9663eaea6",
+  "rollback_sha256": "11a0ef3d985d915a29c1ea2094420f863126bca345ebd0a1721ebdb26d8fdb9b",
+  "checks": {
+    "transaction_wrappers_present": "PASS",
+    "generating_status_and_constraint_present": "PASS",
+    "empty_table_drop_path_present": "PASS",
+    "nonempty_table_refusal_present": "PASS",
+    "backup_and_manual_handling_error_present": "PASS",
+    "apply_rollback_apply_verifier_path_present": "PASS",
+    "public_privilege_check_present": "PASS",
+    "zero_residual_check_present": "PASS",
+    "targeted_schema_tests": "PASS"
+  },
+  "real_database_execution_completed": false,
+  "real_database_blocker": "Two bounded official archive downloads were incomplete before PostgreSQL startup.",
+  "latest_isolated_failure_artifact": "review-evidence/personal-weekly-brief-postgres-isolated.json",
+  "required_next_gate": "Run create/rollback/create, nonempty refusal, permission and zero-residual checks in the authorized production database inside an outer transaction."
+}

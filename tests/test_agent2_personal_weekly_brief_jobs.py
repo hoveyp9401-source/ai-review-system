@@ -398,12 +398,17 @@ async def test_streaming_batch_sends_first_owner_before_all_generation_finishes(
 
 @pytest.mark.asyncio
 async def test_five_minute_recovery_handles_generation_failed_failed_and_claimed() -> None:
+    stale_generating = _brief_record(4, status="generation_failed")
     generation_failed = _brief_record(1, status="generation_failed")
     failed = _brief_record(2, status="failed")
     stale_claimed = _brief_record(3, status="failed")
     calls: list[str] = []
 
     class _Store:
+        async def fail_stale_generations(self, **_kwargs):
+            calls.append("generation_timeout")
+            return (stale_generating,)
+
         async def fail_stale_claims(self, **_kwargs):
             calls.append("claimed_timeout")
             return (stale_claimed,)
@@ -430,6 +435,7 @@ async def test_five_minute_recovery_handles_generation_failed_failed_and_claimed
     )
 
     assert calls == [
+        "generation_timeout",
         "claimed_timeout",
         "generation_requeued",
         "delivery_requeued",
@@ -437,6 +443,7 @@ async def test_five_minute_recovery_handles_generation_failed_failed_and_claimed
     assert result["generation_requeued"][0].status == "snapshot_ready"
     assert result["delivery_requeued"][0].status == "generated"
     assert result["stale_claims_failed"][0].status == "failed"
+    assert result["stale_generations_failed"][0].status == "generation_failed"
 
 
 @pytest.mark.asyncio
@@ -537,3 +544,82 @@ async def test_pre_send_overall_roster_set_change_stops_before_send(monkeypatch)
             frozen_targets=(),
             now=NOW,
         )
+
+
+@pytest.mark.asyncio
+async def test_each_owner_reloads_send_switch_immediately_before_transport(
+    monkeypatch,
+) -> None:
+    row = _brief_record(1)
+    target = SimpleNamespace(
+        tenant_id="tenant-a",
+        internal_user_id=row.owner_user_id,
+        dingtalk_user_id="ding-owner-1",
+        display_name="虚构用户甲",
+        conversation_id=row.conversation_id,
+    )
+    opened_sessions = 0
+
+    class _Sessions:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            nonlocal opened_sessions
+            opened_sessions += 1
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def _revalidate(*_args, **_kwargs):
+        return SimpleNamespace(
+            valid_targets={row.owner_user_id: target},
+            blocked_reasons={},
+        )
+
+    monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
+    monkeypatch.setattr(
+        runner,
+        "load_personal_weekly_brief_target_revalidation",
+        _revalidate,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_personal_weekly_brief_send_switch_enabled",
+        lambda: False,
+        raising=False,
+    )
+
+    result = await runner._dispatch_personal_weekly_brief_record(
+        _settings(
+            agent2_personal_weekly_brief_enabled=True,
+            agent2_personal_weekly_brief_send_enabled=True,
+            agent2_personal_weekly_brief_tenant_id="tenant-a",
+        ),
+        robot=object(),
+        row=row,
+        frozen_targets=(target,),
+        now=NOW,
+    )
+
+    assert result == row
+    assert opened_sessions == 1
+
+
+def test_live_send_switch_reader_does_not_reuse_cached_settings(monkeypatch) -> None:
+    observed = iter((False, True))
+    loads = 0
+
+    def _fresh_settings():
+        nonlocal loads
+        loads += 1
+        return SimpleNamespace(
+            agent2_personal_weekly_brief_send_enabled=next(observed)
+        )
+
+    monkeypatch.setattr(runner, "Settings", _fresh_settings)
+
+    assert runner._personal_weekly_brief_send_switch_enabled() is False
+    assert runner._personal_weekly_brief_send_switch_enabled() is True
+    assert loads == 2

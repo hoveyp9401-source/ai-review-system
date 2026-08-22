@@ -1058,7 +1058,23 @@ async def test_no_data_is_expressed_without_inventing_sources() -> None:
     assert result.plan_progress.items == ()
     assert result.possible_open_loops.items == ()
     assert "没有数据时不推测" in result.message_text
-    assert result.trace_payload()["snapshot_fingerprint"] == _snapshot().fingerprint
+    trace = result.trace_payload()
+    assert trace["snapshot_fingerprint"] == _snapshot().fingerprint
+    assert trace["system_explanations"]["intro"] == {
+        "classification": "system_explanation",
+        "business_conclusion": False,
+        "basis": {
+            "snapshot_fingerprint": _snapshot().fingerprint,
+            "source_count": 0,
+            "daily_report_dates": [],
+            "weekly_plan_found": False,
+        },
+    }
+    assert set(trace["system_explanations"]["empty_notes"]) == {
+        "completed",
+        "plan_progress",
+        "possible_open_loops",
+    }
 
 
 @pytest.mark.asyncio

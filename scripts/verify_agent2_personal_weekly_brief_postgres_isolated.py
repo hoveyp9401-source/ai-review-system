@@ -27,6 +27,7 @@ ALLOWED_DOWNLOAD_HOST = "sbp.enterprisedb.com"
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--migration", type=Path, required=True)
+    parser.add_argument("--rollback", type=Path, required=True)
     parser.add_argument("--archive-url", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reuse-temp-root", type=Path)
@@ -103,6 +104,7 @@ def _download(url: str, target: Path) -> None:
     downloaded = 0
     next_notice = 25 * 1024 * 1024
     with urlopen(url, timeout=180) as response, target.open("xb") as output:
+        expected_size = int(response.headers.get("Content-Length") or "0")
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
@@ -122,6 +124,8 @@ def _download(url: str, target: Path) -> None:
                 next_notice += 25 * 1024 * 1024
     if downloaded < 20 * 1024 * 1024:
         raise RuntimeError("downloaded PostgreSQL archive is unexpectedly small")
+    if expected_size and downloaded != expected_size:
+        raise RuntimeError("downloaded PostgreSQL archive is incomplete")
 
 
 def _extract(archive: Path, target: Path) -> Path:
@@ -156,6 +160,8 @@ def main() -> int:
     args = _args()
     if not args.migration.is_file():
         raise FileNotFoundError("migration file not found")
+    if not args.rollback.is_file():
+        raise FileNotFoundError("rollback file not found")
     started_at = datetime.now(UTC)
     temp_root = (
         args.reuse_temp_root
@@ -191,6 +197,10 @@ def main() -> int:
             print(json.dumps({"event": "postgres_archive_download_started"}), flush=True)
             _download(args.archive_url, archive)
             print(json.dumps({"event": "postgres_archive_downloaded"}), flush=True)
+        with zipfile.ZipFile(archive) as bundle:
+            damaged_member = bundle.testzip()
+        if damaged_member is not None:
+            raise RuntimeError("downloaded PostgreSQL archive failed CRC verification")
         checks["archive_sha256"] = _sha256(archive)
         checks["archive_size_bytes"] = archive.stat().st_size
         checks["archive_zip_crc"] = "PASS"
@@ -256,8 +266,12 @@ def main() -> int:
         if before != "t":
             raise AssertionError("isolated database was not empty before migration")
         migration_text = args.migration.read_text(encoding="utf-8")
+        rollback_text = args.rollback.read_text(encoding="utf-8")
         checks["migration_sha256"] = hashlib.sha256(
             migration_text.encode("utf-8")
+        ).hexdigest()
+        checks["rollback_sha256"] = hashlib.sha256(
+            rollback_text.encode("utf-8")
         ).hexdigest()
         _run(database_args, input_text=migration_text)
         checks["first_apply"] = "PASS"
@@ -270,6 +284,47 @@ def main() -> int:
         ).stdout.strip()
         if table_present != "t":
             raise AssertionError("migration table is missing")
+        public_grants = _run(
+            [
+                *database_args,
+                "-Atc",
+                (
+                    "SELECT count(*) FROM information_schema.role_table_grants "
+                    "WHERE table_schema='public' "
+                    "AND table_name='agent2_personal_weekly_briefs' "
+                    "AND grantee='PUBLIC'"
+                ),
+            ]
+        ).stdout.strip()
+        if public_grants != "0":
+            raise AssertionError("migration granted table access to PUBLIC")
+        checks["public_table_privileges_absent"] = "PASS"
+
+        _run(database_args, input_text=rollback_text)
+        empty_rollback_absent = _run(
+            [
+                *database_args,
+                "-Atc",
+                "SELECT to_regclass('public.agent2_personal_weekly_briefs') IS NULL",
+            ]
+        ).stdout.strip()
+        if empty_rollback_absent != "t":
+            raise AssertionError("empty rollback did not remove the table")
+        checks["empty_table_rollback"] = "PASS"
+        print(json.dumps({"event": "postgres_empty_rollback_passed"}), flush=True)
+
+        _run(database_args, input_text=migration_text)
+        apply_after_rollback_present = _run(
+            [
+                *database_args,
+                "-Atc",
+                "SELECT to_regclass('public.agent2_personal_weekly_briefs') IS NOT NULL",
+            ]
+        ).stdout.strip()
+        if apply_after_rollback_present != "t":
+            raise AssertionError("apply after rollback did not restore the table")
+        checks["apply_after_rollback"] = "PASS"
+        print(json.dumps({"event": "postgres_apply_after_rollback_passed"}), flush=True)
 
         brief_id = str(uuid4())
         insert_sql = f"""
@@ -289,6 +344,28 @@ def main() -> int:
         );
         """
         _run(database_args, input_text=insert_sql)
+        refused_rollback = _run(
+            database_args,
+            input_text=rollback_text,
+            check=False,
+        )
+        if refused_rollback.returncode == 0:
+            raise AssertionError("rollback did not refuse a nonempty table")
+        preserved_after_refusal = _run(
+            [
+                *database_args,
+                "-Atc",
+                (
+                    "SELECT count(*) FROM agent2_personal_weekly_briefs "
+                    f"WHERE brief_id='{brief_id}'"
+                ),
+            ]
+        ).stdout.strip()
+        if preserved_after_refusal != "1":
+            raise AssertionError("nonempty rollback did not preserve the record")
+        checks["nonempty_rollback_refused"] = "PASS"
+        checks["backup_required_before_nonempty_rollback"] = "PASS"
+        print(json.dumps({"event": "postgres_nonempty_rollback_refused"}), flush=True)
         duplicate = _run(
             database_args,
             input_text=insert_sql.replace(brief_id, str(uuid4()), 1),
@@ -300,12 +377,17 @@ def main() -> int:
         print(json.dumps({"event": "postgres_duplicate_guard_passed"}), flush=True)
         transitions = f"""
         UPDATE agent2_personal_weekly_briefs
-        SET status='generated', content_json='{{"trace":{{}}}}'::jsonb,
-            message_text='脱敏简报', llm_model='deepseek-v4-flash',
-            generation_started_at=now(), generated_at=now(),
-            recovery_json=recovery_json || '[{{"kind":"generation_completed"}}]'::jsonb,
+        SET status='generating', generation_started_at=now(),
+            recovery_json=recovery_json || '[{{"kind":"generation_started"}}]'::jsonb,
             updated_at=now()
         WHERE brief_id='{brief_id}' AND status='snapshot_ready';
+        UPDATE agent2_personal_weekly_briefs
+        SET status='generated', content_json='{{"trace":{{}}}}'::jsonb,
+            message_text='脱敏简报', llm_model='deepseek-v4-flash',
+            generated_at=now(),
+            recovery_json=recovery_json || '[{{"kind":"generation_completed"}}]'::jsonb,
+            updated_at=now()
+        WHERE brief_id='{brief_id}' AND status='generating';
         UPDATE agent2_personal_weekly_briefs
         SET status='claimed', claim_token='isolated-claim', send_started_at=now(),
             recovery_json=recovery_json || '[{{"kind":"send_claimed"}}]'::jsonb,
@@ -340,10 +422,29 @@ def main() -> int:
                 ),
             ]
         ).stdout.strip()
-        if delivered != "delivered|true|4|true":
+        if delivered != "delivered|true|5|true":
             raise AssertionError("delivery transition was not persisted")
         checks["snapshot_to_delivered_transitions"] = "PASS"
         print(json.dumps({"event": "postgres_transitions_passed"}), flush=True)
+        _run(
+            database_args,
+            input_text=(
+                "DELETE FROM agent2_personal_weekly_briefs "
+                f"WHERE brief_id='{brief_id}';"
+            ),
+        )
+        _run(database_args, input_text=rollback_text)
+        final_table_absent = _run(
+            [
+                *database_args,
+                "-Atc",
+                "SELECT to_regclass('public.agent2_personal_weekly_briefs') IS NULL",
+            ]
+        ).stdout.strip()
+        if final_table_absent != "t":
+            raise AssertionError("final empty rollback left the table behind")
+        checks["final_empty_rollback_zero_residual"] = "PASS"
+        print(json.dumps({"event": "postgres_final_rollback_passed"}), flush=True)
         _run([dropdb, *common, database_name])
         residual_database = _run(
             [

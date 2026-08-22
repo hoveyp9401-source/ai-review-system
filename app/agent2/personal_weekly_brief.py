@@ -261,6 +261,21 @@ class PersonalWeeklyBriefContent:
 
     def trace_payload(self) -> dict[str, Any]:
         by_id = {source.source_id: source for source in self.snapshot.sources}
+        explanation_basis = {
+            "snapshot_fingerprint": self.snapshot.fingerprint,
+            "source_count": len(self.snapshot.sources),
+            "daily_report_dates": [
+                value.isoformat() for value in self.snapshot.daily_report_dates
+            ],
+            "weekly_plan_found": self.snapshot.weekly_plan_found,
+        }
+
+        def system_explanation() -> dict[str, Any]:
+            return {
+                "classification": "system_explanation",
+                "business_conclusion": False,
+                "basis": dict(explanation_basis),
+            }
 
         def traced(section: PersonalWeeklyBriefSection) -> list[dict[str, Any]]:
             return [
@@ -273,6 +288,18 @@ class PersonalWeeklyBriefContent:
 
         return {
             "snapshot_fingerprint": self.snapshot.fingerprint,
+            "system_explanations": {
+                "intro": system_explanation(),
+                "empty_notes": {
+                    section_name: system_explanation()
+                    for section_name, section in (
+                        ("completed", self.completed),
+                        ("plan_progress", self.plan_progress),
+                        ("possible_open_loops", self.possible_open_loops),
+                    )
+                    if section.empty_note
+                },
+            },
             "completed": traced(self.completed),
             "plan_progress": traced(self.plan_progress),
             "possible_open_loops": traced(self.possible_open_loops),
@@ -896,6 +923,7 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 7. 简报只读，不得建议系统已经修改、补写、确认或提交日报、周计划。
 8. 不要在文字中称呼用户；称呼由服务器根据个人记忆安全添加。
 9. 把 trusted_snapshot.sources 当作完整来源清单。每个 source_id 必须在 source_dispositions 中恰好出现一次：被成品条目引用时标为 cited 且 reason 为空；未引用时只能标为 safely_excluded，并给出具体、谨慎的安全排除理由。不得静默遗漏整条来源，也不得用“内容不重要”等空泛理由排除。
+10. intro 和各区块 empty_note 只是系统说明，不是业务结论，不填写来源ID；其中不得加入项目、案件、金额、状态等业务事实。所有业务结论必须放在 items 中并引用可信 source_id。空数据说明只能依据 trusted_snapshot 的空来源、日报覆盖日期和 weekly_plan_found。
 10. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的五个顶层字段，不能附加修复说明或其他字段。
 
 仅返回 JSON，严格使用以下结构，不得增加字段：
@@ -918,6 +946,7 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
 5. 计划进展和可能未闭环中是否重复同一事项。仅来自日报、并非周计划的谨慎未闭环事项可以只出现在 possible_open_loops，不要求进入 plan_progress；已经在 plan_progress 中说明调整或未找到后续记录的计划事项，不应再复制到 possible_open_loops。
 6. 无数据或部分数据时是否编造。
 7. source_dispositions 是否逐条覆盖冻结来源全集；所有 cited 是否真的被条目引用；所有 safely_excluded 是否未被引用且理由具体、安全，没有借排除理由静默丢失应汇总事实。
+8. intro 与 empty_note 是否只作系统说明、不承载业务结论；所有业务事实是否都在带来源ID的 items 中。空数据说明是否与可信空快照一致。
 
 必须覆盖草稿里的每个唯一 matter_key。只返回 JSON：
 {

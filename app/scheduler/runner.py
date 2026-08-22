@@ -96,7 +96,7 @@ from app.agent2.weekly_plan_sql_collection import (
     SqlWeeklyPlanCollectionOrchestrator,
 )
 from app.agent2.weekly_plan_store import SqlWeeklyPlanStore
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db import AsyncSessionLocal
 from app.llm.client import LLMClient
 from app.llm.extractor import TeamSummaryGenerator
@@ -127,6 +127,7 @@ PERSONAL_WEEKLY_BRIEF_TIMEZONE = "Asia/Shanghai"
 PERSONAL_WEEKLY_BRIEF_MODEL_CONCURRENCY = 4
 PERSONAL_WEEKLY_BRIEF_SEND_CONCURRENCY = 2
 PERSONAL_WEEKLY_BRIEF_CLAIM_TIMEOUT = timedelta(minutes=15)
+PERSONAL_WEEKLY_BRIEF_GENERATION_TIMEOUT = timedelta(minutes=15)
 
 
 class DailyBriefingResumeConflict(RuntimeError):
@@ -795,6 +796,8 @@ async def _dispatch_personal_weekly_brief_record(
     target = revalidation.valid_targets.get(row.owner_user_id)
     if target is None:
         raise RuntimeError("personal weekly brief latest recipient is missing")
+    if not _personal_weekly_brief_send_switch_enabled():
+        return row
     send_started_at = _personal_weekly_observed_now()
     async with AsyncSessionLocal() as delivery_session:
         delivered = await PersonalWeeklyBriefDispatcher(
@@ -818,7 +821,7 @@ async def _dispatch_personal_weekly_brief_record(
         await _record_personal_weekly_brief_context(
             tenant_id=tenant_id,
             row=delivered,
-            target=target,
+            frozen_targets=frozen_targets,
         )
     return delivered
 
@@ -1051,25 +1054,15 @@ async def run_personal_weekly_brief_reconcile_job(
             await _record_personal_weekly_brief_context(
                 tenant_id=tenant_id,
                 row=delivered,
-                target=target,
+                frozen_targets=frozen_targets,
             )
     for row in context_pending:
         frozen_targets = await frozen_for(row)
-        async with AsyncSessionLocal() as scope_session:
-            revalidation = await load_personal_weekly_brief_target_revalidation(
-                scope_session,
-                tenant_id=tenant_id,
-                on_date=local_now.date(),
-                expected_model_name=CANARY_MODEL_NAME,
-                frozen_targets=frozen_targets,
-            )
-        target = revalidation.valid_targets.get(row.owner_user_id)
-        if target is not None:
-            await _record_personal_weekly_brief_context(
-                tenant_id=tenant_id,
-                row=row,
-                target=target,
-            )
+        await _record_personal_weekly_brief_context(
+            tenant_id=tenant_id,
+            row=row,
+            frozen_targets=frozen_targets,
+        )
     return delivered_count
 
 
@@ -1080,6 +1073,12 @@ async def recover_personal_weekly_brief_rows(
     now: datetime,
     send_enabled: bool,
 ) -> dict[str, tuple[PersonalWeeklyBriefRecord, ...]]:
+    stale_generation_failed = await store.fail_stale_generations(
+        tenant_id=tenant_id,
+        stale_before=now - PERSONAL_WEEKLY_BRIEF_GENERATION_TIMEOUT,
+        changed_at=now,
+        limit=100,
+    )
     stale_failed = await store.fail_stale_claims(
         tenant_id=tenant_id,
         stale_before=now - PERSONAL_WEEKLY_BRIEF_CLAIM_TIMEOUT,
@@ -1125,6 +1124,7 @@ async def recover_personal_weekly_brief_rows(
         "generation_requeued": tuple(generation_requeued),
         "delivery_requeued": tuple(delivery_requeued),
         "stale_claims_failed": tuple(stale_failed),
+        "stale_generations_failed": tuple(stale_generation_failed),
     }
 
 
@@ -1149,16 +1149,58 @@ def _personal_weekly_observed_now() -> datetime:
     return datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE))
 
 
+def _personal_weekly_brief_send_switch_enabled() -> bool:
+    """Reload the operator kill switch for every actual private send."""
+
+    return Settings().agent2_personal_weekly_brief_send_enabled is True
+
+
 async def _record_personal_weekly_brief_context(
     *,
     tenant_id: str,
     row: PersonalWeeklyBriefRecord,
-    target: PersonalWeeklyBriefTarget,
+    frozen_targets: tuple[PersonalWeeklyBriefTarget, ...],
     changed_at: datetime | None = None,
 ) -> None:
     if row.status != "delivered" or not row.provider_message_id:
         return
+    receipt = dict(row.delivery_receipt_json or {})
+    delivered_user_ids = receipt.get("delivered_dingtalk_user_ids")
+    if not (
+        receipt.get("schema_version")
+        == "agent2.personal_weekly_brief.delivery.v1"
+        and receipt.get("provider_reference") == row.provider_message_id
+        and receipt.get("delivery_verified") is True
+        and receipt.get("delivery_status") == "SUCCESS"
+        and isinstance(delivered_user_ids, list)
+        and len(delivered_user_ids) == 1
+    ):
+        raise RuntimeError("personal weekly brief stored delivery receipt is invalid")
+    frozen_owner_targets = tuple(
+        target
+        for target in frozen_targets
+        if target.internal_user_id == row.owner_user_id
+        and target.conversation_id == row.conversation_id
+    )
+    if (
+        len(frozen_owner_targets) != 1
+        or delivered_user_ids != [frozen_owner_targets[0].dingtalk_user_id]
+    ):
+        raise RuntimeError("personal weekly brief stored delivery receipt is invalid")
+    context_recorded_at = changed_at or _personal_weekly_observed_now()
     async with AsyncSessionLocal() as session:
+        revalidation = await load_personal_weekly_brief_target_revalidation(
+            session,
+            tenant_id=tenant_id,
+            on_date=context_recorded_at.date(),
+            expected_model_name=CANARY_MODEL_NAME,
+            frozen_targets=frozen_targets,
+        )
+        target = revalidation.valid_targets.get(row.owner_user_id)
+        if target is None:
+            return
+        if delivered_user_ids != [target.dingtalk_user_id]:
+            raise RuntimeError("personal weekly brief stored delivery receipt is invalid")
         user = await session.scalar(
             select(User).where(
                 User.id == UUID(target.internal_user_id),
@@ -1168,18 +1210,6 @@ async def _record_personal_weekly_brief_context(
         )
         if user is None:
             raise RuntimeError("personal weekly brief delivered user identity changed")
-        receipt = dict(row.delivery_receipt_json or {})
-        delivered_user_ids = receipt.get("delivered_dingtalk_user_ids")
-        if not (
-            receipt.get("schema_version")
-            == "agent2.personal_weekly_brief.delivery.v1"
-            and receipt.get("provider_reference") == row.provider_message_id
-            and receipt.get("delivery_verified") is True
-            and receipt.get("delivery_status") == "SUCCESS"
-            and delivered_user_ids == [target.dingtalk_user_id]
-        ):
-            raise RuntimeError("personal weekly brief stored delivery receipt is invalid")
-        context_recorded_at = changed_at or _personal_weekly_observed_now()
         await record_verified_outbound_context_message(
             session,
             user=user,

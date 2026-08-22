@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 PersonalWeeklyBriefStatus = Literal[
     "snapshot_ready",
+    "generating",
     "generation_failed",
     "generated",
     "claimed",
@@ -209,7 +210,7 @@ class SqlPersonalWeeklyBriefStore:
         return await self._transition(
             tenant_id=tenant_id,
             brief_id=brief_id,
-            from_status="snapshot_ready",
+            from_status="generating",
             extra_where=(_briefs.c.source_fingerprint == source_fingerprint),
             values={
                 "status": "generated",
@@ -234,10 +235,8 @@ class SqlPersonalWeeklyBriefStore:
             brief_id=brief_id,
             from_status="snapshot_ready",
             values={
-                "generation_started_at": func.coalesce(
-                    _briefs.c.generation_started_at,
-                    changed_at,
-                ),
+                "status": "generating",
+                "generation_started_at": changed_at,
                 "recovery_json": _recovery_append(
                     kind="generation_started",
                     reason="frozen_snapshot",
@@ -253,7 +252,7 @@ class SqlPersonalWeeklyBriefStore:
         return await self._transition(
             tenant_id=tenant_id,
             brief_id=brief_id,
-            from_status="snapshot_ready",
+            from_status="generating",
             values={
                 "status": "generation_failed",
                 "last_error": error,
@@ -281,6 +280,8 @@ class SqlPersonalWeeklyBriefStore:
             ),
             values={
                 "status": "snapshot_ready",
+                "generation_started_at": None,
+                "generated_at": None,
                 "failed_at": None,
                 "last_error": "",
                 "recovery_json": _recovery_append(
@@ -291,6 +292,57 @@ class SqlPersonalWeeklyBriefStore:
                 "updated_at": changed_at,
             },
         )
+
+    async def fail_stale_generations(
+        self,
+        *,
+        tenant_id: str,
+        stale_before: datetime,
+        changed_at: datetime,
+        limit: int = 100,
+    ) -> tuple[PersonalWeeklyBriefRecord, ...]:
+        rows = (
+            await self.session.execute(
+                select(_briefs.c.brief_id)
+                .where(
+                    _briefs.c.tenant_id == tenant_id,
+                    _briefs.c.status == "generating",
+                    _briefs.c.generation_started_at.is_not(None),
+                    _briefs.c.generation_started_at <= stale_before,
+                )
+                .order_by(_briefs.c.generation_started_at)
+                .limit(limit)
+            )
+        ).scalars().all()
+        failed: list[PersonalWeeklyBriefRecord] = []
+        for brief_id in rows:
+            persisted = (
+                await self.session.execute(
+                    update(_briefs)
+                    .where(
+                        _briefs.c.tenant_id == tenant_id,
+                        _briefs.c.brief_id == brief_id,
+                        _briefs.c.status == "generating",
+                        _briefs.c.generation_started_at <= stale_before,
+                    )
+                    .values(
+                        status="generation_failed",
+                        last_error="generation_timeout",
+                        failed_at=changed_at,
+                        retry_count=_briefs.c.retry_count + 1,
+                        recovery_json=_recovery_append(
+                            kind="generation_timeout_failed",
+                            reason="bounded_generation_timeout",
+                            changed_at=changed_at,
+                        ),
+                        updated_at=changed_at,
+                    )
+                    .returning(*_briefs.c)
+                )
+            ).mappings().one_or_none()
+            if persisted is not None:
+                failed.append(_record_from_row(persisted))
+        return tuple(failed)
 
     async def record_pre_send_block(
         self,

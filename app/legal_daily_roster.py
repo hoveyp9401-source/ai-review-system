@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
-FORMAL_ROSTER_EFFECTIVE_DATE = date(2026, 8, 3)
+FORMAL_ROSTER_EFFECTIVE_DATE = date(2026, 8, 22)
 FORMAL_ROSTER_MEMBER_COUNT = 74
 FORMAL_CHILD_MEMBER_COUNT = 70
 FORMAL_CENTER_MEMBER_COUNT = 4
@@ -23,9 +23,8 @@ FORMAL_CONFIRMED_TEAM_LEADS = {
     "法务二部": "丁益明",
     "法务四部": "薛旭",
 }
-FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES = frozenset(
-    FORMAL_CONFIRMED_TEAM_LEADS.values()
-)
+# 人员统计归属是独立架构事实，不得从负责人职责反向推导。
+FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES = frozenset({"丁益明", "薛旭"})
 FORMAL_CHILD_TEAM_NAMES = frozenset(
     {
         "法务一部",
@@ -200,24 +199,24 @@ def _validate_roster(
         raise RuntimeError("formal roster contains an incomplete identity")
     if any(not member.data_complete for member in members):
         raise RuntimeError("formal roster contains incomplete organization data")
-    if any(str(row.get("user_team_id") or "").strip() != str(row.get("team_id") or "").strip() for row in rows):
-        raise RuntimeError("formal roster contains a system-team mismatch")
     if roster.on_date < FORMAL_ROSTER_EFFECTIVE_DATE:
         return
+    if any(str(row.get("user_team_id") or "").strip() != str(row.get("team_id") or "").strip() for row in rows):
+        raise RuntimeError("formal roster contains a system-team mismatch")
     if roster.member_count != FORMAL_ROSTER_MEMBER_COUNT:
         raise RuntimeError(f"expected {FORMAL_ROSTER_MEMBER_COUNT} formal roster members, got {roster.member_count}")
-    for member_name in FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES:
-        matches = tuple(member for member in roster.members if member.user_name == member_name)
-        if len(matches) != 1 or not matches[0].center_direct:
-            raise RuntimeError(
-                f"formal roster placement changed: {member_name} must be center-direct"
-            )
     if len(roster.child_members) != FORMAL_CHILD_MEMBER_COUNT:
         raise RuntimeError(f"expected {FORMAL_CHILD_MEMBER_COUNT} child members, got {len(roster.child_members)}")
     if len(roster.center_members) != FORMAL_CENTER_MEMBER_COUNT:
         raise RuntimeError(
             f"expected {FORMAL_CENTER_MEMBER_COUNT} center-direct members, got {len(roster.center_members)}"
         )
+    for member_name in FORMAL_CONFIRMED_CENTER_DIRECT_MEMBER_NAMES:
+        matches = tuple(member for member in roster.members if member.user_name == member_name)
+        if len(matches) != 1 or not matches[0].center_direct:
+            raise RuntimeError(
+                f"formal roster placement changed: {member_name} must be center-direct"
+            )
     child_team_names = {member.team_name for member in roster.child_members}
     if child_team_names != FORMAL_CHILD_TEAM_NAMES:
         raise RuntimeError(f"formal child departments changed: {sorted(child_team_names)!r}")

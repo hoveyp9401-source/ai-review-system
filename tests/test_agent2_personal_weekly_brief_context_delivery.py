@@ -72,7 +72,7 @@ async def test_provider_acceptance_does_not_enter_conversation_context(monkeypat
     await runner._record_personal_weekly_brief_context(
         tenant_id="tenant-a",
         row=_row("delivery_pending"),
-        target=TARGET,
+        frozen_targets=(TARGET,),
         changed_at=NOW,
     )
 
@@ -107,6 +107,13 @@ async def test_only_verified_exact_recipient_delivery_enters_context(monkeypatch
     async def _record_outbound(_session, **kwargs):
         observed["outbound"] = kwargs
 
+    async def _revalidate(*_args, **_kwargs):
+        observed["scope_revalidated"] = True
+        return SimpleNamespace(
+            valid_targets={USER_ID: TARGET},
+            blocked_reasons={},
+        )
+
     class _Store:
         def __init__(self, _session):
             pass
@@ -123,6 +130,11 @@ async def test_only_verified_exact_recipient_delivery_enters_context(monkeypatch
     monkeypatch.setattr(runner, "SqlPersonalWeeklyBriefStore", _Store)
     monkeypatch.setattr(
         runner,
+        "load_personal_weekly_brief_target_revalidation",
+        _revalidate,
+    )
+    monkeypatch.setattr(
+        runner,
         "_personal_weekly_observed_now",
         lambda: context_recorded_at,
     )
@@ -130,7 +142,7 @@ async def test_only_verified_exact_recipient_delivery_enters_context(monkeypatch
     await runner._record_personal_weekly_brief_context(
         tenant_id="tenant-a",
         row=_row("delivered"),
-        target=TARGET,
+        frozen_targets=(TARGET,),
     )
 
     receipt = observed["outbound"]["delivery_receipt"]
@@ -139,6 +151,7 @@ async def test_only_verified_exact_recipient_delivery_enters_context(monkeypatch
     assert observed["outbound"]["conversation_id"] == "conversation-a"
     assert observed["context"]["brief_id"] == _row("delivered").brief_id
     assert observed["context"]["changed_at"] == context_recorded_at
+    assert observed["scope_revalidated"] is True
     assert observed["committed"] is True
 
 
@@ -175,11 +188,61 @@ async def test_mismatched_stored_delivery_receipt_never_enters_context(monkeypat
             return self
 
     monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
-
     with pytest.raises(RuntimeError, match="stored delivery receipt is invalid"):
         await runner._record_personal_weekly_brief_context(
             tenant_id="tenant-a",
             row=row,
-            target=TARGET,
+            frozen_targets=(TARGET,),
             changed_at=NOW,
         )
+
+
+@pytest.mark.asyncio
+async def test_latest_identity_change_blocks_context_after_final_delivery(
+    monkeypatch,
+) -> None:
+    observed = {"outbound": 0, "context": 0}
+
+    class _Session:
+        async def scalar(self, _statement):
+            raise AssertionError("blocked latest identity must not load frozen user")
+
+    class _Sessions:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def _revalidate(*_args, **_kwargs):
+        return SimpleNamespace(
+            valid_targets={},
+            blocked_reasons={USER_ID: "target_changed_after_snapshot"},
+        )
+
+    async def _record_outbound(*_args, **_kwargs):
+        observed["outbound"] += 1
+
+    monkeypatch.setattr(runner, "AsyncSessionLocal", _Sessions())
+    monkeypatch.setattr(
+        runner,
+        "load_personal_weekly_brief_target_revalidation",
+        _revalidate,
+    )
+    monkeypatch.setattr(
+        runner,
+        "record_verified_outbound_context_message",
+        _record_outbound,
+    )
+
+    await runner._record_personal_weekly_brief_context(
+        tenant_id="tenant-a",
+        row=_row("delivered"),
+        frozen_targets=(TARGET,),
+        changed_at=NOW,
+    )
+
+    assert observed == {"outbound": 0, "context": 0}
