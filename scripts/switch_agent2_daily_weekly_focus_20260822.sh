@@ -3,14 +3,79 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-agent2-daily-weekly-focus-20260822-v1"
+candidate="$releases/ai-review-system-agent2-daily-weekly-brief-20260822-v1"
 previous="$releases/ai-review-system-agent2-daily-reliability-20260821-v2"
 current="$releases/current"
+shared_env=/home/ai_review_tunnel/ai-review-system/.env
+python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
+roster_backup=/home/ai_review_tunnel/deploy_backups/formal-roster-70-4-20260822-v2.json
 services=(
   ai-review-api.service
   ai-review-stream.service
   ai-review-scheduler.service
 )
+
+roster_applied=0
+weekly_schema_applied=0
+
+run_roster() {
+  local roster_action="$1"
+  shift
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$shared_env"
+    set +a
+    cd "$candidate"
+    PYTHONPATH=. "$python" scripts/manage_formal_roster_70_4_20260822.py \
+      "$roster_action" "$@"
+  )
+}
+
+run_weekly_sql() {
+  local sql_file="$1"
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$shared_env"
+    set +a
+    local dburl="${DATABASE_URL/postgresql+asyncpg:/postgresql:}"
+    psql "$dburl" -X --set=ON_ERROR_STOP=1 --single-transaction \
+      --file "$candidate/$sql_file"
+  )
+}
+
+weekly_table_exists() {
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$shared_env"
+    set +a
+    local dburl="${DATABASE_URL/postgresql+asyncpg:/postgresql:}"
+    [[ "$(psql "$dburl" -X -At --set=ON_ERROR_STOP=1 \
+      --command "SELECT to_regclass('public.agent2_personal_weekly_briefs') IS NOT NULL")" == "t" ]]
+  )
+}
+
+verify_weekly_switches_off() {
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$shared_env"
+    set +a
+    cd "$candidate"
+    PYTHONPATH=. "$python" - <<'PY'
+from app.config import get_settings
+
+get_settings.cache_clear()
+settings = get_settings()
+if settings.agent2_personal_weekly_brief_enabled:
+    raise SystemExit("personal weekly brief generation must remain disabled")
+if settings.agent2_personal_weekly_brief_send_enabled:
+    raise SystemExit("personal weekly brief sending must remain disabled")
+PY
+  )
+}
 
 switch_current() {
   local target="$1"
@@ -157,6 +222,8 @@ wait_healthy() {
 
 rollback() {
   local status="${1:-1}"
+  local rollback_failed=0
+  local target
   trap - ERR INT TERM
   set +e
   if [[ "$processes_frozen" -eq 0 ]]; then
@@ -165,9 +232,43 @@ rollback() {
       exit 1
     fi
   fi
-  switch_current "$previous" agent2-daily-weekly-focus-rollback || exit 1
+
+  if [[ "$weekly_schema_applied" -eq 1 ]]; then
+    if run_weekly_sql scripts/rollback_agent2_personal_weekly_briefs.sql; then
+      weekly_schema_applied=0
+    else
+      rollback_failed=1
+    fi
+  fi
+  if [[ "$roster_applied" -eq 1 ]]; then
+    if run_roster restore --backup-path "$roster_backup"; then
+      roster_applied=0
+    else
+      rollback_failed=1
+    fi
+  fi
+
+  if [[ "$roster_applied" -eq 0 ]]; then
+    target="$previous"
+    if [[ "$(readlink -f "$current")" != "$previous" ]]; then
+      switch_current "$previous" agent2-daily-weekly-brief-rollback \
+        || rollback_failed=1
+    fi
+  else
+    # A failed roster restore must stay on the code that understands 70+4.
+    target="$candidate"
+    if [[ "$(readlink -f "$current")" != "$candidate" ]]; then
+      switch_current "$candidate" agent2-daily-weekly-brief-safe-fallback \
+        || rollback_failed=1
+    fi
+  fi
+
   terminate_frozen_services
-  wait_healthy "$previous" || exit 1
+  wait_healthy "$target" || rollback_failed=1
+  if [[ "$rollback_failed" -ne 0 ]]; then
+    echo "rollback needs manual attention; services kept on the safest available release" >&2
+    exit 1
+  fi
   exit "$status"
 }
 
@@ -175,26 +276,56 @@ if [[ ! -d "$candidate" || -L "$candidate" || ! -d "$previous" || -L "$previous"
   echo "release directory is missing or unsafe" >&2
   exit 1
 fi
+if [[ ! -f "$shared_env" || -L "$shared_env" \
+  || ! -f "$roster_backup" || -L "$roster_backup" \
+  || "$(stat -c %a "$roster_backup")" != "600" ]]; then
+  echo "shared environment or private roster backup is missing or unsafe" >&2
+  exit 1
+fi
+for required_file in \
+  scripts/manage_formal_roster_70_4_20260822.py \
+  scripts/create_agent2_personal_weekly_briefs.sql \
+  scripts/rollback_agent2_personal_weekly_briefs.sql; do
+  if [[ ! -f "$candidate/$required_file" || -L "$candidate/$required_file" ]]; then
+    echo "candidate release file is missing or unsafe: $required_file" >&2
+    exit 1
+  fi
+done
 
 if [[ "$action" == "deploy" ]]; then
   if [[ "$(readlink -f "$current")" != "$previous" ]]; then
     echo "current release changed before deploy" >&2
     exit 1
   fi
+  verify_weekly_switches_off
+  run_roster verify-before
+  if weekly_table_exists; then
+    echo "personal weekly brief table already exists before deploy" >&2
+    exit 1
+  fi
   trap 'rollback "$?"' ERR
   trap 'rollback 130' INT
   trap 'rollback 143' TERM
   freeze_all_services
-  switch_current "$candidate" agent2-daily-weekly-focus-next
+  run_roster apply --backup-path "$roster_backup"
+  roster_applied=1
+  run_weekly_sql scripts/create_agent2_personal_weekly_briefs.sql
+  weekly_schema_applied=1
+  switch_current "$candidate" agent2-daily-weekly-brief-next
   terminate_frozen_services
   wait_healthy "$candidate"
+  run_roster verify-after
+  weekly_table_exists
+  verify_weekly_switches_off
   trap - ERR INT TERM
   echo "deployed $candidate"
 elif [[ "$action" == "rollback" ]]; then
   if [[ "$(readlink -f "$current")" != "$candidate" ]]; then
-    echo "current release is not the Daily focus candidate" >&2
+    echo "current release is not the Daily and weekly brief candidate" >&2
     exit 1
   fi
+  roster_applied=1
+  weekly_schema_applied=1
   rollback 0
 else
   echo "usage: $0 deploy|rollback" >&2
