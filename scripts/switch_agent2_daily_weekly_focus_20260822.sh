@@ -47,6 +47,20 @@ all_frozen_pids_are_stopped() {
   done
 }
 
+all_rollback_pids_are_stopped_or_exited() {
+  local pid state
+  for pid in "${frozen_pids[@]}"; do
+    state="$(awk '/^State:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)"
+    if [[ -z "$state" && ! -e "/proc/$pid/status" ]]; then
+      continue
+    fi
+    if [[ "$state" != "T" ]]; then
+      echo "rollback service process is not frozen: $pid:$state" >&2
+      return 1
+    fi
+  done
+}
+
 freeze_all_services() {
   local service pid
   local service_pids=()
@@ -85,14 +99,18 @@ freeze_running_services_for_rollback() {
       echo "rollback found no running process for $service; restoring code pointer" >&2
       continue
     fi
-    if ! kill -STOP "$pid"; then
+    if ! kill -STOP "$pid" 2>/dev/null; then
+      if [[ ! -e "/proc/$pid/status" ]]; then
+        echo "rollback process exited before freeze: $service:$pid" >&2
+        continue
+      fi
       resume_partial_freeze
       return 1
     fi
     frozen_pids+=("$pid")
   done
   sleep 0.2
-  if ! all_frozen_pids_are_stopped; then
+  if ! all_rollback_pids_are_stopped_or_exited; then
     resume_partial_freeze
     return 1
   fi
