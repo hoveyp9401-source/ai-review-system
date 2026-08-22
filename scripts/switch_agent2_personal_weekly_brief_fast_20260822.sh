@@ -3,14 +3,14 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-agent2-weekly-brief-fast-20260822-v2"
-previous="$releases/ai-review-system-agent2-daily-weekly-brief-20260822-v1"
+candidate="$releases/ai-review-system-agent2-weekly-brief-fast-20260823-v9"
+previous="$releases/ai-review-system-agent2-weekly-brief-fast-20260823-v8"
 current="$releases/current"
 shared_env=/home/ai_review_tunnel/ai-review-system/.env
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
-expected_commit=9e255b25713ee34cc68d0892dc35550864981707
-daily_focus_output=/home/ai_review_tunnel/deploy_backups/daily-focus-weekly-brief-fast-v2-20260822.json
-alignment_output=/home/ai_review_tunnel/deploy_backups/alignment-weekly-brief-fast-v2-20260822.json
+expected_commit=950d72d8568f7cdb83155dd4221edecb83820610
+daily_focus_output=/home/ai_review_tunnel/deploy_backups/daily-focus-weekly-brief-fast-v9-20260823.json
+alignment_output=/home/ai_review_tunnel/deploy_backups/alignment-weekly-brief-fast-v9-20260823.json
 services=(
   ai-review-api.service
   ai-review-stream.service
@@ -65,14 +65,36 @@ async def main() -> None:
         )
         if not exists:
             raise RuntimeError("personal weekly brief table is missing")
-        row_count = int(
-            await session.scalar(
-                text("SELECT count(*) FROM public.agent2_personal_weekly_briefs")
-            )
-            or 0
+        brief_rows = list(
+            (
+                await session.execute(
+                    text(
+                        "SELECT status, last_error, provider_message_id, "
+                        "delivery_receipt_json "
+                        "FROM public.agent2_personal_weekly_briefs"
+                    )
+                )
+            ).mappings().all()
         )
-        if row_count != 0:
-            raise RuntimeError("personal weekly brief table is not empty")
+        safe_failed = bool(
+            len(brief_rows) == 1
+            and brief_rows[0]["status"] == "failed"
+            and str(brief_rows[0]["last_error"] or "").startswith(
+                "retry_safe_preacceptance:HTTPStatusError:400"
+            )
+            and not str(brief_rows[0]["provider_message_id"] or "")
+        )
+        receipt = dict(brief_rows[0]["delivery_receipt_json"] or {}) if len(brief_rows) == 1 else {}
+        safe_delivered = bool(
+            len(brief_rows) == 1
+            and brief_rows[0]["status"] == "delivered"
+            and str(brief_rows[0]["provider_message_id"] or "")
+            and receipt.get("delivery_verified") is True
+            and receipt.get("delivery_status") == "SUCCESS"
+            and len(receipt.get("delivered_dingtalk_user_ids") or []) == 1
+        )
+        if brief_rows and not (safe_failed or safe_delivered):
+            raise RuntimeError("personal weekly brief table is not in safe canary state")
         historical = await load_formal_legal_daily_roster(
             session,
             tenant_id=tenant_id,
