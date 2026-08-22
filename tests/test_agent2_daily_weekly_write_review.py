@@ -35,7 +35,6 @@ from app.agent2.tool_calling.deepseek_adapter import (
     _recent_focus_conflict_adjudication_messages,
     _trusted_persisted_pending_summary,
     _validate_completion_protocol,
-    _weekly_focus_quote_verification_messages,
 )
 from app.agent2.tool_calling.production_contracts import ProductionRuntimeResult
 from app.agent2.weekly_plan_context import (
@@ -936,27 +935,6 @@ def _explicit_weekly_switch_completion(
     )
 
 
-def _weekly_focus_quote_verification_completion(
-    *,
-    decision: str,
-    exact_quote: str,
-) -> _CompletionResponse:
-    return _CompletionResponse(
-        message={
-            "role": "assistant",
-            "content": json.dumps(
-                {
-                    "decision": decision,
-                    "quote_sha256": hashlib.sha256(
-                        exact_quote.encode("utf-8")
-                    ).hexdigest(),
-                }
-            ),
-        },
-        metadata={"finish_reason": "stop"},
-    )
-
-
 def _zero_tool_keep_completion(candidate_reply: str) -> _CompletionResponse:
     return _CompletionResponse(
         message={
@@ -1718,6 +1696,11 @@ def test_weekly_submit_review_keeps_recent_daily_focus_evidence() -> None:
         ),
     )
 
+    review_tool_names = _daily_weekly_write_review_tool_names(
+        parsed.tool_calls,
+        context=context,
+    )
+
     prompt = messages[0]["content"]
     payload = json.loads(messages[1]["content"])
     assert "isolated Agent2 semantic reviewer" in prompt
@@ -1731,6 +1714,8 @@ def test_weekly_submit_review_keeps_recent_daily_focus_evidence() -> None:
     assert payload["trusted_context"]["recent_operations"][-1][
         "tool_name"
     ] == "add_daily_items"
+    assert "add_daily_items" in review_tool_names
+    assert "confirm_report" in review_tool_names
 
 
 def test_focus_conflict_adjudicator_does_not_see_older_weekly_plan_state() -> None:
@@ -1750,17 +1735,6 @@ def test_focus_conflict_adjudicator_does_not_see_older_weekly_plan_state() -> No
     assert focus_context["today_report"]["report_date"] == "2026-08-21"
     assert "weekly_plan" not in focus_context
     assert "weekly_plan_targets" not in focus_context
-
-
-def test_weekly_scope_quote_verifier_receives_no_record_state() -> None:
-    messages = _weekly_focus_quote_verification_messages(
-        exact_quote="没问题 提交",
-    )
-
-    payload = json.loads(messages[1]["content"])
-    assert set(payload) == {"exact_quote", "quote_sha256"}
-    assert payload["exact_quote"] == "没问题 提交"
-    assert "context" not in messages[1]["content"]
 
 
 @pytest.mark.asyncio
@@ -1838,14 +1812,6 @@ async def test_explicit_weekly_submit_can_switch_away_from_recent_daily_focus(
         recent_focus_adjudication_completions=(
             _explicit_weekly_switch_completion(
                 exact_quote="这次提交周工作计划"
-            ),
-            _weekly_focus_quote_verification_completion(
-                decision="approve",
-                exact_quote="这次提交周工作计划",
-            ),
-            _weekly_focus_quote_verification_completion(
-                decision="approve",
-                exact_quote="这次提交周工作计划",
             ),
             _explicit_weekly_switch_completion(
                 exact_quote="这次提交周工作计划"
@@ -1973,10 +1939,6 @@ async def test_one_focus_switch_vote_cannot_override_recent_daily_focus(
         recent_focus_adjudication_completions=(
             _explicit_weekly_switch_completion(
                 exact_quote="没有问题，按这个提交"
-            ),
-            _weekly_focus_quote_verification_completion(
-                decision="reject",
-                exact_quote="没有问题，按这个提交",
             ),
             _tool_completion(
                 _daily_empty_risk_submit_call(

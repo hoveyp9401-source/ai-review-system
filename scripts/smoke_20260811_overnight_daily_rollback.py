@@ -342,10 +342,17 @@ async def _turn(
         original_audit_recorder(payload)
 
     async def capture_successful_model_turns(adapter, *args, **kwargs):
+        runtime_context = kwargs.get("context")
         result = await original_run_canary_turn(adapter, *args, **kwargs)
         model_audits.append(
             {
                 "status": "success",
+                "recent_record_focus": (
+                    runtime_context.recent_record_focus()
+                    if runtime_context is not None
+                    and hasattr(runtime_context, "recent_record_focus")
+                    else None
+                ),
                 "result_receipts": [
                     {
                         "tool_name": receipt.tool_name,

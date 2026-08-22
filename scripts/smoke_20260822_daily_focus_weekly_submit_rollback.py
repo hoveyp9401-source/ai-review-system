@@ -67,6 +67,7 @@ def _safe_failure(name: str, exc: Exception) -> dict[str, object]:
         failure["reason"] = raw[:300]
     elif isinstance(raw, dict):
         for key in (
+            "error",
             "reason",
             "business_result",
             "release_blockers",
@@ -77,7 +78,66 @@ def _safe_failure(name: str, exc: Exception) -> dict[str, object]:
         ):
             if key in raw:
                 failure[key] = raw[key]
+        if isinstance(raw.get("model_audits"), list):
+            failure["model_flow"] = _safe_model_flow(
+                raw["model_audits"]
+            )
     return failure
+
+
+def _safe_model_flow(audits: list[dict[str, object]]) -> list[dict[str, object]]:
+    flow: list[dict[str, object]] = []
+    for audit in audits:
+        turns = audit.get("turns")
+        if not isinstance(turns, list):
+            continue
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            message = turn.get("message")
+            calls = (
+                message.get("calls")
+                if isinstance(message, dict)
+                else None
+            )
+            metadata = turn.get("response_metadata")
+            flow.append(
+                {
+                    "iteration": turn.get("iteration"),
+                    "tool_names": [
+                        str(item.get("name") or "")
+                        for item in calls
+                        if isinstance(item, dict)
+                    ]
+                    if isinstance(calls, list)
+                    else [],
+                    "markers": sorted(
+                        str(key)
+                        for key, value in metadata.items()
+                        if value is True
+                        and (
+                            "review" in str(key)
+                            or "focus" in str(key)
+                            or "adjudication" in str(key)
+                        )
+                    )
+                    if isinstance(metadata, dict)
+                    else [],
+                    "focus_guard": {
+                        str(key): value
+                        for key, value in metadata.items()
+                        if str(key).startswith(
+                            "recent_record_focus_guard_"
+                        )
+                    }
+                    if isinstance(metadata, dict)
+                    else {},
+                    "adapter_context_focus": audit.get(
+                        "recent_record_focus"
+                    ),
+                }
+            )
+    return flow
 
 
 def _daily_state(report: DailyReport) -> dict[str, object]:
@@ -246,9 +306,21 @@ async def _run_case(
     async with AsyncSessionLocal() as session:
         try:
             user, settings = await _user_and_control(session)
+            control = await session.scalar(
+                select(ToolCallCanaryControl).where(
+                    ToolCallCanaryControl.user_id == str(user.id),
+                    ToolCallCanaryControl.enabled.is_(True),
+                )
+            )
+            if control is None:
+                raise AssertionError("enabled Agent2 control is missing")
             binding = await session.scalar(
                 select(Agent2IdentityBinding).where(
                     Agent2IdentityBinding.user_id == str(user.id),
+                    Agent2IdentityBinding.tenant_id
+                    == control.tenant_id,
+                    Agent2IdentityBinding.dingtalk_user_id
+                    == user.dingtalk_user_id,
                     Agent2IdentityBinding.active.is_(True),
                 )
             )
@@ -277,6 +349,7 @@ async def _run_case(
                 now=now,
                 case_name=name,
             )
+            model_audits: list[dict[str, object]] = []
             outcome = await _turn(
                 session,
                 user=user,
@@ -288,6 +361,7 @@ async def _run_case(
                 now=now,
                 conversation_kind="direct",
                 message_occurred_at=now,
+                model_audit_sink=model_audits,
             )
             if outcome.messages_enabled:
                 raise AssertionError("rollback smoke transport was enabled")
@@ -312,7 +386,13 @@ async def _run_case(
             tools = [row.tool_name for row in receipts]
             if expected_domain == "daily":
                 if "submit_next_weekly_plan" in tools:
-                    raise AssertionError("older Weekly Work Plan was submitted")
+                    raise AssertionError(
+                        {
+                            "reason": "older Weekly Work Plan was submitted",
+                            "unexpected_tools": tools,
+                            "model_flow": _safe_model_flow(model_audits),
+                        }
+                    )
                 if tools not in (["add_daily_items"], ["confirm_report"]):
                     raise AssertionError({"unexpected_tools": tools})
                 if report.status != "completed" or not report.confirmed_by_user:
