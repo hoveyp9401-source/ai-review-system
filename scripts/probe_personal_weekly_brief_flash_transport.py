@@ -29,11 +29,22 @@ from scripts.run_agent2_personal_weekly_brief_model_eval import (
 
 
 class _TokenCappedClient:
-    def __init__(self, client: LLMClient, *, max_tokens: int) -> None:
+    def __init__(
+        self,
+        client: LLMClient,
+        *,
+        max_tokens: int,
+        stage: str = "",
+        stage_state: dict[str, str] | None = None,
+    ) -> None:
         self._client = client
         self._max_tokens = max_tokens
+        self._stage = stage
+        self._stage_state = stage_state
 
     async def complete_json(self, **kwargs: Any) -> str:
+        if self._stage and self._stage_state is not None:
+            self._stage_state["value"] = self._stage
         requested = int(kwargs.get("max_tokens") or self._max_tokens)
         kwargs["max_tokens"] = min(requested, self._max_tokens)
         return await self._client.complete_json(**kwargs)
@@ -138,10 +149,13 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     if not settings.llm_api_key or not settings.llm_base_url:
         raise RuntimeError("real model configuration is missing")
     base_client = LLMClient(settings)
+    stage_state = {"value": "generation"}
     generator = Agent2PersonalWeeklyBriefGenerator(
         _TokenCappedClient(
             base_client,
             max_tokens=args.generation_max_tokens,
+            stage="generation",
+            stage_state=stage_state,
         ),
         model=EXPECTED_MODEL,
         thinking_enabled=args.generation_thinking == "enabled",
@@ -152,6 +166,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         _TokenCappedClient(
             base_client,
             max_tokens=args.review_max_tokens,
+            stage="independent_review",
+            stage_state=stage_state,
         ),
         model=EXPECTED_MODEL,
         thinking_enabled=args.review_thinking == "enabled",
@@ -167,7 +183,6 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         for round_number in range(1, args.rounds + 1):
             started = perf_counter()
-            stage = "generation"
             try:
                 outcome = await pipeline.generate_and_review(
                     snapshot=snapshot,
@@ -207,7 +222,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                     {
                         "round": round_number,
                         "status": "FAIL",
-                        "stage": stage,
+                        "stage": stage_state["value"],
                         "elapsed_seconds": round(perf_counter() - started, 3),
                         **_error_payload(exc),
                     }
@@ -217,7 +232,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         {
                             "round": round_number,
                             "status": "FAIL",
-                            "stage": stage,
+                            "stage": stage_state["value"],
                             "error_type": type(exc).__name__,
                         }
                     ),

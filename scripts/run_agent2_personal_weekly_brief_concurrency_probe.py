@@ -22,6 +22,7 @@ from app.agent2.personal_weekly_brief import (
     PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
     PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
     PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
 )
 from app.agent2.tool_calling.canary_config import (
     CANARY_MAX_REQUEST_ATTEMPTS,
@@ -48,6 +49,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--case", choices=("empty", "complex"), default="empty")
+    parser.add_argument("--waves", type=int, default=1, choices=range(1, 20))
     return parser.parse_args()
 
 
@@ -113,6 +115,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
         ),
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+        review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     )
     active = 0
     maximum_active = 0
@@ -154,24 +157,35 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     wall_started = perf_counter()
     try:
-        results = list(await asyncio.gather(*(one_owner(index) for index in range(CONCURRENCY))))
+        results = []
+        for wave in range(args.waves):
+            wave_results = await asyncio.gather(
+                *(
+                    one_owner(wave * CONCURRENCY + index)
+                    for index in range(CONCURRENCY)
+                )
+            )
+            results.extend(wave_results)
     finally:
         await client.close()
     wall_seconds = perf_counter() - wall_started
+    expected_count = CONCURRENCY * args.waves
     success_count = sum(item["status"] == "PASS" for item in results)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "status": (
             "PASS"
-            if success_count == CONCURRENCY and maximum_active == CONCURRENCY
+            if success_count == expected_count and maximum_active == CONCURRENCY
             else "FAIL"
         ),
         "model": CANARY_MODEL_NAME,
         "case": args.case,
+        "waves": args.waves,
+        "expected_count": expected_count,
         "configured_concurrency": CONCURRENCY,
         "maximum_observed_active_owners": maximum_active,
         "success_count": success_count,
-        "failure_count": CONCURRENCY - success_count,
+        "failure_count": expected_count - success_count,
         "wall_seconds": round(wall_seconds, 3),
         "started_at": started_at.isoformat(),
         "finished_at": datetime.now(UTC).isoformat(),

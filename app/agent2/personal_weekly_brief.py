@@ -38,6 +38,7 @@ PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED = False
 PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS = 4000
 PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS = 2000
 PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS = 3
+PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES = 3
 _MAX_SECTION_ITEMS = {
     "completed": 12,
     "possible_open_loops": 8,
@@ -50,7 +51,26 @@ _EMPTY_SECTION_NOTES = {
 _CRITICAL_LITERAL_PATTERNS = (
     re.compile(r"(?<!\d)\d{1,4}年\d{1,2}月\d{1,2}日"),
     re.compile(r"(?<!\d)\d{1,2}月\d{1,2}日"),
-    re.compile(r"(?<!\d)\d+(?:\.\d+)?(?:亿元|万元|元|%|笔|份|项|人|天)"),
+    re.compile(r"(?<!\d)\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?!\d)"),
+    re.compile(r"(?<!\d)\d{1,2}[-/]\d{1,2}(?!\d)"),
+    re.compile(r"[¥￥]\s?\d[\d,]*(?:\.\d+)?"),
+    re.compile(
+        r"(?<!\d)\d[\d,]*(?:\.\d+)?"
+        r"(?:亿元|万元|千元|百万元|亿|万|元|%|笔|份|项|人|天)"
+    ),
+)
+_EXPLICIT_NEGATION_MARKERS = (
+    "没有",
+    "并未",
+    "尚未",
+    "未能",
+    "无法",
+    "不能",
+    "未收到",
+    "未完成",
+    "未通过",
+    "不通过",
+    "不再",
 )
 
 
@@ -456,7 +476,7 @@ class Agent2PersonalWeeklyBriefReviewer:
                     "trusted_snapshot": snapshot.as_payload(),
                     "draft": content.as_payload(),
                     "server_checks": {
-                        "critical_amount_date_literals_complete": True,
+                        "recognized_amount_date_literals_complete": True,
                         "frozen_source_dispositions_complete": True,
                         "weekly_plan_sources_exactly_once": True,
                         "section_source_bindings_valid": True,
@@ -557,12 +577,16 @@ class Agent2PersonalWeeklyBriefModelPipeline:
         generator: Agent2PersonalWeeklyBriefGenerator,
         reviewer: Agent2PersonalWeeklyBriefReviewer,
         max_semantic_attempts: int = 2,
+        review_votes: int = 1,
     ) -> None:
         if max_semantic_attempts not in {2, 3}:
             raise ValueError("personal weekly brief semantic attempts must be bounded")
+        if review_votes not in {1, 3}:
+            raise ValueError("personal weekly brief review votes must be one or three")
         self._generator = generator
         self._reviewer = reviewer
         self._max_semantic_attempts = max_semantic_attempts
+        self._review_votes = review_votes
 
     async def generate_and_review(
         self,
@@ -605,57 +629,75 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                 }
                 continue
             generation_durations.append(perf_counter() - generation_started)
-            review_started = perf_counter()
-            model_calls += 1
-            try:
-                review = await self._reviewer.review(
-                    snapshot=snapshot,
+            approvals: list[dict[str, Any]] = []
+            rejections: list[dict[str, str]] = []
+            invalid_reviews = 0
+            for _vote in range(self._review_votes):
+                review_started = perf_counter()
+                model_calls += 1
+                try:
+                    vote = await self._reviewer.review(
+                        snapshot=snapshot,
+                        content=content,
+                    )
+                except PersonalWeeklyBriefReviewRejected as exc:
+                    rejections.extend(dict(issue) for issue in exc.issues)
+                except ValueError:
+                    invalid_reviews += 1
+                else:
+                    approvals.append(vote)
+                finally:
+                    review_durations.append(perf_counter() - review_started)
+
+            required_votes = self._review_votes // 2 + 1
+            if len(approvals) >= required_votes:
+                review = dict(approvals[0])
+                if self._review_votes > 1:
+                    review["review_consensus"] = {
+                        "required": required_votes,
+                        "approved": len(approvals),
+                        "rejected": self._review_votes - len(approvals) - invalid_reviews,
+                        "invalid": invalid_reviews,
+                    }
+                return PersonalWeeklyBriefModelOutcome(
                     content=content,
+                    review=review,
+                    semantic_attempts=attempt,
+                    model_calls=model_calls,
+                    generation_seconds=tuple(generation_durations),
+                    review_seconds=tuple(review_durations),
+                    total_seconds=perf_counter() - started,
                 )
-            except PersonalWeeklyBriefReviewRejected as exc:
-                review_durations.append(perf_counter() - review_started)
-                if attempt >= self._max_semantic_attempts:
-                    raise
-                repair_context = {
-                    "instruction": (
-                        "上一版未通过独立事实复核。保持同一可信快照，"
-                        "逐项修复下列问题并重新返回完整 JSON；不得删除未被指出的关键事实。"
-                        "只能返回 intro、completed、plan_progress、possible_open_loops、"
-                        "source_dispositions 五个顶层字段，不得增加说明或其他字段。"
-                    ),
-                    "previous_draft": content.as_payload(),
-                    "issues": list(exc.issues)[:20],
-                }
-                continue
-            except ValueError:
-                review_durations.append(perf_counter() - review_started)
-                if attempt >= self._max_semantic_attempts:
-                    raise
-                repair_context = {
-                    "instruction": (
-                        "上一轮独立复核输出未通过服务器 JSON/结构校验。"
-                        "保持完整 trusted_snapshot，重新生成完整五字段 JSON，"
-                        "随后服务器会重新执行独立复核。"
-                    ),
-                    "previous_draft": content.as_payload(),
-                    "issues": [
-                        {
-                            "matter_key": "__review_output__",
-                            "reason": "独立复核输出无效，需要重新生成后再次复核。",
-                        }
-                    ],
-                }
-                continue
-            review_durations.append(perf_counter() - review_started)
-            return PersonalWeeklyBriefModelOutcome(
-                content=content,
-                review=review,
-                semantic_attempts=attempt,
-                model_calls=model_calls,
-                generation_seconds=tuple(generation_durations),
-                review_seconds=tuple(review_durations),
-                total_seconds=perf_counter() - started,
-            )
+
+            unique_issues: list[dict[str, str]] = []
+            seen_issues: set[tuple[str, str]] = set()
+            for issue in rejections:
+                key = (issue["matter_key"], issue["reason"])
+                if key not in seen_issues:
+                    seen_issues.add(key)
+                    unique_issues.append(issue)
+            if attempt >= self._max_semantic_attempts:
+                if rejections:
+                    raise PersonalWeeklyBriefReviewRejected(unique_issues[:20])
+                raise ValueError("independent model review returned invalid JSON")
+            if invalid_reviews:
+                unique_issues.append(
+                    {
+                        "matter_key": "__review_output__",
+                        "reason": "独立复核输出无效，需要重新生成后再次复核。",
+                    }
+                )
+            repair_context = {
+                "instruction": (
+                    "上一版未通过独立事实复核多数判断。保持同一可信快照，"
+                    "逐项修复下列问题并重新返回完整 JSON；不得删除未被指出的关键事实。"
+                    "只能返回 intro、completed、plan_progress、possible_open_loops、"
+                    "source_dispositions 五个顶层字段，不得增加说明或其他字段。"
+                ),
+                "previous_draft": content.as_payload(),
+                "issues": unique_issues[:20],
+            }
+            continue
         raise AssertionError("personal weekly brief pipeline exited unexpectedly")
 
 
@@ -708,6 +750,12 @@ def _validated_content(
         name="possible_open_loops",
         source_by_id=source_by_id,
         require_status=False,
+    )
+    completed, plan_progress, possible_open_loops = (
+        _restore_missing_critical_literals(
+            source_by_id=source_by_id,
+            sections=(completed, plan_progress, possible_open_loops),
+        )
     )
     plan_keys = {item.matter_key for item in plan_progress.items}
     open_keys = {item.matter_key for item in possible_open_loops.items}
@@ -764,6 +812,98 @@ def _critical_literals(value: str) -> tuple[str, ...]:
     return tuple(literals)
 
 
+def _critical_verbatim_fragments(value: str) -> tuple[str, ...]:
+    fragments: list[str] = []
+    seen: set[str] = set()
+    sentences = [
+        sentence.strip(" ，,")
+        for sentence in re.split(r"[。；;]+", value)
+        if sentence.strip(" ，,")
+    ]
+    for sentence in sentences:
+        explicit_condition = (
+            ("只有" in sentence and "才" in sentence)
+            or (
+                ("如果" in sentence or "若" in sentence)
+                and any(
+                    consequence in sentence
+                    for consequence in ("则", "将", "会", "无法", "不能")
+                )
+            )
+        )
+        if explicit_condition and sentence not in seen:
+            seen.add(sentence)
+            fragments.append(sentence)
+        for clause in re.split(r"[，,]+", sentence):
+            normalized = clause.strip()
+            if (
+                normalized
+                and any(marker in normalized for marker in _EXPLICIT_NEGATION_MARKERS)
+                and normalized not in seen
+            ):
+                seen.add(normalized)
+                fragments.append(normalized)
+    return tuple(fragments)
+
+
+def _required_critical_facts(value: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (*_critical_literals(value), *_critical_verbatim_fragments(value))
+        )
+    )
+
+
+def _restore_missing_critical_literals(
+    *,
+    source_by_id: dict[str, SourceEvidence],
+    sections: tuple[PersonalWeeklyBriefSection, ...],
+) -> tuple[PersonalWeeklyBriefSection, ...]:
+    mutable_items = [list(section.items) for section in sections]
+    for source_id, source in source_by_id.items():
+        required_facts = _required_critical_facts(source.original_text)
+        if not required_facts:
+            continue
+        locations: list[tuple[int, int]] = []
+        conclusion_parts: list[str] = []
+        for section_index, items in enumerate(mutable_items):
+            for item_index, item in enumerate(items):
+                if source_id in item.source_ids:
+                    locations.append((section_index, item_index))
+                    conclusion_parts.append(item.text)
+        if not locations:
+            continue
+        conclusion = "\n".join(conclusion_parts)
+        missing = [
+            fact for fact in required_facts if fact not in conclusion
+        ]
+        if not missing:
+            continue
+        section_index, item_index = locations[0]
+        original_item = mutable_items[section_index][item_index]
+        restored_text = (
+            f"{original_item.text.rstrip('。')}"
+            f"（关键信息：{'、'.join(missing)}）。"
+        )
+        if len(restored_text) > 1000:
+            raise ValueError(
+                "personal weekly brief critical literal restoration is too long"
+            )
+        mutable_items[section_index][item_index] = PersonalWeeklyBriefItem(
+            matter_key=original_item.matter_key,
+            text=restored_text,
+            source_ids=original_item.source_ids,
+            status=original_item.status,
+        )
+    return tuple(
+        PersonalWeeklyBriefSection(
+            empty_note=section.empty_note,
+            items=tuple(mutable_items[index]),
+        )
+        for index, section in enumerate(sections)
+    )
+
+
 def _validate_critical_literal_coverage(
     *,
     source_by_id: dict[str, SourceEvidence],
@@ -783,7 +923,7 @@ def _validate_critical_literal_coverage(
     ]
     if excluded_critical_sources:
         raise ValueError(
-            "personal weekly brief source with critical amount or date "
+                "personal weekly brief source with critical fact "
             f"cannot be excluded: {excluded_critical_sources[0]}"
         )
     texts_by_source: dict[str, list[str]] = {
@@ -798,10 +938,12 @@ def _validate_critical_literal_coverage(
         conclusion = "\n".join(texts_by_source[source_id])
         if any(
             literal not in conclusion
-            for literal in _critical_literals(source_by_id[source_id].original_text)
+            for literal in _required_critical_facts(
+                source_by_id[source_id].original_text
+            )
         ):
             raise ValueError(
-                "personal weekly brief critical amount or date literal "
+                "personal weekly brief critical fact "
                 f"is missing for source {source_id}"
             )
 
@@ -1020,6 +1162,7 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 2. 今日工作中的“跟进、沟通、准备、起草、计划”等不得改写成“完成”。金额、日期、对象、条件、否定等关键事实不能遗漏或改变。
    明确否定必须保留否定的具体对象：例如来源写“对方没有承诺付款”，可以写“尚未明确付款承诺”，但不能只概括成“尚未有结果”或“尚未闭环”。
 3. 同一项目、案件或事项跨多天重复且指向明确时，必须合并为一条，保留所有关键进展和事实；只有无法可靠判断是否同一事项时才分开，不得靠猜测强行合并。
+   周计划与日报建立进展关系时，必须有相同的具体项目、案件、公司、文件或明确上下文对象；仅“项目、合同、案件、材料”等泛词相同不算同一事项。找不到同一对象的后来日报时，周计划只能标为“暂时没有找到后续记录”，不得为了凑进展绑定到另一事项。
 4. 计划进展状态只能是：已完成、持续推进、安排调整、后续安排、暂时没有找到后续记录。除最后一种外，必须同时引用周计划和当日或后来日报证据；没有后来记录时只能用最后一种，绝不能说“未完成”。trusted_snapshot 中每个 source_kind=weekly_plan 的 source_id 都必须在 plan_progress 中恰好引用一次；同一事项跨日时可以在一条进展中引用多条周计划来源，但不得漏项或重复。
 5. plan_progress 与 possible_open_loops 中同一事项只能出现一次，并使用相同的稳定 matter_key 来帮助服务器去重；plan_progress 已引用的任何 source_id 都不能再次用于 possible_open_loops，即使换了 matter_key 也不行。
 6. 没有数据、只有部分日期、没有周计划或没有风险栏时如实说明，不得编造。
@@ -1042,13 +1185,13 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核步骤。你不能改写草稿，只能逐项判断是否安全通过。
 
 必须先按 trusted_snapshot.sources 中每一条实际引用的 source_id 逐条对照原文，再按 matter_key 汇总结论；不能只看草稿是否通顺。对每个 matter_key 检查：
-1. 结论引用的 source_ids 是否真的支持文字，是否有伪造来源；completed 每项是否至少引用 today_work 日报来源；
-2. 对该事项引用的每个 source_id，是否改变或遗漏其中任何金额、日期、对象、条件、否定、归属和完成状态；只要一个来源中的这类关键事实没有进入结论，就必须拒绝。允许合并同义表达、删除“继续跟进”等重复过程词，不要求逐字复制原文；
+1. 结论是否得到所列来源的语义支持，是否编造了来源没有的对象、动作或结果；来源ID绑定和 completed 的 today_work 绑定已经由服务器检查，不再重复判断；
+2. 对该事项引用的来源，是否改变或遗漏其中任何对象、条件、否定、归属和完成状态；金额与明确日期已由服务器做字面核对，不得再提出金额或日期遗漏问题。允许合并同义表达、删除“继续跟进”等重复过程词，不要求逐字复制原文；
 3. 是否把跟进、沟通、准备、起草或计划武断写成完成；
-4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”；每条 weekly_plan 来源是否在计划进展中恰好出现一次。“后续安排”可以由后来日报的 tomorrow_plan 支持，它不表示已完成；“安排调整”只需后来日报明确记录安排发生变化，不要求再有调整后事项的最终完成证据。
+4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”。周计划来源是否逐项覆盖已由服务器检查，不再重复判断。“后续安排”可以由后来日报的 tomorrow_plan 支持，它不表示已完成；“安排调整”只需后来日报明确记录安排发生变化，不要求再有调整后事项的最终完成证据。
 5. 计划进展和可能未闭环中是否重复同一事项。仅来自日报、并非周计划的谨慎未闭环事项可以只出现在 possible_open_loops，不要求进入 plan_progress；已经在 plan_progress 中说明调整或未找到后续记录的计划事项，不应再复制到 possible_open_loops。
 6. 无数据或部分数据时是否编造。
-7. source_dispositions 是否逐条覆盖冻结来源全集；所有 cited 是否真的被条目引用；所有 safely_excluded 是否未被引用且理由具体、安全，没有借排除理由静默丢失应汇总事实。
+7. source_dispositions 的逐条覆盖、cited绑定和 safely_excluded 结构已由服务器检查，不再重复判断；只判断安全排除理由在语义上是否明显掩盖了应汇总的重要事项。
 8. intro 与 empty_note 是否只作系统说明、不承载业务结论；所有业务事实是否都在带来源ID的 items 中。空数据说明是否与可信空快照一致。
 
 以下情况明确属于安全，不得据此拒绝：
@@ -1065,7 +1208,7 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
   "reviewed_matter_keys": ["逐个唯一事项键"],
   "issues": [{"matter_key": "事项键", "reason": "不通过原因"}]
 }
-user_prompt 中的 server_checks 是服务器在调用你之前已经完成的确定性核对，值为 true 时具有最高权威：不得再次声称金额/明确日期遗漏、来源全集不完整、周计划来源漏项/重复或栏目来源绑定错误。你只需独立审核服务器无法确定的语义：条件与否定是否改变、完成状态是否夸大、对象与事项是否编造、计划状态和跨日归类是否正确。
+user_prompt 中的 server_checks 是服务器在调用你之前已经完成的确定性核对。recognized_amount_date_literals_complete=true 只表示服务器已核对它能识别的常见金额和日期格式，不代表所有自然语言数字都已核对；你不得误报已被服务器确认存在的字面金额/日期，但仍需检查其他自然表达。其余 true 项具有最高权威：不得再次声称来源全集不完整、周计划来源漏项/重复或栏目来源绑定错误。你还需独立审核服务器无法确定的语义：条件与否定是否改变、完成状态是否夸大、对象与事项是否编造、计划状态和跨日归类是否正确。
 issues 只能列出真正不安全、需要修复的事项；禁止把“通过、符合规则、未发现问题”的检查过程写入 issues。全部事项安全时，approved 必须为 true 且 issues 必须是空数组；只要一项不安全，approved 必须为 false。reason 只用一句话指出具体遗漏或错误，不写检查过程、通过说明或推测服务器未提供的来源。不得自行生成替换文字，也不得增加 explanation、summary 或逐项通过说明字段。"""
 
 
@@ -1078,6 +1221,7 @@ __all__ = [
     "PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED",
     "PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS",
     "PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED",
+    "PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES",
     "PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS",
     "PersonalWeeklyBriefContent",
     "PersonalWeeklyBriefItem",

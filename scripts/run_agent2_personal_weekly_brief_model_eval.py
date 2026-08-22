@@ -25,6 +25,7 @@ from app.agent2.personal_weekly_brief import (
     PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
     PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
     PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     PersonalWeeklyBriefContent,
     PersonalWeeklyBriefReviewRejected,
     PersonalWeeklyBriefSnapshot,
@@ -325,6 +326,8 @@ def _assert_partial_without_plan(
         raise AssertionError(
             "partial-date non-completion was not preserved as one open loop"
         )
+    if "付款条件" not in matching_open_loops[0].text:
+        raise AssertionError("partial-date pending payment condition was lost")
     return {"daily_dates": ["2026-08-17", "2026-08-20"], "plan_items": 0}
 
 
@@ -458,10 +461,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         generator=generator,
         reviewer=reviewer,
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+        review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     )
     results: list[dict[str, Any]] = []
     successful_content_by_case: dict[str, PersonalWeeklyBriefContent] = {}
     repair_performance_exercise: dict[str, Any] | None = None
+    maximum_bounded_model_call_exercise: dict[str, Any] | None = None
     try:
         for round_number in range(1, args.rounds + 1):
             for case_id, snapshot, validator in _cases():
@@ -567,7 +572,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             (
                 item
                 for item in reversed(results)
-                if item["model_metrics"]["model_calls"] == 4
+                if item["model_metrics"]["semantic_attempts"] > 1
             ),
             None,
         )
@@ -575,8 +580,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             repair_performance_exercise = {
                 "status": "PASS",
                 "exercise_kind": "natural_bounded_repair_from_real_matrix",
-                "combined_worst_path_model_calls": 4,
-                "combined_worst_path_seconds": natural_repair[
+                "observed_bounded_path_model_calls": natural_repair[
+                    "model_metrics"
+                ]["model_calls"],
+                "observed_bounded_path_seconds": natural_repair[
                     "model_metrics"
                 ]["total_seconds"],
                 "case_id": natural_repair["case_id"],
@@ -631,11 +638,24 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 perf_counter() - repair_generation_started
             )
             repair_review_started = perf_counter()
-            repaired_review = await reviewer.review(
-                snapshot=_complex_snapshot(),
-                content=repaired_content,
-            )
+            repair_approvals = 0
+            repair_rejections = 0
+            repair_invalid = 0
+            for _review_vote in range(PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES):
+                try:
+                    await reviewer.review(
+                        snapshot=_complex_snapshot(),
+                        content=repaired_content,
+                    )
+                except PersonalWeeklyBriefReviewRejected:
+                    repair_rejections += 1
+                except ValueError:
+                    repair_invalid += 1
+                else:
+                    repair_approvals += 1
             repair_review_seconds = perf_counter() - repair_review_started
+            if repair_approvals < PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES // 2 + 1:
+                raise AssertionError("forced repair review consensus did not approve")
             repair_assertions = _assert_complex(repaired_content)
             repair_phase_seconds = (
                 repair_generation_seconds + repair_review_seconds
@@ -649,9 +669,15 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "exercise_kind": (
                     "forced_repair_with_real_generation_and_real_review"
                 ),
-                "normal_phase_model_calls": 2,
-                "repair_phase_model_calls": 2,
-                "combined_worst_path_model_calls": 4,
+                "normal_phase_model_calls": normal_complex["model_metrics"][
+                    "model_calls"
+                ],
+                "repair_phase_model_calls": 1 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
+                "observed_bounded_path_model_calls": normal_complex[
+                    "model_metrics"
+                ]["model_calls"]
+                + 1
+                + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
                 "repair_generation_seconds": round(
                     repair_generation_seconds, 3
                 ),
@@ -660,21 +686,113 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "normal_phase_seconds": normal_complex["model_metrics"][
                     "total_seconds"
                 ],
-                "combined_worst_path_seconds": round(combined_seconds, 3),
-                "independent_model_review": repaired_review,
+                "observed_bounded_path_seconds": round(combined_seconds, 3),
+                "review_consensus": {
+                    "approved": repair_approvals,
+                    "rejected": repair_rejections,
+                    "invalid": repair_invalid,
+                },
                 "assertions": repair_assertions,
                 "content": repaired_content.as_payload(),
                 "trace": repaired_content.trace_payload(),
             }
         combined_seconds = float(
-            repair_performance_exercise["combined_worst_path_seconds"]
+            repair_performance_exercise["observed_bounded_path_seconds"]
         )
         print(
             json.dumps(
                 {
                     "event": "repair_performance_exercise_passed",
-                    "combined_model_calls": 4,
+                    "combined_model_calls": repair_performance_exercise[
+                        "observed_bounded_path_model_calls"
+                    ],
                     "combined_seconds": round(combined_seconds, 3),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+        maximum_started = perf_counter()
+        phase_results: list[dict[str, Any]] = []
+        previous_content: PersonalWeeklyBriefContent | None = None
+        maximum_snapshot = _empty_snapshot()
+        for phase in range(1, PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS + 1):
+            repair_context = None
+            if previous_content is not None:
+                repair_context = {
+                    "instruction": (
+                        "这是最大有界调用路径的脱敏稳定性演练。"
+                        "保持全部可信事实，重新返回完整结构。"
+                    ),
+                    "previous_draft": previous_content.as_payload(),
+                    "issues": [
+                        {
+                            "matter_key": "__brief__",
+                            "reason": "再次逐项核对金额、日期、条件、否定和计划状态。",
+                        }
+                    ],
+                }
+            generation_started = perf_counter()
+            phase_content = await generator.generate(
+                snapshot=maximum_snapshot,
+                recipient_name="脱敏用户",
+                personal_memory={"entries": []},
+                repair_context=repair_context,
+            )
+            generation_seconds = perf_counter() - generation_started
+            review_started = perf_counter()
+            phase_approvals = 0
+            phase_rejections = 0
+            phase_invalid = 0
+            for _review_vote in range(PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES):
+                try:
+                    await reviewer.review(
+                        snapshot=maximum_snapshot,
+                        content=phase_content,
+                    )
+                except PersonalWeeklyBriefReviewRejected:
+                    phase_rejections += 1
+                except ValueError:
+                    phase_invalid += 1
+                else:
+                    phase_approvals += 1
+            review_seconds = perf_counter() - review_started
+            if phase_approvals < PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES // 2 + 1:
+                raise AssertionError("maximum bounded review consensus did not approve")
+            phase_assertions = _assert_empty(phase_content)
+            phase_results.append(
+                {
+                    "phase": phase,
+                    "generation_seconds": round(generation_seconds, 3),
+                    "review_seconds": round(review_seconds, 3),
+                    "review_consensus": {
+                        "approved": phase_approvals,
+                        "rejected": phase_rejections,
+                        "invalid": phase_invalid,
+                    },
+                    "assertions": phase_assertions,
+                }
+            )
+            previous_content = phase_content
+        maximum_bounded_model_call_exercise = {
+            "status": "PASS",
+            "model_calls": PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS
+            * (1 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES),
+            "semantic_phases": PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+            "total_seconds": round(perf_counter() - maximum_started, 3),
+            "phases": phase_results,
+        }
+        print(
+            json.dumps(
+                {
+                    "event": "maximum_bounded_model_call_exercise_passed",
+                    "model_calls": maximum_bounded_model_call_exercise[
+                        "model_calls"
+                    ],
+                    "total_seconds": maximum_bounded_model_call_exercise[
+                        "total_seconds"
+                    ],
                 },
                 ensure_ascii=False,
             ),
@@ -689,17 +807,22 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     normal_totals = [
         float(item["model_metrics"]["total_seconds"])
         for item in results
-        if item["model_metrics"]["model_calls"] == 2
+        if item["model_metrics"]["semantic_attempts"] == 1
     ]
     repair_totals = [
         float(item["model_metrics"]["total_seconds"])
         for item in results
-        if item["model_metrics"]["model_calls"] == 4
+        if item["model_metrics"]["semantic_attempts"] > 1
     ]
     if repair_performance_exercise is None:
         raise AssertionError("repair performance exercise did not run")
     repair_totals.append(
-        float(repair_performance_exercise["combined_worst_path_seconds"])
+        float(repair_performance_exercise["observed_bounded_path_seconds"])
+    )
+    if maximum_bounded_model_call_exercise is None:
+        raise AssertionError("maximum bounded model-call exercise did not run")
+    maximum_bounded_seconds = float(
+        maximum_bounded_model_call_exercise["total_seconds"]
     )
     concurrency_limit = 4
     projected_seconds = math.ceil(74 / concurrency_limit) * max(observed_totals)
@@ -710,18 +833,23 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "rounds": args.rounds,
         "case_count": len(results),
         "repair_performance_exercise": repair_performance_exercise,
+        "maximum_bounded_model_call_exercise": (
+            maximum_bounded_model_call_exercise
+        ),
         "performance": {
-            "normal_model_calls_per_owner": 2,
+            "normal_model_calls_per_owner": 1 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
             "maximum_model_calls_per_owner": (
-                PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS * 2
+                PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS
+                * (1 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES)
             ),
             "observed_owner_seconds_min": min(observed_totals),
             "observed_owner_seconds_max": max(observed_totals),
             "observed_owner_seconds_average": round(
                 sum(observed_totals) / len(observed_totals), 3
             ),
-            "normal_two_call_owner_seconds": normal_totals,
-            "repair_four_call_owner_seconds": repair_totals,
+            "normal_consensus_owner_seconds": normal_totals,
+            "repair_consensus_owner_seconds": repair_totals,
+            "maximum_twelve_call_owner_seconds": maximum_bounded_seconds,
             "production_concurrency_limit": concurrency_limit,
             "projected_74_normal_minutes_using_observed_max": (
                 round(
@@ -738,6 +866,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 if repair_totals
                 else None
+            ),
+            "projected_74_maximum_six_call_minutes": round(
+                math.ceil(74 / concurrency_limit)
+                * maximum_bounded_seconds
+                / 60,
+                3,
             ),
             "projected_74_owner_seconds_using_observed_max": round(
                 projected_seconds, 3

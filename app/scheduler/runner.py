@@ -43,6 +43,7 @@ from app.agent2.personal_weekly_brief import (
     PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
     PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
     PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     PersonalWeeklyBriefSnapshot,
     derive_personal_weekly_brief_window,
 )
@@ -687,6 +688,7 @@ async def run_personal_weekly_brief_generation_job(
         generator=generator,
         reviewer=reviewer,
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+        review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     )
 
     async def generate_one(row):
@@ -946,6 +948,7 @@ async def run_personal_weekly_brief_reconcile_job(
             max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
         ),
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+        review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     )
     delivered_count = 0
     for week_start in sorted({row.week_start for row in requeued_generation}):

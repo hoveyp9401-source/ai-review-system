@@ -15,6 +15,7 @@ from app.agent2.personal_weekly_brief import (
     PersonalWeeklyBriefModelOutputInvalid,
     PersonalWeeklyBriefSnapshot,
     SourceEvidence,
+    _critical_literals,
     derive_personal_weekly_brief_window,
 )
 
@@ -148,7 +149,7 @@ async def test_independent_reviewer_accepts_real_model_json_code_fence() -> None
     assert review_llm.calls[0]["max_retries"] == 1
     review_payload = json.loads(review_llm.calls[0]["user_prompt"])
     assert review_payload["server_checks"] == {
-        "critical_amount_date_literals_complete": True,
+        "recognized_amount_date_literals_complete": True,
         "frozen_source_dispositions_complete": True,
         "weekly_plan_sources_exactly_once": True,
         "section_source_bindings_valid": True,
@@ -180,6 +181,24 @@ def test_snapshot_rejects_unbounded_model_input() -> None:
     )
     with pytest.raises(ValueError, match="too many sources"):
         _snapshot(*too_many)
+
+
+def test_critical_literal_guard_covers_common_amount_and_date_formats() -> None:
+    literals = set(
+        _critical_literals(
+            "截止2026-09-01复核，9/1再确认；金额100万、￥1,000,000，"
+            "另有1,000,000元和12.5%。"
+        )
+    )
+
+    assert {
+        "2026-09-01",
+        "9/1",
+        "100万",
+        "￥1,000,000",
+        "1,000,000元",
+        "12.5%",
+    }.issubset(literals)
 
 
 def test_snapshot_rejects_excessive_total_source_text() -> None:
@@ -475,18 +494,18 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
         ],
     }
 
-    with pytest.raises(
-        PersonalWeeklyBriefModelOutputInvalid,
-        match="critical amount or date literal",
-    ):
-        await Agent2PersonalWeeklyBriefGenerator(
-            _FakeLLM(payload),
-            model="agent2-model",
-        ).generate(
-            snapshot=_snapshot(source),
-            recipient_name="测试用户",
-            personal_memory={"entries": []},
-        )
+    restored = await Agent2PersonalWeeklyBriefGenerator(
+        _FakeLLM(payload),
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(source),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert "120万元" in restored.message_text
+    assert "8月20日" in restored.message_text
+    assert "关键信息" in restored.message_text
 
     excluded_payload = {
         "intro": "本周简报。",
@@ -503,7 +522,7 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
     }
     with pytest.raises(
         PersonalWeeklyBriefModelOutputInvalid,
-        match="critical amount or date cannot be excluded",
+        match="source with critical fact",
     ):
         await Agent2PersonalWeeklyBriefGenerator(
             _FakeLLM(excluded_payload),
@@ -513,6 +532,51 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
+
+
+@pytest.mark.asyncio
+async def test_server_restores_explicit_condition_and_negation_fragments() -> None:
+    source = _source(
+        "daily:critical-semantics",
+        kind="daily_report",
+        on_date=date(2026, 8, 20),
+        section="today_work",
+        text="对方没有承诺付款，表示只有付款条件确认后才答复。",
+    )
+    result = await Agent2PersonalWeeklyBriefGenerator(
+        _FakeLLM(
+            {
+                "intro": "本周简报。",
+                "completed": {
+                    "empty_note": "",
+                    "items": [
+                        {
+                            "matter_key": "payment-followup",
+                            "text": "继续跟进付款事项。",
+                            "source_ids": [source.source_id],
+                        }
+                    ],
+                },
+                "plan_progress": _empty_section("没有周计划。"),
+                "possible_open_loops": _empty_section("没有重复提示。"),
+                "source_dispositions": [
+                    {
+                        "source_id": source.source_id,
+                        "disposition": "cited",
+                        "reason": "",
+                    }
+                ],
+            }
+        ),
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(source),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert "对方没有承诺付款" in result.message_text
+    assert "表示只有付款条件确认后才答复" in result.message_text
 
 
 def test_reviewer_prompt_does_not_duplicate_source_trace() -> None:
@@ -601,6 +665,82 @@ async def test_model_pipeline_can_use_two_bounded_repairs_for_weekly_batch() -> 
 
     assert outcome.semantic_attempts == 3
     assert outcome.model_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_three_review_votes_prevent_one_false_rejection() -> None:
+    valid = {
+        "intro": "本周没有已保存的数据。",
+        "completed": _empty_section("没有日报今日工作记录。"),
+        "plan_progress": _empty_section("没有周计划记录。"),
+        "possible_open_loops": _empty_section("没有数据时不推测。"),
+    }
+    rejected = {
+        "approved": False,
+        "reviewed_matter_keys": [],
+        "issues": [{"matter_key": "__brief__", "reason": "误判为存在遗漏。"}],
+    }
+    approved = {"approved": True, "reviewed_matter_keys": [], "issues": []}
+    llm = _SequenceLLM(valid, rejected, approved, approved)
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+        review_votes=3,
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.model_calls == 4
+    assert outcome.review["review_consensus"] == {
+        "required": 2,
+        "approved": 2,
+        "rejected": 1,
+        "invalid": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_three_review_votes_repair_after_majority_rejection() -> None:
+    valid = {
+        "intro": "本周没有已保存的数据。",
+        "completed": _empty_section("没有日报今日工作记录。"),
+        "plan_progress": _empty_section("没有周计划记录。"),
+        "possible_open_loops": _empty_section("没有数据时不推测。"),
+    }
+    rejected = {
+        "approved": False,
+        "reviewed_matter_keys": [],
+        "issues": [{"matter_key": "__brief__", "reason": "需要重做。"}],
+    }
+    approved = {"approved": True, "reviewed_matter_keys": [], "issues": []}
+    llm = _SequenceLLM(
+        valid,
+        rejected,
+        rejected,
+        approved,
+        valid,
+        approved,
+        approved,
+        approved,
+    )
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+        review_votes=3,
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.semantic_attempts == 2
+    assert outcome.model_calls == 8
 
 
 @pytest.mark.asyncio

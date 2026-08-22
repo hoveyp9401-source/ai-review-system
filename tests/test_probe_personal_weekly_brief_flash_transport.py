@@ -49,6 +49,21 @@ def test_probe_caps_weekly_tokens_without_changing_other_request_fields() -> Non
     }
 
 
+def test_probe_records_the_actual_generation_or_review_stage() -> None:
+    base = _RecordingClient()
+    state = {"value": "generation"}
+    client = _TokenCappedClient(  # type: ignore[arg-type]
+        base,
+        max_tokens=2000,
+        stage="independent_review",
+        stage_state=state,
+    )
+
+    asyncio.run(client.complete_json(max_tokens=8000))
+
+    assert state["value"] == "independent_review"
+
+
 def test_probe_classifies_remote_disconnect_without_copying_error_text() -> None:
     error = RuntimeError("Server disconnected without sending a response")
 

@@ -6,6 +6,7 @@ from app.agent2.personal_weekly_brief import (
     PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
     PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
     PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
 )
 
 from scripts.run_agent2_personal_weekly_brief_concurrency_probe import (
@@ -67,10 +68,13 @@ def test_production_weekly_brief_uses_two_fast_independent_flash_calls() -> None
     ) == 2
     assert runner.count("max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS") == 2
     assert PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS == 3
+    assert PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES == 3
     assert runner.count(
         "max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS"
     ) == 2
+    assert runner.count("review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES") == 2
     model_eval = Path(
         "scripts/run_agent2_personal_weekly_brief_model_eval.py"
     ).read_text(encoding="utf-8")
-    assert "PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS * 2" in model_eval
+    assert "maximum_twelve_call_owner_seconds" in model_eval
+    assert model_eval.count("PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES") >= 5

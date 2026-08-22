@@ -1,0 +1,54 @@
+{
+  "schema_version": "agent2.personal_weekly_brief.fast_flash_fix.v1",
+  "verified_at": "2026-08-22T18:10:33+08:00",
+  "model": "deepseek-v4-flash",
+  "root_cause": {
+    "thinking_enabled_max_tokens": 8000,
+    "failed_finish_reason": "length",
+    "failed_reasoning_length": 17811,
+    "failed_content_length": 1185,
+    "failed_completion_tokens": 8000,
+    "conclusion": "explicit thinking exhausted the completion budget and truncated the JSON result"
+  },
+  "fixed_protocol": {
+    "generation_thinking_enabled": false,
+    "review_thinking_enabled": false,
+    "generation_max_tokens": 4000,
+    "review_max_tokens": 2000,
+    "review_votes": 3,
+    "review_majority_required": 2,
+    "maximum_semantic_attempts": 3,
+    "maximum_model_calls": 12,
+    "server_restores_missing_exact_amounts_dates_conditions_and_negations": true
+  },
+  "raw_no_thinking_probe": {
+    "rounds": 2,
+    "passed": 2,
+    "finish_reasons": ["stop", "stop"],
+    "elapsed_seconds": [4.235, 4.209],
+    "completion_tokens": [889, 900]
+  },
+  "real_model_matrix": {
+    "status": "PASS",
+    "case_count": 12,
+    "observed_owner_seconds_average": 7.025,
+    "observed_owner_seconds_max": 9.815,
+    "maximum_twelve_call_exercise_status": "PASS",
+    "maximum_twelve_call_exercise_seconds": 16.03,
+    "sha256": "d23b5441eadec714895028ae8b950662ef6afcfe59ebaf70c41fe519ee3ace07"
+  },
+  "sustained_complex_concurrency": {
+    "waves": 19,
+    "configured_concurrency": 4,
+    "owner_pipelines": 76,
+    "success_count": 76,
+    "failure_count": 0,
+    "wall_seconds": 192.981,
+    "sha256": "89960561e77257c7a3ec89d638e73c3748e10ec11ab7368ce39d49df252a4102"
+  },
+  "artifact_mode": "0600",
+  "database_accessed": false,
+  "dingtalk_transport_called": false,
+  "real_user_data_used": false,
+  "result": "PASS"
+}
