@@ -934,15 +934,15 @@ def _validate_critical_literal_coverage(
         )
         if len(encoded_excluded) > 9000:
             encoded_excluded = json.dumps(
-                [
-                    {
-                        "source_id": item["source_id"],
-                        "excluded_context_count": len(
-                            item["excluded_contexts"]
-                        ),
-                    }
-                    for item in excluded_details
-                ],
+                {
+                    "all_excluded_critical_sources_must_be_reprocessed": True,
+                    "excluded_source_count": len(excluded_details),
+                    "instruction": (
+                        "逐项检查 trusted_snapshot 与上一版 "
+                        "source_dispositions；所有含金额或日期且被标为 "
+                        "safely_excluded 的来源都必须重新处理。"
+                    ),
+                },
                 ensure_ascii=False,
                 separators=(",", ":"),
             )

@@ -696,16 +696,16 @@ async def test_all_excluded_critical_sources_are_reported_in_one_repair() -> Non
 
 
 @pytest.mark.asyncio
-async def test_many_excluded_critical_sources_keep_all_ids_within_repair_limit() -> None:
+async def test_maximum_excluded_critical_sources_fit_within_repair_limit() -> None:
     sources = tuple(
         _source(
-            f"daily:excluded:large:{index}",
+            f"daily:{index:03d}:" + "a" * 110,
             kind="daily_report",
             on_date=date(2026, 8, 17 + index % 5),
             section="today_work",
-            text=f"事项{index}金额100万" + "补充说明" * 300 + "。",
+            text=f"事项{index}金额100万" + "补充说明" * 30 + "。",
         )
-        for index in range(10)
+        for index in range(120)
     )
     payload = {
         "intro": "本周简报。",
@@ -734,8 +734,9 @@ async def test_many_excluded_critical_sources_keep_all_ids_within_repair_limit()
 
     error = caught.value.repair_detail
     assert len(error) < 12000
-    assert "excluded_context_count" in error
-    assert all(source.source_id in error for source in sources)
+    assert "all_excluded_critical_sources_must_be_reprocessed" in error
+    assert '"excluded_source_count":120' in error
+    assert "trusted_snapshot" in error
 
 
 def test_reviewer_prompt_does_not_duplicate_source_trace() -> None:
