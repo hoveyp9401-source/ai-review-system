@@ -21,7 +21,7 @@
     "focused_critical_fact_review": true,
     "maximum_semantic_attempts": 3,
     "maximum_model_calls": 15,
-    "server_requires_full_amount_date_contexts": true,
+    "server_reports_full_amount_date_contexts_for_model_repair": true,
     "conditions_negations_and_statuses_remain_model_reviewed": true
   },
   "raw_no_thinking_probe": {

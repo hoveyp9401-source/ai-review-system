@@ -1,4 +1,7 @@
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from app.agent2.personal_weekly_brief import (
     PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
@@ -13,6 +16,7 @@ from scripts.run_agent2_personal_weekly_brief_concurrency_probe import (
     _settings,
 )
 from scripts.run_agent2_personal_weekly_brief_model_eval import (
+    _assert_complex,
     _read_model_only_config,
 )
 
@@ -78,3 +82,50 @@ def test_production_weekly_brief_uses_fast_independent_flash_calls() -> None:
     ).read_text(encoding="utf-8")
     assert "maximum_fifteen_call_owner_seconds" in model_eval
     assert model_eval.count("PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES") >= 5
+
+
+def test_complex_oracle_rejects_weekly_plan_linked_to_wrong_daily_matter() -> None:
+    def item(matter_key, source_ids, *, status="", text=""):
+        return SimpleNamespace(
+            matter_key=matter_key,
+            source_ids=set(source_ids),
+            status=status,
+            text=text,
+        )
+
+    completed = SimpleNamespace(
+        items=(
+            item(
+                "star-river",
+                {"daily:star:mon", "daily:star:thu"},
+                text="对方没有承诺付款，只有付款条件确认后才答复。",
+            ),
+        )
+    )
+    plan_progress = SimpleNamespace(
+        items=(
+            item("a", {"plan:completed", "daily:completed"}, status="已完成"),
+            item("b", {"plan:ongoing", "daily:ongoing"}, status="持续推进"),
+            item("c", {"plan:adjusted", "daily:adjusted"}, status="安排调整"),
+            item("d", {"plan:future", "daily:future"}, status="后续安排"),
+            item("e", {"plan:no-followup"}, status="暂时没有找到后续记录"),
+        )
+    )
+    content = SimpleNamespace(
+        completed=completed,
+        plan_progress=plan_progress,
+        possible_open_loops=SimpleNamespace(items=()),
+        message_text=(
+            "涉案金额120万元，对方原定8月20日前回复。"
+            "对方没有承诺付款，只有付款条件确认后才答复。"
+            "暂时没有找到后续记录不等于未完成。"
+        ),
+    )
+    _assert_complex(content)
+
+    content.plan_progress.items[0].source_ids = {
+        "plan:completed",
+        "daily:star:mon",
+    }
+    with pytest.raises(AssertionError, match="wrong daily matter"):
+        _assert_complex(content)

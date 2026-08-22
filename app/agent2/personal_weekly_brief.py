@@ -406,7 +406,9 @@ class Agent2PersonalWeeklyBriefGenerator:
             detail = str(exc)
             if "JSON" not in detail and "JSON object" not in detail:
                 detail = f"invalid output: {detail}"
-            raise PersonalWeeklyBriefModelOutputInvalid(detail) from exc
+            raise PersonalWeeklyBriefModelOutputInvalid(
+                repair_detail=detail
+            ) from None
         return PersonalWeeklyBriefContent(
             intro=content["intro"],
             completed=content["completed"],
@@ -551,7 +553,11 @@ class PersonalWeeklyBriefReviewRejected(ValueError):
 
 
 class PersonalWeeklyBriefModelOutputInvalid(ValueError):
-    """A model response failed JSON or deterministic source validation."""
+    """Keep user-derived repair detail away from logs and tracebacks."""
+
+    def __init__(self, *, repair_detail: str) -> None:
+        super().__init__("personal weekly brief model output failed validation")
+        self.repair_detail = repair_detail
 
 
 @dataclass(frozen=True)
@@ -622,7 +628,7 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                     "issues": [
                         {
                             "matter_key": "__model_output__",
-                            "reason": str(exc),
+                            "reason": exc.repair_detail,
                         }
                     ],
                 }
@@ -922,6 +928,7 @@ def _validate_critical_literal_coverage(
             for source_id in item.source_ids:
                 if source_id in texts_by_source:
                     texts_by_source[source_id].append(item.text)
+    missing_by_source: list[dict[str, Any]] = []
     for source_id in sorted(cited_source_ids):
         conclusion = "\n".join(texts_by_source[source_id])
         source = source_by_id[source_id]
@@ -936,11 +943,33 @@ def _validate_critical_literal_coverage(
                 for context in _critical_literal_contexts(source.original_text)
                 if any(literal in context for literal in missing_literals)
             ]
-            raise ValueError(
-                "personal weekly brief critical fact "
-                f"is missing for source {source_id}: "
-                f"{json.dumps(missing_contexts, ensure_ascii=False)}"
+            missing_by_source.append(
+                {
+                    "source_id": source_id,
+                    "missing_contexts": missing_contexts,
+                }
             )
+    if missing_by_source:
+        encoded = json.dumps(
+            missing_by_source,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(encoded) > 9000:
+            encoded = json.dumps(
+                [
+                    {
+                        "source_id": item["source_id"],
+                        "missing_context_count": len(item["missing_contexts"]),
+                    }
+                    for item in missing_by_source
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        raise ValueError(
+            "personal weekly brief critical facts are missing: " + encoded
+        )
 
 
 def _validated_source_dispositions(

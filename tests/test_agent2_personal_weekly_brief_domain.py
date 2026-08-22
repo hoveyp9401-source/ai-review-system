@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -504,8 +505,13 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
             personal_memory={"entries": []},
         )
 
-    assert "跟进甲项目120万元争议" in str(caught.value)
-    assert "对方原定8月20日前回复" in str(caught.value)
+    assert "跟进甲项目120万元争议" in caught.value.repair_detail
+    assert "对方原定8月20日前回复" in caught.value.repair_detail
+    assert "甲项目" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    rendered_traceback = "".join(traceback.format_exception(caught.value))
+    assert "甲项目" not in rendered_traceback
+    assert "120万元" not in rendered_traceback
 
     excluded_payload = {
         "intro": "本周简报。",
@@ -520,10 +526,7 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
             }
         ],
     }
-    with pytest.raises(
-        PersonalWeeklyBriefModelOutputInvalid,
-        match="source with critical fact",
-    ):
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as excluded:
         await Agent2PersonalWeeklyBriefGenerator(
             _FakeLLM(excluded_payload),
             model="agent2-model",
@@ -532,6 +535,8 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
+    assert "source with critical fact" in excluded.value.repair_detail
+    assert "甲项目" not in str(excluded.value)
 
 
 @pytest.mark.asyncio
@@ -580,6 +585,63 @@ async def test_model_output_can_preserve_explicit_condition_and_negation() -> No
 
     assert "对方没有承诺付款" in result.message_text
     assert "表示只有付款条件确认后才答复" in result.message_text
+
+
+@pytest.mark.asyncio
+async def test_all_missing_critical_sources_are_reported_in_one_repair() -> None:
+    first = _source(
+        "daily:missing:first",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="today_work",
+        text="甲项目金额100万，9/1前回复。",
+    )
+    second = _source(
+        "daily:missing:second",
+        kind="daily_report",
+        on_date=date(2026, 8, 19),
+        section="today_work",
+        text="乙项目金额￥1,000,000，截止2026-09-01。",
+    )
+    payload = {
+        "intro": "本周简报。",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "project-a",
+                    "text": "跟进甲项目。",
+                    "source_ids": [first.source_id],
+                },
+                {
+                    "matter_key": "project-b",
+                    "text": "跟进乙项目。",
+                    "source_ids": [second.source_id],
+                },
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有重复提示。"),
+        "source_dispositions": [
+            {"source_id": first.source_id, "disposition": "cited", "reason": ""},
+            {"source_id": second.source_id, "disposition": "cited", "reason": ""},
+        ],
+    }
+
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
+        await Agent2PersonalWeeklyBriefGenerator(
+            _FakeLLM(payload),
+            model="agent2-model",
+        ).generate(
+            snapshot=_snapshot(first, second),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
+
+    error = caught.value.repair_detail
+    assert first.source_id in error and "甲项目金额100万" in error
+    assert second.source_id in error and "乙项目金额￥1,000,000" in error
+    assert "甲项目" not in str(caught.value)
 
 
 def test_reviewer_prompt_does_not_duplicate_source_trace() -> None:
@@ -1215,7 +1277,7 @@ async def test_strong_plan_status_without_daily_evidence_is_rejected() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="plan status requires later daily evidence"):
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
         await Agent2PersonalWeeklyBriefGenerator(
             llm,
             model="agent2-model",
@@ -1224,6 +1286,7 @@ async def test_strong_plan_status_without_daily_evidence_is_rejected() -> None:
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
+    assert "plan status requires later daily evidence" in caught.value.repair_detail
 
 
 @pytest.mark.asyncio
@@ -1253,7 +1316,7 @@ async def test_completed_item_must_be_anchored_in_today_work() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="completed item requires today_work evidence"):
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
         await Agent2PersonalWeeklyBriefGenerator(
             llm,
             model="agent2-model",
@@ -1262,6 +1325,7 @@ async def test_completed_item_must_be_anchored_in_today_work() -> None:
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
+    assert "completed item requires today_work evidence" in caught.value.repair_detail
 
 
 @pytest.mark.asyncio
@@ -1299,7 +1363,7 @@ async def test_every_weekly_plan_source_must_appear_once_in_plan_progress() -> N
         }
     )
 
-    with pytest.raises(ValueError, match="must cover every weekly plan source once"):
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
         await Agent2PersonalWeeklyBriefGenerator(
             llm,
             model="agent2-model",
@@ -1308,6 +1372,7 @@ async def test_every_weekly_plan_source_must_appear_once_in_plan_progress() -> N
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
+    assert "must cover every weekly plan source once" in caught.value.repair_detail
 
 
 @pytest.mark.asyncio
@@ -1342,7 +1407,7 @@ async def test_frozen_source_universe_cannot_be_silently_omitted() -> None:
         "possible_open_loops": _empty_section("没有需要提示的事项。"),
     }
 
-    with pytest.raises(ValueError, match="frozen source universe is incomplete"):
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
         await Agent2PersonalWeeklyBriefGenerator(
             _FakeLLM(payload),
             model="agent2-model",
@@ -1351,6 +1416,7 @@ async def test_frozen_source_universe_cannot_be_silently_omitted() -> None:
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
+    assert "frozen source universe is incomplete" in caught.value.repair_detail
 
 
 @pytest.mark.asyncio
@@ -1499,7 +1565,7 @@ async def test_plan_progress_and_open_loops_cannot_repeat_the_same_matter() -> N
         }
     )
 
-    with pytest.raises(ValueError, match="duplicate matter across sections"):
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
         await Agent2PersonalWeeklyBriefGenerator(
             llm,
             model="agent2-model",
@@ -1508,6 +1574,7 @@ async def test_plan_progress_and_open_loops_cannot_repeat_the_same_matter() -> N
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
+    assert "duplicate matter across sections" in caught.value.repair_detail
 
 
 @pytest.mark.asyncio
@@ -1554,7 +1621,7 @@ async def test_plan_progress_and_open_loops_cannot_reuse_the_same_daily_source()
         }
     )
 
-    with pytest.raises(ValueError, match="source cannot repeat in open loops"):
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
         await Agent2PersonalWeeklyBriefGenerator(
             llm,
             model="agent2-model",
@@ -1563,6 +1630,7 @@ async def test_plan_progress_and_open_loops_cannot_reuse_the_same_daily_source()
             recipient_name="测试用户",
             personal_memory={"entries": []},
         )
+    assert "source cannot repeat in open loops" in caught.value.repair_detail
 
 
 @pytest.mark.asyncio

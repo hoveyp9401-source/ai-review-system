@@ -267,6 +267,34 @@ def _assert_complex(content: PersonalWeeklyBriefContent) -> dict[str, Any]:
         raise AssertionError(
             f"unexpected plan statuses: {observed_statuses!r}"
         )
+    expected_source_pairs = {
+        "plan:completed": {"plan:completed", "daily:completed"},
+        "plan:ongoing": {"plan:ongoing", "daily:ongoing"},
+        "plan:adjusted": {"plan:adjusted", "daily:adjusted"},
+        "plan:future": {"plan:future", "daily:future"},
+        "plan:no-followup": {"plan:no-followup"},
+    }
+    observed_source_pairs = {
+        source_id: set(by_plan_source[source_id].source_ids)
+        for source_id in expected_source_pairs
+    }
+    if observed_source_pairs != expected_source_pairs:
+        raise AssertionError(
+            f"weekly plan was paired with the wrong daily matter: "
+            f"{observed_source_pairs!r}"
+        )
+    unrelated_daily_sources = {
+        "daily:star:mon",
+        "daily:star:thu",
+        "daily:risk",
+    }
+    if any(
+        unrelated_daily_sources.intersection(item.source_ids)
+        for item in content.plan_progress.items
+    ):
+        raise AssertionError(
+            "unrelated daily matter was attached to weekly plan progress"
+        )
     merged = [
         item
         for item in _all_items(content)
@@ -889,7 +917,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 if repair_totals
                 else None
             ),
-            "projected_74_maximum_six_call_minutes": round(
+            "projected_74_maximum_fifteen_call_minutes": round(
                 math.ceil(74 / concurrency_limit)
                 * maximum_bounded_seconds
                 / 60,
