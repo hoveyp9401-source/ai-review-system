@@ -1,0 +1,21 @@
+{
+  "schema_version": "agent2.personal_weekly_brief.production_migration_smoke.v1",
+  "executed_at": "2026-08-22T13:57:59+08:00",
+  "production_connection_used": true,
+  "real_user_data_used": false,
+  "real_message_sent": false,
+  "create_inside_outer_transaction": "pass",
+  "outer_transaction_rollback_removed_table": "pass",
+  "nonempty_rollback_rejected": "pass",
+  "nonempty_record_preserved_after_rejection": "pass",
+  "empty_rollback_removed_table": "pass",
+  "final_public_table_absent": true,
+  "temporary_directory_residue": 0,
+  "sql_sha256": {
+    "create": "81f13205826e8d11a8deb6371a9e477ba5aeb13de79402c0474f71463b08945c",
+    "rollback": "2a16ae92342b72e8ba1ecf91f23f2c6a93a3f54b308bde5c224d8ec614b2ee04",
+    "smoke": "8263c461584eacbc04a78210956bbef5edd27af25e65e8c9fa9c79be2a16dac5"
+  },
+  "result": "pass",
+  "production_state_changed": false
+}
