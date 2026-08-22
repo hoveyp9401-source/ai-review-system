@@ -324,7 +324,7 @@ def _assert_complex(content: PersonalWeeklyBriefContent) -> dict[str, Any]:
     open_keys = {item.matter_key for item in content.possible_open_loops.items}
     if plan_keys & open_keys:
         raise AssertionError("plan progress and open loops were not deduplicated")
-    if "不等于未完成" not in message:
+    if "仅表示现有记录中没有找到明确对应内容" not in message:
         raise AssertionError("no-follow-up disclaimer is missing")
     return {"plan_statuses": observed_statuses, "merged_source_count": 2}
 

@@ -128,7 +128,7 @@ def test_complex_oracle_rejects_weekly_plan_linked_to_wrong_daily_matter() -> No
         message_text=(
             "涉案金额120万元，对方原定8月20日前回复。"
             "对方没有承诺付款，只有付款条件确认后才答复。"
-            "暂时没有找到后续记录不等于未完成。"
+            "暂无后续记录仅表示现有记录中没有找到明确对应内容。"
         ),
     )
     _assert_complex(content)
