@@ -75,6 +75,30 @@ freeze_all_services() {
   processes_frozen=1
 }
 
+freeze_running_services_for_rollback() {
+  local service pid
+  frozen_pids=()
+  processes_frozen=0
+  for service in "${services[@]}"; do
+    pid="$(systemctl show "$service" -p MainPID --value 2>/dev/null || true)"
+    if [[ ! "$pid" =~ ^[0-9]+$ || "$pid" -le 1 ]]; then
+      echo "rollback found no running process for $service; restoring code pointer" >&2
+      continue
+    fi
+    if ! kill -STOP "$pid"; then
+      resume_partial_freeze
+      return 1
+    fi
+    frozen_pids+=("$pid")
+  done
+  sleep 0.2
+  if ! all_frozen_pids_are_stopped; then
+    resume_partial_freeze
+    return 1
+  fi
+  processes_frozen=1
+}
+
 terminate_frozen_services() {
   local pid
   for pid in "${frozen_pids[@]}"; do
@@ -118,7 +142,10 @@ rollback() {
   trap - ERR INT TERM
   set +e
   if [[ "$processes_frozen" -eq 0 ]]; then
-    freeze_all_services || exit 1
+    if ! freeze_running_services_for_rollback; then
+      echo "could not freeze running services before rollback" >&2
+      exit 1
+    fi
   fi
   switch_current "$previous" agent2-daily-weekly-focus-rollback || exit 1
   terminate_frozen_services
