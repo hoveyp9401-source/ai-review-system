@@ -37,5 +37,15 @@
     "agent2_personal_weekly_briefs"
   ],
   "result": "pass",
+  "committed_roundtrip_restore": {
+    "executed_at": "2026-08-22T14:00:15+08:00",
+    "services_frozen": 3,
+    "apply_verified": "70+4",
+    "restore_verified": "72+2",
+    "services_after": "active",
+    "health_after": "ok",
+    "temporary_file_residue": 0,
+    "real_message_sent": false
+  },
   "production_state_changed": false
 }
