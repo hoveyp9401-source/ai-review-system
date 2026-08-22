@@ -86,7 +86,7 @@ PY
 
 verify_candidate_files() {
   local actual
-  if [[ -n "$(find "$candidate" -perm /022 -print -quit)" ]]; then
+  if [[ -n "$(find "$candidate" -perm /222 -print -quit)" ]]; then
     echo "candidate release contains writable paths" >&2
     return 1
   fi
@@ -194,9 +194,37 @@ run_daily_focus_postdeploy_smoke() {
     set +a
     cd "$candidate"
     umask 077
+    unset SMOKE_CASE_NAMES
     PYTHONPATH=. "$python" \
       scripts/smoke_20260822_daily_focus_weekly_submit_rollback.py \
       >"$daily_focus_output"
+    "$python" - "$daily_focus_output" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "bare",
+    "natural",
+    "followup",
+    "daily_plan_followup",
+    "explicit_weekly_switch",
+}
+actual = {str(item.get("name") or "") for item in payload.get("results", [])}
+if payload.get("status") != "pass" or payload.get("passed") != 5:
+    raise SystemExit("Daily focus smoke did not pass all five cases")
+if payload.get("failed") != 0 or payload.get("failures"):
+    raise SystemExit("Daily focus smoke contains a failed case")
+if actual != expected:
+    raise SystemExit("Daily focus smoke case set is incomplete")
+if payload.get("dingtalk_send_calls") != 0 or payload.get("transport_enabled_cases") != 0:
+    raise SystemExit("Daily focus smoke transport was not fully disabled")
+if any(int(value) != 0 for value in payload.get("rollback_residue", {}).values()):
+    raise SystemExit("Daily focus smoke left rollback residue")
+if any(int(value) != 0 for value in payload.get("production_state_changes", {}).values()):
+    raise SystemExit("Daily focus smoke changed production state")
+PY
   )
 }
 

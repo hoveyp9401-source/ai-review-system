@@ -54,7 +54,7 @@ def test_schema_files_run_in_one_outer_transaction() -> None:
 def test_candidate_is_read_only_and_key_release_files_are_hash_pinned() -> None:
     source = _source()
 
-    assert 'find "$candidate" -perm /022' in source
+    assert 'find "$candidate" -perm /222' in source
     assert "expected_roster_script_sha=" in source
     assert "expected_weekly_create_sha=" in source
     assert "expected_weekly_rollback_sha=" in source
@@ -133,6 +133,27 @@ def test_success_path_keeps_rollback_armed_through_online_business_gates() -> No
     final_health = deploy.index('wait_healthy "$candidate"', daily_smoke)
     disarm = deploy.index("trap - ERR INT TERM", final_health)
     assert history < alignment < daily_smoke < final_health < disarm
+
+
+def test_daily_focus_gate_forces_and_parses_the_exact_five_case_matrix() -> None:
+    source = _source()
+    smoke = source.split("run_daily_focus_postdeploy_smoke() {", 1)[1].split(
+        "switch_current() {", 1
+    )[0]
+
+    assert "unset SMOKE_CASE_NAMES" in smoke
+    assert 'payload.get("passed") != 5' in smoke
+    for case_name in (
+        "bare",
+        "natural",
+        "followup",
+        "daily_plan_followup",
+        "explicit_weekly_switch",
+    ):
+        assert f'"{case_name}"' in smoke
+    assert 'payload.get("transport_enabled_cases") != 0' in smoke
+    assert 'payload.get("rollback_residue", {})' in smoke
+    assert 'payload.get("production_state_changes", {})' in smoke
 
 
 def test_manual_rollback_arms_both_data_restore_guards() -> None:
