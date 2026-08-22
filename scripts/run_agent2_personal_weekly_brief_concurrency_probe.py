@@ -114,6 +114,15 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
             max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
         ),
+        critical_reviewer=Agent2PersonalWeeklyBriefReviewer(
+            client,
+            model=CANARY_MODEL_NAME,
+            thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+            timeout_seconds=CANARY_TIMEOUT_SECONDS,
+            max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+            max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+            review_mode="critical_facts",
+        ),
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
         review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     )

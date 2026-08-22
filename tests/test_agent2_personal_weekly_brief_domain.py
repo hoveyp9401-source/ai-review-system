@@ -494,18 +494,18 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
         ],
     }
 
-    restored = await Agent2PersonalWeeklyBriefGenerator(
-        _FakeLLM(payload),
-        model="agent2-model",
-    ).generate(
-        snapshot=_snapshot(source),
-        recipient_name="测试用户",
-        personal_memory={"entries": []},
-    )
+    with pytest.raises(PersonalWeeklyBriefModelOutputInvalid) as caught:
+        await Agent2PersonalWeeklyBriefGenerator(
+            _FakeLLM(payload),
+            model="agent2-model",
+        ).generate(
+            snapshot=_snapshot(source),
+            recipient_name="测试用户",
+            personal_memory={"entries": []},
+        )
 
-    assert "120万元" in restored.message_text
-    assert "8月20日" in restored.message_text
-    assert "关键信息" in restored.message_text
+    assert "跟进甲项目120万元争议" in str(caught.value)
+    assert "对方原定8月20日前回复" in str(caught.value)
 
     excluded_payload = {
         "intro": "本周简报。",
@@ -535,7 +535,7 @@ async def test_cited_source_cannot_drop_exact_amount_or_date_literals() -> None:
 
 
 @pytest.mark.asyncio
-async def test_server_restores_explicit_condition_and_negation_fragments() -> None:
+async def test_model_output_can_preserve_explicit_condition_and_negation() -> None:
     source = _source(
         "daily:critical-semantics",
         kind="daily_report",
@@ -552,7 +552,10 @@ async def test_server_restores_explicit_condition_and_negation_fragments() -> No
                     "items": [
                         {
                             "matter_key": "payment-followup",
-                            "text": "继续跟进付款事项。",
+                            "text": (
+                                "继续跟进付款事项；对方没有承诺付款，"
+                                "表示只有付款条件确认后才答复。"
+                            ),
                             "source_ids": [source.source_id],
                         }
                     ],
@@ -700,7 +703,13 @@ async def test_three_review_votes_prevent_one_false_rejection() -> None:
         "approved": 2,
         "rejected": 1,
         "invalid": 0,
+        "votes_cast": 3,
+        "dispute_adjudicated": True,
     }
+    adjudication_prompt = json.loads(llm.calls[3]["user_prompt"])
+    assert adjudication_prompt["disputed_issues"] == [
+        {"matter_key": "__brief__", "reason": "误判为存在遗漏。"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -721,9 +730,7 @@ async def test_three_review_votes_repair_after_majority_rejection() -> None:
         valid,
         rejected,
         rejected,
-        approved,
         valid,
-        approved,
         approved,
         approved,
     )
@@ -740,7 +747,95 @@ async def test_three_review_votes_repair_after_majority_rejection() -> None:
     )
 
     assert outcome.semantic_attempts == 2
+    assert outcome.model_calls == 6
+
+
+@pytest.mark.asyncio
+async def test_focused_critical_review_repairs_lost_condition_result() -> None:
+    source = _source(
+        "daily:condition-review",
+        kind="daily_report",
+        on_date=date(2026, 8, 20),
+        section="today_work",
+        text="对方表示只有付款条件确认后才答复。",
+    )
+    incomplete = {
+        "intro": "本周简报。",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "payment-condition",
+                    "text": "对方表示需先确认付款条件。",
+                    "source_ids": [source.source_id],
+                }
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有重复提示。"),
+    }
+    repaired = {
+        **incomplete,
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "payment-condition",
+                    "text": "对方表示只有付款条件确认后才答复。",
+                    "source_ids": [source.source_id],
+                }
+            ],
+        },
+    }
+    approved = {
+        "approved": True,
+        "reviewed_matter_keys": ["payment-condition"],
+        "issues": [],
+    }
+    critical_rejected = {
+        "approved": False,
+        "reviewed_matter_keys": ["payment-condition"],
+        "issues": [
+            {
+                "matter_key": "payment-condition",
+                "reason": "只保留条件前提，遗漏确认后才答复的结果。",
+            }
+        ],
+    }
+    llm = _SequenceLLM(
+        incomplete,
+        approved,
+        approved,
+        critical_rejected,
+        repaired,
+        approved,
+        approved,
+        approved,
+    )
+    general_reviewer = Agent2PersonalWeeklyBriefReviewer(
+        llm,
+        model="agent2-model",
+    )
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=general_reviewer,
+        critical_reviewer=Agent2PersonalWeeklyBriefReviewer(
+            llm,
+            model="agent2-model",
+            review_mode="critical_facts",
+        ),
+        review_votes=3,
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(source),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.semantic_attempts == 2
     assert outcome.model_calls == 8
+    assert "确认后才答复" in outcome.content.message_text
 
 
 @pytest.mark.asyncio

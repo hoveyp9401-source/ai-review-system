@@ -684,9 +684,19 @@ async def run_personal_weekly_brief_generation_job(
         max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
         max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
     )
+    critical_reviewer = Agent2PersonalWeeklyBriefReviewer(
+        llm_client,
+        model=CANARY_MODEL_NAME,
+        thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+        timeout_seconds=CANARY_TIMEOUT_SECONDS,
+        max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+        max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+        review_mode="critical_facts",
+    )
     model_pipeline = Agent2PersonalWeeklyBriefModelPipeline(
         generator=generator,
         reviewer=reviewer,
+        critical_reviewer=critical_reviewer,
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
         review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     )
@@ -946,6 +956,15 @@ async def run_personal_weekly_brief_reconcile_job(
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
             max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
             max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+        ),
+        critical_reviewer=Agent2PersonalWeeklyBriefReviewer(
+            llm_client,
+            model=CANARY_MODEL_NAME,
+            thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+            timeout_seconds=CANARY_TIMEOUT_SECONDS,
+            max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+            max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+            review_mode="critical_facts",
         ),
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
         review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,

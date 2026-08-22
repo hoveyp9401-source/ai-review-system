@@ -15,11 +15,14 @@
     "review_thinking_enabled": false,
     "generation_max_tokens": 4000,
     "review_max_tokens": 2000,
-    "review_votes": 3,
+    "initial_review_votes": 2,
+    "dispute_adjudication_vote": 1,
     "review_majority_required": 2,
+    "focused_critical_fact_review": true,
     "maximum_semantic_attempts": 3,
-    "maximum_model_calls": 12,
-    "server_restores_missing_exact_amounts_dates_conditions_and_negations": true
+    "maximum_model_calls": 15,
+    "server_requires_full_amount_date_contexts": true,
+    "conditions_negations_and_statuses_remain_model_reviewed": true
   },
   "raw_no_thinking_probe": {
     "rounds": 2,
@@ -31,11 +34,11 @@
   "real_model_matrix": {
     "status": "PASS",
     "case_count": 12,
-    "observed_owner_seconds_average": 7.025,
-    "observed_owner_seconds_max": 9.815,
-    "maximum_twelve_call_exercise_status": "PASS",
-    "maximum_twelve_call_exercise_seconds": 16.03,
-    "sha256": "d23b5441eadec714895028ae8b950662ef6afcfe59ebaf70c41fe519ee3ace07"
+    "observed_owner_seconds_average": 6.135,
+    "observed_owner_seconds_max": 13.634,
+    "maximum_fifteen_call_exercise_status": "PASS",
+    "maximum_fifteen_call_exercise_seconds": 11.668,
+    "sha256": "5f3ac44dd8f7cee00af214cfce8c47b4507f0bb29ce1146844df023bd3d14fbd"
   },
   "sustained_complex_concurrency": {
     "waves": 19,
@@ -43,8 +46,8 @@
     "owner_pipelines": 76,
     "success_count": 76,
     "failure_count": 0,
-    "wall_seconds": 192.981,
-    "sha256": "89960561e77257c7a3ec89d638e73c3748e10ec11ab7368ce39d49df252a4102"
+    "wall_seconds": 199.115,
+    "sha256": "8536798b23482f65b02a1eb9176dcd01aaeee5ab3115795eb9ea843ef9e3024b"
   },
   "artifact_mode": "0600",
   "database_accessed": false,

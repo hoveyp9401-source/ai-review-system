@@ -59,21 +59,6 @@ _CRITICAL_LITERAL_PATTERNS = (
         r"(?:亿元|万元|千元|百万元|亿|万|元|%|笔|份|项|人|天)"
     ),
 )
-_EXPLICIT_NEGATION_MARKERS = (
-    "没有",
-    "并未",
-    "尚未",
-    "未能",
-    "无法",
-    "不能",
-    "未收到",
-    "未完成",
-    "未通过",
-    "不通过",
-    "不再",
-)
-
-
 @dataclass(frozen=True)
 class PersonalWeeklyBriefWindow:
     week_start: date
@@ -445,9 +430,12 @@ class Agent2PersonalWeeklyBriefReviewer:
         timeout_seconds: float = 60.0,
         max_retries: int = 1,
         max_tokens: int = 8000,
+        review_mode: Literal["general", "critical_facts"] = "general",
     ) -> None:
         if not model.strip():
             raise ValueError("Agent2 review model is required")
+        if review_mode not in {"general", "critical_facts"}:
+            raise ValueError("Agent2 weekly brief review mode is invalid")
         self._llm_client = llm_client
         self.model = model
         self._thinking_enabled = thinking_enabled
@@ -462,26 +450,35 @@ class Agent2PersonalWeeklyBriefReviewer:
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
         self._max_tokens = max_tokens
+        self._system_prompt = (
+            _CRITICAL_FACT_REVIEW_SYSTEM_PROMPT
+            if review_mode == "critical_facts"
+            else _REVIEW_SYSTEM_PROMPT
+        )
 
     async def review(
         self,
         *,
         snapshot: PersonalWeeklyBriefSnapshot,
         content: PersonalWeeklyBriefContent,
+        disputed_issues: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        user_payload: dict[str, Any] = {
+            "trusted_snapshot": snapshot.as_payload(),
+            "draft": content.as_payload(),
+            "server_checks": {
+                "recognized_amount_date_literals_complete": True,
+                "frozen_source_dispositions_complete": True,
+                "weekly_plan_sources_exactly_once": True,
+                "section_source_bindings_valid": True,
+            },
+        }
+        if disputed_issues is not None:
+            user_payload["disputed_issues"] = disputed_issues[:20]
         raw = await self._llm_client.complete_json(
-            system_prompt=_REVIEW_SYSTEM_PROMPT,
+            system_prompt=self._system_prompt,
             user_prompt=json.dumps(
-                {
-                    "trusted_snapshot": snapshot.as_payload(),
-                    "draft": content.as_payload(),
-                    "server_checks": {
-                        "recognized_amount_date_literals_complete": True,
-                        "frozen_source_dispositions_complete": True,
-                        "weekly_plan_sources_exactly_once": True,
-                        "section_source_bindings_valid": True,
-                    },
-                },
+                user_payload,
                 ensure_ascii=False,
                 sort_keys=True,
             ),
@@ -576,6 +573,7 @@ class Agent2PersonalWeeklyBriefModelPipeline:
         *,
         generator: Agent2PersonalWeeklyBriefGenerator,
         reviewer: Agent2PersonalWeeklyBriefReviewer,
+        critical_reviewer: Agent2PersonalWeeklyBriefReviewer | None = None,
         max_semantic_attempts: int = 2,
         review_votes: int = 1,
     ) -> None:
@@ -585,6 +583,7 @@ class Agent2PersonalWeeklyBriefModelPipeline:
             raise ValueError("personal weekly brief review votes must be one or three")
         self._generator = generator
         self._reviewer = reviewer
+        self._critical_reviewer = critical_reviewer
         self._max_semantic_attempts = max_semantic_attempts
         self._review_votes = review_votes
 
@@ -631,16 +630,24 @@ class Agent2PersonalWeeklyBriefModelPipeline:
             generation_durations.append(perf_counter() - generation_started)
             approvals: list[dict[str, Any]] = []
             rejections: list[dict[str, str]] = []
+            rejection_votes = 0
             invalid_reviews = 0
-            for _vote in range(self._review_votes):
+
+            async def cast_review_vote(
+                *,
+                disputed_issues: list[dict[str, str]] | None = None,
+            ) -> None:
+                nonlocal model_calls, rejection_votes, invalid_reviews
                 review_started = perf_counter()
                 model_calls += 1
                 try:
                     vote = await self._reviewer.review(
                         snapshot=snapshot,
                         content=content,
+                        disputed_issues=disputed_issues,
                     )
                 except PersonalWeeklyBriefReviewRejected as exc:
+                    rejection_votes += 1
                     rejections.extend(dict(issue) for issue in exc.issues)
                 except ValueError:
                     invalid_reviews += 1
@@ -649,25 +656,81 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                 finally:
                     review_durations.append(perf_counter() - review_started)
 
+            initial_votes = 1 if self._review_votes == 1 else 2
+            for _vote in range(initial_votes):
+                await cast_review_vote()
+
             required_votes = self._review_votes // 2 + 1
+            if (
+                self._review_votes == 3
+                and len(approvals) < required_votes
+                and rejection_votes < required_votes
+            ):
+                disputed: list[dict[str, str]] = []
+                seen_disputes: set[tuple[str, str]] = set()
+                for issue in rejections:
+                    key = (issue["matter_key"], issue["reason"])
+                    if key not in seen_disputes:
+                        seen_disputes.add(key)
+                        disputed.append(issue)
+                if invalid_reviews:
+                    disputed.append(
+                        {
+                            "matter_key": "__review_output__",
+                            "reason": "一次初审输出无效，请独立裁决现有草稿。",
+                        }
+                    )
+                await cast_review_vote(disputed_issues=disputed)
+
             if len(approvals) >= required_votes:
                 review = dict(approvals[0])
                 if self._review_votes > 1:
                     review["review_consensus"] = {
                         "required": required_votes,
                         "approved": len(approvals),
-                        "rejected": self._review_votes - len(approvals) - invalid_reviews,
+                        "rejected": rejection_votes,
                         "invalid": invalid_reviews,
+                        "votes_cast": len(approvals)
+                        + rejection_votes
+                        + invalid_reviews,
+                        "dispute_adjudicated": (
+                            len(approvals) + rejection_votes + invalid_reviews
+                            > initial_votes
+                        ),
                     }
-                return PersonalWeeklyBriefModelOutcome(
-                    content=content,
-                    review=review,
-                    semantic_attempts=attempt,
-                    model_calls=model_calls,
-                    generation_seconds=tuple(generation_durations),
-                    review_seconds=tuple(review_durations),
-                    total_seconds=perf_counter() - started,
-                )
+                critical_issues: list[dict[str, str]] = []
+                critical_invalid = False
+                if self._critical_reviewer is not None:
+                    critical_started = perf_counter()
+                    model_calls += 1
+                    try:
+                        critical_review = await self._critical_reviewer.review(
+                            snapshot=snapshot,
+                            content=content,
+                        )
+                    except PersonalWeeklyBriefReviewRejected as exc:
+                        critical_issues.extend(dict(issue) for issue in exc.issues)
+                    except ValueError:
+                        critical_invalid = True
+                    else:
+                        review["critical_fact_review"] = critical_review
+                    finally:
+                        review_durations.append(perf_counter() - critical_started)
+                if not critical_issues and not critical_invalid:
+                    return PersonalWeeklyBriefModelOutcome(
+                        content=content,
+                        review=review,
+                        semantic_attempts=attempt,
+                        model_calls=model_calls,
+                        generation_seconds=tuple(generation_durations),
+                        review_seconds=tuple(review_durations),
+                        total_seconds=perf_counter() - started,
+                    )
+                if critical_issues:
+                    rejection_votes = max(rejection_votes, required_votes)
+                    rejections.extend(critical_issues)
+                if critical_invalid:
+                    invalid_reviews += 1
 
             unique_issues: list[dict[str, str]] = []
             seen_issues: set[tuple[str, str]] = set()
@@ -677,7 +740,7 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                     seen_issues.add(key)
                     unique_issues.append(issue)
             if attempt >= self._max_semantic_attempts:
-                if rejections:
+                if rejection_votes:
                     raise PersonalWeeklyBriefReviewRejected(unique_issues[:20])
                 raise ValueError("independent model review returned invalid JSON")
             if invalid_reviews:
@@ -751,12 +814,6 @@ def _validated_content(
         source_by_id=source_by_id,
         require_status=False,
     )
-    completed, plan_progress, possible_open_loops = (
-        _restore_missing_critical_literals(
-            source_by_id=source_by_id,
-            sections=(completed, plan_progress, possible_open_loops),
-        )
-    )
     plan_keys = {item.matter_key for item in plan_progress.items}
     open_keys = {item.matter_key for item in possible_open_loops.items}
     if plan_keys & open_keys:
@@ -812,96 +869,27 @@ def _critical_literals(value: str) -> tuple[str, ...]:
     return tuple(literals)
 
 
-def _critical_verbatim_fragments(value: str) -> tuple[str, ...]:
-    fragments: list[str] = []
-    seen: set[str] = set()
-    sentences = [
-        sentence.strip(" ，,")
+def _critical_literal_contexts(value: str) -> tuple[str, ...]:
+    literals = _critical_literals(value)
+    if not literals:
+        return ()
+    clauses = [
+        clause.strip(" ,")
         for sentence in re.split(r"[。；;]+", value)
-        if sentence.strip(" ，,")
+        for clause in sentence.split("，")
+        if clause.strip(" ,")
     ]
-    for sentence in sentences:
-        explicit_condition = (
-            ("只有" in sentence and "才" in sentence)
-            or (
-                ("如果" in sentence or "若" in sentence)
-                and any(
-                    consequence in sentence
-                    for consequence in ("则", "将", "会", "无法", "不能")
-                )
-            )
+    contexts: list[str] = []
+    seen: set[str] = set()
+    for literal in literals:
+        context = next(
+            (clause for clause in clauses if literal in clause),
+            literal,
         )
-        if explicit_condition and sentence not in seen:
-            seen.add(sentence)
-            fragments.append(sentence)
-        for clause in re.split(r"[，,]+", sentence):
-            normalized = clause.strip()
-            if (
-                normalized
-                and any(marker in normalized for marker in _EXPLICIT_NEGATION_MARKERS)
-                and normalized not in seen
-            ):
-                seen.add(normalized)
-                fragments.append(normalized)
-    return tuple(fragments)
-
-
-def _required_critical_facts(value: str) -> tuple[str, ...]:
-    return tuple(
-        dict.fromkeys(
-            (*_critical_literals(value), *_critical_verbatim_fragments(value))
-        )
-    )
-
-
-def _restore_missing_critical_literals(
-    *,
-    source_by_id: dict[str, SourceEvidence],
-    sections: tuple[PersonalWeeklyBriefSection, ...],
-) -> tuple[PersonalWeeklyBriefSection, ...]:
-    mutable_items = [list(section.items) for section in sections]
-    for source_id, source in source_by_id.items():
-        required_facts = _required_critical_facts(source.original_text)
-        if not required_facts:
-            continue
-        locations: list[tuple[int, int]] = []
-        conclusion_parts: list[str] = []
-        for section_index, items in enumerate(mutable_items):
-            for item_index, item in enumerate(items):
-                if source_id in item.source_ids:
-                    locations.append((section_index, item_index))
-                    conclusion_parts.append(item.text)
-        if not locations:
-            continue
-        conclusion = "\n".join(conclusion_parts)
-        missing = [
-            fact for fact in required_facts if fact not in conclusion
-        ]
-        if not missing:
-            continue
-        section_index, item_index = locations[0]
-        original_item = mutable_items[section_index][item_index]
-        restored_text = (
-            f"{original_item.text.rstrip('。')}"
-            f"（关键信息：{'、'.join(missing)}）。"
-        )
-        if len(restored_text) > 1000:
-            raise ValueError(
-                "personal weekly brief critical literal restoration is too long"
-            )
-        mutable_items[section_index][item_index] = PersonalWeeklyBriefItem(
-            matter_key=original_item.matter_key,
-            text=restored_text,
-            source_ids=original_item.source_ids,
-            status=original_item.status,
-        )
-    return tuple(
-        PersonalWeeklyBriefSection(
-            empty_note=section.empty_note,
-            items=tuple(mutable_items[index]),
-        )
-        for index, section in enumerate(sections)
-    )
+        if context not in seen:
+            seen.add(context)
+            contexts.append(context)
+    return tuple(contexts)
 
 
 def _validate_critical_literal_coverage(
@@ -923,7 +911,7 @@ def _validate_critical_literal_coverage(
     ]
     if excluded_critical_sources:
         raise ValueError(
-                "personal weekly brief source with critical fact "
+            "personal weekly brief source with critical fact "
             f"cannot be excluded: {excluded_critical_sources[0]}"
         )
     texts_by_source: dict[str, list[str]] = {
@@ -936,15 +924,22 @@ def _validate_critical_literal_coverage(
                     texts_by_source[source_id].append(item.text)
     for source_id in sorted(cited_source_ids):
         conclusion = "\n".join(texts_by_source[source_id])
-        if any(
-            literal not in conclusion
-            for literal in _required_critical_facts(
-                source_by_id[source_id].original_text
-            )
-        ):
+        source = source_by_id[source_id]
+        missing_literals = [
+            literal
+            for literal in _critical_literals(source.original_text)
+            if literal not in conclusion
+        ]
+        if missing_literals:
+            missing_contexts = [
+                context
+                for context in _critical_literal_contexts(source.original_text)
+                if any(literal in context for literal in missing_literals)
+            ]
             raise ValueError(
                 "personal weekly brief critical fact "
-                f"is missing for source {source_id}"
+                f"is missing for source {source_id}: "
+                f"{json.dumps(missing_contexts, ensure_ascii=False)}"
             )
 
 
@@ -1182,6 +1177,16 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 }"""
 
 
+_CRITICAL_FACT_REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的周简报关键语义复核。不要检查JSON格式、来源编号、金额或日期；这些已由服务器核对。只逐项检查：
+1. 原文有“只有A才B、如果A则/将B、若A会B”等明确条件时，草稿是否同时保留前提A和结果B；只写前提不算保留条件。
+2. 原文明示“没有/未/无法/不能”时，草稿是否保留被否定的具体对象；只写“未闭环/没有结果”不能代替“没有承诺付款”等具体否定。
+3. 原文的跟进、沟通、准备、起草、计划是否被夸大成完成，或原文已完成是否被改成未完成。
+
+必须覆盖草稿里的每个唯一matter_key。只返回JSON：
+{"approved":true或false,"reviewed_matter_keys":["逐个唯一事项键"],"issues":[{"matter_key":"事项键","reason":"具体条件、否定或完成状态错误"}]}
+全部安全时approved=true且issues=[]；只报告真实错误，不写通过说明，不改写草稿。"""
+
+
 _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核步骤。你不能改写草稿，只能逐项判断是否安全通过。
 
 必须先按 trusted_snapshot.sources 中每一条实际引用的 source_id 逐条对照原文，再按 matter_key 汇总结论；不能只看草稿是否通顺。对每个 matter_key 检查：
@@ -1209,6 +1214,7 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
   "issues": [{"matter_key": "事项键", "reason": "不通过原因"}]
 }
 user_prompt 中的 server_checks 是服务器在调用你之前已经完成的确定性核对。recognized_amount_date_literals_complete=true 只表示服务器已核对它能识别的常见金额和日期格式，不代表所有自然语言数字都已核对；你不得误报已被服务器确认存在的字面金额/日期，但仍需检查其他自然表达。其余 true 项具有最高权威：不得再次声称来源全集不完整、周计划来源漏项/重复或栏目来源绑定错误。你还需独立审核服务器无法确定的语义：条件与否定是否改变、完成状态是否夸大、对象与事项是否编造、计划状态和跨日归类是否正确。
+如果 user_prompt 含 disputed_issues，你是前两次审核意见不一致后的争议裁决者。必须逐条对照 disputed_issues、原始来源和草稿，只确认真实存在的问题；不得盲从前一位审核者，也不得提出与争议无关的新问题。争议均不成立时 approved=true、issues=[]；任一争议成立时 approved=false，并只返回成立的争议。
 issues 只能列出真正不安全、需要修复的事项；禁止把“通过、符合规则、未发现问题”的检查过程写入 issues。全部事项安全时，approved 必须为 true 且 issues 必须是空数组；只要一项不安全，approved 必须为 false。reason 只用一句话指出具体遗漏或错误，不写检查过程、通过说明或推测服务器未提供的来源。不得自行生成替换文字，也不得增加 explanation、summary 或逐项通过说明字段。"""
 
 

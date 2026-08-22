@@ -50,7 +50,7 @@ def test_real_model_gate_loads_only_allowlisted_llm_fields(tmp_path) -> None:
     assert settings.dingtalk_default_robot_webhook == ""
 
 
-def test_production_weekly_brief_uses_two_fast_independent_flash_calls() -> None:
+def test_production_weekly_brief_uses_fast_independent_flash_calls() -> None:
     assert PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED is False
     assert PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED is False
     assert PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS == 4000
@@ -62,11 +62,11 @@ def test_production_weekly_brief_uses_two_fast_independent_flash_calls() -> None
     ) == 2
     assert runner.count(
         "thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED"
-    ) == 2
+    ) == 4
     assert runner.count(
         "max_tokens=PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS"
     ) == 2
-    assert runner.count("max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS") == 2
+    assert runner.count("max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS") == 4
     assert PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS == 3
     assert PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES == 3
     assert runner.count(
@@ -76,5 +76,5 @@ def test_production_weekly_brief_uses_two_fast_independent_flash_calls() -> None
     model_eval = Path(
         "scripts/run_agent2_personal_weekly_brief_model_eval.py"
     ).read_text(encoding="utf-8")
-    assert "maximum_twelve_call_owner_seconds" in model_eval
+    assert "maximum_fifteen_call_owner_seconds" in model_eval
     assert model_eval.count("PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES") >= 5

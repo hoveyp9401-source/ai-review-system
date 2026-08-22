@@ -457,9 +457,19 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
         max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
     )
+    critical_reviewer = Agent2PersonalWeeklyBriefReviewer(
+        client,
+        model=CANARY_MODEL_NAME,
+        thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+        timeout_seconds=CANARY_TIMEOUT_SECONDS,
+        max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+        max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+        review_mode="critical_facts",
+    )
     pipeline = Agent2PersonalWeeklyBriefModelPipeline(
         generator=generator,
         reviewer=reviewer,
+        critical_reviewer=critical_reviewer,
         max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
         review_votes=PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
     )
@@ -760,12 +770,22 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             review_seconds = perf_counter() - review_started
             if phase_approvals < PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES // 2 + 1:
                 raise AssertionError("maximum bounded review consensus did not approve")
+            critical_started = perf_counter()
+            await critical_reviewer.review(
+                snapshot=maximum_snapshot,
+                content=phase_content,
+            )
+            critical_review_seconds = perf_counter() - critical_started
             phase_assertions = _assert_empty(phase_content)
             phase_results.append(
                 {
                     "phase": phase,
                     "generation_seconds": round(generation_seconds, 3),
                     "review_seconds": round(review_seconds, 3),
+                    "critical_review_seconds": round(
+                        critical_review_seconds,
+                        3,
+                    ),
                     "review_consensus": {
                         "approved": phase_approvals,
                         "rejected": phase_rejections,
@@ -778,7 +798,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         maximum_bounded_model_call_exercise = {
             "status": "PASS",
             "model_calls": PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS
-            * (1 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES),
+            * (2 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES),
             "semantic_phases": PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
             "total_seconds": round(perf_counter() - maximum_started, 3),
             "phases": phase_results,
@@ -837,10 +857,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             maximum_bounded_model_call_exercise
         ),
         "performance": {
-            "normal_model_calls_per_owner": 1 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES,
+            "normal_model_calls_per_owner": (
+                4 if PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES == 3 else 3
+            ),
             "maximum_model_calls_per_owner": (
                 PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS
-                * (1 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES)
+                * (2 + PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES)
             ),
             "observed_owner_seconds_min": min(observed_totals),
             "observed_owner_seconds_max": max(observed_totals),
@@ -849,7 +871,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "normal_consensus_owner_seconds": normal_totals,
             "repair_consensus_owner_seconds": repair_totals,
-            "maximum_twelve_call_owner_seconds": maximum_bounded_seconds,
+            "maximum_fifteen_call_owner_seconds": maximum_bounded_seconds,
             "production_concurrency_limit": concurrency_limit,
             "projected_74_normal_minutes_using_observed_max": (
                 round(
