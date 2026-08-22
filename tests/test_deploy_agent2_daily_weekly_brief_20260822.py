@@ -54,7 +54,7 @@ def test_schema_files_run_in_one_outer_transaction() -> None:
 def test_candidate_is_read_only_and_key_release_files_are_hash_pinned() -> None:
     source = _source()
 
-    assert 'find "$candidate" -type f -perm /022' in source
+    assert 'find "$candidate" -perm /022' in source
     assert "expected_roster_script_sha=" in source
     assert "expected_weekly_create_sha=" in source
     assert "expected_weekly_rollback_sha=" in source

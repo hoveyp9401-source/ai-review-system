@@ -86,8 +86,8 @@ PY
 
 verify_candidate_files() {
   local actual
-  if [[ -n "$(find "$candidate" -type f -perm /022 -print -quit)" ]]; then
-    echo "candidate release contains writable files" >&2
+  if [[ -n "$(find "$candidate" -perm /022 -print -quit)" ]]; then
+    echo "candidate release contains writable paths" >&2
     return 1
   fi
   actual="$(sha256sum "$candidate/scripts/manage_formal_roster_70_4_20260822.py" | awk '{print $1}')"
