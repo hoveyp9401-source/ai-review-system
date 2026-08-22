@@ -156,6 +156,12 @@ def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _transactional(sql: str) -> str:
+    """Wrap embeddable release SQL for standalone isolated verification."""
+
+    return "BEGIN;\n" + sql.rstrip() + "\nCOMMIT;\n"
+
+
 def main() -> int:
     args = _args()
     if not args.migration.is_file():
@@ -273,10 +279,10 @@ def main() -> int:
         checks["rollback_sha256"] = hashlib.sha256(
             rollback_text.encode("utf-8")
         ).hexdigest()
-        _run(database_args, input_text=migration_text)
+        _run(database_args, input_text=_transactional(migration_text))
         checks["first_apply"] = "PASS"
         print(json.dumps({"event": "postgres_migration_first_apply_passed"}), flush=True)
-        _run(database_args, input_text=migration_text)
+        _run(database_args, input_text=_transactional(migration_text))
         checks["idempotent_second_apply"] = "PASS"
         print(json.dumps({"event": "postgres_migration_second_apply_passed"}), flush=True)
         table_present = _run(
@@ -300,7 +306,7 @@ def main() -> int:
             raise AssertionError("migration granted table access to PUBLIC")
         checks["public_table_privileges_absent"] = "PASS"
 
-        _run(database_args, input_text=rollback_text)
+        _run(database_args, input_text=_transactional(rollback_text))
         empty_rollback_absent = _run(
             [
                 *database_args,
@@ -313,7 +319,7 @@ def main() -> int:
         checks["empty_table_rollback"] = "PASS"
         print(json.dumps({"event": "postgres_empty_rollback_passed"}), flush=True)
 
-        _run(database_args, input_text=migration_text)
+        _run(database_args, input_text=_transactional(migration_text))
         apply_after_rollback_present = _run(
             [
                 *database_args,
@@ -346,7 +352,7 @@ def main() -> int:
         _run(database_args, input_text=insert_sql)
         refused_rollback = _run(
             database_args,
-            input_text=rollback_text,
+            input_text=_transactional(rollback_text),
             check=False,
         )
         if refused_rollback.returncode == 0:
@@ -433,7 +439,7 @@ def main() -> int:
                 f"WHERE brief_id='{brief_id}';"
             ),
         )
-        _run(database_args, input_text=rollback_text)
+        _run(database_args, input_text=_transactional(rollback_text))
         final_table_absent = _run(
             [
                 *database_args,

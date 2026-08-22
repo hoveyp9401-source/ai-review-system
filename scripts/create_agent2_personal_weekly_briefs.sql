@@ -1,5 +1,3 @@
-BEGIN;
-
 CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs (
     brief_id uuid PRIMARY KEY,
     tenant_id varchar(128) NOT NULL,
@@ -100,5 +98,3 @@ CREATE INDEX IF NOT EXISTS agent2_personal_weekly_brief_context_idx
     ON agent2_personal_weekly_briefs
     (tenant_id, delivered_at, owner_user_id)
     WHERE status = 'delivered' AND context_recorded_at IS NULL;
-
-COMMIT;

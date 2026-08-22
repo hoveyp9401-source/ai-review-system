@@ -6,8 +6,8 @@ def test_personal_weekly_brief_migration_is_transactional_and_idempotent() -> No
         encoding="utf-8"
     )
 
-    assert sql.lstrip().startswith("BEGIN;")
-    assert sql.rstrip().endswith("COMMIT;")
+    assert not sql.lstrip().startswith("BEGIN;")
+    assert not sql.rstrip().endswith("COMMIT;")
     assert "CREATE TABLE IF NOT EXISTS agent2_personal_weekly_briefs" in sql
     assert "UNIQUE (tenant_id, owner_user_id, week_start)" in sql
     assert "UNIQUE (tenant_id, idempotency_key)" in sql
@@ -32,11 +32,12 @@ def test_personal_weekly_brief_rollback_refuses_nonempty_table() -> None:
         encoding="utf-8"
     )
 
-    assert sql.lstrip().startswith("BEGIN;")
-    assert sql.rstrip().endswith("COMMIT;")
-    assert "LOCK TABLE agent2_personal_weekly_briefs" in sql
+    assert not sql.lstrip().startswith("BEGIN;")
+    assert not sql.rstrip().endswith("COMMIT;")
+    assert "LOCK TABLE public.agent2_personal_weekly_briefs" in sql
     assert "backup and manual handling required" in sql
-    assert "DROP TABLE agent2_personal_weekly_briefs" in sql
+    assert "FROM public.agent2_personal_weekly_briefs" in sql
+    assert "DROP TABLE public.agent2_personal_weekly_briefs" in sql
 
 
 def test_isolated_postgres_gate_covers_apply_rollback_apply_and_permissions() -> None:
@@ -54,3 +55,5 @@ def test_isolated_postgres_gate_covers_apply_rollback_apply_and_permissions() ->
     ):
         assert required_check in source
     assert 'parser.add_argument("--rollback"' in source
+    assert '"BEGIN;\\n"' in source
+    assert '"\\nCOMMIT;\\n"' in source

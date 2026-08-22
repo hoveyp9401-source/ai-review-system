@@ -1,5 +1,3 @@
-BEGIN;
-
 DO $$
 DECLARE
     record_count bigint;
@@ -8,9 +6,9 @@ BEGIN
         RETURN;
     END IF;
 
-    LOCK TABLE agent2_personal_weekly_briefs IN ACCESS EXCLUSIVE MODE;
+    LOCK TABLE public.agent2_personal_weekly_briefs IN ACCESS EXCLUSIVE MODE;
     SELECT count(*) INTO record_count
-    FROM agent2_personal_weekly_briefs;
+    FROM public.agent2_personal_weekly_briefs;
 
     IF record_count > 0 THEN
         RAISE EXCEPTION
@@ -18,8 +16,6 @@ BEGIN
             record_count;
     END IF;
 
-    DROP TABLE agent2_personal_weekly_briefs;
+    DROP TABLE public.agent2_personal_weekly_briefs;
 END
 $$;
-
-COMMIT;

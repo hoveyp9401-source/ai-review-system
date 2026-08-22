@@ -55,7 +55,7 @@ python -m pytest -q --tb=no
 ## PostgreSQL迁移与回退验证
 
 - 早一版迁移曾在官方/EDB PostgreSQL 16.15临时实例通过首次应用、幂等应用、约束、状态变化和零残留；原始摘要保存在 `personal-weekly-brief-postgres-prior-pass.json`，但它早于本轮 `generating` 状态和回退包，不能冒充最新SQL验收。
-- 最新验证脚本现覆盖：apply→空表rollback→apply、PUBLIC无表权限、非空表拒绝rollback并保留记录、清空后最终rollback零残留；回退错误明确要求先备份并人工处理。当前SQL哈希和脚本级门禁保存在 `personal-weekly-brief-migration-rollback-script-gate.json`，状态明确为 `PASS_STATIC_ONLY`，没有冒充真实数据库执行。
+- 最新创建/回退SQL已移除内部BEGIN/COMMIT，可安全嵌入主任务的生产外层事务；回退的LOCK、SELECT、DROP全部限定 `public.agent2_personal_weekly_briefs`。独立验证脚本在本机模式自行给每一步包事务，并覆盖：apply→空表rollback→apply、PUBLIC无表权限、非空表拒绝rollback并保留记录、清空后最终rollback零残留；回退错误明确要求先备份并人工处理。当前SQL哈希和脚本级门禁保存在 `personal-weekly-brief-migration-rollback-script-gate.json`，状态明确为 `PASS_STATIC_ONLY`，没有冒充真实数据库执行。
 - 按主任务上限，本轮只重试官方临时包两次；两次下载都不完整，最新证据为 `personal-weekly-brief-postgres-isolated.json` 的FAIL。脚本已补下载长度和ZIP完整性校验，两次均在启动PostgreSQL前停止并删除临时目录；匹配进程0、目录0、生产数据库连接0、钉钉发送0。
 - 因此最新迁移/回退包尚缺真实数据库执行证据。主任务需在已授权生产库用外层事务执行create→rollback→create、非空拒绝和最终清理核对，确认回滚后零残留，再允许双开关关闭的代码与表结构部署。
 
