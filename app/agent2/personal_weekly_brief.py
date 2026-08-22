@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import hashlib
 import json
+import re
 from time import perf_counter
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -32,10 +33,25 @@ _MAX_MESSAGE_CHARS = 3600
 _MAX_SOURCE_COUNT = 120
 _MAX_SOURCE_TEXT_CHARS = 2000
 _MAX_TOTAL_SOURCE_CHARS = 30000
+PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED = False
+PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED = False
+PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS = 4000
+PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS = 2000
+PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS = 3
 _MAX_SECTION_ITEMS = {
     "completed": 12,
     "possible_open_loops": 8,
 }
+_EMPTY_SECTION_NOTES = {
+    "completed": "本周没有找到已保存的今日工作记录。",
+    "plan_progress": "本周没有找到可核对的周计划事项。",
+    "possible_open_loops": "本周暂时没有找到需要单独提醒的未闭环事项。",
+}
+_CRITICAL_LITERAL_PATTERNS = (
+    re.compile(r"(?<!\d)\d{1,4}年\d{1,2}月\d{1,2}日"),
+    re.compile(r"(?<!\d)\d{1,2}月\d{1,2}日"),
+    re.compile(r"(?<!\d)\d+(?:\.\d+)?(?:亿元|万元|元|%|笔|份|项|人|天)"),
+)
 
 
 @dataclass(frozen=True)
@@ -320,16 +336,24 @@ class Agent2PersonalWeeklyBriefGenerator:
         thinking_enabled: bool = True,
         timeout_seconds: float = 60.0,
         max_retries: int = 1,
+        max_tokens: int = 8000,
     ) -> None:
         if not model.strip():
             raise ValueError("Agent2 model is required")
         self._llm_client = llm_client
         self.model = model
         self._thinking_enabled = thinking_enabled
-        if timeout_seconds <= 0 or max_retries < 0 or max_retries > 1:
+        if (
+            timeout_seconds <= 0
+            or max_retries < 0
+            or max_retries > 1
+            or max_tokens < 500
+            or max_tokens > 8000
+        ):
             raise ValueError("Agent2 weekly brief request limits are invalid")
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
+        self._max_tokens = max_tokens
 
     async def generate(
         self,
@@ -367,7 +391,7 @@ class Agent2PersonalWeeklyBriefGenerator:
             thinking_enabled=self._thinking_enabled,
             timeout_seconds=self._timeout_seconds,
             max_retries=self._max_retries,
-            max_tokens=8000,
+            max_tokens=self._max_tokens,
         )
         try:
             payload = extract_json_object(response)
@@ -400,16 +424,24 @@ class Agent2PersonalWeeklyBriefReviewer:
         thinking_enabled: bool = False,
         timeout_seconds: float = 60.0,
         max_retries: int = 1,
+        max_tokens: int = 8000,
     ) -> None:
         if not model.strip():
             raise ValueError("Agent2 review model is required")
         self._llm_client = llm_client
         self.model = model
         self._thinking_enabled = thinking_enabled
-        if timeout_seconds <= 0 or max_retries < 0 or max_retries > 1:
+        if (
+            timeout_seconds <= 0
+            or max_retries < 0
+            or max_retries > 1
+            or max_tokens < 500
+            or max_tokens > 8000
+        ):
             raise ValueError("Agent2 weekly brief review limits are invalid")
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
+        self._max_tokens = max_tokens
 
     async def review(
         self,
@@ -423,7 +455,12 @@ class Agent2PersonalWeeklyBriefReviewer:
                 {
                     "trusted_snapshot": snapshot.as_payload(),
                     "draft": content.as_payload(),
-                    "trace": content.trace_payload(),
+                    "server_checks": {
+                        "critical_amount_date_literals_complete": True,
+                        "frozen_source_dispositions_complete": True,
+                        "weekly_plan_sources_exactly_once": True,
+                        "section_source_bindings_valid": True,
+                    },
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -432,17 +469,18 @@ class Agent2PersonalWeeklyBriefReviewer:
             thinking_enabled=self._thinking_enabled,
             timeout_seconds=self._timeout_seconds,
             max_retries=self._max_retries,
-            max_tokens=8000,
+            max_tokens=self._max_tokens,
         )
         try:
             payload = extract_json_object(raw)
         except (TypeError, ValueError) as exc:
             raise ValueError("independent model review returned invalid JSON") from exc
-        if set(payload) != {
+        required_review_fields = {
             "approved",
             "reviewed_matter_keys",
             "issues",
-        }:
+        }
+        if not required_review_fields.issubset(payload):
             raise ValueError("independent model review returned invalid payload")
         reviewed = payload["reviewed_matter_keys"]
         issues = payload["issues"]
@@ -475,7 +513,7 @@ class Agent2PersonalWeeklyBriefReviewer:
             if matter_key not in expected_keys and matter_key not in {
                 source.source_id for source in snapshot.sources
             }:
-                raise ValueError("independent model review issue has unknown matter")
+                matter_key = "__brief__"
             normalized_issues.append({"matter_key": matter_key, "reason": reason})
         if payload["approved"] is not True or normalized_issues:
             raise PersonalWeeklyBriefReviewRejected(normalized_issues)
@@ -520,8 +558,8 @@ class Agent2PersonalWeeklyBriefModelPipeline:
         reviewer: Agent2PersonalWeeklyBriefReviewer,
         max_semantic_attempts: int = 2,
     ) -> None:
-        if max_semantic_attempts != 2:
-            raise ValueError("personal weekly brief semantic attempts must equal two")
+        if max_semantic_attempts not in {2, 3}:
+            raise ValueError("personal weekly brief semantic attempts must be bounded")
         self._generator = generator
         self._reviewer = reviewer
         self._max_semantic_attempts = max_semantic_attempts
@@ -700,6 +738,11 @@ def _validated_content(
         source_by_id=source_by_id,
         cited_source_ids=all_cited_source_ids,
     )
+    _validate_critical_literal_coverage(
+        source_by_id=source_by_id,
+        sections=(completed, plan_progress, possible_open_loops),
+        source_dispositions=source_dispositions,
+    )
     return {
         "intro": intro,
         "completed": completed,
@@ -707,6 +750,60 @@ def _validated_content(
         "possible_open_loops": possible_open_loops,
         "source_dispositions": source_dispositions,
     }
+
+
+def _critical_literals(value: str) -> tuple[str, ...]:
+    literals: list[str] = []
+    seen: set[str] = set()
+    for pattern in _CRITICAL_LITERAL_PATTERNS:
+        for match in pattern.finditer(value):
+            literal = match.group(0)
+            if literal not in seen:
+                seen.add(literal)
+                literals.append(literal)
+    return tuple(literals)
+
+
+def _validate_critical_literal_coverage(
+    *,
+    source_by_id: dict[str, SourceEvidence],
+    sections: tuple[PersonalWeeklyBriefSection, ...],
+    source_dispositions: tuple[PersonalWeeklyBriefSourceDisposition, ...],
+) -> None:
+    cited_source_ids = {
+        disposition.source_id
+        for disposition in source_dispositions
+        if disposition.disposition == "cited"
+    }
+    excluded_critical_sources = [
+        source_id
+        for source_id, source in source_by_id.items()
+        if _critical_literals(source.original_text)
+        and source_id not in cited_source_ids
+    ]
+    if excluded_critical_sources:
+        raise ValueError(
+            "personal weekly brief source with critical amount or date "
+            f"cannot be excluded: {excluded_critical_sources[0]}"
+        )
+    texts_by_source: dict[str, list[str]] = {
+        source_id: [] for source_id in cited_source_ids
+    }
+    for section in sections:
+        for item in section.items:
+            for source_id in item.source_ids:
+                if source_id in texts_by_source:
+                    texts_by_source[source_id].append(item.text)
+    for source_id in sorted(cited_source_ids):
+        conclusion = "\n".join(texts_by_source[source_id])
+        if any(
+            literal not in conclusion
+            for literal in _critical_literals(source_by_id[source_id].original_text)
+        ):
+            raise ValueError(
+                "personal weekly brief critical amount or date literal "
+                f"is missing for source {source_id}"
+            )
 
 
 def _validated_source_dispositions(
@@ -785,7 +882,12 @@ def _validated_section(
     if raw_items and empty_note:
         raise ValueError(f"personal weekly brief {name} cannot mix items and empty note")
     if not raw_items:
-        empty_note = _bounded_text(empty_note, field=f"{name}.empty_note", maximum=500)
+        empty_note = empty_note or _EMPTY_SECTION_NOTES[name]
+        empty_note = _bounded_text(
+            empty_note,
+            field=f"{name}.empty_note",
+            maximum=500,
+        )
     items: list[PersonalWeeklyBriefItem] = []
     for raw in raw_items:
         expected = {"matter_key", "text", "source_ids"}
@@ -916,6 +1018,7 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 请把当周周一至周五的日报与本周周计划整理成自然、简洁、像服务同事的中文。所有语义判断、跨日合并、计划进展判断和未闭环判断都由你完成，但必须遵守：
 1. 只能使用 trusted_snapshot.sources；每条结论必须列出实际支持它的 source_ids，不得伪造来源，也不得声称“已核对”。completed 中每一项必须至少引用一条 section=today_work 的日报来源；问题、明日计划或周计划只能作为补充证据，不能单独成为“本周完成事项”。
 2. 今日工作中的“跟进、沟通、准备、起草、计划”等不得改写成“完成”。金额、日期、对象、条件、否定等关键事实不能遗漏或改变。
+   明确否定必须保留否定的具体对象：例如来源写“对方没有承诺付款”，可以写“尚未明确付款承诺”，但不能只概括成“尚未有结果”或“尚未闭环”。
 3. 同一项目、案件或事项跨多天重复且指向明确时，必须合并为一条，保留所有关键进展和事实；只有无法可靠判断是否同一事项时才分开，不得靠猜测强行合并。
 4. 计划进展状态只能是：已完成、持续推进、安排调整、后续安排、暂时没有找到后续记录。除最后一种外，必须同时引用周计划和当日或后来日报证据；没有后来记录时只能用最后一种，绝不能说“未完成”。trusted_snapshot 中每个 source_kind=weekly_plan 的 source_id 都必须在 plan_progress 中恰好引用一次；同一事项跨日时可以在一条进展中引用多条周计划来源，但不得漏项或重复。
 5. plan_progress 与 possible_open_loops 中同一事项只能出现一次，并使用相同的稳定 matter_key 来帮助服务器去重；plan_progress 已引用的任何 source_id 都不能再次用于 possible_open_loops，即使换了 matter_key 也不行。
@@ -938,9 +1041,9 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 
 _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核步骤。你不能改写草稿，只能逐项判断是否安全通过。
 
-必须先按 trace 中每一条实际引用的 source_id 逐条对照原文，再按 matter_key 汇总结论；不能只看草稿是否通顺。对每个 matter_key 检查：
+必须先按 trusted_snapshot.sources 中每一条实际引用的 source_id 逐条对照原文，再按 matter_key 汇总结论；不能只看草稿是否通顺。对每个 matter_key 检查：
 1. 结论引用的 source_ids 是否真的支持文字，是否有伪造来源；completed 每项是否至少引用 today_work 日报来源；
-2. 对该事项引用的每个 source_id，是否改变或遗漏其中任何金额、日期、对象、条件、否定、归属和完成状态；只要一个来源中的关键事实没有进入结论，就必须拒绝；
+2. 对该事项引用的每个 source_id，是否改变或遗漏其中任何金额、日期、对象、条件、否定、归属和完成状态；只要一个来源中的这类关键事实没有进入结论，就必须拒绝。允许合并同义表达、删除“继续跟进”等重复过程词，不要求逐字复制原文；
 3. 是否把跟进、沟通、准备、起草或计划武断写成完成；
 4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”；每条 weekly_plan 来源是否在计划进展中恰好出现一次。“后续安排”可以由后来日报的 tomorrow_plan 支持，它不表示已完成；“安排调整”只需后来日报明确记录安排发生变化，不要求再有调整后事项的最终完成证据。
 5. 计划进展和可能未闭环中是否重复同一事项。仅来自日报、并非周计划的谨慎未闭环事项可以只出现在 possible_open_loops，不要求进入 plan_progress；已经在 plan_progress 中说明调整或未找到后续记录的计划事项，不应再复制到 possible_open_loops。
@@ -948,13 +1051,22 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
 7. source_dispositions 是否逐条覆盖冻结来源全集；所有 cited 是否真的被条目引用；所有 safely_excluded 是否未被引用且理由具体、安全，没有借排除理由静默丢失应汇总事实。
 8. intro 与 empty_note 是否只作系统说明、不承载业务结论；所有业务事实是否都在带来源ID的 items 中。空数据说明是否与可信空快照一致。
 
+以下情况明确属于安全，不得据此拒绝：
+- completed 项只要至少引用一条 today_work 日报即可，不要求再引用对应周计划；同一事项同时出现在 completed 和 plan_progress 是允许的，二者分别回答“本周做了什么”和“计划进展”。
+- 仅来自日报的风险或谨慎未闭环事项可以只在 possible_open_loops，不要求进入 plan_progress，也不要求证明它属于周计划。
+- plan_progress 的 status 已是“后续安排”时，正文写“安排下周一确认”等自然表达不等于已完成。
+- 周计划来源后没有任何后来日报来源时，“暂时没有找到后续记录”就是正确状态，不得要求模型证明不存在服务器未提供的来源。
+- “没有承诺付款”改写成“尚未明确付款承诺”、“继续跟进”压缩成“持续推进”等不改变事实的自然表达可以通过；但金额、明确日期、条件关系、否定和完成状态仍必须保留。
+- 原文“对方没有承诺付款”时，草稿只写“事项尚未闭环”不够，因为否定对象“付款承诺”已丢失，必须拒绝；写成“尚未明确付款承诺”才属于保留否定事实的安全改写。
+
 必须覆盖草稿里的每个唯一 matter_key。只返回 JSON：
 {
   "approved": true或false,
   "reviewed_matter_keys": ["逐个唯一事项键"],
   "issues": [{"matter_key": "事项键", "reason": "不通过原因"}]
 }
-只要一项不安全，approved 必须为 false。不得自行生成替换文字。"""
+user_prompt 中的 server_checks 是服务器在调用你之前已经完成的确定性核对，值为 true 时具有最高权威：不得再次声称金额/明确日期遗漏、来源全集不完整、周计划来源漏项/重复或栏目来源绑定错误。你只需独立审核服务器无法确定的语义：条件与否定是否改变、完成状态是否夸大、对象与事项是否编造、计划状态和跨日归类是否正确。
+issues 只能列出真正不安全、需要修复的事项；禁止把“通过、符合规则、未发现问题”的检查过程写入 issues。全部事项安全时，approved 必须为 true 且 issues 必须是空数组；只要一项不安全，approved 必须为 false。reason 只用一句话指出具体遗漏或错误，不写检查过程、通过说明或推测服务器未提供的来源。不得自行生成替换文字，也不得增加 explanation、summary 或逐项通过说明字段。"""
 
 
 __all__ = [
@@ -962,6 +1074,11 @@ __all__ = [
     "Agent2PersonalWeeklyBriefReviewer",
     "Agent2PersonalWeeklyBriefModelPipeline",
     "PLAN_PROGRESS_STATUSES",
+    "PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS",
+    "PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED",
+    "PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS",
+    "PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED",
+    "PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS",
     "PersonalWeeklyBriefContent",
     "PersonalWeeklyBriefItem",
     "PersonalWeeklyBriefModelOutcome",

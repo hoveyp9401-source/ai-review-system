@@ -1,3 +1,13 @@
+from pathlib import Path
+
+from app.agent2.personal_weekly_brief import (
+    PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
+    PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
+)
+
 from scripts.run_agent2_personal_weekly_brief_concurrency_probe import (
     _settings,
 )
@@ -37,3 +47,30 @@ def test_real_model_gate_loads_only_allowlisted_llm_fields(tmp_path) -> None:
     assert settings.database_url.endswith("@127.0.0.1:1/unused")
     assert settings.dingtalk_app_secret == ""
     assert settings.dingtalk_default_robot_webhook == ""
+
+
+def test_production_weekly_brief_uses_two_fast_independent_flash_calls() -> None:
+    assert PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED is False
+    assert PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED is False
+    assert PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS == 4000
+    assert PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS == 2000
+
+    runner = Path("app/scheduler/runner.py").read_text(encoding="utf-8")
+    assert runner.count(
+        "thinking_enabled=PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED"
+    ) == 2
+    assert runner.count(
+        "thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED"
+    ) == 2
+    assert runner.count(
+        "max_tokens=PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS"
+    ) == 2
+    assert runner.count("max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS") == 2
+    assert PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS == 3
+    assert runner.count(
+        "max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS"
+    ) == 2
+    model_eval = Path(
+        "scripts/run_agent2_personal_weekly_brief_model_eval.py"
+    ).read_text(encoding="utf-8")
+    assert "PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS * 2" in model_eval

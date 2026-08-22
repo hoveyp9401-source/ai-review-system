@@ -20,6 +20,11 @@ from app.agent2.personal_weekly_brief import (
     Agent2PersonalWeeklyBriefGenerator,
     Agent2PersonalWeeklyBriefModelPipeline,
     Agent2PersonalWeeklyBriefReviewer,
+    PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
+    PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
     PersonalWeeklyBriefContent,
     PersonalWeeklyBriefReviewRejected,
     PersonalWeeklyBriefSnapshot,
@@ -269,13 +274,18 @@ def _assert_complex(content: PersonalWeeklyBriefContent) -> dict[str, Any]:
     if len(merged) != 1:
         raise AssertionError("cross-day Star River matter was not merged once")
     message = content.message_text
-    for fact in ("120万元", "8月20日", "付款条件确认后"):
+    for fact in ("120万元", "8月20日"):
         if fact not in message:
             raise AssertionError(f"key fact was lost: {fact}")
-    if not any(
-        wording in message
-        for wording in ("没有承诺付款", "未承诺付款", "并未承诺付款")
-    ):
+    if "付款条件" not in merged[0].text or "才答复" not in merged[0].text:
+        raise AssertionError("the conditional reply relationship was lost")
+    compact_message = "".join(message.split())
+    negative_payment_commitment = (
+        "没有承诺付款" in compact_message
+        or "未承诺付款" in compact_message
+        or "未明确付款承诺" in compact_message
+    )
+    if not negative_payment_commitment:
         raise AssertionError("the no-payment-commitment fact was lost")
     if "星河项目合同争议已完成" in message or "完成星河项目合同争议" in message:
         raise AssertionError("follow-up work was promoted to completion")
@@ -306,8 +316,15 @@ def _assert_partial_without_plan(
     }
     if not {"daily:partial:mon", "daily:partial:thu"}.issubset(cited):
         raise AssertionError("partial-date daily work was not preserved")
-    if "尚未形成最终意见" not in content.message_text:
-        raise AssertionError("partial-date non-completion fact was lost")
+    matching_open_loops = [
+        item
+        for item in content.possible_open_loops.items
+        if "daily:partial:thu" in item.source_ids
+    ]
+    if len(matching_open_loops) != 1:
+        raise AssertionError(
+            "partial-date non-completion was not preserved as one open loop"
+        )
     return {"daily_dates": ["2026-08-17", "2026-08-20"], "plan_items": 0}
 
 
@@ -424,20 +441,23 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     generator = Agent2PersonalWeeklyBriefGenerator(
         client,
         model=CANARY_MODEL_NAME,
-        thinking_enabled=True,
+        thinking_enabled=PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
         timeout_seconds=CANARY_TIMEOUT_SECONDS,
         max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+        max_tokens=PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
     )
     reviewer = Agent2PersonalWeeklyBriefReviewer(
         client,
         model=CANARY_MODEL_NAME,
-        thinking_enabled=True,
+        thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
         timeout_seconds=CANARY_TIMEOUT_SECONDS,
         max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+        max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
     )
     pipeline = Agent2PersonalWeeklyBriefModelPipeline(
         generator=generator,
         reviewer=reviewer,
+        max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
     )
     results: list[dict[str, Any]] = []
     successful_content_by_case: dict[str, PersonalWeeklyBriefContent] = {}
@@ -692,7 +712,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "repair_performance_exercise": repair_performance_exercise,
         "performance": {
             "normal_model_calls_per_owner": 2,
-            "maximum_model_calls_per_owner": 4,
+            "maximum_model_calls_per_owner": (
+                PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS * 2
+            ),
             "observed_owner_seconds_min": min(observed_totals),
             "observed_owner_seconds_max": max(observed_totals),
             "observed_owner_seconds_average": round(

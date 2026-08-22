@@ -38,6 +38,11 @@ from app.agent2.personal_weekly_brief import (
     Agent2PersonalWeeklyBriefGenerator,
     Agent2PersonalWeeklyBriefModelPipeline,
     Agent2PersonalWeeklyBriefReviewer,
+    PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
+    PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
     PersonalWeeklyBriefSnapshot,
     derive_personal_weekly_brief_window,
 )
@@ -665,20 +670,23 @@ async def run_personal_weekly_brief_generation_job(
     generator = Agent2PersonalWeeklyBriefGenerator(
         llm_client,
         model=CANARY_MODEL_NAME,
-        thinking_enabled=CANARY_THINKING_ENABLED,
+        thinking_enabled=PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
         timeout_seconds=CANARY_TIMEOUT_SECONDS,
         max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+        max_tokens=PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
     )
     reviewer = Agent2PersonalWeeklyBriefReviewer(
         llm_client,
         model=CANARY_MODEL_NAME,
-        thinking_enabled=True,
+        thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
         timeout_seconds=CANARY_TIMEOUT_SECONDS,
         max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+        max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
     )
     model_pipeline = Agent2PersonalWeeklyBriefModelPipeline(
         generator=generator,
         reviewer=reviewer,
+        max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
     )
 
     async def generate_one(row):
@@ -922,19 +930,22 @@ async def run_personal_weekly_brief_reconcile_job(
     generator = Agent2PersonalWeeklyBriefGenerator(
         llm_client,
         model=CANARY_MODEL_NAME,
-        thinking_enabled=CANARY_THINKING_ENABLED,
+        thinking_enabled=PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
         timeout_seconds=CANARY_TIMEOUT_SECONDS,
         max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+        max_tokens=PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
     )
     model_pipeline = Agent2PersonalWeeklyBriefModelPipeline(
         generator=generator,
         reviewer=Agent2PersonalWeeklyBriefReviewer(
             llm_client,
             model=CANARY_MODEL_NAME,
-            thinking_enabled=True,
+            thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
             max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+            max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
         ),
+        max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
     )
     delivered_count = 0
     for week_start in sorted({row.week_start for row in requeued_generation}):

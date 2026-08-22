@@ -17,6 +17,11 @@ from app.agent2.personal_weekly_brief import (
     Agent2PersonalWeeklyBriefGenerator,
     Agent2PersonalWeeklyBriefModelPipeline,
     Agent2PersonalWeeklyBriefReviewer,
+    PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
+    PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
+    PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
 )
 from app.agent2.tool_calling.canary_config import (
     CANARY_MAX_REQUEST_ATTEMPTS,
@@ -27,6 +32,8 @@ from app.config import Settings
 from app.llm.client import LLMClient
 from scripts.run_agent2_personal_weekly_brief_model_eval import (
     EXPECTED_MODEL,
+    _assert_complex,
+    _complex_snapshot,
     _empty_snapshot,
     _read_model_only_config,
 )
@@ -40,6 +47,7 @@ def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--case", choices=("empty", "complex"), default="empty")
     return parser.parse_args()
 
 
@@ -91,21 +99,25 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         generator=Agent2PersonalWeeklyBriefGenerator(
             client,
             model=CANARY_MODEL_NAME,
-            thinking_enabled=True,
+            thinking_enabled=PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
             max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+            max_tokens=PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
         ),
         reviewer=Agent2PersonalWeeklyBriefReviewer(
             client,
             model=CANARY_MODEL_NAME,
-            thinking_enabled=True,
+            thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
             max_retries=CANARY_MAX_REQUEST_ATTEMPTS - 1,
+            max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
         ),
+        max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS,
     )
     active = 0
     maximum_active = 0
     lock = asyncio.Lock()
+    snapshot = _complex_snapshot() if args.case == "complex" else _empty_snapshot()
 
     async def one_owner(index: int) -> dict[str, Any]:
         nonlocal active, maximum_active
@@ -115,10 +127,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         started = perf_counter()
         try:
             outcome = await pipeline.generate_and_review(
-                snapshot=_empty_snapshot(),
+                snapshot=snapshot,
                 recipient_name=f"脱敏并发用户{index}",
                 personal_memory={"entries": []},
             )
+            if args.case == "complex":
+                _assert_complex(outcome.content)
             return {
                 "owner_index": index,
                 "status": "PASS",
@@ -153,6 +167,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             else "FAIL"
         ),
         "model": CANARY_MODEL_NAME,
+        "case": args.case,
         "configured_concurrency": CONCURRENCY,
         "maximum_observed_active_owners": maximum_active,
         "success_count": success_count,
