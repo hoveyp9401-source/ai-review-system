@@ -13,7 +13,6 @@ from app.legal_daily_roster import (
     FormalLegalDailyRoster,
     load_formal_legal_daily_roster,
 )
-from app.models import Agent2ConversationState
 
 
 @dataclass(frozen=True)
@@ -45,6 +44,7 @@ def validate_personal_weekly_brief_targets(
     expected_model_name: str,
     runtime_tenant_id: str | None = None,
 ) -> tuple[PersonalWeeklyBriefTarget, ...]:
+    del conversation_states
     if roster.member_count != FORMAL_ROSTER_MEMBER_COUNT:
         raise RuntimeError("personal weekly brief scope must contain exactly 74 members")
     if not expected_model_name.strip():
@@ -63,10 +63,6 @@ def validate_personal_weekly_brief_targets(
         key=lambda row: str(getattr(row, "user_id", "")),
         label="Agent2 control",
     )
-    states_by_user_key: dict[str, list[Any]] = {}
-    for state in conversation_states:
-        states_by_user_key.setdefault(str(getattr(state, "user_key", "")), []).append(state)
-
     roster_ids = set(roster.user_ids)
     if set(binding_by_user) != roster_ids:
         raise RuntimeError("personal weekly brief identity binding scope is incomplete")
@@ -93,22 +89,13 @@ def validate_personal_weekly_brief_targets(
             and str(getattr(control, "model_name", "")) == expected_model_name
         ):
             raise RuntimeError("personal weekly brief Agent2 control mismatch")
-        user_key = f"{runtime_tenant}:{member.user_id}"
-        states = states_by_user_key.get(user_key, [])
-        conversations = {
-            str(getattr(state, "conversation_id", "")).strip()
-            for state in states
-            if str(getattr(state, "conversation_id", "")).strip()
-        }
-        if len(states) != 1 or len(conversations) != 1:
-            raise RuntimeError("personal weekly brief conversation context is not unique")
         targets.append(
             PersonalWeeklyBriefTarget(
                 tenant_id=runtime_tenant,
                 internal_user_id=member.user_id,
                 dingtalk_user_id=member.dingtalk_user_id,
                 display_name=member.user_name,
-                conversation_id=conversations.pop(),
+                conversation_id=_direct_conversation_id(member.user_id),
             )
         )
     return tuple(targets)
@@ -124,6 +111,7 @@ def revalidate_personal_weekly_brief_targets(
     expected_model_name: str,
     runtime_tenant_id: str | None = None,
 ) -> PersonalWeeklyBriefTargetRevalidation:
+    del conversation_states
     runtime_tenant = str(runtime_tenant_id or roster.tenant_id).strip()
     if not runtime_tenant:
         raise RuntimeError("personal weekly brief runtime tenant is missing")
@@ -142,10 +130,6 @@ def revalidate_personal_weekly_brief_targets(
 
     bindings_by_user = _group_by(bindings, key=lambda row: str(getattr(row, "user_id", "")))
     controls_by_user = _group_by(controls, key=lambda row: str(getattr(row, "user_id", "")))
-    states_by_user = _group_by(
-        conversation_states,
-        key=lambda row: str(getattr(row, "user_key", "")),
-    )
     valid: dict[str, PersonalWeeklyBriefTarget] = {}
     blocked: dict[str, str] = {}
     for member in roster.members:
@@ -177,21 +161,12 @@ def revalidate_personal_weekly_brief_targets(
         ):
             blocked[user_id] = "agent2_control_changed"
             continue
-        state_rows = states_by_user.get(f"{runtime_tenant}:{user_id}", ())
-        conversation_ids = {
-            str(getattr(row, "conversation_id", "")).strip()
-            for row in state_rows
-            if str(getattr(row, "conversation_id", "")).strip()
-        }
-        if len(state_rows) != 1 or len(conversation_ids) != 1:
-            blocked[user_id] = "conversation_context_not_unique"
-            continue
         latest = PersonalWeeklyBriefTarget(
             tenant_id=runtime_tenant,
             internal_user_id=user_id,
             dingtalk_user_id=member.dingtalk_user_id,
             display_name=member.user_name,
-            conversation_id=next(iter(conversation_ids)),
+            conversation_id=_direct_conversation_id(user_id),
         )
         if latest != frozen_by_user[user_id]:
             blocked[user_id] = "target_changed_after_snapshot"
@@ -248,21 +223,11 @@ async def load_personal_weekly_brief_targets(
             )
         ).all()
     )
-    user_keys = tuple(f"{tenant_id}:{user_id}" for user_id in user_ids)
-    states = tuple(
-        (
-            await session.scalars(
-                select(Agent2ConversationState).where(
-                    Agent2ConversationState.user_key.in_(user_keys)
-                )
-            )
-        ).all()
-    )
     return validate_personal_weekly_brief_targets(
         roster=roster,
         bindings=bindings,
         controls=controls,
-        conversation_states=states,
+        conversation_states=(),
         expected_model_name=expected_model_name,
         runtime_tenant_id=tenant_id,
     )
@@ -303,22 +268,12 @@ async def load_personal_weekly_brief_target_revalidation(
             )
         ).all()
     )
-    user_keys = tuple(f"{tenant_id}:{user_id}" for user_id in user_ids)
-    states = tuple(
-        (
-            await session.scalars(
-                select(Agent2ConversationState).where(
-                    Agent2ConversationState.user_key.in_(user_keys)
-                )
-            )
-        ).all()
-    )
     return revalidate_personal_weekly_brief_targets(
         roster=roster,
         frozen_targets=frozen_targets,
         bindings=bindings,
         controls=controls,
-        conversation_states=states,
+        conversation_states=(),
         expected_model_name=expected_model_name,
         runtime_tenant_id=tenant_id,
     )
@@ -339,6 +294,13 @@ def _group_by(rows, *, key) -> dict[str, tuple[Any, ...]]:
     for row in rows:
         grouped.setdefault(key(row), []).append(row)
     return {identifier: tuple(values) for identifier, values in grouped.items()}
+
+
+def _direct_conversation_id(user_id: str) -> str:
+    normalized = str(user_id or "").strip()
+    if not normalized or len(normalized) > 200:
+        raise RuntimeError("personal weekly brief direct conversation identity is invalid")
+    return f"agent2-direct:{normalized}"
 
 
 __all__ = [

@@ -284,17 +284,18 @@ async def run_simulation() -> dict[str, Any]:
         )
     except RuntimeError:
         ambiguous_identity_rejected = True
-    ambiguous_context_rejected = False
-    try:
-        validate_personal_weekly_brief_targets(
-            roster=roster,
-            bindings=bindings,
-            controls=controls,
-            conversation_states=(*states, states[0]),
-            expected_model_name=CANARY_MODEL_NAME,
-        )
-    except RuntimeError:
-        ambiguous_context_rejected = True
+    repeated_context_targets = validate_personal_weekly_brief_targets(
+        roster=roster,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=(*states, states[0]),
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+    prior_context_independent = all(
+        target.conversation_id
+        == f"agent2-direct:{target.internal_user_id}"
+        for target in repeated_context_targets
+    )
 
     settings = Settings(_env_file=None)
     payload = {
@@ -309,7 +310,7 @@ async def run_simulation() -> dict[str, Any]:
         "source_isolation_passed": source_isolation_passed,
         "outsider_rejected": outsider_rejected,
         "ambiguous_identity_rejected": ambiguous_identity_rejected,
-        "ambiguous_context_rejected": ambiguous_context_rejected,
+        "prior_context_independent": prior_context_independent,
         "generation_switch_enabled": settings.agent2_personal_weekly_brief_enabled,
         "send_switch_enabled": settings.agent2_personal_weekly_brief_send_enabled,
         "transport_calls": transport.calls,
@@ -322,7 +323,7 @@ async def run_simulation() -> dict[str, Any]:
         "source_isolation_passed": 74,
         "outsider_rejected": True,
         "ambiguous_identity_rejected": True,
-        "ambiguous_context_rejected": True,
+        "prior_context_independent": True,
         "generation_switch_enabled": False,
         "send_switch_enabled": False,
         "transport_calls": 0,

@@ -87,6 +87,10 @@ def test_exact_74_agent2_users_resolve_to_private_self_only_targets() -> None:
     assert {target.internal_user_id for target in targets} == set(roster.user_ids)
     assert len({target.dingtalk_user_id for target in targets}) == 74
     assert all(target.tenant_id == "tenant-a" for target in targets)
+    assert all(
+        target.conversation_id == f"agent2-direct:{target.internal_user_id}"
+        for target in targets
+    )
 
 
 def test_formal_roster_and_agent2_runtime_can_use_separate_tenants() -> None:
@@ -198,18 +202,20 @@ def test_scope_rejects_any_user_not_confirmed_on_current_agent2(change) -> None:
         )
 
 
-def test_scope_rejects_ambiguous_conversation_context() -> None:
+def test_scope_uses_private_direct_context_without_requiring_prior_chat() -> None:
     roster, bindings, controls, states = _scope()
     states = (*states, states[0])
 
-    with pytest.raises(RuntimeError, match="conversation context"):
-        validate_personal_weekly_brief_targets(
-            roster=roster,
-            bindings=bindings,
-            controls=controls,
-            conversation_states=states,
-            expected_model_name=CANARY_MODEL_NAME,
-        )
+    targets = validate_personal_weekly_brief_targets(
+        roster=roster,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+
+    assert len(targets) == 74
+    assert targets[0].conversation_id == f"agent2-direct:{roster.members[0].user_id}"
 
 
 def test_pre_send_revalidation_blocks_only_changed_control_owner() -> None:
@@ -241,7 +247,7 @@ def test_pre_send_revalidation_blocks_only_changed_control_owner() -> None:
     assert len(result.valid_targets) == 73
 
 
-def test_pre_send_revalidation_blocks_only_changed_conversation_owner() -> None:
+def test_pre_send_revalidation_uses_stable_private_direct_context() -> None:
     roster, bindings, controls, states = _scope()
     frozen = validate_personal_weekly_brief_targets(
         roster=roster,
@@ -267,10 +273,12 @@ def test_pre_send_revalidation_blocks_only_changed_conversation_owner() -> None:
         expected_model_name=CANARY_MODEL_NAME,
     )
 
-    assert result.blocked_reasons == {
-        roster.members[0].user_id: "target_changed_after_snapshot"
-    }
-    assert len(result.valid_targets) == 73
+    assert result.blocked_reasons == {}
+    assert len(result.valid_targets) == 74
+    assert (
+        result.valid_targets[roster.members[0].user_id].conversation_id
+        == f"agent2-direct:{roster.members[0].user_id}"
+    )
 
 
 def test_pre_send_revalidation_stops_when_formal_roster_set_changes() -> None:
