@@ -1,0 +1,35 @@
+{
+  "schema_version": "legal.formal_roster_70_4.production_rollback_smoke.v1",
+  "executed_at": "2026-08-22T12:56:54+08:00",
+  "effective_date": "2026-08-22",
+  "production_connection_used": true,
+  "real_message_sent": false,
+  "before": {
+    "total_count": 74,
+    "child_count": 72,
+    "center_count": 2,
+    "target_center_count": 0
+  },
+  "inside_transaction": {
+    "total_count": 74,
+    "child_count": 70,
+    "center_count": 4,
+    "target_center_count": 2
+  },
+  "after_rollback": {
+    "total_count": 74,
+    "child_count": 72,
+    "center_count": 2,
+    "target_center_count": 0
+  },
+  "reports_for_targets_on_or_after_effective_date": 0,
+  "backup": {
+    "mode": "0600",
+    "sha256": "5429b69964121364fd63a52d734f6b1fb991d9cb8faff15c123790dadda1b52a",
+    "contains_private_identifiers": true,
+    "content_copied_into_evidence": false
+  },
+  "migration_script_sha256": "b7d62579a8f67714bb197d1849d61a4f31e90356d46096e032ad9b05296ca88f",
+  "result": "pass",
+  "production_state_changed": false
+}
