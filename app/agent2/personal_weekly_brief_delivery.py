@@ -58,8 +58,16 @@ class DingTalkPersonalWeeklyBriefTransport:
         from app.services.dingtalk import DingTalkDeliveryError, _delivery_user_ids
 
         try:
-            payload = await self._robot.get_robot_direct_message_status(
+            payload = await self._robot.wait_for_robot_direct_delivery(
                 process_query_key=provider_reference,
+                expected_user_ids=[],
+            )
+        except DingTalkDeliveryError as exc:
+            if exc.terminal_failure:
+                raise
+            return PersonalWeeklyBriefDelivery(
+                provider_reference=provider_reference,
+                delivery_verified=False,
             )
         except (OSError, RuntimeError, TimeoutError):
             return PersonalWeeklyBriefDelivery(

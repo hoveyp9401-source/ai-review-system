@@ -257,6 +257,14 @@ async def main() -> None:
             and pang_after[0].provider_message_id == existing_pang_provider
         ),
         "failed_names": failed_names,
+        "source_counts_by_status": {
+            status: sorted(
+                len((row.source_snapshot or {}).get("sources") or [])
+                for row in rows_after
+                if row.status == status
+            )
+            for status in sorted(statuses)
+        },
         "job_result": result,
     }
     if args.action != "inspect" and not (

@@ -36,7 +36,7 @@ _MAX_TOTAL_SOURCE_CHARS = 30000
 PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED = False
 PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED = False
 PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED = True
-PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS = 4000
+PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS = 8000
 PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS = 2000
 PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS = 4000
 PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS = 3
@@ -469,7 +469,11 @@ class Agent2PersonalWeeklyBriefReviewer:
     ) -> dict[str, Any]:
         user_payload: dict[str, Any] = {
             "trusted_snapshot": snapshot.as_payload(),
-            "draft": content.as_payload(),
+            "draft": {
+                key: value
+                for key, value in content.as_payload().items()
+                if key != "source_dispositions"
+            },
             "server_checks": {
                 "recognized_amount_date_literals_complete": True,
                 "frozen_source_dispositions_complete": True,
@@ -625,7 +629,7 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                     "instruction": (
                         "上一版模型输出未通过服务器结构或来源校验。"
                         "保持完整 trusted_snapshot，重新返回严格的完整 JSON；"
-                        "只能包含规定的五个顶层字段。"
+                        "只能包含规定的四个顶层字段。"
                     ),
                     "issues": [
                         {
@@ -762,8 +766,8 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                 "instruction": (
                     "上一版未通过独立事实复核多数判断。保持同一可信快照，"
                     "逐项修复下列问题并重新返回完整 JSON；不得删除未被指出的关键事实。"
-                    "只能返回 intro、completed、plan_progress、possible_open_loops、"
-                    "source_dispositions 五个顶层字段，不得增加说明或其他字段。"
+                    "只能返回 intro、completed、plan_progress、possible_open_loops "
+                    "四个顶层字段，不得增加说明、来源处置清单或其他字段。"
                 ),
                 "previous_draft": content.as_payload(),
                 "issues": unique_issues[:20],
@@ -1281,18 +1285,17 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 6. 没有数据、只有部分日期、没有周计划或没有风险栏时如实说明，不得编造。
 7. 简报只读，不得建议系统已经修改、补写、确认或提交日报、周计划。
 8. 不要在文字中称呼用户；称呼由服务器根据个人记忆安全添加。
-9. 把 trusted_snapshot.sources 当作完整来源清单。每个 source_id 必须在 source_dispositions 中恰好出现一次：被成品条目引用时标为 cited 且 reason 为空；未引用时只能标为 safely_excluded，并给出具体、谨慎的安全排除理由。不得静默遗漏整条来源，也不得用“内容不重要”等空泛理由排除。
+9. 把 trusted_snapshot.sources 当作完整来源清单。每个 source_id 都必须在三个业务区块的某个成品条目中引用，相关来源应合并到同一事项的 source_ids；不得静默遗漏来源。不要返回 source_dispositions，逐来源审计清单由服务器根据引用关系自动生成。
 10. intro 固定写“本周工作简报”，不得加入任何业务事实。各区块 empty_note 只是系统说明，不是业务结论，不填写来源ID；其中不得加入项目、案件、金额、状态等业务事实。所有业务结论必须放在 items 中并引用可信 source_id。空数据说明只能依据 trusted_snapshot 的空来源、日报覆盖日期和 weekly_plan_found。
 11. 成品要像一位清楚、克制的同事写的简报：优先合并同类事项，删除重复过程词和模板话，不写“系统核对、数据范围、来源完整、已保存记录”等工程说明；completed 和 possible_open_loops 通常各控制在3至6条，但事实确实较多时可以超过，不能为了变短漏掉关键事项。
-12. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的五个顶层字段，不能附加修复说明或其他字段。若 issues 指出周计划与日报不是同一具体事项，必须删除该进展项中的日报 source_id，把 status 改为“暂时没有找到后续记录”，text 只保留对应周计划事项；不得再次寻找只有泛词相似的日报凑进展。
+12. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的四个顶层字段，不能附加修复说明、来源处置清单或其他字段。若 issues 指出周计划与日报不是同一具体事项，必须删除该进展项中的日报 source_id，把 status 改为“暂时没有找到后续记录”，text 只保留对应周计划事项；不得再次寻找只有泛词相似的日报凑进展。
 
 仅返回 JSON，严格使用以下结构，不得增加字段：
 {
   "intro": "本周工作简报",
   "completed": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "结论", "source_ids": ["来源ID"]}]},
   "plan_progress": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "进展", "status": "五种状态之一", "source_ids": ["来源ID"]}]},
-  "possible_open_loops": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "谨慎说明", "source_ids": ["来源ID"]}]},
-  "source_dispositions": [{"source_id": "来源ID", "disposition": "cited或safely_excluded", "reason": "cited时为空；安全排除时写具体理由"}]
+  "possible_open_loops": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "谨慎说明", "source_ids": ["来源ID"]}]}
 }"""
 
 

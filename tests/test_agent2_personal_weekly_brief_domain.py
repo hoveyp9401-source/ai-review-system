@@ -116,6 +116,47 @@ async def test_generator_accepts_real_model_json_code_fence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_generator_keeps_large_source_audit_out_of_model_output() -> None:
+    source = _source(
+        "daily:audit:1",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="today_work",
+        text="完成合同审核。",
+    )
+    llm = _FakeLLM(
+        {
+            "intro": "本周工作简报",
+            "completed": {
+                "empty_note": "",
+                "items": [
+                    {
+                        "matter_key": "contract-review",
+                        "text": "完成合同审核。",
+                        "source_ids": [source.source_id],
+                    }
+                ],
+            },
+            "plan_progress": _empty_section("没有周计划记录。"),
+            "possible_open_loops": _empty_section("没有未闭环事项。"),
+        }
+    )
+
+    result = await Agent2PersonalWeeklyBriefGenerator(
+        llm,
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(source),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert "不要返回 source_dispositions" in llm.calls[0]["system_prompt"]
+    assert '"source_dispositions":' not in llm.calls[0]["system_prompt"]
+    assert [item.disposition for item in result.source_dispositions] == ["cited"]
+
+
+@pytest.mark.asyncio
 async def test_independent_reviewer_accepts_real_model_json_code_fence() -> None:
     content = await Agent2PersonalWeeklyBriefGenerator(
         _FakeLLM(
@@ -149,6 +190,7 @@ async def test_independent_reviewer_accepts_real_model_json_code_fence() -> None
     assert review_llm.calls[0]["timeout_seconds"] == 60.0
     assert review_llm.calls[0]["max_retries"] == 1
     review_payload = json.loads(review_llm.calls[0]["user_prompt"])
+    assert "source_dispositions" not in review_payload["draft"]
     assert review_payload["server_checks"] == {
         "recognized_amount_date_literals_complete": True,
         "frozen_source_dispositions_complete": True,
@@ -831,7 +873,7 @@ def test_reviewer_prompt_does_not_duplicate_source_trace() -> None:
     )[0]
 
     assert '"trusted_snapshot": snapshot.as_payload()' in review_body
-    assert '"draft": content.as_payload()' in review_body
+    assert 'if key != "source_dispositions"' in review_body
     assert '"trace": content.trace_payload()' not in review_body
     assert "禁止把“通过、符合规则、未发现问题”的检查过程写入 issues" in source
     assert "server_checks 是服务器在调用你之前已经完成的确定性核对" in source

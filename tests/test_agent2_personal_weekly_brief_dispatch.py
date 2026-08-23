@@ -194,12 +194,16 @@ async def test_dingtalk_transport_records_acceptance_before_separate_delivery_qu
         async def send_robot_direct_text_verified(self, **_kwargs):
             raise AssertionError("weekly brief must not hide acceptance behind polling")
 
-        async def get_robot_direct_message_status(self, **_kwargs):
-                calls.append("verified")
-                return {
-                    "sendStatus": "SUCCESS",
-                    "messageReadInfoList": [{"userId": "ding-user-a"}],
-                }
+        async def wait_for_robot_direct_delivery(self, **kwargs):
+            assert kwargs == {
+                "process_query_key": "provider-two-phase",
+                "expected_user_ids": [],
+            }
+            calls.append("verified")
+            return {
+                "sendStatus": "SUCCESS",
+                "messageReadInfoList": [{"userId": "ding-user-a"}],
+            }
 
     transport = DingTalkPersonalWeeklyBriefTransport(_Robot())
     accepted = await transport.send_private_text_accepted(
