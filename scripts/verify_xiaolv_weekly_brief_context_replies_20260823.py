@@ -11,7 +11,11 @@ from zoneinfo import ZoneInfo
 
 CASES = (
     ("second", "刚才简报第二项是什么？", "周计划与日报不会串线"),
-    ("unclosed", "哪些事项还没有闭环？", "周简报发出后能否承接"),
+    (
+        "unclosed",
+        "刚才这份简报里，哪项是可能未闭环的？",
+        "周简报发出后能否承接",
+    ),
     ("summary", "这份简报主要说了什么？", "连续对话"),
 )
 CONTEXT_MARKER = "小律上下文链路测试"
