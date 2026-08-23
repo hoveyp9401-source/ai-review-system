@@ -190,6 +190,29 @@ class PersonalWeeklyBriefSnapshot:
             "source_fingerprint": self.fingerprint,
         }
 
+    def model_payload(self) -> dict[str, Any]:
+        aliases, _ = _source_alias_maps(self)
+        return {
+            "week_start": self.week_start.isoformat(),
+            "week_end": self.week_end.isoformat(),
+            "snapshot_at": self.snapshot_at.isoformat(),
+            "daily_report_dates": [
+                value.isoformat() for value in self.daily_report_dates
+            ],
+            "weekly_plan_found": self.weekly_plan_found,
+            "sources": [
+                {
+                    "source_id": aliases[source.source_id],
+                    "source_kind": source.source_kind,
+                    "source_date": source.source_date.isoformat(),
+                    "section": source.section,
+                    "original_text": source.original_text,
+                }
+                for source in self.sources
+            ],
+            "source_fingerprint": self.fingerprint,
+        }
+
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "PersonalWeeklyBriefSnapshot":
         return cls(
@@ -376,7 +399,7 @@ class Agent2PersonalWeeklyBriefGenerator:
                 "authenticated_display_name": recipient_name,
                 "personal_memory": personal_memory,
             },
-            "trusted_snapshot": snapshot.as_payload(),
+            "trusted_snapshot": snapshot.model_payload(),
         }
         if repair_context is not None:
             encoded_repair = json.dumps(
@@ -402,6 +425,10 @@ class Agent2PersonalWeeklyBriefGenerator:
         )
         try:
             payload = extract_json_object(response)
+            payload = _resolve_model_source_references(
+                payload,
+                snapshot=snapshot,
+            )
             content = _validated_content(payload, snapshot=snapshot)
             message_text = _render_message(content, snapshot=snapshot)
         except (TypeError, ValueError) as exc:
@@ -468,12 +495,8 @@ class Agent2PersonalWeeklyBriefReviewer:
         disputed_issues: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         user_payload: dict[str, Any] = {
-            "trusted_snapshot": snapshot.as_payload(),
-            "draft": {
-                key: value
-                for key, value in content.as_payload().items()
-                if key != "source_dispositions"
-            },
+            "trusted_snapshot": snapshot.model_payload(),
+            "draft": _model_content_payload(content, snapshot=snapshot),
             "server_checks": {
                 "recognized_amount_date_literals_complete": True,
                 "frozen_source_dispositions_complete": True,
@@ -482,7 +505,17 @@ class Agent2PersonalWeeklyBriefReviewer:
             },
         }
         if disputed_issues is not None:
-            user_payload["disputed_issues"] = disputed_issues[:20]
+            aliases, _ = _source_alias_maps(snapshot)
+            user_payload["disputed_issues"] = [
+                {
+                    **issue,
+                    "matter_key": aliases.get(
+                        str(issue.get("matter_key") or ""),
+                        str(issue.get("matter_key") or ""),
+                    ),
+                }
+                for issue in disputed_issues[:20]
+            ]
         raw = await self._llm_client.complete_json(
             system_prompt=self._system_prompt,
             user_prompt=json.dumps(
@@ -528,12 +561,14 @@ class Agent2PersonalWeeklyBriefReviewer:
         if reviewed_keys != expected_keys or len(reviewed) != len(reviewed_keys):
             raise ValueError("independent model review did not cover every matter")
         normalized_issues: list[dict[str, str]] = []
+        _, source_ids_by_alias = _source_alias_maps(snapshot)
         for issue in issues:
             if not isinstance(issue, dict) or set(issue) != {"matter_key", "reason"}:
                 raise ValueError("independent model review issue is invalid")
             matter_key = _bounded_text(
                 issue["matter_key"], field="review.matter_key", maximum=128
             )
+            matter_key = source_ids_by_alias.get(matter_key, matter_key)
             reason = _bounded_text(issue["reason"], field="review.reason", maximum=500)
             if matter_key not in expected_keys and matter_key not in {
                 source.source_id for source in snapshot.sources
@@ -769,7 +804,10 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                     "只能返回 intro、completed、plan_progress、possible_open_loops "
                     "四个顶层字段，不得增加说明、来源处置清单或其他字段。"
                 ),
-                "previous_draft": content.as_payload(),
+                    "previous_draft": _model_content_payload(
+                        content,
+                        snapshot=snapshot,
+                    ),
                 "issues": unique_issues[:20],
             }
             continue
@@ -867,6 +905,85 @@ def _validated_content(
         "possible_open_loops": possible_open_loops,
         "source_dispositions": source_dispositions,
     }
+
+
+def _source_alias_maps(
+    snapshot: PersonalWeeklyBriefSnapshot,
+) -> tuple[dict[str, str], dict[str, str]]:
+    aliases = {
+        source.source_id: f"s{index:03d}"
+        for index, source in enumerate(snapshot.sources, start=1)
+    }
+    return aliases, {alias: source_id for source_id, alias in aliases.items()}
+
+
+def _resolve_model_source_references(
+    payload: dict[str, Any],
+    *,
+    snapshot: PersonalWeeklyBriefSnapshot,
+) -> dict[str, Any]:
+    _, source_ids_by_alias = _source_alias_maps(snapshot)
+    actual_source_ids = {source.source_id for source in snapshot.sources}
+
+    def resolved(value: Any) -> str:
+        source_id = str(value or "").strip()
+        if source_id in source_ids_by_alias:
+            return source_ids_by_alias[source_id]
+        if source_id in actual_source_ids:
+            return source_id
+        return source_id
+
+    normalized = dict(payload)
+    for section_name in ("completed", "plan_progress", "possible_open_loops"):
+        section = normalized.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        section_copy = dict(section)
+        items = section_copy.get("items")
+        if isinstance(items, list):
+            section_copy["items"] = [
+                {
+                    **item,
+                    "source_ids": [resolved(value) for value in item.get("source_ids", [])],
+                }
+                if isinstance(item, dict)
+                else item
+                for item in items
+            ]
+        normalized[section_name] = section_copy
+    dispositions = normalized.get("source_dispositions")
+    if isinstance(dispositions, list):
+        normalized["source_dispositions"] = [
+            {**item, "source_id": resolved(item.get("source_id"))}
+            if isinstance(item, dict)
+            else item
+            for item in dispositions
+        ]
+    return normalized
+
+
+def _model_content_payload(
+    content: PersonalWeeklyBriefContent,
+    *,
+    snapshot: PersonalWeeklyBriefSnapshot,
+) -> dict[str, Any]:
+    aliases, _ = _source_alias_maps(snapshot)
+    payload = {
+        key: value
+        for key, value in content.as_payload().items()
+        if key != "source_dispositions"
+    }
+    for section_name in ("completed", "plan_progress", "possible_open_loops"):
+        section = dict(payload[section_name])
+        section["items"] = [
+            {
+                **item,
+                "source_ids": [aliases[source_id] for source_id in item["source_ids"]],
+            }
+            for item in section["items"]
+        ]
+        payload[section_name] = section
+    return payload
 
 
 def _critical_literals(value: str) -> tuple[str, ...]:

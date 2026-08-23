@@ -133,7 +133,7 @@ async def test_generator_keeps_large_source_audit_out_of_model_output() -> None:
                     {
                         "matter_key": "contract-review",
                         "text": "完成合同审核。",
-                        "source_ids": [source.source_id],
+                        "source_ids": ["s001"],
                     }
                 ],
             },
@@ -153,6 +153,10 @@ async def test_generator_keeps_large_source_audit_out_of_model_output() -> None:
 
     assert "不要返回 source_dispositions" in llm.calls[0]["system_prompt"]
     assert '"source_dispositions":' not in llm.calls[0]["system_prompt"]
+    model_snapshot = json.loads(llm.calls[0]["user_prompt"])["trusted_snapshot"]
+    assert model_snapshot["sources"][0]["source_id"] == "s001"
+    assert "source_record_id" not in model_snapshot["sources"][0]
+    assert result.completed.items[0].source_ids == (source.source_id,)
     assert [item.disposition for item in result.source_dispositions] == ["cited"]
 
 
@@ -872,8 +876,8 @@ def test_reviewer_prompt_does_not_duplicate_source_trace() -> None:
         "class PersonalWeeklyBriefReviewRejected", 1
     )[0]
 
-    assert '"trusted_snapshot": snapshot.as_payload()' in review_body
-    assert 'if key != "source_dispositions"' in review_body
+    assert '"trusted_snapshot": snapshot.model_payload()' in review_body
+    assert '"draft": _model_content_payload(content, snapshot=snapshot)' in review_body
     assert '"trace": content.trace_payload()' not in review_body
     assert "禁止把“通过、符合规则、未发现问题”的检查过程写入 issues" in source
     assert "server_checks 是服务器在调用你之前已经完成的确定性核对" in source
