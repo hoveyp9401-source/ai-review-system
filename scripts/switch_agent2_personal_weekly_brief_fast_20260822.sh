@@ -3,15 +3,15 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-agent2-weekly-brief-rollout-20260823-v27"
-previous="$releases/ai-review-system-agent2-weekly-brief-rollout-20260823-v26"
+candidate="$releases/ai-review-system-agent2-weekly-brief-rollout-20260823-v30"
+previous="$releases/ai-review-system-agent2-weekly-brief-rollout-20260823-v27"
 current="$releases/current"
 shared_env=/home/ai_review_tunnel/ai-review-system/.env
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
-expected_commit=9c1112abba30a85d690880a786099c73045c4bff
-daily_focus_output=/home/ai_review_tunnel/deploy_backups/daily-focus-weekly-brief-rollout-v27-20260823.json
-alignment_output=/home/ai_review_tunnel/deploy_backups/alignment-weekly-brief-rollout-v27-20260823.json
-control_backup=/home/ai_review_tunnel/deploy_backups/weekly-brief-rollout-v27-controls-before-20260823.json
+expected_commit=e34588e884ebcac6b92fa0647443fbb8f37c4f2a
+daily_focus_output=/home/ai_review_tunnel/deploy_backups/daily-focus-weekly-brief-rollout-v30-20260823.json
+alignment_output=/home/ai_review_tunnel/deploy_backups/alignment-weekly-brief-rollout-v30-20260823.json
+control_backup=/home/ai_review_tunnel/deploy_backups/weekly-brief-rollout-v30-controls-before-20260823.json
 services=(
   ai-review-api.service
   ai-review-stream.service
@@ -102,13 +102,12 @@ async def main() -> None:
             == {"2026-08-17"}
             and status_counts
             == {
-                "delivered": 20,
-                "delivery_pending": 2,
+                "delivered": 71,
                 "failed": 1,
-                "snapshot_ready": 51,
+                "snapshot_ready": 2,
             }
             and sum(bool(str(row["provider_message_id"] or "")) for row in brief_rows)
-            == 22
+            == 71
             and sum(
                 bool(
                     dict(row["delivery_receipt_json"] or {}).get(
@@ -118,7 +117,7 @@ async def main() -> None:
                 )
                 for row in brief_rows
             )
-            == 20
+            == 71
         )
         if brief_rows and not (safe_failed or safe_delivered or safe_recovery):
             raise RuntimeError("personal weekly brief table is not in safe canary state")
@@ -336,7 +335,7 @@ rollback() {
     restore_previous_controls || exit 1
   fi
   if [[ "$(readlink -f "$current")" != "$previous" ]]; then
-    switch_current "$previous" weekly-brief-rollout-v27-rollback || exit 1
+    switch_current "$previous" weekly-brief-rollout-v30-rollback || exit 1
   fi
   terminate_frozen_services
   wait_healthy "$previous" || exit 1
@@ -366,7 +365,7 @@ if [[ "$action" == "deploy" ]]; then
   trap 'rollback 143' TERM
   freeze_all_services
   apply_candidate_controls
-  switch_current "$candidate" weekly-brief-rollout-v27-next
+  switch_current "$candidate" weekly-brief-rollout-v30-next
   terminate_frozen_services
   wait_healthy "$candidate"
   verify_weekly_brief_off_and_empty
@@ -380,7 +379,7 @@ if [[ "$action" == "deploy" ]]; then
   echo "deployed $candidate"
 elif [[ "$action" == "rollback" ]]; then
   if [[ "$(readlink -f "$current")" != "$candidate" ]]; then
-    echo "current release is not weekly brief rollout v27" >&2
+    echo "current release is not weekly brief rollout v30" >&2
     exit 1
   fi
   freeze_all_services
