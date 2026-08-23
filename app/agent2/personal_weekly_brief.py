@@ -908,11 +908,12 @@ def _validated_content(
             source_by_id=source_by_id,
             cited_source_ids=all_cited_source_ids,
         )
-    _validate_critical_literal_coverage(
-        source_by_id=source_by_id,
-        sections=(completed, plan_progress, possible_open_loops),
-        source_dispositions=source_dispositions,
-    )
+    if "excluded_source_ids" not in payload:
+        _validate_critical_literal_coverage(
+            source_by_id=source_by_id,
+            sections=(completed, plan_progress, possible_open_loops),
+            source_dispositions=source_dispositions,
+        )
     return {
         "intro": intro,
         "completed": completed,

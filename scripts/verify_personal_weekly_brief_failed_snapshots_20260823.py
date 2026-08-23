@@ -31,6 +31,7 @@ def _load_process_environment(pid: int) -> None:
 def _safe_error_category(exc: Exception) -> str:
     detail = str(getattr(exc, "repair_detail", "") or str(exc)).lower()
     categories = (
+        ("independent model review rejected", "semantic_review_rejected"),
         ("payload keys", "payload_keys"),
         ("source universe is incomplete", "source_coverage"),
         ("source dispositions are incomplete", "source_dispositions"),
