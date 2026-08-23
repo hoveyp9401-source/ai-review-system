@@ -91,6 +91,7 @@ async def main() -> None:
     from app.db import AsyncSessionLocal, engine
     from app.llm.client import LLMClient
     from app.models import User
+    from app.utils.json import extract_json_object
 
     settings = get_settings()
     tenant_values = tuple(
@@ -162,9 +163,47 @@ async def main() -> None:
         await session.rollback()
 
     llm_client = LLMClient(settings)
+
+    class _CaptureLLM:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.calls: list[dict[str, object]] = []
+
+        async def complete_json(self, **kwargs) -> str:
+            raw = await self.inner.complete_json(**kwargs)
+            system_prompt = str(kwargs.get("system_prompt") or "")
+            if "关键语义复核" in system_prompt:
+                phase = "critical_review"
+            elif "事实复核步骤" in system_prompt:
+                phase = "general_review"
+            else:
+                phase = "generation"
+            trace: dict[str, object] = {
+                "phase": phase,
+                "response_length": len(str(raw or "")),
+                "thinking_enabled": bool(kwargs.get("thinking_enabled")),
+                "max_tokens": int(kwargs.get("max_tokens") or 0),
+            }
+            try:
+                parsed = extract_json_object(raw)
+            except (TypeError, ValueError):
+                trace["json_object"] = False
+            else:
+                trace.update(
+                    {
+                        "json_object": True,
+                        "top_level_keys": sorted(str(key) for key in parsed),
+                        "approved_type": type(parsed.get("approved")).__name__,
+                        "issues_type": type(parsed.get("issues")).__name__,
+                    }
+                )
+            self.calls.append(trace)
+            return raw
+
+    captured_llm = _CaptureLLM(llm_client)
     pipeline = Agent2PersonalWeeklyBriefModelPipeline(
         generator=Agent2PersonalWeeklyBriefGenerator(
-            llm_client,
+            captured_llm,
             model=CANARY_MODEL_NAME,
             thinking_enabled=PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
@@ -172,7 +211,7 @@ async def main() -> None:
             max_tokens=PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS,
         ),
         reviewer=Agent2PersonalWeeklyBriefReviewer(
-            llm_client,
+            captured_llm,
             model=CANARY_MODEL_NAME,
             thinking_enabled=PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
@@ -180,7 +219,7 @@ async def main() -> None:
             max_tokens=PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS,
         ),
         critical_reviewer=Agent2PersonalWeeklyBriefReviewer(
-            llm_client,
+            captured_llm,
             model=CANARY_MODEL_NAME,
             thinking_enabled=PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
@@ -233,6 +272,7 @@ async def main() -> None:
         "database_writes": 0,
         "dingtalk_sends": 0,
         "results": results,
+        "call_trace": captured_llm.calls,
     }
     args.output.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",

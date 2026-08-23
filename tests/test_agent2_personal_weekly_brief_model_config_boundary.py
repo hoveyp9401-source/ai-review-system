@@ -58,7 +58,7 @@ def test_real_model_gate_loads_only_allowlisted_llm_fields(tmp_path) -> None:
 
 def test_production_weekly_brief_uses_bounded_reasoned_flash_reviews() -> None:
     assert PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED is False
-    assert PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED is True
+    assert PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED is False
     assert PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED is True
     assert PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS == 8000
     assert PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS == 8000
