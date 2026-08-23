@@ -199,11 +199,20 @@ async def main() -> None:
             await session.commit()
 
     if args.action == "retry_failed":
-        if before_counts != {
+        final_two_failure_counts = {
             "delivered": 71,
             "failed": 1,
             "generation_failed": 2,
-        }:
+        }
+        final_one_failure_counts = {
+            "delivered": 72,
+            "failed": 1,
+            "generation_failed": 1,
+        }
+        if (
+            before_counts != final_two_failure_counts
+            and before_counts != final_one_failure_counts
+        ):
             raise RuntimeError("weekly brief final retry state changed")
         _write(args.backup, raw_backup)
         changed_at = datetime.now(TIMEZONE)
@@ -230,7 +239,8 @@ async def main() -> None:
                     updated_at=changed_at,
                 )
             )
-            if requeued.rowcount != 2:
+            expected_requeues = before_counts["generation_failed"]
+            if requeued.rowcount != expected_requeues:
                 raise RuntimeError("final retry requeue count changed")
             await session.commit()
 
@@ -253,10 +263,16 @@ async def main() -> None:
             "failed": 1,
             "snapshot_ready": 2,
         }
+        last_retry_counts = {
+            "delivered": 72,
+            "failed": 1,
+            "snapshot_ready": 1,
+        }
         if (
             before_counts != initial_recovery_counts
             and before_counts != resumed_recovery_counts
             and before_counts != final_retry_counts
+            and before_counts != last_retry_counts
         ):
             raise RuntimeError("weekly brief recovery state changed before run")
         _write(
@@ -333,11 +349,10 @@ async def main() -> None:
         "snapshot_ready": 51,
     }:
         payload["status"] = "FAIL"
-    if args.action == "retry_failed" and after_counts != {
-        "delivered": 71,
-        "failed": 1,
-        "snapshot_ready": 2,
-    }:
+    if args.action == "retry_failed" and after_counts not in (
+        Counter({"delivered": 71, "failed": 1, "snapshot_ready": 2}),
+        Counter({"delivered": 72, "failed": 1, "snapshot_ready": 1}),
+    ):
         payload["status"] = "FAIL"
     if args.action == "run" and not (
         after_counts == {"delivered": 73, "failed": 1}

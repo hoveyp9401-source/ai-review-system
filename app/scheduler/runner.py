@@ -351,6 +351,13 @@ def register_personal_weekly_brief_jobs(
     return tuple(registered)
 
 
+async def run_serialized_personal_weekly_brief_job(lock, worker):
+    """Serialize generation and reconciliation across one scheduler process."""
+
+    async with lock:
+        return await worker()
+
+
 async def run_bounded_personal_weekly_brief_model_batch(
     rows,
     *,
@@ -2256,21 +2263,27 @@ async def run_scheduler() -> None:
     )
 
     async def personal_weekly_brief_job() -> None:
-        result = await run_personal_weekly_brief_generation_job(
-            settings,
-            llm_client=llm_client,
-            robot=robot,
-            now=datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)),
+        result = await run_serialized_personal_weekly_brief_job(
+            personal_weekly_brief_batch_lock,
+            lambda: run_personal_weekly_brief_generation_job(
+                settings,
+                llm_client=llm_client,
+                robot=robot,
+                now=datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)),
+            ),
         )
         if any(result.values()):
             logger.info("Agent2 personal weekly brief result=%s", result)
 
     async def personal_weekly_brief_reconcile_job() -> None:
-        delivered = await run_personal_weekly_brief_reconcile_job(
-            settings,
-            llm_client=llm_client,
-            robot=robot,
-            now=datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)),
+        delivered = await run_serialized_personal_weekly_brief_job(
+            personal_weekly_brief_batch_lock,
+            lambda: run_personal_weekly_brief_reconcile_job(
+                settings,
+                llm_client=llm_client,
+                robot=robot,
+                now=datetime.now(ZoneInfo(PERSONAL_WEEKLY_BRIEF_TIMEZONE)),
+            ),
         )
         if delivered:
             logger.info(
@@ -2278,6 +2291,7 @@ async def run_scheduler() -> None:
                 delivered,
             )
 
+    personal_weekly_brief_batch_lock = asyncio.Lock()
     register_personal_weekly_brief_jobs(
         scheduler,
         settings=settings,

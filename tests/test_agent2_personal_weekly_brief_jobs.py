@@ -123,6 +123,39 @@ def test_main_scheduler_wires_generation_and_reconciliation_registration() -> No
     assert "register_personal_weekly_brief_jobs(" in source
     assert "run_personal_weekly_brief_generation_job(" in source
     assert "run_personal_weekly_brief_reconcile_job(" in source
+    assert "personal_weekly_brief_batch_lock = asyncio.Lock()" in source
+    assert source.count("run_serialized_personal_weekly_brief_job(") >= 3
+
+
+@pytest.mark.asyncio
+async def test_generation_and_reconciliation_share_one_serial_execution_lock() -> None:
+    from app.scheduler.runner import run_serialized_personal_weekly_brief_job
+
+    lock = asyncio.Lock()
+    active = 0
+    maximum_active = 0
+
+    async def worker(value: str) -> str:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return value
+
+    results = await asyncio.gather(
+        run_serialized_personal_weekly_brief_job(
+            lock,
+            lambda: worker("generation"),
+        ),
+        run_serialized_personal_weekly_brief_job(
+            lock,
+            lambda: worker("reconciliation"),
+        ),
+    )
+
+    assert results == ["generation", "reconciliation"]
+    assert maximum_active == 1
 
 
 def test_weekly_batch_is_not_wired_into_daily_chat_request_paths() -> None:
