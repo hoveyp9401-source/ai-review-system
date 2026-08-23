@@ -871,12 +871,13 @@ async def test_excluded_critical_source_is_cited_on_second_model_attempt() -> No
     }
     review_approved = {
         "approved": True,
-        "reviewed_matter_keys": [
-            f"project-{index}" for index in range(len(source_groups))
-        ],
         "issues": [],
     }
-    llm = _SequenceLLM(first_invalid, second_valid, review_approved)
+    llm = _SequenceLLM(
+        first_invalid,
+        second_valid,
+        *(review_approved for _ in source_groups),
+    )
     pipeline = Agent2PersonalWeeklyBriefModelPipeline(
         generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
         reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
@@ -907,8 +908,8 @@ def test_reviewer_prompt_does_not_duplicate_source_trace() -> None:
         "class PersonalWeeklyBriefReviewRejected", 1
     )[0]
 
-    assert '"trusted_snapshot": snapshot.model_payload()' in review_body
-    assert '"draft": _model_content_payload(content, snapshot=snapshot)' in review_body
+    assert "model_snapshot = snapshot.model_payload()" in source
+    assert "model_draft = _model_content_payload(content, snapshot=snapshot)" in source
     assert '"trace": content.trace_payload()' not in review_body
     assert "禁止把“通过、符合规则、未发现问题”的检查过程写入 issues" in source
     assert "server_checks 是服务器在调用你之前已经完成的确定性核对" in source
