@@ -438,6 +438,54 @@ async def test_reviewed_source_issue_uses_compact_id_on_generation_repair() -> N
 
 
 @pytest.mark.asyncio
+async def test_unlisted_source_is_completed_as_reviewed_exclusion_candidate() -> None:
+    cited = _source(
+        "daily:coverage:cited",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="today_work",
+        text="完成甲事项。",
+    )
+    unlisted = _source(
+        "daily:coverage:unlisted",
+        kind="daily_report",
+        on_date=date(2026, 8, 19),
+        section="today_work",
+        text="重复跟进甲事项。",
+    )
+    result = await Agent2PersonalWeeklyBriefGenerator(
+        _FakeLLM(
+            {
+                "intro": "本周工作简报",
+                "completed": {
+                    "empty_note": "",
+                    "items": [
+                        {
+                            "matter_key": "matter-a",
+                            "text": "完成甲事项。",
+                            "source_ids": ["s001"],
+                        }
+                    ],
+                },
+                "plan_progress": _empty_section("没有周计划。"),
+                "possible_open_loops": _empty_section("没有未闭环事项。"),
+                "excluded_source_ids": [],
+            }
+        ),
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(cited, unlisted),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    dispositions = {item.source_id: item for item in result.source_dispositions}
+    assert dispositions[cited.source_id].disposition == "cited"
+    assert dispositions[unlisted.source_id].disposition == "safely_excluded"
+    assert "服务器补入独立复核" in dispositions[unlisted.source_id].reason
+
+
+@pytest.mark.asyncio
 async def test_unknown_review_issue_key_becomes_safe_global_repair_issue() -> None:
     source = _source(
         "daily:review-global:1",

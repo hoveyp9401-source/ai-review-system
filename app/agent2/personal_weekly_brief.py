@@ -1204,7 +1204,6 @@ def _validated_excluded_source_ids(
         len(excluded) != len(excluded_set)
         or not excluded_set.issubset(source_by_id)
         or excluded_set & cited_source_ids
-        or excluded_set | cited_source_ids != set(source_by_id)
     ):
         raise ValueError("personal weekly brief frozen source universe is incomplete")
     return tuple(
@@ -1216,7 +1215,11 @@ def _validated_excluded_source_ids(
             reason=(
                 ""
                 if source_id in cited_source_ids
-                else "未选入成品条目，需由独立复核确认不影响本周简报完整性。"
+                else (
+                    "未选入成品条目，需由独立复核确认不影响本周简报完整性。"
+                    if source_id in excluded_set
+                    else "模型未明确处置，服务器补入独立复核的排除候选。"
+                )
             ),
         )
         for source_id in source_by_id
