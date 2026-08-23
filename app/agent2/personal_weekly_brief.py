@@ -516,34 +516,6 @@ class Agent2PersonalWeeklyBriefReviewer:
                 }
                 for issue in disputed_issues[:20]
             ]
-        raw = await self._llm_client.complete_json(
-            system_prompt=self._system_prompt,
-            user_prompt=json.dumps(
-                user_payload,
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            model=self.model,
-            thinking_enabled=self._thinking_enabled,
-            timeout_seconds=self._timeout_seconds,
-            max_retries=self._max_retries,
-            max_tokens=self._max_tokens,
-        )
-        try:
-            payload = extract_json_object(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("independent model review returned invalid JSON") from exc
-        required_review_fields = {"approved", "issues"}
-        if not required_review_fields.issubset(payload):
-            raise ValueError("independent model review returned invalid payload")
-        reviewed = payload.get("reviewed_matter_keys")
-        issues = payload["issues"]
-        if (
-            type(payload["approved"]) is not bool
-            or not isinstance(issues, list)
-            or (reviewed is not None and not isinstance(reviewed, list))
-        ):
-            raise ValueError("independent model review returned invalid fields")
         expected_keys = {
             item.matter_key
             for section in (
@@ -553,34 +525,99 @@ class Agent2PersonalWeeklyBriefReviewer:
             )
             for item in section.items
         }
-        reviewed_keys = (
-            expected_keys
-            if reviewed is None
-            else {
-                str(value).strip()
-                for value in reviewed
-                if str(value).strip()
-            }
-        )
-        if reviewed is not None and (
-            reviewed_keys != expected_keys or len(reviewed) != len(reviewed_keys)
-        ):
-            raise ValueError("independent model review did not cover every matter")
         normalized_issues: list[dict[str, str]] = []
-        _, source_ids_by_alias = _source_alias_maps(snapshot)
-        for issue in issues:
-            if not isinstance(issue, dict) or set(issue) != {"matter_key", "reason"}:
-                raise ValueError("independent model review issue is invalid")
-            matter_key = _bounded_text(
-                issue["matter_key"], field="review.matter_key", maximum=128
+        reviewed_keys: set[str] = set()
+        payload: dict[str, Any] = {}
+        request_count = 0
+        for format_attempt in range(2):
+            request_count += 1
+            raw = await self._llm_client.complete_json(
+                system_prompt=self._system_prompt,
+                user_prompt=json.dumps(
+                    user_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                model=self.model,
+                thinking_enabled=self._thinking_enabled,
+                timeout_seconds=self._timeout_seconds,
+                max_retries=self._max_retries,
+                max_tokens=self._max_tokens,
             )
-            matter_key = source_ids_by_alias.get(matter_key, matter_key)
-            reason = _bounded_text(issue["reason"], field="review.reason", maximum=500)
-            if matter_key not in expected_keys and matter_key not in {
-                source.source_id for source in snapshot.sources
-            }:
-                matter_key = "__brief__"
-            normalized_issues.append({"matter_key": matter_key, "reason": reason})
+            try:
+                payload = extract_json_object(raw)
+                required_review_fields = {"approved", "issues"}
+                if not required_review_fields.issubset(payload):
+                    raise ValueError(
+                        "independent model review returned invalid payload"
+                    )
+                reviewed = payload.get("reviewed_matter_keys")
+                issues = payload["issues"]
+                if (
+                    type(payload["approved"]) is not bool
+                    or not isinstance(issues, list)
+                    or (reviewed is not None and not isinstance(reviewed, list))
+                ):
+                    raise ValueError(
+                        "independent model review returned invalid fields"
+                    )
+                reviewed_keys = (
+                    expected_keys
+                    if reviewed is None
+                    else {
+                        str(value).strip()
+                        for value in reviewed
+                        if str(value).strip()
+                    }
+                )
+                if reviewed is not None and (
+                    reviewed_keys != expected_keys
+                    or len(reviewed) != len(reviewed_keys)
+                ):
+                    raise ValueError(
+                        "independent model review did not cover every matter"
+                    )
+                normalized_issues = []
+                _, source_ids_by_alias = _source_alias_maps(snapshot)
+                for issue in issues:
+                    if not isinstance(issue, dict) or set(issue) != {
+                        "matter_key",
+                        "reason",
+                    }:
+                        raise ValueError(
+                            "independent model review issue is invalid"
+                        )
+                    matter_key = _bounded_text(
+                        issue["matter_key"],
+                        field="review.matter_key",
+                        maximum=128,
+                    )
+                    matter_key = source_ids_by_alias.get(matter_key, matter_key)
+                    reason = _bounded_text(
+                        issue["reason"],
+                        field="review.reason",
+                        maximum=500,
+                    )
+                    if matter_key not in expected_keys and matter_key not in {
+                        source.source_id for source in snapshot.sources
+                    }:
+                        matter_key = "__brief__"
+                    normalized_issues.append(
+                        {"matter_key": matter_key, "reason": reason}
+                    )
+            except (TypeError, ValueError) as exc:
+                if format_attempt == 0:
+                    user_payload["review_response_repair"] = {
+                        "instruction": (
+                            "上一条复核回复未通过结构解析。不要改变事实判断，"
+                            "只重新返回 approved 与 issues 两个字段的严格 JSON。"
+                        )
+                    }
+                    continue
+                raise ValueError(
+                    "independent model review returned invalid JSON"
+                ) from exc
+            break
         if payload["approved"] is not True or normalized_issues:
             raise PersonalWeeklyBriefReviewRejected(normalized_issues)
         return {
@@ -588,6 +625,7 @@ class Agent2PersonalWeeklyBriefReviewer:
             "reviewed_matter_keys": sorted(reviewed_keys),
             "issues": [],
             "model": self.model,
+            "request_count": request_count,
         }
 
 

@@ -13,6 +13,7 @@ def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-process-id", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-counts", default="")
     return parser.parse_args()
 
 
@@ -114,8 +115,40 @@ async def main() -> None:
             failed,
             key=lambda row: len((row.source_snapshot or {}).get("sources") or []),
         )
-        indexes = (0, len(ordered) // 5, 2 * len(ordered) // 5, 3 * len(ordered) // 5, 4 * len(ordered) // 5, len(ordered) - 1)
-        selected = tuple(ordered[index] for index in dict.fromkeys(indexes))
+        requested_counts = tuple(
+            int(value.strip())
+            for value in args.source_counts.split(",")
+            if value.strip()
+        )
+        if requested_counts:
+            selected_rows = []
+            for requested_count in requested_counts:
+                match = next(
+                    (
+                        row
+                        for row in ordered
+                        if len((row.source_snapshot or {}).get("sources") or [])
+                        == requested_count
+                        and row not in selected_rows
+                    ),
+                    None,
+                )
+                if match is None:
+                    raise RuntimeError(
+                        f"no failed snapshot with source count {requested_count}"
+                    )
+                selected_rows.append(match)
+            selected = tuple(selected_rows)
+        else:
+            indexes = (
+                0,
+                len(ordered) // 5,
+                2 * len(ordered) // 5,
+                3 * len(ordered) // 5,
+                4 * len(ordered) // 5,
+                len(ordered) - 1,
+            )
+            selected = tuple(ordered[index] for index in dict.fromkeys(indexes))
         users = tuple(
             (
                 await session.scalars(

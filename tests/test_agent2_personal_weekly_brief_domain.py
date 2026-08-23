@@ -190,6 +190,7 @@ async def test_independent_reviewer_accepts_real_model_json_code_fence() -> None
     review = await reviewer.review(snapshot=_snapshot(), content=content)
 
     assert review["approved"] is True
+    assert review["request_count"] == 1
     assert review_llm.calls[0]["max_tokens"] == 8000
     assert review_llm.calls[0]["timeout_seconds"] == 60.0
     assert review_llm.calls[0]["max_retries"] == 1
@@ -201,6 +202,36 @@ async def test_independent_reviewer_accepts_real_model_json_code_fence() -> None
         "weekly_plan_sources_exactly_once": True,
         "section_source_bindings_valid": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_independent_reviewer_repairs_only_invalid_response_shape() -> None:
+    content = await Agent2PersonalWeeklyBriefGenerator(
+        _FakeLLM(
+            {
+                "intro": "本周工作简报",
+                "completed": _empty_section("没有日报今日工作记录。"),
+                "plan_progress": _empty_section("没有周计划记录。"),
+                "possible_open_loops": _empty_section("没有未闭环事项。"),
+            }
+        ),
+        model="agent2-model",
+    ).generate(
+        snapshot=_snapshot(),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+    llm = _SequenceLLM("not-json", {"approved": True, "issues": []})
+
+    review = await Agent2PersonalWeeklyBriefReviewer(
+        llm,
+        model="agent2-model",
+    ).review(snapshot=_snapshot(), content=content)
+
+    assert review["approved"] is True
+    assert review["request_count"] == 2
+    repaired_prompt = json.loads(llm.calls[1]["user_prompt"])
+    assert "review_response_repair" in repaired_prompt
 
 
 def test_snapshot_rejects_unbounded_model_input() -> None:
@@ -1189,10 +1220,8 @@ async def test_model_pipeline_retries_after_one_invalid_review_output() -> None:
     llm = _SequenceLLM(
         valid,
         "review-not-json",
-        valid,
         {
             "approved": True,
-            "reviewed_matter_keys": [],
             "issues": [],
         },
     )
@@ -1207,9 +1236,10 @@ async def test_model_pipeline_retries_after_one_invalid_review_output() -> None:
         personal_memory={"entries": []},
     )
 
-    assert outcome.model_calls == 4
-    assert outcome.semantic_attempts == 2
-    assert len(outcome.review_seconds) == 2
+    assert outcome.model_calls == 2
+    assert outcome.semantic_attempts == 1
+    assert len(outcome.review_seconds) == 1
+    assert len(llm.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -1220,7 +1250,14 @@ async def test_model_pipeline_stops_after_second_invalid_review_output() -> None
         "plan_progress": _empty_section("没有周计划记录。"),
         "possible_open_loops": _empty_section("没有数据时不推测。"),
     }
-    llm = _SequenceLLM(valid, "bad-review-one", valid, "bad-review-two")
+    llm = _SequenceLLM(
+        valid,
+        "bad-review-one",
+        "bad-review-two",
+        valid,
+        "bad-review-three",
+        "bad-review-four",
+    )
     pipeline = Agent2PersonalWeeklyBriefModelPipeline(
         generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
         reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
@@ -1233,7 +1270,7 @@ async def test_model_pipeline_stops_after_second_invalid_review_output() -> None
             personal_memory={"entries": []},
         )
 
-    assert len(llm.calls) == 4
+    assert len(llm.calls) == 6
 
 
 @pytest.mark.asyncio
@@ -2130,5 +2167,6 @@ async def test_independent_model_review_must_cover_every_generated_matter() -> N
         model="agent2-model",
     )
 
-    with pytest.raises(ValueError, match="did not cover every matter"):
+    with pytest.raises(ValueError, match="review returned invalid JSON"):
         await reviewer.review(snapshot=_snapshot(source), content=generated)
+    assert len(reviewer._llm_client.calls) == 2
