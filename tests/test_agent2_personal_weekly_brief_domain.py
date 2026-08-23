@@ -166,6 +166,7 @@ def test_generator_prompt_keeps_daily_tomorrow_plan_out_of_weekly_progress() -> 
     assert "weekly_plan_found=false" in _SYSTEM_PROMPT
     assert "日报的 tomorrow_plan 不是正式周计划" in _SYSTEM_PROMPT
     assert "plan_progress.items 必须为空" in _SYSTEM_PROMPT
+    assert "同一个周计划来源不能拆成多个进展项" in _SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio
