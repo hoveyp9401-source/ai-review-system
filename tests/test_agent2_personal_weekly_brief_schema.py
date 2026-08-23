@@ -46,6 +46,14 @@ def test_personal_weekly_brief_rollback_refuses_nonempty_table() -> None:
     assert "DROP TABLE public.agent2_personal_weekly_briefs" in sql
 
 
+def test_legacy_synthetic_conversation_is_never_marked_as_recorded_context() -> None:
+    source = Path("app/agent2/personal_weekly_brief_store.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert '_briefs.c.conversation_id.not_like("agent2-direct:%")' in source
+
+
 def test_isolated_postgres_gate_covers_apply_rollback_apply_and_permissions() -> None:
     source = Path(
         "scripts/verify_agent2_personal_weekly_brief_postgres_isolated.py"

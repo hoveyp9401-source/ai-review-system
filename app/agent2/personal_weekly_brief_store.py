@@ -190,6 +190,7 @@ class SqlPersonalWeeklyBriefStore:
                     _briefs.c.tenant_id == tenant_id,
                     _briefs.c.status == "delivered",
                     _briefs.c.context_recorded_at.is_(None),
+                    _briefs.c.conversation_id.not_like("agent2-direct:%"),
                 )
                 .order_by(_briefs.c.delivered_at, _briefs.c.owner_user_id)
                 .limit(limit)
