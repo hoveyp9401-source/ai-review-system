@@ -13,6 +13,11 @@ from app.legal_daily_roster import (
     FormalLegalDailyRoster,
     load_formal_legal_daily_roster,
 )
+from app.models import WebhookEvent
+from app.services.dingtalk import (
+    DingTalkPayloadError,
+    normalize_dingtalk_conversation_kind,
+)
 
 
 @dataclass(frozen=True)
@@ -44,7 +49,12 @@ def validate_personal_weekly_brief_targets(
     expected_model_name: str,
     runtime_tenant_id: str | None = None,
 ) -> tuple[PersonalWeeklyBriefTarget, ...]:
-    del conversation_states
+    """Freeze each formal owner against Xiaolv's observed private chat.
+
+    Owners without one unambiguous provider conversation remain in the formal
+    74-person snapshot with an empty conversation id.  Pre-send revalidation
+    then blocks only those owners instead of inventing a synthetic chat id.
+    """
     if roster.member_count != FORMAL_ROSTER_MEMBER_COUNT:
         raise RuntimeError("personal weekly brief scope must contain exactly 74 members")
     if not expected_model_name.strip():
@@ -68,6 +78,9 @@ def validate_personal_weekly_brief_targets(
         raise RuntimeError("personal weekly brief identity binding scope is incomplete")
     if set(control_by_user) != roster_ids:
         raise RuntimeError("personal weekly brief Agent2 control scope is incomplete")
+    conversation_ids_by_dingtalk_user = _conversation_ids_by_dingtalk_user(
+        conversation_states
+    )
 
     targets: list[PersonalWeeklyBriefTarget] = []
     for member in roster.members:
@@ -95,9 +108,22 @@ def validate_personal_weekly_brief_targets(
                 internal_user_id=member.user_id,
                 dingtalk_user_id=member.dingtalk_user_id,
                 display_name=member.user_name,
-                conversation_id=_direct_conversation_id(member.user_id),
+                conversation_id=_only_conversation_id(
+                    conversation_ids_by_dingtalk_user.get(
+                        member.dingtalk_user_id,
+                        set(),
+                    )
+                ),
             )
         )
+    dingtalk_ids = [target.dingtalk_user_id for target in targets]
+    conversations = [
+        target.conversation_id for target in targets if target.conversation_id
+    ]
+    if len(dingtalk_ids) != len(set(dingtalk_ids)) or len(conversations) != len(
+        set(conversations)
+    ):
+        raise RuntimeError("personal weekly brief direct conversation scope is ambiguous")
     return tuple(targets)
 
 
@@ -111,7 +137,7 @@ def revalidate_personal_weekly_brief_targets(
     expected_model_name: str,
     runtime_tenant_id: str | None = None,
 ) -> PersonalWeeklyBriefTargetRevalidation:
-    del conversation_states
+    """Recheck frozen identity and private-chat facts immediately before send."""
     runtime_tenant = str(runtime_tenant_id or roster.tenant_id).strip()
     if not runtime_tenant:
         raise RuntimeError("personal weekly brief runtime tenant is missing")
@@ -130,6 +156,9 @@ def revalidate_personal_weekly_brief_targets(
 
     bindings_by_user = _group_by(bindings, key=lambda row: str(getattr(row, "user_id", "")))
     controls_by_user = _group_by(controls, key=lambda row: str(getattr(row, "user_id", "")))
+    conversation_ids_by_dingtalk_user = _conversation_ids_by_dingtalk_user(
+        conversation_states
+    )
     valid: dict[str, PersonalWeeklyBriefTarget] = {}
     blocked: dict[str, str] = {}
     for member in roster.members:
@@ -161,12 +190,22 @@ def revalidate_personal_weekly_brief_targets(
         ):
             blocked[user_id] = "agent2_control_changed"
             continue
+        conversation_ids = conversation_ids_by_dingtalk_user.get(
+            member.dingtalk_user_id,
+            set(),
+        )
+        if not conversation_ids:
+            blocked[user_id] = "direct_conversation_unavailable"
+            continue
+        if len(conversation_ids) != 1:
+            blocked[user_id] = "direct_conversation_ambiguous"
+            continue
         latest = PersonalWeeklyBriefTarget(
             tenant_id=runtime_tenant,
             internal_user_id=user_id,
             dingtalk_user_id=member.dingtalk_user_id,
             display_name=member.user_name,
-            conversation_id=_direct_conversation_id(user_id),
+            conversation_id=next(iter(conversation_ids)),
         )
         if latest != frozen_by_user[user_id]:
             blocked[user_id] = "target_changed_after_snapshot"
@@ -195,6 +234,7 @@ async def load_personal_weekly_brief_targets(
     roster_tenant_id: str | None = None,
     on_date: date,
     expected_model_name: str,
+    robot_code: str,
 ) -> tuple[PersonalWeeklyBriefTarget, ...]:
     roster = await load_formal_legal_daily_roster(
         session,
@@ -223,11 +263,16 @@ async def load_personal_weekly_brief_targets(
             )
         ).all()
     )
+    direct_conversations = await _load_direct_conversation_observations(
+        session,
+        dingtalk_user_ids=tuple(member.dingtalk_user_id for member in roster.members),
+        robot_code=robot_code,
+    )
     return validate_personal_weekly_brief_targets(
         roster=roster,
         bindings=bindings,
         controls=controls,
-        conversation_states=(),
+        conversation_states=direct_conversations,
         expected_model_name=expected_model_name,
         runtime_tenant_id=tenant_id,
     )
@@ -241,6 +286,7 @@ async def load_personal_weekly_brief_target_revalidation(
     on_date: date,
     expected_model_name: str,
     frozen_targets: tuple[PersonalWeeklyBriefTarget, ...],
+    robot_code: str,
 ) -> PersonalWeeklyBriefTargetRevalidation:
     roster = await load_formal_legal_daily_roster(
         session,
@@ -268,12 +314,17 @@ async def load_personal_weekly_brief_target_revalidation(
             )
         ).all()
     )
+    direct_conversations = await _load_direct_conversation_observations(
+        session,
+        dingtalk_user_ids=tuple(member.dingtalk_user_id for member in roster.members),
+        robot_code=robot_code,
+    )
     return revalidate_personal_weekly_brief_targets(
         roster=roster,
         frozen_targets=frozen_targets,
         bindings=bindings,
         controls=controls,
-        conversation_states=(),
+        conversation_states=direct_conversations,
         expected_model_name=expected_model_name,
         runtime_tenant_id=tenant_id,
     )
@@ -296,11 +347,91 @@ def _group_by(rows, *, key) -> dict[str, tuple[Any, ...]]:
     return {identifier: tuple(values) for identifier, values in grouped.items()}
 
 
-def _direct_conversation_id(user_id: str) -> str:
-    normalized = str(user_id or "").strip()
-    if not normalized or len(normalized) > 200:
-        raise RuntimeError("personal weekly brief direct conversation identity is invalid")
-    return f"agent2-direct:{normalized}"
+def _conversation_ids_by_dingtalk_user(
+    rows: tuple[Any, ...] | list[Any],
+) -> dict[str, set[str]]:
+    grouped: dict[str, set[str]] = {}
+    for row in rows:
+        dingtalk_user_id = str(
+            getattr(row, "dingtalk_user_id", "") or ""
+        ).strip()
+        conversation_id = str(
+            getattr(row, "conversation_id", "") or ""
+        ).strip()
+        if not dingtalk_user_id or not conversation_id:
+            continue
+        if len(dingtalk_user_id) > 128 or len(conversation_id) > 256:
+            continue
+        grouped.setdefault(dingtalk_user_id, set()).add(conversation_id)
+    return grouped
+
+
+def _only_conversation_id(conversation_ids: set[str]) -> str:
+    if len(conversation_ids) != 1:
+        return ""
+    return next(iter(conversation_ids))
+
+
+@dataclass(frozen=True)
+class _DirectConversationObservation:
+    dingtalk_user_id: str
+    conversation_id: str
+
+
+async def _load_direct_conversation_observations(
+    session: Any,
+    *,
+    dingtalk_user_ids: tuple[str, ...],
+    robot_code: str,
+) -> tuple[_DirectConversationObservation, ...]:
+    expected_robot_code = str(robot_code or "").strip()
+    if not expected_robot_code:
+        raise RuntimeError("personal weekly brief Xiaolv robot identity is missing")
+    events = tuple(
+        (
+            await session.scalars(
+                select(WebhookEvent).where(
+                    WebhookEvent.platform == "dingtalk",
+                    WebhookEvent.dingtalk_user_id.in_(dingtalk_user_ids),
+                )
+            )
+        ).all()
+    )
+    observations: list[_DirectConversationObservation] = []
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if str(payload.get("robotCode") or "").strip() != expected_robot_code:
+            continue
+        try:
+            conversation_kind = normalize_dingtalk_conversation_kind(
+                payload.get("conversationType")
+                or payload.get("conversation_type")
+            )
+        except DingTalkPayloadError:
+            continue
+        if conversation_kind != "direct":
+            continue
+        dingtalk_user_id = str(event.dingtalk_user_id or "").strip()
+        conversation_id = str(
+            payload.get("conversationId")
+            or payload.get("conversation_id")
+            or payload.get("openConversationId")
+            or ""
+        ).strip()
+        if (
+            not dingtalk_user_id
+            or len(dingtalk_user_id) > 128
+            or not conversation_id
+            or len(conversation_id) > 256
+        ):
+            continue
+        observations.append(
+            _DirectConversationObservation(
+                dingtalk_user_id=dingtalk_user_id,
+                conversation_id=conversation_id,
+            )
+        )
+    return tuple(observations)
 
 
 __all__ = [

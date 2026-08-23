@@ -19,7 +19,7 @@ async def test_all_74_formal_targets_are_owner_isolated_without_send() -> None:
     assert result["source_isolation_passed"] == 74
     assert result["outsider_rejected"] is True
     assert result["ambiguous_identity_rejected"] is True
-    assert result["prior_context_independent"] is True
+    assert result["real_private_context_bound"] is True
     assert result["send_switch_enabled"] is False
     assert result["transport_calls"] == 0
     assert result["database_accessed"] is False

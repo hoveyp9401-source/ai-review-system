@@ -183,6 +183,7 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
                 on_date=datetime.now(TIMEZONE).date(),
                 expected_model_name=CANARY_MODEL_NAME,
                 frozen_targets=targets,
+                robot_code=settings.dingtalk_robot_code,
             )
             if target.internal_user_id not in latest_scope.valid_targets:
                 raise RuntimeError("single-delivery recipient changed")
@@ -212,6 +213,7 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
                 roster_tenant_id=roster_tenant,
                 row=row,
                 frozen_targets=targets,
+                robot_code=settings.dingtalk_robot_code,
             )
 
     async with AsyncSessionLocal() as session:

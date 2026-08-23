@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent2.personal_weekly_brief_scope import (
+    _load_direct_conversation_observations,
     revalidate_personal_weekly_brief_targets,
     validate_personal_weekly_brief_targets,
 )
@@ -64,6 +65,7 @@ def _scope(count: int = 74):
     )
     states = tuple(
         SimpleNamespace(
+            dingtalk_user_id=member.dingtalk_user_id,
             user_key=f"tenant-a:{member.user_id}",
             conversation_id=f"conversation-{index:02d}",
         )
@@ -87,10 +89,9 @@ def test_exact_74_agent2_users_resolve_to_private_self_only_targets() -> None:
     assert {target.internal_user_id for target in targets} == set(roster.user_ids)
     assert len({target.dingtalk_user_id for target in targets}) == 74
     assert all(target.tenant_id == "tenant-a" for target in targets)
-    assert all(
-        target.conversation_id == f"agent2-direct:{target.internal_user_id}"
-        for target in targets
-    )
+    assert [target.conversation_id for target in targets] == [
+        f"conversation-{index:02d}" for index in range(74)
+    ]
 
 
 def test_formal_roster_and_agent2_runtime_can_use_separate_tenants() -> None:
@@ -111,6 +112,7 @@ def test_formal_roster_and_agent2_runtime_can_use_separate_tenants() -> None:
     )
     states = tuple(
         SimpleNamespace(
+            dingtalk_user_id=member.dingtalk_user_id,
             user_key=f"{runtime_tenant}:{member.user_id}",
             conversation_id=f"runtime-conversation-{index:02d}",
         )
@@ -202,7 +204,7 @@ def test_scope_rejects_any_user_not_confirmed_on_current_agent2(change) -> None:
         )
 
 
-def test_scope_uses_private_direct_context_without_requiring_prior_chat() -> None:
+def test_scope_deduplicates_repeated_observations_of_same_private_chat() -> None:
     roster, bindings, controls, states = _scope()
     states = (*states, states[0])
 
@@ -215,7 +217,72 @@ def test_scope_uses_private_direct_context_without_requiring_prior_chat() -> Non
     )
 
     assert len(targets) == 74
-    assert targets[0].conversation_id == f"agent2-direct:{roster.members[0].user_id}"
+    assert targets[0].conversation_id == "conversation-00"
+
+
+def test_scope_keeps_formal_member_without_prior_chat_but_blocks_only_that_send() -> None:
+    roster, bindings, controls, states = _scope()
+    missing_user = roster.members[-1]
+    states = states[:-1]
+
+    frozen = validate_personal_weekly_brief_targets(
+        roster=roster,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+    result = revalidate_personal_weekly_brief_targets(
+        roster=roster,
+        frozen_targets=frozen,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+
+    assert len(frozen) == 74
+    assert frozen[-1].internal_user_id == missing_user.user_id
+    assert frozen[-1].conversation_id == ""
+    assert len(result.valid_targets) == 73
+    assert result.blocked_reasons == {
+        missing_user.user_id: "direct_conversation_unavailable"
+    }
+
+
+def test_scope_blocks_only_owner_with_ambiguous_private_chat_identity() -> None:
+    roster, bindings, controls, states = _scope()
+    ambiguous_owner = roster.members[0]
+    states = (
+        *states,
+        SimpleNamespace(
+            dingtalk_user_id=ambiguous_owner.dingtalk_user_id,
+            user_key=f"tenant-a:{ambiguous_owner.user_id}",
+            conversation_id="another-private-conversation",
+        ),
+    )
+
+    frozen = validate_personal_weekly_brief_targets(
+        roster=roster,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+    result = revalidate_personal_weekly_brief_targets(
+        roster=roster,
+        frozen_targets=frozen,
+        bindings=bindings,
+        controls=controls,
+        conversation_states=states,
+        expected_model_name=CANARY_MODEL_NAME,
+    )
+
+    assert frozen[0].conversation_id == ""
+    assert len(result.valid_targets) == 73
+    assert result.blocked_reasons == {
+        ambiguous_owner.user_id: "direct_conversation_ambiguous"
+    }
 
 
 def test_pre_send_revalidation_blocks_only_changed_control_owner() -> None:
@@ -247,7 +314,7 @@ def test_pre_send_revalidation_blocks_only_changed_control_owner() -> None:
     assert len(result.valid_targets) == 73
 
 
-def test_pre_send_revalidation_uses_stable_private_direct_context() -> None:
+def test_pre_send_revalidation_blocks_only_owner_whose_private_chat_changed() -> None:
     roster, bindings, controls, states = _scope()
     frozen = validate_personal_weekly_brief_targets(
         roster=roster,
@@ -258,6 +325,7 @@ def test_pre_send_revalidation_uses_stable_private_direct_context() -> None:
     )
     states = (
         SimpleNamespace(
+            dingtalk_user_id=states[0].dingtalk_user_id,
             user_key=states[0].user_key,
             conversation_id="conversation-changed-after-0900",
         ),
@@ -273,12 +341,10 @@ def test_pre_send_revalidation_uses_stable_private_direct_context() -> None:
         expected_model_name=CANARY_MODEL_NAME,
     )
 
-    assert result.blocked_reasons == {}
-    assert len(result.valid_targets) == 74
-    assert (
-        result.valid_targets[roster.members[0].user_id].conversation_id
-        == f"agent2-direct:{roster.members[0].user_id}"
-    )
+    assert result.blocked_reasons == {
+        roster.members[0].user_id: "target_changed_after_snapshot"
+    }
+    assert len(result.valid_targets) == 73
 
 
 def test_pre_send_revalidation_stops_when_formal_roster_set_changes() -> None:
@@ -310,3 +376,51 @@ def test_pre_send_revalidation_stops_when_formal_roster_set_changes() -> None:
             conversation_states=states,
             expected_model_name=CANARY_MODEL_NAME,
         )
+
+
+@pytest.mark.asyncio
+async def test_direct_conversation_loader_accepts_only_current_xiaolv_private_chat() -> None:
+    events = (
+        SimpleNamespace(
+            dingtalk_user_id="ding-00",
+            payload={
+                "robotCode": "xiaolv-robot",
+                "conversationType": "1",
+                "conversationId": "real-private-conversation",
+            },
+        ),
+        SimpleNamespace(
+            dingtalk_user_id="ding-00",
+            payload={
+                "robotCode": "old-robot",
+                "conversationType": "1",
+                "conversationId": "old-robot-conversation",
+            },
+        ),
+        SimpleNamespace(
+            dingtalk_user_id="ding-00",
+            payload={
+                "robotCode": "xiaolv-robot",
+                "conversationType": "2",
+                "conversationId": "group-conversation",
+            },
+        ),
+    )
+
+    class _Result:
+        def all(self):
+            return events
+
+    class _Session:
+        async def scalars(self, _statement):
+            return _Result()
+
+    observations = await _load_direct_conversation_observations(
+        _Session(),
+        dingtalk_user_ids=("ding-00",),
+        robot_code="xiaolv-robot",
+    )
+
+    assert [(row.dingtalk_user_id, row.conversation_id) for row in observations] == [
+        ("ding-00", "real-private-conversation")
+    ]

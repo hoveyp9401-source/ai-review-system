@@ -658,6 +658,7 @@ async def run_personal_weekly_brief_generation_job(
             roster_tenant_id=roster_tenant_id,
             on_date=local_now.date(),
             expected_model_name=CANARY_MODEL_NAME,
+            robot_code=getattr(settings, "dingtalk_robot_code", ""),
         )
         source_loader = SqlPersonalWeeklyBriefSourceLoader(snapshot_session)
         snapshot_service = PersonalWeeklyBriefSnapshotService(
@@ -821,6 +822,7 @@ async def _dispatch_personal_weekly_brief_record(
             on_date=local_now.date(),
             expected_model_name=CANARY_MODEL_NAME,
             frozen_targets=frozen_targets,
+            robot_code=getattr(settings, "dingtalk_robot_code", ""),
         )
     reason = revalidation.blocked_reasons.get(row.owner_user_id)
     if reason:
@@ -866,6 +868,7 @@ async def _dispatch_personal_weekly_brief_record(
             roster_tenant_id=roster_tenant_id,
             row=delivered,
             frozen_targets=frozen_targets,
+            robot_code=getattr(settings, "dingtalk_robot_code", ""),
         )
     return delivered
 
@@ -917,6 +920,7 @@ async def run_personal_weekly_brief_dispatch_job(
             on_date=local_now.date(),
             expected_model_name=CANARY_MODEL_NAME,
             frozen_targets=frozen_targets,
+            robot_code=getattr(settings, "dingtalk_robot_code", ""),
         )
 
     async def send_row(row):
@@ -1121,6 +1125,7 @@ async def run_personal_weekly_brief_reconcile_job(
                 roster_tenant_id=roster_tenant_id,
                 row=delivered,
                 frozen_targets=frozen_targets,
+                robot_code=getattr(settings, "dingtalk_robot_code", ""),
             )
     for row in context_pending:
         frozen_targets = await frozen_for(row)
@@ -1129,6 +1134,7 @@ async def run_personal_weekly_brief_reconcile_job(
             roster_tenant_id=roster_tenant_id,
             row=row,
             frozen_targets=frozen_targets,
+            robot_code=getattr(settings, "dingtalk_robot_code", ""),
         )
     return delivered_count
 
@@ -1228,6 +1234,7 @@ async def _record_personal_weekly_brief_context(
     roster_tenant_id: str | None = None,
     row: PersonalWeeklyBriefRecord,
     frozen_targets: tuple[PersonalWeeklyBriefTarget, ...],
+    robot_code: str,
     changed_at: datetime | None = None,
 ) -> None:
     if row.status != "delivered" or not row.provider_message_id:
@@ -1264,6 +1271,7 @@ async def _record_personal_weekly_brief_context(
             on_date=context_recorded_at.date(),
             expected_model_name=CANARY_MODEL_NAME,
             frozen_targets=frozen_targets,
+            robot_code=robot_code,
         )
         target = revalidation.valid_targets.get(row.owner_user_id)
         if target is None:

@@ -73,6 +73,7 @@ async def test_provider_acceptance_does_not_enter_conversation_context(monkeypat
         tenant_id="tenant-a",
         row=_row("delivery_pending"),
         frozen_targets=(TARGET,),
+        robot_code="robot-a",
         changed_at=NOW,
     )
 
@@ -143,6 +144,7 @@ async def test_only_verified_exact_recipient_delivery_enters_context(monkeypatch
         tenant_id="tenant-a",
         row=_row("delivered"),
         frozen_targets=(TARGET,),
+        robot_code="robot-a",
     )
 
     receipt = observed["outbound"]["delivery_receipt"]
@@ -193,6 +195,7 @@ async def test_mismatched_stored_delivery_receipt_never_enters_context(monkeypat
             tenant_id="tenant-a",
             row=row,
             frozen_targets=(TARGET,),
+            robot_code="robot-a",
             changed_at=NOW,
         )
 
@@ -242,6 +245,7 @@ async def test_latest_identity_change_blocks_context_after_final_delivery(
         tenant_id="tenant-a",
         row=_row("delivered"),
         frozen_targets=(TARGET,),
+        robot_code="robot-a",
         changed_at=NOW,
     )
 
