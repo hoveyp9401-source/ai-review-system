@@ -82,7 +82,7 @@ def test_production_weekly_brief_uses_bounded_reasoned_flash_reviews() -> None:
         "max_tokens=PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS"
     ) == 2
     assert PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS == 3
-    assert PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES == 3
+    assert PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES == 1
     assert runner.count(
         "max_semantic_attempts=PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS"
     ) == 2
