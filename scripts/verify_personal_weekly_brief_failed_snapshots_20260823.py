@@ -28,6 +28,35 @@ def _load_process_environment(pid: int) -> None:
     os.environ.update(values)
 
 
+def _safe_error_category(exc: Exception) -> str:
+    detail = str(getattr(exc, "repair_detail", "") or str(exc)).lower()
+    categories = (
+        ("payload keys", "payload_keys"),
+        ("source universe is incomplete", "source_coverage"),
+        ("source dispositions are incomplete", "source_dispositions"),
+        ("item sources are invalid", "item_source_shape"),
+        ("unknown sources", "unknown_source"),
+        ("completed item requires", "completed_evidence"),
+        ("plan progress must cover", "weekly_plan_coverage"),
+        ("plan progress requires", "weekly_plan_evidence"),
+        ("plan status requires", "plan_status_evidence"),
+        ("no-follow-up status", "no_followup_evidence"),
+        ("critical facts are missing", "critical_fact_missing"),
+        ("critical facts cannot be excluded", "critical_fact_excluded"),
+        ("message is too long", "message_too_long"),
+        ("section is invalid", "section_shape"),
+        ("items are invalid", "items_shape"),
+        ("cannot mix items", "empty_note_conflict"),
+        ("item is invalid", "item_shape"),
+        ("independent model review", "review_output"),
+        ("invalid output", "other_model_validation"),
+    )
+    return next(
+        (category for marker, category in categories if marker in detail),
+        "unclassified",
+    )
+
+
 async def main() -> None:
     args = _args()
     if args.output.exists() or args.output.is_symlink():
@@ -146,6 +175,7 @@ async def main() -> None:
                     "source_count": source_count,
                     "status": "FAIL",
                     "error_type": type(exc).__name__,
+                    "error_category": _safe_error_category(exc),
                 }
             return {
                 "source_count": source_count,

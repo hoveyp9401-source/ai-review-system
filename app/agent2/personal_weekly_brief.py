@@ -34,7 +34,7 @@ _MAX_SOURCE_COUNT = 120
 _MAX_SOURCE_TEXT_CHARS = 2000
 _MAX_TOTAL_SOURCE_CHARS = 30000
 PERSONAL_WEEKLY_BRIEF_GENERATION_THINKING_ENABLED = False
-PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED = False
+PERSONAL_WEEKLY_BRIEF_REVIEW_THINKING_ENABLED = True
 PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_THINKING_ENABLED = True
 PERSONAL_WEEKLY_BRIEF_GENERATION_MAX_TOKENS = 8000
 PERSONAL_WEEKLY_BRIEF_REVIEW_MAX_TOKENS = 2000
@@ -42,8 +42,8 @@ PERSONAL_WEEKLY_BRIEF_CRITICAL_REVIEW_MAX_TOKENS = 4000
 PERSONAL_WEEKLY_BRIEF_MAX_SEMANTIC_ATTEMPTS = 3
 PERSONAL_WEEKLY_BRIEF_REVIEW_VOTES = 3
 _MAX_SECTION_ITEMS = {
-    "completed": 12,
-    "possible_open_loops": 8,
+    "completed": 30,
+    "possible_open_loops": 20,
 }
 _EMPTY_SECTION_NOTES = {
     "completed": "本周没有找到已保存的今日工作记录。",
@@ -664,7 +664,7 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                     "instruction": (
                         "上一版模型输出未通过服务器结构或来源校验。"
                         "保持完整 trusted_snapshot，重新返回严格的完整 JSON；"
-                        "只能包含规定的四个顶层字段。"
+                    "只能包含规定的五个顶层字段。"
                     ),
                     "issues": [
                         {
@@ -801,8 +801,8 @@ class Agent2PersonalWeeklyBriefModelPipeline:
                 "instruction": (
                     "上一版未通过独立事实复核多数判断。保持同一可信快照，"
                     "逐项修复下列问题并重新返回完整 JSON；不得删除未被指出的关键事实。"
-                    "只能返回 intro、completed、plan_progress、possible_open_loops "
-                    "四个顶层字段，不得增加说明、来源处置清单或其他字段。"
+                    "只能返回 intro、completed、plan_progress、possible_open_loops、"
+                    "excluded_source_ids 五个顶层字段，不得增加说明或其他字段。"
                 ),
                     "previous_draft": _model_content_payload(
                         content,
@@ -820,7 +820,7 @@ def _validated_content(
     snapshot: PersonalWeeklyBriefSnapshot,
 ) -> dict[str, Any]:
     required = {"intro", "completed", "plan_progress", "possible_open_loops"}
-    allowed = required | {"source_dispositions"}
+    allowed = required | {"source_dispositions", "excluded_source_ids"}
     if not required.issubset(payload) or not set(payload).issubset(allowed):
         missing = sorted(required - set(payload))
         unexpected = sorted(set(payload) - allowed)
@@ -888,11 +888,20 @@ def _validated_content(
         for item in section.items
         for source_id in item.source_ids
     }
-    source_dispositions = _validated_source_dispositions(
-        payload.get("source_dispositions"),
-        source_by_id=source_by_id,
-        cited_source_ids=all_cited_source_ids,
-    )
+    if "source_dispositions" in payload and "excluded_source_ids" in payload:
+        raise ValueError("personal weekly brief source audit fields conflict")
+    if "excluded_source_ids" in payload:
+        source_dispositions = _validated_excluded_source_ids(
+            payload.get("excluded_source_ids"),
+            source_by_id=source_by_id,
+            cited_source_ids=all_cited_source_ids,
+        )
+    else:
+        source_dispositions = _validated_source_dispositions(
+            payload.get("source_dispositions"),
+            source_by_id=source_by_id,
+            cited_source_ids=all_cited_source_ids,
+        )
     _validate_critical_literal_coverage(
         source_by_id=source_by_id,
         sections=(completed, plan_progress, possible_open_loops),
@@ -959,6 +968,11 @@ def _resolve_model_source_references(
             else item
             for item in dispositions
         ]
+    excluded_source_ids = normalized.get("excluded_source_ids")
+    if isinstance(excluded_source_ids, list):
+        normalized["excluded_source_ids"] = [
+            resolved(value) for value in excluded_source_ids
+        ]
     return normalized
 
 
@@ -973,6 +987,11 @@ def _model_content_payload(
         for key, value in content.as_payload().items()
         if key != "source_dispositions"
     }
+    payload["excluded_source_ids"] = [
+        aliases[disposition.source_id]
+        for disposition in content.source_dispositions
+        if disposition.disposition == "safely_excluded"
+    ]
     for section_name in ("completed", "plan_progress", "possible_open_loops"):
         section = dict(payload[section_name])
         section["items"] = [
@@ -996,6 +1015,39 @@ def _critical_literals(value: str) -> tuple[str, ...]:
                 seen.add(literal)
                 literals.append(literal)
     return tuple(literals)
+
+
+def _validated_excluded_source_ids(
+    value: Any,
+    *,
+    source_by_id: dict[str, SourceEvidence],
+    cited_source_ids: set[str],
+) -> tuple[PersonalWeeklyBriefSourceDisposition, ...]:
+    if not isinstance(value, list):
+        raise ValueError("personal weekly brief excluded sources are invalid")
+    excluded = [str(item or "").strip() for item in value]
+    excluded_set = set(excluded)
+    if (
+        len(excluded) != len(excluded_set)
+        or not excluded_set.issubset(source_by_id)
+        or excluded_set & cited_source_ids
+        or excluded_set | cited_source_ids != set(source_by_id)
+    ):
+        raise ValueError("personal weekly brief frozen source universe is incomplete")
+    return tuple(
+        PersonalWeeklyBriefSourceDisposition(
+            source_id=source_id,
+            disposition=(
+                "cited" if source_id in cited_source_ids else "safely_excluded"
+            ),
+            reason=(
+                ""
+                if source_id in cited_source_ids
+                else "未选入成品条目，需由独立复核确认不影响本周简报完整性。"
+            ),
+        )
+        for source_id in source_by_id
+    )
 
 
 def _critical_literal_contexts(value: str) -> tuple[str, ...]:
@@ -1080,7 +1132,15 @@ def _validate_critical_literal_coverage(
         for item in section.items:
             for source_id in item.source_ids:
                 if source_id in texts_by_source:
-                    texts_by_source[source_id].append(item.text)
+                    source = source_by_id[source_id]
+                    texts_by_source[source_id].append(
+                        source.original_text
+                        if (
+                            item.status == "暂时没有找到后续记录"
+                            and source.source_kind == "weekly_plan"
+                        )
+                        else item.text
+                    )
     missing_by_source: list[dict[str, Any]] = []
     for source_id in sorted(cited_source_ids):
         conclusion = "\n".join(texts_by_source[source_id])
@@ -1402,25 +1462,27 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
 6. 没有数据、只有部分日期、没有周计划或没有风险栏时如实说明，不得编造。
 7. 简报只读，不得建议系统已经修改、补写、确认或提交日报、周计划。
 8. 不要在文字中称呼用户；称呼由服务器根据个人记忆安全添加。
-9. 把 trusted_snapshot.sources 当作完整来源清单。每个 source_id 都必须在三个业务区块的某个成品条目中引用，相关来源应合并到同一事项的 source_ids；不得静默遗漏来源。不要返回 source_dispositions，逐来源审计清单由服务器根据引用关系自动生成。
+9. 把 trusted_snapshot.sources 当作完整来源清单。每个紧要的 source_id 都应在三个业务区块的某个成品条目中引用，相关来源应合并到同一事项的 source_ids；只有重复过程、对成品没有新增事实的来源才可放入 excluded_source_ids。每个来源必须在条目引用或 excluded_source_ids 中恰好出现一次，不得静默遗漏。不要返回 source_dispositions 或排除理由；逐来源审计清单由服务器根据引用和独立复核结果生成。
 10. intro 固定写“本周工作简报”，不得加入任何业务事实。各区块 empty_note 只是系统说明，不是业务结论，不填写来源ID；其中不得加入项目、案件、金额、状态等业务事实。所有业务结论必须放在 items 中并引用可信 source_id。空数据说明只能依据 trusted_snapshot 的空来源、日报覆盖日期和 weekly_plan_found。
 11. 成品要像一位清楚、克制的同事写的简报：优先合并同类事项，删除重复过程词和模板话，不写“系统核对、数据范围、来源完整、已保存记录”等工程说明；completed 和 possible_open_loops 通常各控制在3至6条，但事实确实较多时可以超过，不能为了变短漏掉关键事项。
-12. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的四个顶层字段，不能附加修复说明、来源处置清单或其他字段。若 issues 指出周计划与日报不是同一具体事项，必须删除该进展项中的日报 source_id，把 status 改为“暂时没有找到后续记录”，text 只保留对应周计划事项；不得再次寻找只有泛词相似的日报凑进展。
+12. 如果 user_prompt 含 repair_context，上一版已被独立复核拒绝。必须根据 issues 修复上一版，重新输出完整结构；可信来源仍只有 trusted_snapshot，不能为了通过复核编造或删掉其他关键事实。修复结果也只能包含下方规定的五个顶层字段，不能附加修复说明、来源处置清单或其他字段。若 issues 指出周计划与日报不是同一具体事项，必须删除该进展项中的日报 source_id，把 status 改为“暂时没有找到后续记录”，text 只保留对应周计划事项；不得再次寻找只有泛词相似的日报凑进展。
 
 仅返回 JSON，严格使用以下结构，不得增加字段：
 {
   "intro": "本周工作简报",
   "completed": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "结论", "source_ids": ["来源ID"]}]},
   "plan_progress": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "进展", "status": "五种状态之一", "source_ids": ["来源ID"]}]},
-  "possible_open_loops": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "谨慎说明", "source_ids": ["来源ID"]}]}
+  "possible_open_loops": {"empty_note": "无项目时的自然说明，否则为空字符串", "items": [{"matter_key": "稳定事项键", "text": "谨慎说明", "source_ids": ["来源ID"]}]},
+  "excluded_source_ids": ["仅限重复且没有新增事实的来源ID"]
 }"""
 
 
-_CRITICAL_FACT_REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的周简报关键语义复核。不要检查JSON格式、来源编号、金额或日期；这些已由服务器核对。只逐项检查：
+_CRITICAL_FACT_REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的周简报关键语义复核。不要检查JSON格式或来源编号；这些已由服务器核对。只逐项检查：
 1. 原文有“只有A才B、如果A则/将B、若A会B”等明确条件时，草稿是否同时保留前提A和结果B；只写前提不算保留条件。
 2. 原文明示“没有/未/无法/不能”时，草稿是否保留被否定的具体对象；只写“未闭环/没有结果”不能代替“没有承诺付款”等具体否定。
 3. 原文的跟进、沟通、准备、起草、计划是否被夸大成完成，或原文已完成是否被改成未完成。
-4. plan_progress 中除“暂时没有找到后续记录”外，周计划与后来日报是否明确指向同一个具体项目、案件、公司、文件或工作对象。只有“合同”或“案件材料”等泛词相同不算同一事项；例如“合同审核”和“合同评审技能网页化”不是同一具体工作，“整理案件材料”和“被告案件签阅文件”也不是同一具体工作。对象不一致时必须拒绝，不能用语言相近代替事实对应。
+4. 金额、明确日期、数量、对象和关键期限是否在成品中保留；不得因总结而删除会改变复盘结论的数字或时间。
+5. plan_progress 中除“暂时没有找到后续记录”外，周计划与后来日报是否明确指向同一个具体项目、案件、公司、文件或工作对象。只有“合同”或“案件材料”等泛词相同不算同一事项；例如“合同审核”和“合同评审技能网页化”不是同一具体工作，“整理案件材料”和“被告案件签阅文件”也不是同一具体工作。对象不一致时必须拒绝，不能用语言相近代替事实对应。
 
 必须覆盖草稿里的每个唯一matter_key。只返回JSON：
 {"approved":true或false,"reviewed_matter_keys":["逐个唯一事项键"],"issues":[{"matter_key":"事项键","reason":"具体条件、否定或完成状态错误"}]}
@@ -1430,14 +1492,14 @@ _CRITICAL_FACT_REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的周简报关�
 _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核步骤。你不能改写草稿，只能逐项判断是否安全通过。
 
 必须先按 trusted_snapshot.sources 中每一条实际引用的 source_id 逐条对照原文，再按 matter_key 汇总结论；不能只看草稿是否通顺。对每个 matter_key 检查：
-1. 结论是否得到所列来源的语义支持，是否编造了来源没有的对象、动作或结果；来源ID绑定和 completed 的 today_work 绑定已经由服务器检查，不再重复判断；
+1. 结论是否得到所列来源的语义支持，是否编造了来源没有的对象、动作或结果；还要逐条查看完整 trusted_snapshot.sources 与 draft.excluded_source_ids，若被排除来源含有未被其他条目涵盖的重要工作、风险、计划、金额、日期或进展，必须拒绝并用该来源ID作为 matter_key；来源ID绑定和 completed 的 today_work 绑定已经由服务器检查，不再重复判断；
 2. 对该事项引用的来源，是否改变或遗漏其中任何对象、条件、否定、归属和完成状态；金额与明确日期已由服务器做字面核对，不得再提出金额或日期遗漏问题。允许合并同义表达、删除“继续跟进”等重复过程词，不要求逐字复制原文；
 3. 是否把跟进、沟通、准备、起草或计划武断写成完成；
 4. 计划状态是否与周计划及后来日报证据一致；没有后来记录时是否只使用“暂时没有找到后续记录”。周计划来源是否逐项覆盖已由服务器检查，不再重复判断。“后续安排”可以由后来日报的 tomorrow_plan 支持，它不表示已完成；“安排调整”只需后来日报明确记录安排发生变化，不要求再有调整后事项的最终完成证据。
    对应关系必须是同一个具体项目、案件、公司、文件或工作对象；只有“合同、审核、案件、材料”等泛词相似不能建立计划进展。例如“合同审核”不能仅因出现“合同评审技能网页化”就判为完成，“整理案件材料”也不能仅因出现“被告案件签阅文件”就判为完成。
 5. 计划进展和可能未闭环中是否重复同一事项。仅来自日报、并非周计划的谨慎未闭环事项可以只出现在 possible_open_loops，不要求进入 plan_progress；已经在 plan_progress 中说明调整或未找到后续记录的计划事项，不应再复制到 possible_open_loops。
 6. 无数据或部分数据时是否编造。
-7. source_dispositions 的逐条覆盖、cited绑定和 safely_excluded 结构已由服务器检查，不再重复判断；只判断安全排除理由在语义上是否明显掩盖了应汇总的重要事项。
+7. 来源引用与 excluded_source_ids 的逐条覆盖结构已由服务器检查，不再重复判断；但你必须独立判断每条排除是否在语义上掩盖了应汇总的重要事项。
 8. intro 与 empty_note 是否只作系统说明、不承载业务结论；所有业务事实是否都在带来源ID的 items 中。空数据说明是否与可信空快照一致。
 9. 同一工作线是否被无意义拆成多条近义事项；plan_progress 的正文是否重复 status；possible_open_loops 是否逐条重复“未找到记录、尚未闭环”等模板话。只有确实影响成品清晰度的重复才拒绝，不得为了追求短而要求删除事实。
 
