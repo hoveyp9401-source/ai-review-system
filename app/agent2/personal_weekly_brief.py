@@ -533,19 +533,15 @@ class Agent2PersonalWeeklyBriefReviewer:
             payload = extract_json_object(raw)
         except (TypeError, ValueError) as exc:
             raise ValueError("independent model review returned invalid JSON") from exc
-        required_review_fields = {
-            "approved",
-            "reviewed_matter_keys",
-            "issues",
-        }
+        required_review_fields = {"approved", "issues"}
         if not required_review_fields.issubset(payload):
             raise ValueError("independent model review returned invalid payload")
-        reviewed = payload["reviewed_matter_keys"]
+        reviewed = payload.get("reviewed_matter_keys")
         issues = payload["issues"]
         if (
             type(payload["approved"]) is not bool
-            or not isinstance(reviewed, list)
             or not isinstance(issues, list)
+            or (reviewed is not None and not isinstance(reviewed, list))
         ):
             raise ValueError("independent model review returned invalid fields")
         expected_keys = {
@@ -557,8 +553,18 @@ class Agent2PersonalWeeklyBriefReviewer:
             )
             for item in section.items
         }
-        reviewed_keys = {str(value).strip() for value in reviewed if str(value).strip()}
-        if reviewed_keys != expected_keys or len(reviewed) != len(reviewed_keys):
+        reviewed_keys = (
+            expected_keys
+            if reviewed is None
+            else {
+                str(value).strip()
+                for value in reviewed
+                if str(value).strip()
+            }
+        )
+        if reviewed is not None and (
+            reviewed_keys != expected_keys or len(reviewed) != len(reviewed_keys)
+        ):
             raise ValueError("independent model review did not cover every matter")
         normalized_issues: list[dict[str, str]] = []
         _, source_ids_by_alias = _source_alias_maps(snapshot)
@@ -1484,8 +1490,8 @@ _CRITICAL_FACT_REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的周简报关�
 4. 金额、明确日期、数量、对象和关键期限是否在成品中保留；不得因总结而删除会改变复盘结论的数字或时间。
 5. plan_progress 中除“暂时没有找到后续记录”外，周计划与后来日报是否明确指向同一个具体项目、案件、公司、文件或工作对象。只有“合同”或“案件材料”等泛词相同不算同一事项；例如“合同审核”和“合同评审技能网页化”不是同一具体工作，“整理案件材料”和“被告案件签阅文件”也不是同一具体工作。对象不一致时必须拒绝，不能用语言相近代替事实对应。
 
-必须覆盖草稿里的每个唯一matter_key。只返回JSON：
-{"approved":true或false,"reviewed_matter_keys":["逐个唯一事项键"],"issues":[{"matter_key":"事项键","reason":"具体条件、否定或完成状态错误"}]}
+必须在内部覆盖草稿里的每个事项，但不要把全部事项键抄回。只返回JSON：
+{"approved":true或false,"issues":[{"matter_key":"仅填写确有问题的事项键或来源ID","reason":"具体条件、数字、日期、否定或完成状态错误"}]}
 全部安全时approved=true且issues=[]；只报告真实错误，不写通过说明，不改写草稿。"""
 
 
@@ -1511,11 +1517,10 @@ _REVIEW_SYSTEM_PROMPT = """你是 Agent2 内独立的个人周简报事实复核
 - “没有承诺付款”改写成“尚未明确付款承诺”、“继续跟进”压缩成“持续推进”等不改变事实的自然表达可以通过；但金额、明确日期、条件关系、否定和完成状态仍必须保留。
 - 原文“对方没有承诺付款”时，草稿只写“事项尚未闭环”不够，因为否定对象“付款承诺”已丢失，必须拒绝；写成“尚未明确付款承诺”才属于保留否定事实的安全改写。
 
-必须覆盖草稿里的每个唯一 matter_key。只返回 JSON：
+必须在内部覆盖草稿里的每个事项和被排除来源，但不要把全部事项键抄回。只返回 JSON：
 {
   "approved": true或false,
-  "reviewed_matter_keys": ["逐个唯一事项键"],
-  "issues": [{"matter_key": "事项键", "reason": "不通过原因"}]
+  "issues": [{"matter_key": "仅填写确有问题的事项键或来源ID", "reason": "不通过原因"}]
 }
 user_prompt 中的 server_checks 是服务器在调用你之前已经完成的确定性核对。recognized_amount_date_literals_complete=true 只表示服务器已核对它能识别的常见金额和日期格式，不代表所有自然语言数字都已核对；你不得误报已被服务器确认存在的字面金额/日期，但仍需检查其他自然表达。其余 true 项具有最高权威：不得再次声称来源全集不完整、周计划来源漏项/重复或栏目来源绑定错误。你还需独立审核服务器无法确定的语义：条件与否定是否改变、完成状态是否夸大、对象与事项是否编造、计划状态和跨日归类是否正确。
 如果 user_prompt 含 disputed_issues，你是前两次审核意见不一致后的争议裁决者。必须逐条对照 disputed_issues、原始来源和草稿，只确认真实存在的问题；不得盲从前一位审核者，也不得提出与争议无关的新问题。争议均不成立时 approved=true、issues=[]；任一争议成立时 approved=false，并只返回成立的争议。

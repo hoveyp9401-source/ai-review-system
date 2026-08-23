@@ -179,7 +179,7 @@ async def test_independent_reviewer_accepts_real_model_json_code_fence() -> None
     )
     review_llm = _FakeLLM(
             "```json\n"
-            '{"approved":true,"reviewed_matter_keys":[],"issues":[]}'
+            '{"approved":true,"issues":[]}'
             "\n```"
         )
     reviewer = Agent2PersonalWeeklyBriefReviewer(
