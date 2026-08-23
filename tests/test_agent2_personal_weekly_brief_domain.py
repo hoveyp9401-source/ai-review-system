@@ -154,9 +154,13 @@ async def test_generator_keeps_large_source_audit_out_of_model_output() -> None:
     assert "不要返回 source_dispositions" in llm.calls[0]["system_prompt"]
     assert '"source_dispositions":' not in llm.calls[0]["system_prompt"]
     model_snapshot = json.loads(llm.calls[0]["user_prompt"])["trusted_snapshot"]
+    server_limits = json.loads(llm.calls[0]["user_prompt"])["server_limits"]
     assert model_snapshot["sources"][0]["source_id"] == "s001"
     assert "source_record_id" not in model_snapshot["sources"][0]
     assert result.completed.items[0].source_ids == (source.source_id,)
+    assert server_limits["plan_progress_max_items"] == 0
+    assert server_limits["completed_max_items"] == 30
+    assert server_limits["possible_open_loops_max_items"] == 20
     assert [item.disposition for item in result.source_dispositions] == ["cited"]
 
 
