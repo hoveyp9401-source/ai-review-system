@@ -402,6 +402,10 @@ class Agent2PersonalWeeklyBriefGenerator:
             "trusted_snapshot": snapshot.model_payload(),
         }
         if repair_context is not None:
+            repair_context = _model_repair_context(
+                repair_context,
+                snapshot=snapshot,
+            )
             encoded_repair = json.dumps(
                 repair_context,
                 ensure_ascii=False,
@@ -1048,6 +1052,38 @@ def _model_content_payload(
         ]
         payload[section_name] = section
     return payload
+
+
+def _model_repair_context(
+    repair_context: dict[str, Any],
+    *,
+    snapshot: PersonalWeeklyBriefSnapshot,
+) -> dict[str, Any]:
+    aliases, _ = _source_alias_maps(snapshot)
+
+    def compact_text(value: Any) -> str:
+        text = str(value or "")
+        for source_id, alias in aliases.items():
+            text = text.replace(source_id, alias)
+        return text
+
+    compact = dict(repair_context)
+    issues = compact.get("issues")
+    if isinstance(issues, list):
+        compact["issues"] = [
+            {
+                **issue,
+                "matter_key": aliases.get(
+                    str(issue.get("matter_key") or ""),
+                    str(issue.get("matter_key") or ""),
+                ),
+                "reason": compact_text(issue.get("reason")),
+            }
+            if isinstance(issue, dict)
+            else issue
+            for issue in issues
+        ]
+    return compact
 
 
 def _review_user_payloads(

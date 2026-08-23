@@ -368,6 +368,63 @@ async def test_model_pipeline_repairs_once_after_independent_rejection() -> None
 
 
 @pytest.mark.asyncio
+async def test_reviewed_source_issue_uses_compact_id_on_generation_repair() -> None:
+    source = _source(
+        "daily:repair:compact-source",
+        kind="daily_report",
+        on_date=date(2026, 8, 18),
+        section="today_work",
+        text="沟通甲方。",
+    )
+    first = {
+        "intro": "本周工作简报",
+        "completed": _empty_section("没有需要展示的事项。"),
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有未闭环事项。"),
+        "excluded_source_ids": ["s001"],
+    }
+    second = {
+        "intro": "本周工作简报",
+        "completed": {
+            "empty_note": "",
+            "items": [
+                {
+                    "matter_key": "party-communication",
+                    "text": "沟通甲方。",
+                    "source_ids": ["s001"],
+                }
+            ],
+        },
+        "plan_progress": _empty_section("没有周计划。"),
+        "possible_open_loops": _empty_section("没有未闭环事项。"),
+        "excluded_source_ids": [],
+    }
+    rejected = {
+        "approved": False,
+        "issues": [
+            {"matter_key": "s001", "reason": "该来源包含应汇总的工作。"}
+        ],
+    }
+    approved = {"approved": True, "issues": []}
+    llm = _SequenceLLM(first, rejected, second, approved)
+    pipeline = Agent2PersonalWeeklyBriefModelPipeline(
+        generator=Agent2PersonalWeeklyBriefGenerator(llm, model="agent2-model"),
+        reviewer=Agent2PersonalWeeklyBriefReviewer(llm, model="agent2-model"),
+    )
+
+    outcome = await pipeline.generate_and_review(
+        snapshot=_snapshot(source),
+        recipient_name="测试用户",
+        personal_memory={"entries": []},
+    )
+
+    assert outcome.semantic_attempts == 2
+    repair_payload = json.loads(llm.calls[2]["user_prompt"])["repair_context"]
+    assert repair_payload["issues"][0]["matter_key"] == "s001"
+    assert source.source_id not in json.dumps(repair_payload, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
 async def test_unknown_review_issue_key_becomes_safe_global_repair_issue() -> None:
     source = _source(
         "daily:review-global:1",
