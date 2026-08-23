@@ -3,14 +3,14 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-agent2-weekly-brief-fast-20260823-v9"
-previous="$releases/ai-review-system-agent2-weekly-brief-fast-20260823-v8"
+candidate="$releases/ai-review-system-agent2-weekly-brief-context-20260823-v10"
+previous="$releases/ai-review-system-agent2-weekly-brief-fast-20260823-v9"
 current="$releases/current"
 shared_env=/home/ai_review_tunnel/ai-review-system/.env
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
-expected_commit=950d72d8568f7cdb83155dd4221edecb83820610
-daily_focus_output=/home/ai_review_tunnel/deploy_backups/daily-focus-weekly-brief-fast-v9-20260823.json
-alignment_output=/home/ai_review_tunnel/deploy_backups/alignment-weekly-brief-fast-v9-20260823.json
+expected_commit=897500460fe27cd918bedf3d2967c1a76f442e37
+daily_focus_output=/home/ai_review_tunnel/deploy_backups/daily-focus-weekly-brief-context-v10-20260823.json
+alignment_output=/home/ai_review_tunnel/deploy_backups/alignment-weekly-brief-context-v10-20260823.json
 services=(
   ai-review-api.service
   ai-review-stream.service
@@ -277,7 +277,7 @@ rollback() {
     freeze_all_services || exit 1
   fi
   if [[ "$(readlink -f "$current")" != "$previous" ]]; then
-    switch_current "$previous" weekly-brief-fast-v2-rollback || exit 1
+    switch_current "$previous" weekly-brief-context-v10-rollback || exit 1
   fi
   terminate_frozen_services
   wait_healthy "$previous" || exit 1
@@ -305,7 +305,7 @@ if [[ "$action" == "deploy" ]]; then
   trap 'rollback 130' INT
   trap 'rollback 143' TERM
   freeze_all_services
-  switch_current "$candidate" weekly-brief-fast-v2-next
+  switch_current "$candidate" weekly-brief-context-v10-next
   terminate_frozen_services
   wait_healthy "$candidate"
   verify_weekly_brief_off_and_empty
@@ -319,7 +319,7 @@ if [[ "$action" == "deploy" ]]; then
   echo "deployed $candidate"
 elif [[ "$action" == "rollback" ]]; then
   if [[ "$(readlink -f "$current")" != "$candidate" ]]; then
-    echo "current release is not weekly brief fast v2" >&2
+    echo "current release is not weekly brief context v10" >&2
     exit 1
   fi
   freeze_all_services
