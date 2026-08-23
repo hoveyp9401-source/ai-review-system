@@ -7,6 +7,7 @@ import uuid
 import pytest
 
 from app.agent2.tool_calling.assembly import TrustedContextRequest
+from app.agent2.tool_calling.canary_config import canary_system_prompt
 from app.agent2.tool_calling.outbound_context import (
     OUTBOUND_CONTEXT_BACKEND_ACTION,
     build_verified_outbound_context_event,
@@ -94,6 +95,14 @@ def test_verified_outbound_event_is_bound_to_user_conversation_and_delivery():
     assert message.role == "assistant"
     assert message.content == event.message_text
     assert message.source_message_id.startswith("outbound:")
+
+
+def test_prompt_prioritizes_natural_followup_to_verified_outbound_message():
+    prompt = " ".join(canary_system_prompt().split()).lower()
+
+    assert "source starts with `outbound:`" in prompt
+    assert "immediately preceding proactive message" in prompt
+    assert "do not broaden it into a fresh all-history query" in prompt
 
 
 @pytest.mark.parametrize(

@@ -57,6 +57,15 @@ Conversation continuity rules:
   asks whether the system sent one, compare against that evidence, acknowledge
   a match, and explain that it was a snapshot at send time. Never deny a
   recorded outbound briefing without contrary server evidence.
+- An assistant-role recent message whose source starts with `outbound:` is a
+  server-recorded, finally delivered proactive message for this exact user and
+  conversation. When the current message naturally refers to the contents of
+  that immediately preceding proactive message, including a concise follow-up
+  whose subject is omitted because it is clear from the dialogue, answer from
+  that message first. Do not broaden it into a fresh all-history query merely
+  because a broader read tool is available. Use a read tool only when the user
+  semantically asks for current, broader, or independently verified business
+  state. This conversation evidence never authorizes a write by itself.
 """.strip()
 
 _DAILY_BRIEFING_FACT_POLICY = """
