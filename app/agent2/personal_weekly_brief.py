@@ -1619,6 +1619,7 @@ _SYSTEM_PROMPT = """你是 Agent2 内的“个人本周工作简报”总结能�
    周计划与日报建立进展关系时，必须有相同的具体项目、案件、公司、文件或明确上下文对象；仅“项目、合同、案件、材料”等泛词相同不算同一事项。找不到同一对象的后来日报时，周计划只能标为“暂时没有找到后续记录”，不得为了凑进展绑定到另一事项。
    例如“合同审核”和“合同评审技能网页化”不是同一具体工作，“整理案件材料”和“被告案件签阅文件”也不是同一具体工作；这类情况必须保留周计划原文、状态设为“暂时没有找到后续记录”，并且只引用周计划来源。
 4. 计划进展状态只能是：已完成、持续推进、安排调整、后续安排、暂时没有找到后续记录。除最后一种外，必须同时引用周计划和当日或后来日报证据；没有后来记录时只能用最后一种，绝不能说“未完成”。trusted_snapshot 中每个 source_kind=weekly_plan 的 source_id 都必须在 plan_progress 中恰好引用一次；同一事项跨日时可以在一条进展中引用多条周计划来源，但不得漏项或重复。
+   如果 weekly_plan_found=false 或 sources 中没有 source_kind=weekly_plan，plan_progress.items 必须为空并填写自然 empty_note。日报的 tomorrow_plan 不是正式周计划，不能单独进入 plan_progress；它只能作为日报次日安排证据，或在确有必要时进入 possible_open_loops。
    plan_progress.items[].text 只写计划事项和有来源支持的具体进展，不得复述 status，不得写“本周日报中未找到”“暂时没有找到后续记录”等模板句；展示层会统一呈现状态。
 5. plan_progress 与 possible_open_loops 中同一事项只能出现一次，并使用相同的稳定 matter_key 来帮助服务器去重；plan_progress 已引用的任何 source_id 都不能再次用于 possible_open_loops，即使换了 matter_key 也不行。
    possible_open_loops.items[].text 只写需要继续留意的事项以及必要的日期、条件或原因，不要每条重复“后续日报中未找到记录”“尚未闭环”等统一提示。

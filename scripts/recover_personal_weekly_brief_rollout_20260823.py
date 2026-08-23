@@ -16,7 +16,10 @@ SATURDAY = datetime(2026, 8, 22, 9, 0, tzinfo=TIMEZONE)
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("inspect", "prepare", "run"))
+    parser.add_argument(
+        "action",
+        choices=("inspect", "prepare", "retry_failed", "run"),
+    )
     parser.add_argument("--source-process-id", type=int, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--backup", type=Path)
@@ -70,7 +73,7 @@ async def main() -> None:
     args = _args()
     if args.action != "inspect" and args.output is None:
         raise RuntimeError("recovery output path is required")
-    if args.action == "prepare" and args.backup is None:
+    if args.action in {"prepare", "retry_failed"} and args.backup is None:
         raise RuntimeError("recovery backup path is required")
     for path in (args.output, args.backup):
         if path is not None and (path.exists() or path.is_symlink()):
@@ -195,14 +198,66 @@ async def main() -> None:
                 raise RuntimeError("release requeue count changed")
             await session.commit()
 
+    if args.action == "retry_failed":
+        if before_counts != {
+            "delivered": 71,
+            "failed": 1,
+            "generation_failed": 2,
+        }:
+            raise RuntimeError("weekly brief final retry state changed")
+        _write(args.backup, raw_backup)
+        changed_at = datetime.now(TIMEZONE)
+        async with AsyncSessionLocal() as session:
+            requeued = await session.execute(
+                update(_briefs)
+                .where(
+                    _briefs.c.tenant_id == tenant_id,
+                    _briefs.c.week_start == week_start,
+                    _briefs.c.status == "generation_failed",
+                )
+                .values(
+                    status="snapshot_ready",
+                    generation_started_at=None,
+                    generated_at=None,
+                    failed_at=None,
+                    last_error="",
+                    retry_count=0,
+                    recovery_json=_recovery_append(
+                        kind="generation_final_retry_requeued",
+                        reason="bounded final retry after v27 partial rollout",
+                        changed_at=changed_at,
+                    ),
+                    updated_at=changed_at,
+                )
+            )
+            if requeued.rowcount != 2:
+                raise RuntimeError("final retry requeue count changed")
+            await session.commit()
+
     result: dict[str, object] = {}
     if args.action == "run":
-        if before_counts != {
+        initial_recovery_counts = {
             "delivered": 1,
             "delivery_pending": 4,
             "generated": 18,
             "snapshot_ready": 51,
-        }:
+        }
+        resumed_recovery_counts = {
+            "delivered": 20,
+            "delivery_pending": 2,
+            "failed": 1,
+            "snapshot_ready": 51,
+        }
+        final_retry_counts = {
+            "delivered": 71,
+            "failed": 1,
+            "snapshot_ready": 2,
+        }
+        if (
+            before_counts != initial_recovery_counts
+            and before_counts != resumed_recovery_counts
+            and before_counts != final_retry_counts
+        ):
             raise RuntimeError("weekly brief recovery state changed before run")
         _write(
             args.output,
@@ -211,14 +266,17 @@ async def main() -> None:
         llm_client = LLMClient(settings)
         robot = DingTalkRobotClient(settings)
         try:
-            result["reconcile_before"] = (
-                await run_personal_weekly_brief_reconcile_job(
-                    settings,
-                    llm_client=llm_client,
-                    robot=robot,
-                    now=datetime.now(TIMEZONE),
+            if before_counts == initial_recovery_counts:
+                result["reconcile_before"] = (
+                    await run_personal_weekly_brief_reconcile_job(
+                        settings,
+                        llm_client=llm_client,
+                        robot=robot,
+                        now=datetime.now(TIMEZONE),
+                    )
                 )
-            )
+            else:
+                result["reconcile_before"] = "already_completed_before_resume"
             result["generation"] = await run_personal_weekly_brief_generation_job(
                 settings,
                 llm_client=llm_client,
@@ -273,6 +331,12 @@ async def main() -> None:
         "delivery_pending": 4,
         "generated": 18,
         "snapshot_ready": 51,
+    }:
+        payload["status"] = "FAIL"
+    if args.action == "retry_failed" and after_counts != {
+        "delivered": 71,
+        "failed": 1,
+        "snapshot_ready": 2,
     }:
         payload["status"] = "FAIL"
     if args.action == "run" and not (

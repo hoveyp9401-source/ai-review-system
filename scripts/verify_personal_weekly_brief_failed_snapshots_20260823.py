@@ -14,6 +14,12 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--source-process-id", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-counts", default="")
+    parser.add_argument("--owner-names", default="")
+    parser.add_argument(
+        "--row-status",
+        choices=("generation_failed", "snapshot_ready"),
+        default="generation_failed",
+    )
     return parser.parse_args()
 
 
@@ -106,22 +112,46 @@ async def main() -> None:
     async with AsyncSessionLocal() as session:
         failed = await SqlPersonalWeeklyBriefStore(session).load_for_status(
             tenant_id=tenant_id,
-            status="generation_failed",
+            status=args.row_status,
             week_start=week_start,
             limit=100,
         )
-        if len(failed) < 6:
+        requested_names = tuple(
+            value.strip()
+            for value in args.owner_names.split(",")
+            if value.strip()
+        )
+        if not requested_names and len(failed) < 6:
             raise RuntimeError("not enough failed snapshots for bounded validation")
         ordered = sorted(
             failed,
             key=lambda row: len((row.source_snapshot or {}).get("sources") or []),
         )
+        all_users = tuple(
+            (
+                await session.scalars(
+                    select(User).where(
+                        User.id.in_([UUID(row.owner_user_id) for row in ordered])
+                    )
+                )
+            ).all()
+        )
+        all_names = {str(user.id): user.name for user in all_users}
         requested_counts = tuple(
             int(value.strip())
             for value in args.source_counts.split(",")
             if value.strip()
         )
-        if requested_counts:
+        if requested_names:
+            selected = tuple(
+                row
+                for name in requested_names
+                for row in ordered
+                if all_names.get(row.owner_user_id) == name
+            )
+            if len(selected) != len(requested_names):
+                raise RuntimeError("requested failed owner set is incomplete")
+        elif requested_counts:
             selected_rows = []
             for requested_count in requested_counts:
                 match = next(
@@ -150,16 +180,7 @@ async def main() -> None:
                 len(ordered) - 1,
             )
             selected = tuple(ordered[index] for index in dict.fromkeys(indexes))
-        users = tuple(
-            (
-                await session.scalars(
-                    select(User).where(
-                        User.id.in_([UUID(row.owner_user_id) for row in selected])
-                    )
-                )
-            ).all()
-        )
-        names = {str(user.id): user.name for user in users}
+        names = all_names
         await session.rollback()
 
     llm_client = LLMClient(settings)
@@ -197,6 +218,40 @@ async def main() -> None:
                         "issues_type": type(parsed.get("issues")).__name__,
                     }
                 )
+                if phase == "generation":
+                    trace["sections"] = {
+                        section_name: {
+                            "items_type": type(
+                                (parsed.get(section_name) or {}).get("items")
+                            ).__name__
+                            if isinstance(parsed.get(section_name), dict)
+                            else "missing",
+                            "item_count": len(
+                                (parsed.get(section_name) or {}).get("items") or []
+                            )
+                            if isinstance(parsed.get(section_name), dict)
+                            and isinstance(
+                                (parsed.get(section_name) or {}).get("items"),
+                                list,
+                            )
+                            else -1,
+                            "empty_note_present": bool(
+                                str(
+                                    (parsed.get(section_name) or {}).get(
+                                        "empty_note"
+                                    )
+                                    or ""
+                                ).strip()
+                            )
+                            if isinstance(parsed.get(section_name), dict)
+                            else False,
+                        }
+                        for section_name in (
+                            "completed",
+                            "plan_progress",
+                            "possible_open_loops",
+                        )
+                    }
             self.calls.append(trace)
             return raw
 

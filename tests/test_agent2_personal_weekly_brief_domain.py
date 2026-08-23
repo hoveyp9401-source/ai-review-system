@@ -160,6 +160,14 @@ async def test_generator_keeps_large_source_audit_out_of_model_output() -> None:
     assert [item.disposition for item in result.source_dispositions] == ["cited"]
 
 
+def test_generator_prompt_keeps_daily_tomorrow_plan_out_of_weekly_progress() -> None:
+    from app.agent2.personal_weekly_brief import _SYSTEM_PROMPT
+
+    assert "weekly_plan_found=false" in _SYSTEM_PROMPT
+    assert "日报的 tomorrow_plan 不是正式周计划" in _SYSTEM_PROMPT
+    assert "plan_progress.items 必须为空" in _SYSTEM_PROMPT
+
+
 @pytest.mark.asyncio
 async def test_independent_reviewer_accepts_real_model_json_code_fence() -> None:
     content = await Agent2PersonalWeeklyBriefGenerator(
