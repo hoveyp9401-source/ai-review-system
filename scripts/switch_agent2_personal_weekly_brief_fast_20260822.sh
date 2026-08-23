@@ -3,14 +3,15 @@ set -euo pipefail
 
 action="${1:-}"
 releases=/home/ai_review_tunnel/releases
-candidate="$releases/ai-review-system-agent2-weekly-brief-context-20260823-v10"
-previous="$releases/ai-review-system-agent2-weekly-brief-fast-20260823-v9"
+candidate="$releases/ai-review-system-agent2-weekly-brief-context-20260823-v14"
+previous="$releases/ai-review-system-agent2-weekly-brief-context-20260823-v10"
 current="$releases/current"
 shared_env=/home/ai_review_tunnel/ai-review-system/.env
 python=/home/ai_review_tunnel/ai-review-system/venv/bin/python
-expected_commit=897500460fe27cd918bedf3d2967c1a76f442e37
-daily_focus_output=/home/ai_review_tunnel/deploy_backups/daily-focus-weekly-brief-context-v10-20260823.json
-alignment_output=/home/ai_review_tunnel/deploy_backups/alignment-weekly-brief-context-v10-20260823.json
+expected_commit=c964d71236ab5ceb8726234d5f82166c86e00367
+daily_focus_output=/home/ai_review_tunnel/deploy_backups/daily-focus-weekly-brief-context-v14-20260823.json
+alignment_output=/home/ai_review_tunnel/deploy_backups/alignment-weekly-brief-context-v14-20260823.json
+control_backup=/home/ai_review_tunnel/deploy_backups/weekly-brief-context-v14-controls-before-20260823.json
 services=(
   ai-review-api.service
   ai-review-stream.service
@@ -130,6 +131,35 @@ run_control_alignment() {
       --code-root "$candidate" \
       --expected-model deepseek-v4-flash \
       >"$alignment_output"
+  )
+}
+
+apply_candidate_controls() {
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$shared_env"
+    set +a
+    cd "$candidate"
+    umask 077
+    PYTHONPATH=. "$python" scripts/manage_full_rollout.py apply \
+      --backup-path "$control_backup" \
+      --confirm-count 74
+  )
+  [[ -f "$control_backup" && ! -L "$control_backup" ]]
+  [[ "$(stat -c %a "$control_backup")" == "600" ]]
+}
+
+restore_previous_controls() {
+  [[ -f "$control_backup" && ! -L "$control_backup" ]]
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$shared_env"
+    set +a
+    cd "$candidate"
+    PYTHONPATH=. "$python" scripts/manage_full_rollout.py rollback \
+      --backup-path "$control_backup"
   )
 }
 
@@ -276,8 +306,11 @@ rollback() {
   if [[ "$processes_frozen" -eq 0 ]]; then
     freeze_all_services || exit 1
   fi
+  if [[ -f "$control_backup" && ! -L "$control_backup" ]]; then
+    restore_previous_controls || exit 1
+  fi
   if [[ "$(readlink -f "$current")" != "$previous" ]]; then
-    switch_current "$previous" weekly-brief-context-v10-rollback || exit 1
+    switch_current "$previous" weekly-brief-context-v14-rollback || exit 1
   fi
   terminate_frozen_services
   wait_healthy "$previous" || exit 1
@@ -296,7 +329,8 @@ if [[ "$action" == "deploy" ]]; then
     exit 1
   fi
   if [[ -e "$daily_focus_output" || -L "$daily_focus_output" \
-    || -e "$alignment_output" || -L "$alignment_output" ]]; then
+    || -e "$alignment_output" || -L "$alignment_output" \
+    || -e "$control_backup" || -L "$control_backup" ]]; then
     echo "deployment evidence path already exists" >&2
     exit 1
   fi
@@ -305,7 +339,8 @@ if [[ "$action" == "deploy" ]]; then
   trap 'rollback 130' INT
   trap 'rollback 143' TERM
   freeze_all_services
-  switch_current "$candidate" weekly-brief-context-v10-next
+  apply_candidate_controls
+  switch_current "$candidate" weekly-brief-context-v14-next
   terminate_frozen_services
   wait_healthy "$candidate"
   verify_weekly_brief_off_and_empty
@@ -319,7 +354,7 @@ if [[ "$action" == "deploy" ]]; then
   echo "deployed $candidate"
 elif [[ "$action" == "rollback" ]]; then
   if [[ "$(readlink -f "$current")" != "$candidate" ]]; then
-    echo "current release is not weekly brief context v10" >&2
+    echo "current release is not weekly brief context v14" >&2
     exit 1
   fi
   freeze_all_services
