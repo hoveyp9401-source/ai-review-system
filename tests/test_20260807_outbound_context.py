@@ -8,6 +8,9 @@ import pytest
 
 from app.agent2.tool_calling.assembly import TrustedContextRequest
 from app.agent2.tool_calling.canary_config import canary_system_prompt
+from app.agent2.tool_calling.deepseek_adapter import (
+    _latest_verified_outbound_chat_message,
+)
 from app.agent2.tool_calling.outbound_context import (
     OUTBOUND_CONTEXT_BACKEND_ACTION,
     build_verified_outbound_context_event,
@@ -109,6 +112,30 @@ def test_prompt_prioritizes_natural_followup_to_verified_outbound_message():
     insight_description = TOOL_REGISTRY["query_report_insights"].description
     assert "not merely the contents" in insight_description
     assert "preceding delivered message is not such a read" in insight_description
+
+
+def test_latest_verified_outbound_is_exposed_as_native_assistant_history():
+    outbound = TrustedRecentMessage(
+        role="assistant",
+        content="刚发出的个人周简报",
+        source_message_id="outbound:personal-weekly-brief:test",
+    )
+
+    assert _latest_verified_outbound_chat_message(
+        SimpleNamespace(recent_messages=(outbound,))
+    ) == {"role": "assistant", "content": outbound.content}
+    assert _latest_verified_outbound_chat_message(
+        SimpleNamespace(
+            recent_messages=(
+                outbound,
+                TrustedRecentMessage(
+                    role="user",
+                    content="后来已经换了话题",
+                    source_message_id="inbound:new-topic",
+                ),
+            )
+        )
+    ) is None
 
 
 @pytest.mark.parametrize(

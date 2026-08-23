@@ -255,6 +255,22 @@ def _canary_user_input_payload(
     }
 
 
+def _latest_verified_outbound_chat_message(
+    context: TrustedContext,
+) -> dict[str, str] | None:
+    """Promote only the latest verified proactive send into native chat history."""
+
+    if not context.recent_messages:
+        return None
+    latest = context.recent_messages[-1]
+    if not (
+        latest.role == "assistant"
+        and latest.source_message_id.startswith("outbound:")
+    ):
+        return None
+    return {"role": "assistant", "content": latest.content}
+
+
 class DeepSeekToolCallingAdapter:
     """Native DeepSeek tool-calling transport with fail-closed parsing."""
 
@@ -309,6 +325,11 @@ class DeepSeekToolCallingAdapter:
         session = runtime.open_session(context)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
+        ]
+        outbound_history = _latest_verified_outbound_chat_message(context)
+        if outbound_history is not None:
+            messages.append(outbound_history)
+        messages.append(
             {
                 "role": "user",
                 "content": json.dumps(
@@ -320,8 +341,8 @@ class DeepSeekToolCallingAdapter:
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
-            },
-        ]
+            }
+        )
         audits: list[RawToolCallAudit] = []
         model_turns: list[ModelTurnAudit] = []
         plans: list[TurnExecutionPlan] = []
@@ -502,6 +523,11 @@ class DeepSeekToolCallingAdapter:
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
+        ]
+        outbound_history = _latest_verified_outbound_chat_message(context)
+        if outbound_history is not None:
+            messages.append(outbound_history)
+        messages.append(
             {
                 "role": "user",
                 "content": json.dumps(
@@ -514,8 +540,8 @@ class DeepSeekToolCallingAdapter:
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
-            },
-        ]
+            }
+        )
         audits: list[RawToolCallAudit] = []
         model_turns: list[ModelTurnAudit] = []
         runtime_results: list[ProductionRuntimeResult] = []
