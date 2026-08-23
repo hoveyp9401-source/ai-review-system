@@ -18,6 +18,7 @@ from app.agent2.tool_calling.production_store import (
     ProductionContextStore,
     _select_recent_messages_with_scheduled_outbound,
 )
+from app.agent2.tool_calling.registry import TOOL_REGISTRY
 from app.agent2.tool_calling.context import (
     CANARY_STATE_NAMESPACE,
     TrustedRecentMessage,
@@ -105,6 +106,9 @@ def test_prompt_prioritizes_natural_followup_to_verified_outbound_message():
     assert "do not broaden it into a fresh all-history query" in prompt
     assert "read-tool boundary does not override a natural question" in prompt
     assert "do not call a historical insight tool" in prompt
+    insight_description = TOOL_REGISTRY["query_report_insights"].description
+    assert "not merely the contents" in insight_description
+    assert "preceding delivered message is not such a read" in insight_description
 
 
 @pytest.mark.parametrize(

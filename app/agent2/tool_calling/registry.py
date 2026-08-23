@@ -593,7 +593,11 @@ TOOL_REGISTRY = MappingProxyType(
         "query_report_insights": _definition(
             "query_report_insights",
             "Read historical daily-report insights after the current user_message has "
-            "semantically asked for them. Use report_count for one person's total saved "
+            "semantically asked for fresh business records, not merely the contents of "
+            "the immediately preceding delivered `outbound:` assistant message. When "
+            "a concise follow-up naturally asks about a section or item already presented "
+            "in that message, answer from trusted recent conversation instead of calling "
+            "this tool. Use report_count for one person's total saved "
             "or completed reports; recent_work for one person's work over a bounded period; "
             "period_work for an organization's current-week or previous-week summary; "
             "submission_coverage for one formal legal department's current-week or "
@@ -619,8 +623,9 @@ TOOL_REGISTRY = MappingProxyType(
             "report_count, completed_count, and pending_confirmation_count separately. "
             "Do not use this for today's raw member report, missing-submission status, "
             "a single-date department snapshot, performance metrics, defendant cases, "
-            "or any report write. For any recent, weekly, last-week, cross-history, "
-            "attention, or unclosed question, this is the required read tool.",
+            "or any report write. For any fresh recent, weekly, last-week, cross-history, "
+            "attention, or unclosed business-record question, this is the required read "
+            "tool; a question about the preceding delivered message is not such a read.",
             QueryReportInsightsArgs,
             "read",
             "low",
