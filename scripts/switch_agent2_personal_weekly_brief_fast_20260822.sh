@@ -38,6 +38,7 @@ verify_weekly_brief_off_and_empty() {
     cd "$candidate"
     PYTHONPATH=. "$python" - <<'PY'
 import asyncio
+from collections import Counter
 from datetime import date
 
 from sqlalchemy import text
@@ -70,7 +71,7 @@ async def main() -> None:
             (
                 await session.execute(
                     text(
-                        "SELECT status, last_error, provider_message_id, "
+                        "SELECT week_start, status, last_error, provider_message_id, "
                         "delivery_receipt_json "
                         "FROM public.agent2_personal_weekly_briefs"
                     )
@@ -94,7 +95,33 @@ async def main() -> None:
             and receipt.get("delivery_status") == "SUCCESS"
             and len(receipt.get("delivered_dingtalk_user_ids") or []) == 1
         )
-        if brief_rows and not (safe_failed or safe_delivered):
+        status_counts = Counter(str(row["status"]) for row in brief_rows)
+        safe_recovery = bool(
+            len(brief_rows) == 74
+            and {row["week_start"].isoformat() for row in brief_rows}
+            == {"2026-08-17"}
+            and status_counts
+            == {
+                "delivered": 1,
+                "delivery_pending": 4,
+                "generated": 18,
+                "generating": 2,
+                "generation_failed": 49,
+            }
+            and sum(bool(str(row["provider_message_id"] or "")) for row in brief_rows)
+            == 5
+            and sum(
+                bool(
+                    dict(row["delivery_receipt_json"] or {}).get(
+                        "delivery_verified"
+                    )
+                    is True
+                )
+                for row in brief_rows
+            )
+            == 1
+        )
+        if brief_rows and not (safe_failed or safe_delivered or safe_recovery):
             raise RuntimeError("personal weekly brief table is not in safe canary state")
         historical = await load_formal_legal_daily_roster(
             session,
