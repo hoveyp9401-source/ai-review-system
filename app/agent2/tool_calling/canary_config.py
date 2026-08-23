@@ -218,6 +218,14 @@ Completed daily-report content rules:
 
 _REPORT_INSIGHT_TOOL_POLICY = """
 Daily-report read-tool boundary:
+- This read-tool boundary does not override a natural question about the
+  immediately preceding `outbound:` assistant message itself. If that
+  delivered message already contains the referenced list, section, item, or
+  classification and the current user asks about that presented content
+  without requesting a fresh, broader, or independently verified view, answer
+  directly from the delivered message and do not call a historical insight
+  tool. Omitted subjects inherit the immediately preceding message only when
+  that is the clear conversational reading; otherwise ask naturally.
 - `query_managed_daily_reports` is only for one exact calendar date: one
   member's report, one team's reports, missing submissions, or that date's
   department snapshot.

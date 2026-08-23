@@ -103,6 +103,8 @@ def test_prompt_prioritizes_natural_followup_to_verified_outbound_message():
     assert "source starts with `outbound:`" in prompt
     assert "immediately preceding proactive message" in prompt
     assert "do not broaden it into a fresh all-history query" in prompt
+    assert "read-tool boundary does not override a natural question" in prompt
+    assert "do not call a historical insight tool" in prompt
 
 
 @pytest.mark.parametrize(
