@@ -1,0 +1,1102 @@
+diff --git a/app/agent2/tool_calling/daily_add_model_contract.py b/app/agent2/tool_calling/daily_add_model_contract.py
+index 59b97d17..e316ad0d 100644
+--- a/app/agent2/tool_calling/daily_add_model_contract.py
++++ b/app/agent2/tool_calling/daily_add_model_contract.py
+@@ -379,6 +379,7 @@ class FocusedDailyCompleteSourceEvidence(CurrentUserMessageEvidence):
+ class FocusedDailyPlanArguments(StrictContract):
+     date_selection: Literal["server_default"]
+     fields: FocusedDailyFields
++    replace_existing_snapshot: bool = False
+     empty_field_evidence: tuple[
+         FocusedDailyEmptyFieldEvidence,
+         ...,
+@@ -580,6 +581,7 @@ def compile_focused_daily_plan_arguments(
+             for evidence in plan.empty_field_evidence
+         ],
+         "reviewed_omitted_empty_fields": reviewed_omitted_empty_fields,
++        "replace_existing_snapshot": plan.replace_existing_snapshot,
+         "submit_after_write": plan.submit_after_write,
+     }
+     return compile_model_add_daily_items(compact_arguments), plan.reply
+diff --git a/app/agent2/tool_calling/daily_turn_processor.py b/app/agent2/tool_calling/daily_turn_processor.py
+index 1559057d..837b6160 100644
+--- a/app/agent2/tool_calling/daily_turn_processor.py
++++ b/app/agent2/tool_calling/daily_turn_processor.py
+@@ -145,6 +145,7 @@ class VerifiedDailyTurn:
+     model_call_count: int = 1
+     source_gap_patch_model_call_count: int = 0
+     allow_partial_source_coverage: bool = False
++    model_owned_flat_partition: bool = False
+     elapsed_seconds: float | None = None
+     reply_draft: str | None = None
+ 
+@@ -269,7 +270,10 @@ class DailyTurnProcessor:
+                 verified_turn,
+                 reason="dated_heading_target_mismatch",
+             )
+-        if not _structured_daily_fields_match(verified_turn):
++        if (
++            not verified_turn.model_owned_flat_partition
++            and not _structured_daily_fields_match(verified_turn)
++        ):
+             return _non_direct_outcome(
+                 verified_turn,
+                 reason="structured_field_mismatch",
+@@ -282,12 +286,18 @@ class DailyTurnProcessor:
+                 verified_turn,
+                 reason="weekly_date_in_daily_tomorrow",
+             )
+-        if not _structured_daily_empty_fields_match(verified_turn):
++        if (
++            not verified_turn.model_owned_flat_partition
++            and not _structured_daily_empty_fields_match(verified_turn)
++        ):
+             return _non_direct_outcome(
+                 verified_turn,
+                 reason="structured_empty_field_mismatch",
+             )
+-        grouping_complete = _structured_daily_grouping_matches(verified_turn)
++        grouping_complete = (
++            verified_turn.model_owned_flat_partition
++            or _structured_daily_grouping_matches(verified_turn)
++        )
+         if not grouping_complete and not verified_turn.allow_partial_source_coverage:
+             return _non_direct_outcome(
+                 verified_turn,
+diff --git a/app/agent2/tool_calling/deepseek_adapter.py b/app/agent2/tool_calling/deepseek_adapter.py
+index 3855ca82..97cd8cc2 100644
+--- a/app/agent2/tool_calling/deepseek_adapter.py
++++ b/app/agent2/tool_calling/deepseek_adapter.py
+@@ -2637,15 +2637,19 @@ class DeepSeekToolCallingAdapter:
+                             else ()
+                         )
+                         flat_long_daily = bool(
+-                            long_daily_chunks
+-                            and long_daily_narrative_confirmed
+-                            and not _daily_section_heading_spans(user_text)
+-                            and len(user_text) >= 1200
++                            bounded_daily_probe_pending
++                            and not user_messages
++                            and len(user_text) >= _CANARY_LONG_FOCUSED_SOURCE_CHARS
+                         )
+                         if flat_long_daily:
+                             long_daily_chunks = ()
+                             completion_messages = _bounded_long_daily_flat_messages(
+-                                user_text
++                                user_text,
++                                existing_report=(
++                                    context.today_report.safe_snapshot()
++                                    if context.today_report is not None
++                                    else None
++                                ),
+                             )
+                             completion_tool_schemas = []
+                         if long_daily_chunks:
+@@ -3990,43 +3994,10 @@ class DeepSeekToolCallingAdapter:
+                             model_turns[-1],
+                             response_metadata={
+                                 **model_turns[-1].response_metadata,
+-                                "snapshot_replacement_not_proven": True,
++                                "snapshot_replacement_deferred_to_daily_processor": True,
+                                 "draft_executed": False,
+                             },
+                         )
+-                        if (
+-                            parsed.report_addition_plan_compiled
+-                            and report_additions_plan_retry_count == 0
+-                        ):
+-                            raw_meta_arguments = next(
+-                                (
+-                                    item.raw_arguments
+-                                    for item in reversed(audits)
+-                                    if item.tool_name
+-                                    == _PLAN_REPORT_ADDITIONS_TOOL_NAME
+-                                ),
+-                                "",
+-                            )
+-                            report_additions_repair_feedback = {
+-                                "validation_error": (
+-                                    "daily_snapshot_replacement_not_proven"
+-                                ),
+-                                "previous_unexecuted_arguments": (
+-                                    raw_meta_arguments[-16000:]
+-                                ),
+-                            }
+-                            report_additions_plan_retry_count += 1
+-                            bounded_report_add_probe_pending = True
+-                            bounded_report_add_turn_active = False
+-                            bounded_daily_turn_active = False
+-                            continue
+-                        raise _with_canary_turn_state(
+-                            DeepSeekResponseError(
+-                                "Daily snapshot replacement could not be proven"
+-                            ),
+-                            audits=audits,
+-                            model_turns=model_turns,
+-                        )
+                     if prepared_snapshot is not None:
+                         prepared_draft, snapshot_report = prepared_snapshot
+                         materialized_snapshot = (
+@@ -4110,6 +4081,11 @@ class DeepSeekToolCallingAdapter:
+                                     for turn in model_turns
+                                 )
+                             ),
++                            model_owned_flat_partition=any(
++                                turn.response_metadata.get("long_daily_flat_plan")
++                                is True
++                                for turn in model_turns
++                            ),
+                             model_call_count=(
+                                 1
+                                 if authoritative_daily_model_turns
+@@ -4636,6 +4612,66 @@ class DeepSeekToolCallingAdapter:
+                         assistant_message=assistant_message,
+                         tool_calls=daily_turn_outcome.calls,
+                     )
++                    verified_replacement_call = next(
++                        (
++                            call
++                            for call in daily_turn_outcome.calls
++                            if call.tool_name == "add_daily_items"
++                            and call.arguments.get("replace_existing_snapshot") is True
++                        ),
++                        None,
++                    )
++                    if verified_replacement_call is not None:
++                        report = context.today_report
++                        represented_fields = {
++                            str(item.get("field") or "")
++                            for item in verified_replacement_call.arguments.get("items")
++                            or ()
++                            if isinstance(item, dict)
++                        }
++                        represented_fields.update(
++                            str(field)
++                            for field in verified_replacement_call.arguments.get(
++                                "acknowledged_empty_fields"
++                            )
++                            or ()
++                        )
++                        if (
++                            report is None
++                            or report.status not in {"collecting", "pending_confirmation"}
++                            or represented_fields
++                            != {"today_work", "problems", "tomorrow_plan"}
++                        ):
++                            raise _with_canary_turn_state(
++                                DeepSeekResponseError(
++                                    "Daily snapshot replacement was not complete"
++                                ),
++                                audits=audits,
++                                model_turns=model_turns,
++                            )
++                        materialized = (
++                            _materialize_complete_labelled_daily_snapshot_replacement(
++                                parsed,
++                                report=report,
++                            )
++                        )
++                        if materialized is None:
++                            raise _with_canary_turn_state(
++                                DeepSeekResponseError(
++                                    "Daily snapshot replacement could not be materialized"
++                                ),
++                                audits=audits,
++                                model_turns=model_turns,
++                            )
++                        parsed = materialized
++                        model_turns[-1] = replace(
++                            model_turns[-1],
++                            response_metadata={
++                                **model_turns[-1].response_metadata,
++                                "complete_daily_snapshot_replacement_after_review": True,
++                                "draft_executed": False,
++                            },
++                        )
+ 
+                 if (
+                     bounded_report_add_turn_active
+@@ -8249,33 +8285,57 @@ def _focused_daily_ruled_out_main_message() -> dict[str, str]:
+     }
+ 
+ 
+-def _bounded_long_daily_flat_messages(source: str) -> list[dict[str, str]]:
+-    """Minimize the model output surface for one confirmed long Daily narrative."""
++def _bounded_long_daily_flat_messages(
++    source: str,
++    *,
++    existing_report: dict[str, Any] | None = None,
++) -> list[dict[str, str]]:
++    """Minimize the model output surface for one substantial Daily candidate."""
+ 
+     return [
+         {
+             "role": "system",
+             "content": (
+-                "You are Agent2 extracting one current Daily Report from a long spoken "
+-                "narrative already confirmed by another Agent2 model. Return JSON only "
+-                "with exactly decision and items. decision must be daily_add. items is an "
+-                "ordered array. Each item has exactly field and exact_quote. field is "
++                "You are Agent2 deciding and extracting one substantial current-message "
++                "Daily Report candidate. Return JSON only. If this is not a pure Daily "
++                "Report addition or complete replacement, return exactly "
++                '{"decision":"not_daily"}. Otherwise return exactly decision, '
++                "replace_existing_snapshot, items, and empty_fields. decision must be "
++                "daily_add. replace_existing_snapshot is true only when this message is "
++                "one complete Daily Report snapshot intended to supersede the user's "
++                "existing draft; it is false for additions and partial sections. items is "
++                "an ordered array. Each item has exactly field and exact_quote. field is "
+                 "today_work, problems, or tomorrow_plan. exact_quote must be one complete "
+                 "contiguous verbatim substring copied character-for-character from the "
+-                "user source. Every substantive source assertion must be covered exactly "
+-                "once. Quotes must not overlap. Use problems only for actual current "
++                "user source. empty_fields is an array whose entries have exactly field "
++                "and exact_quote. Use it only when the user explicitly says that one Daily "
++                "field is empty; an absence statement such as 暂无问题 is never a problems "
++                "item. Every substantive source assertion and explicit empty statement "
++                "must be covered exactly once. Quotes must not overlap. Use problems only for actual current "
+                 "problems, risks, blocks, or unresolved difficulties. Use tomorrow_plan "
+                 "only for an action explicitly assigned to tomorrow or the next reporting "
+                 "day; recommendations, later possibilities, and discussion conclusions "
+                 "remain today_work. Preserve dates, numbers, negations, conditions, actors, "
+                 "and attribution. You may leave only oral filler, punctuation, and framing "
+-                "uncovered. Do not polish, summarize, add content, or include explanations."
++                "uncovered. The optional existing report is context, never current-source "
++                "evidence. When the new message is a complete self-standing report that "
++                "restates the whole Daily and the existing report is only an earlier draft, "
++                "choose replacement so the resend does not create duplicates. Do not choose "
++                "replacement for a supplement or one-section update. Do not polish, summarize, "
++                "add content, or include explanations."
+             ),
+         },
+         {
+             "role": "user",
+             "content": json.dumps(
+-                {"source": source},
++                {
++                    "source": source,
++                    **(
++                        {"existing_daily_report": existing_report}
++                        if existing_report is not None
++                        else {}
++                    ),
++                },
+                 ensure_ascii=False,
+                 separators=(",", ":"),
+             ),
+@@ -8294,13 +8354,38 @@ def _compile_long_daily_flat_completion(
+         payload = json.loads(completion.message.get("content") or "")
+     except (TypeError, json.JSONDecodeError) as exc:
+         raise DeepSeekResponseError("long Daily flat plan returned invalid JSON") from exc
++    if payload == {"decision": "not_daily"}:
++        return _CompletionResponse(
++            message={
++                "role": "assistant",
++                "content": json.dumps(payload, separators=(",", ":")),
++            },
++            metadata={**completion.metadata, "long_daily_flat_plan": True},
++        )
++    legacy_shape = isinstance(payload, dict) and set(payload) == {
++        "decision",
++        "items",
++    }
++    current_shape = isinstance(payload, dict) and set(payload) == {
++        "decision",
++        "replace_existing_snapshot",
++        "items",
++        "empty_fields",
++    }
+     if (
+-        not isinstance(payload, dict)
+-        or set(payload) != {"decision", "items"}
++        not (legacy_shape or current_shape)
+         or payload.get("decision") != "daily_add"
+         or not isinstance(payload.get("items"), list)
+         or not payload["items"]
+         or len(payload["items"]) > 100
++        or (
++            current_shape
++            and (
++                not isinstance(payload.get("replace_existing_snapshot"), bool)
++                or not isinstance(payload.get("empty_fields"), list)
++                or len(payload["empty_fields"]) > 3
++            )
++        )
+     ):
+         raise DeepSeekResponseError("long Daily flat plan returned invalid shape")
+ 
+@@ -8341,6 +8426,54 @@ def _compile_long_daily_flat_completion(
+                 },
+             }
+         )
++
++    empty_field_evidence: list[dict[str, Any]] = []
++    non_item_source_evidence: list[dict[str, Any]] = []
++    for item in payload.get("empty_fields") or ():
++        if not isinstance(item, dict) or set(item) != {"field", "exact_quote"}:
++            raise DeepSeekResponseError(
++                "long Daily flat plan returned invalid empty-field evidence"
++            )
++        field_name = str(item.get("field") or "")
++        quote = str(item.get("exact_quote") or "")
++        if field_name not in fields or fields[field_name] or not quote.strip():
++            raise DeepSeekResponseError(
++                "long Daily flat plan returned conflicting empty-field evidence"
++            )
++        exact_quote = quote if source.count(quote) == 1 else (
++            _align_approximate_source_quote(source, quote) or ""
++        )
++        if not exact_quote or source.count(exact_quote) != 1:
++            raise DeepSeekResponseError(
++                "long Daily flat plan returned ungrounded empty-field evidence"
++            )
++        start = source.index(exact_quote)
++        end = start + len(exact_quote)
++        if any(
++            start < other_end and other_start < end
++            for other_start, other_end in accepted_spans
++        ):
++            raise DeepSeekResponseError(
++                "long Daily flat plan returned overlapping empty-field evidence"
++            )
++        accepted_spans.append((start, end))
++        empty_field_evidence.append(
++            {
++                "field": field_name,
++                "source_evidence": {
++                    "source_message_index": 1,
++                    "exact_quote": exact_quote,
++                },
++            }
++        )
++        non_item_source_evidence.append(
++            {
++                "field": field_name,
++                "source_message_index": 1,
++                "exact_quote": exact_quote,
++                "reason": "explicit_empty_field",
++            }
++        )
+     if not any(fields.values()):
+         raise DeepSeekResponseError("long Daily flat plan contained no grounded item")
+ 
+@@ -8350,10 +8483,13 @@ def _compile_long_daily_flat_completion(
+             "arguments": {
+                 "date_selection": "server_default",
+                 "fields": fields,
+-                "empty_field_evidence": [],
+-                "non_item_source_evidence": [],
++                "empty_field_evidence": empty_field_evidence,
++                "non_item_source_evidence": non_item_source_evidence,
+                 "source_accounting_check": "complete",
+                 "request_scope_check": "pure_daily_add",
++                "replace_existing_snapshot": bool(
++                    payload.get("replace_existing_snapshot", False)
++                ),
+                 "submit_after_write": False,
+             },
+             "reply": "已整理日报内容。",
+diff --git a/app/agent2/tool_calling/write_reply.py b/app/agent2/tool_calling/write_reply.py
+index a0290374..0f3be45a 100644
+--- a/app/agent2/tool_calling/write_reply.py
++++ b/app/agent2/tool_calling/write_reply.py
+@@ -856,6 +856,11 @@ def complete_verified_daily_reply_draft(
+     """
+ 
+     outcome = expected_write_outcome(receipts)
++    if outcome == "not_executed":
++        return bind_verified_daily_labels_to_model_reply(
++            "这次没有写入日报，内容和状态都没有变化。",
++            receipts,
++        )
+     bound = (
+         None
+         if outcome == "no_change"
+diff --git a/scripts/run_agent2_isolated_api_smoke.py b/scripts/run_agent2_isolated_api_smoke.py
+index 9ac0fa80..1a511ac6 100644
+--- a/scripts/run_agent2_isolated_api_smoke.py
++++ b/scripts/run_agent2_isolated_api_smoke.py
+@@ -46,6 +46,8 @@ CASE_NAMES = (
+     "idempotency",
+     "daily_crud",
+     "asr_name_correction",
++    "partial_resend",
++    "short_empty_followup",
+ )
+ ADVERSE_CASE_COVERAGE: dict[str, dict[str, object]] = {
+     "d953c1934cca0c681f325c6fc97849b6e16e920ab9a7a122a85a015548e399a0": {
+@@ -94,6 +96,9 @@ ADVERSE_CASE_COVERAGE: dict[str, dict[str, object]] = {
+     "08a85f4ab4bab9cac9adb34251164b48c783698f43a1978166000d48015fa2ca": {
+         "cases": ("bare_confirm",), "mode": "exact"
+     },
++    "9d18c2544c5eec55ecbdbdba3dd15fcf80d051897c69a83bb5faff968ca21ea2": {
++        "cases": ("partial_resend",), "mode": "exact"
++    },
+ }
+ MODEL_AUDIT_FAILURES: list[dict[str, Any]] = []
+ 
+@@ -1140,6 +1145,81 @@ async def _run_cases(
+         _assert(list(after.today_work or []) == ["完成合同终稿复核"], "daily edit/delete result mismatch")
+         return {"today_count": len(after.today_work or [])}
+ 
++    async def partial_resend() -> dict[str, Any]:
++        source = inputs[
++            "9d18c2544c5eec55ecbdbdba3dd15fcf80d051897c69a83bb5faff968ca21ea2"
++        ]
++        await _seed_report(
++            session_factory,
++            user_id=user_ids[16],
++            team_id=team_id,
++            report_date=TODAY,
++            today_work=["旧残缺草稿标记"],
++            problems=[],
++            tomorrow_plan=["旧重复计划标记", "旧重复计划标记"],
++            acknowledge_problems=False,
++        )
++        response = await post(
++            17,
++            source,
++            "complete-resend",
++            conversation="isolated-partial-resend",
++        )
++        report = await _report(session_factory, user_ids[16], TODAY)
++        _assert(report is not None, "complete resend removed the report")
++        fields = _report_fields(report)
++        body = "\n".join(
++            [*fields["today_work"], *fields["problems"], *fields["tomorrow_plan"]]
++        )
++        _assert("旧残缺草稿标记" not in body, "complete resend kept the old partial draft")
++        _assert("旧重复计划标记" not in body, "complete resend kept duplicate old plans")
++        _assert(
++            bool((report.section_status or {}).get("problems_acknowledged_empty")),
++            "complete resend lost the explicit empty problem field",
++        )
++        _assert(response.get("actual_write") is True, "complete resend did not write")
++        review = await _independent_daily_snapshot_review(
++            evaluator_llm_client,
++            source_messages=(source,),
++            stored_fields=fields,
++        )
++        return {
++            "field_counts": {key: len(value) for key, value in fields.items()},
++            "status": report.status,
++            "semantic_review": review,
++        }
++
++    async def short_empty_followup() -> dict[str, Any]:
++        today = ["核对合同付款条件"]
++        tomorrow = ["继续与法官沟通", "继续与法官沟通"]
++        await _seed_report(
++            session_factory,
++            user_id=user_ids[17],
++            team_id=team_id,
++            report_date=TODAY,
++            today_work=today,
++            problems=[],
++            tomorrow_plan=tomorrow,
++            acknowledge_problems=False,
++        )
++        response = await post(
++            18,
++            "发现的问题暂无",
++            "empty-problems",
++            conversation="isolated-short-empty-followup",
++        )
++        report = await _report(session_factory, user_ids[17], TODAY)
++        _assert(report is not None, "short empty follow-up removed the report")
++        _assert(list(report.today_work or []) == today, "short empty follow-up changed work")
++        _assert(list(report.tomorrow_plan or []) == tomorrow, "short empty follow-up changed plans")
++        _assert(list(report.problems or []) == [], "empty wording was stored as a problem item")
++        _assert(
++            bool((report.section_status or {}).get("problems_acknowledged_empty")),
++            "short empty follow-up did not acknowledge the problem field",
++        )
++        _assert(response.get("actual_write") is True, "short empty follow-up did not write")
++        return {"status": report.status, "problem_count": len(report.problems or [])}
++
+     factories = (
+         ("short_full", short_full),
+         ("structured_full", structured_full),
+@@ -1157,6 +1237,8 @@ async def _run_cases(
+         ("idempotency", idempotency),
+         ("daily_crud", daily_crud),
+         ("asr_name_correction", asr_name_correction),
++        ("partial_resend", partial_resend),
++        ("short_empty_followup", short_empty_followup),
+     )
+     for name, factory in factories:
+         if selected_cases and name not in selected_cases:
+diff --git a/tests/test_20260826_daily_turn_processor.py b/tests/test_20260826_daily_turn_processor.py
+index bbfa1ec4..37be5793 100644
+--- a/tests/test_20260826_daily_turn_processor.py
++++ b/tests/test_20260826_daily_turn_processor.py
+@@ -2082,6 +2082,290 @@ def test_long_daily_flat_plan_binds_model_fields_to_exact_source() -> None:
+     )
+ 
+ 
++def test_long_daily_flat_plan_keeps_an_explicit_empty_problem_out_of_items() -> None:
++    source = (
++        "先说完成合同复核和付款材料核对，发现的问题暂无，"
++        "明天继续沟通签署并整理归档清单。"
++    )
++    completion = _CompletionResponse(
++        message={
++            "role": "assistant",
++            "content": json.dumps(
++                {
++                    "decision": "daily_add",
++                    "replace_existing_snapshot": False,
++                    "items": [
++                        {
++                            "field": "today_work",
++                            "exact_quote": "完成合同复核和付款材料核对",
++                        },
++                        {
++                            "field": "tomorrow_plan",
++                            "exact_quote": "明天继续沟通签署并整理归档清单。",
++                        },
++                    ],
++                    "empty_fields": [
++                        {
++                            "field": "problems",
++                            "exact_quote": "发现的问题暂无",
++                        }
++                    ],
++                },
++                ensure_ascii=False,
++            ),
++        },
++        metadata={"finish_reason": "stop", "model_call_performed": True},
++    )
++
++    compiled = _compile_long_daily_flat_completion(completion, source=source)
++    payload = json.loads(compiled.message["content"])
++
++    assert payload["arguments"]["fields"]["problems"] == []
++    assert payload["arguments"]["empty_field_evidence"] == [
++        {
++            "field": "problems",
++            "source_evidence": {
++                "source_message_index": 1,
++                "exact_quote": "发现的问题暂无",
++            },
++        }
++    ]
++    assert payload["arguments"]["non_item_source_evidence"] == [
++        {
++            "field": "problems",
++            "source_message_index": 1,
++            "exact_quote": "发现的问题暂无",
++            "reason": "explicit_empty_field",
++        }
++    ]
++
++
++@pytest.mark.asyncio
++async def test_substantial_natural_daily_uses_one_flat_model_result() -> None:
++    today_quote = (
++        "今天先核对海滨项目合同付款条件并向业务部门反馈，随后整理诉讼材料、"
++        "更新案件进展、核验三份证据清单，并与项目组确认下周开庭准备事项；"
++        "同时完成两份用印文件审查，向分公司说明修改意见，核对授权委托书和"
++        "主体资格材料，整理会议纪要并更新案件台账；最后与财务核实回款金额，"
++        "向承办法官反馈调解意见，汇总项目风险提示并发送给相关负责人确认；"
++        "另外检查合同归档目录、补充缺失附件、更新诉讼节点，并向业务团队说明"
++        "后续配合要求和材料提交时间"
++    )
++    empty_quote = "目前没有需要上报的问题或风险"
++    tomorrow_quote = (
++        "明天继续跟进合同签署，补齐付款附件，并把庭审材料交给承办律师复核"
++    )
++    source = "。".join((today_quote, empty_quote, tomorrow_quote)) + "。"
++    assert len(source) >= 250
++    completion = _CompletionResponse(
++        message={
++            "role": "assistant",
++            "content": json.dumps(
++                {
++                    "decision": "daily_add",
++                    "replace_existing_snapshot": False,
++                    "items": [
++                        {"field": "today_work", "exact_quote": today_quote},
++                        {"field": "tomorrow_plan", "exact_quote": tomorrow_quote},
++                    ],
++                    "empty_fields": [
++                        {"field": "problems", "exact_quote": empty_quote}
++                    ],
++                },
++                ensure_ascii=False,
++            ),
++        },
++        metadata={"finish_reason": "stop"},
++    )
++    calls = 0
++    adapter = DeepSeekToolCallingAdapter(
++        http_client=object(),
++        model="deepseek-v4-flash",
++        timeout_seconds=10,
++        max_tool_loops=4,
++        endpoint="https://example.invalid/chat/completions",
++    )
++
++    async def flat_model(messages, *, tool_schemas, thinking_enabled):
++        nonlocal calls
++        del thinking_enabled
++        calls += 1
++        assert tool_schemas == []
++        if calls == 1:
++            assert json.loads(messages[1]["content"])["source"] == source
++            return completion
++        assert "checking only whether" in messages[0]["content"]
++        return _CompletionResponse(
++            message={
++                "role": "assistant",
++                "content": json.dumps(
++                    {
++                        "decision": "empty_fields",
++                        "empty_field_evidence": [
++                            {
++                                "field": "problems",
++                                "source_evidence": {
++                                    "source_message_index": 1,
++                                    "exact_quote": empty_quote,
++                                },
++                            }
++                        ],
++                    },
++                    ensure_ascii=False,
++                ),
++            },
++            metadata={"finish_reason": "stop"},
++        )
++
++    adapter._complete = flat_model
++    runtime = _CaptureRuntime(source)
++    context = _context(report=None).model_copy(update={"recent_messages": ()})
++
++    result = await adapter.run_canary_turn(
++        system_prompt="Agent2 substantial natural Daily test",
++        user_text=source,
++        context=context,
++        runtime_session=runtime,
++        thinking_enabled=True,
++    )
++
++    assert calls == 2
++    assert runtime.commit_count == 1
++    assert result.final_content
++    assert runtime.calls[0].arguments["acknowledged_empty_fields"] == ["problems"]
++    assert [item["field"] for item in runtime.calls[0].arguments["items"]] == [
++        "today_work",
++        "tomorrow_plan",
++    ]
++
++
++@pytest.mark.asyncio
++async def test_flat_model_field_decision_is_not_overruled_by_nested_headings() -> None:
++    first_work = "与法官沟通调解方案并向分公司反馈处理意见和后续付款安排"
++    local_plan = "明日计划：继续与法官沟通现金付款和分期履行方案。"
++    second_work = (
++        "针对鉴定初稿拟定异议回复，与分公司开会确认回复方向和核心要点，"
++        "同时核对主体材料、鉴定依据和计划提交时间"
++    )
++    third_work = (
++        "围绕评估流程启动事项拟定内部方案，跟进公司决策并整理会议意见，"
++        "同步更新案件台账和相关风险说明"
++    )
++    fourth_work = (
++        "核对总部大楼项目七八月付款情况，与关联项目共同评估诉讼节奏，"
++        "并向业务部门说明后续付款跟进要求"
++    )
++    empty_quote = "暂无。"
++    final_plan = (
++        "李有才案件完成鉴定回复意见修订并正式提交；徐州文庙项目继续跟进"
++        "诉前调解；吴昌来案件整理证据材料并形成书面记录。"
++    )
++    source = (
++        "一、今日工作总结\n（一）徐州文庙项目\n"
++        + first_work
++        + "\n"
++        + local_plan
++        + "\n（二）李有才案件\n"
++        + second_work
++        + "\n（三）北京银行项目\n"
++        + third_work
++        + "\n（四）总部大楼项目\n"
++        + fourth_work
++        + "\n二、发现问题\n"
++        + empty_quote
++        + "\n三、明日工作计划\n"
++        + final_plan
++    )
++    assert len(source) >= 250
++    completion = _CompletionResponse(
++        message={
++            "role": "assistant",
++            "content": json.dumps(
++                {
++                    "decision": "daily_add",
++                    "replace_existing_snapshot": False,
++                    "items": [
++                        {"field": "today_work", "exact_quote": first_work},
++                        {"field": "tomorrow_plan", "exact_quote": local_plan},
++                        {"field": "today_work", "exact_quote": second_work},
++                        {"field": "today_work", "exact_quote": third_work},
++                        {"field": "today_work", "exact_quote": fourth_work},
++                        {"field": "tomorrow_plan", "exact_quote": final_plan},
++                    ],
++                    "empty_fields": [
++                        {"field": "problems", "exact_quote": empty_quote}
++                    ],
++                },
++                ensure_ascii=False,
++            ),
++        },
++        metadata={"finish_reason": "stop"},
++    )
++    calls = 0
++    adapter = DeepSeekToolCallingAdapter(
++        http_client=object(),
++        model="deepseek-v4-flash",
++        timeout_seconds=10,
++        max_tool_loops=4,
++        endpoint="https://example.invalid/chat/completions",
++    )
++
++    async def model(messages, *, tool_schemas, thinking_enabled):
++        nonlocal calls
++        del thinking_enabled
++        calls += 1
++        assert tool_schemas == []
++        if calls == 1:
++            assert json.loads(messages[1]["content"])["source"] == source
++            return completion
++        assert "checking only whether" in messages[0]["content"]
++        return _CompletionResponse(
++            message={
++                "role": "assistant",
++                "content": json.dumps(
++                    {
++                        "decision": "empty_fields",
++                        "empty_field_evidence": [
++                            {
++                                "field": "problems",
++                                "source_evidence": {
++                                    "source_message_index": 1,
++                                    "exact_quote": empty_quote,
++                                },
++                            }
++                        ],
++                    },
++                    ensure_ascii=False,
++                ),
++            },
++            metadata={"finish_reason": "stop"},
++        )
++
++    adapter._complete = model
++    runtime = _CaptureRuntime(source)
++    context = _context(report=None).model_copy(update={"recent_messages": ()})
++
++    await adapter.run_canary_turn(
++        system_prompt="Agent2 nested Daily headings test",
++        user_text=source,
++        context=context,
++        runtime_session=runtime,
++        thinking_enabled=True,
++    )
++
++    assert calls == 1
++    stored = {
++        item["content"]: item["field"]
++        for item in runtime.calls[0].arguments["items"]
++    }
++    assert stored[first_work] == "today_work"
++    assert stored[second_work] == "today_work"
++    assert stored[third_work] == "today_work"
++    assert stored[fourth_work] == "today_work"
++    assert stored[local_plan] == "tomorrow_plan"
++    assert stored[final_plan] == "tomorrow_plan"
++
++
+ def test_structured_daily_chunk_requires_every_physical_item_line() -> None:
+     source_chunk = "今日工作：\n1、完成合同审核\n2、整理案件材料"
+ 
+@@ -4617,27 +4901,42 @@ class _CaptureRuntime:
+     async def execute(self, calls, *, defer_finalization=False):
+         assert defer_finalization is True
+         self.calls = calls
+-        items = list(calls[0].arguments["items"])
++        add_call = next(call for call in calls if call.tool_name == "add_daily_items")
++        items = list(add_call.arguments["items"])
++        replacing = any(call.tool_name == "delete_daily_items" for call in calls)
++        field_items = {
++            field: [
++                {
++                    "item_id": f"new-{index}",
++                    "content": item["content"],
++                }
++                for index, item in enumerate(items, start=1)
++                if item["field"] == field
++            ]
++            for field in ("today_work", "problems", "tomorrow_plan")
++        }
++        if not replacing:
++            field_items["today_work"] = [
++                {"item_id": "prior-1", "content": "完成一份用印审核"},
++                *field_items["today_work"],
++            ]
++        acknowledged = list(
++            add_call.arguments.get("acknowledged_empty_fields") or ()
++        )
++        missing = [
++            field
++            for field in ("today_work", "problems", "tomorrow_plan")
++            if not field_items[field] and field not in acknowledged
++        ]
+         snapshot = {
+             "report_id": str(REPORT_ID),
+             "report_date": "2026-08-26",
+             "version": 2,
+             "status": "collecting",
+-            "fields": {
+-                "today_work": [
+-                    {"item_id": "prior-1", "content": "完成一份用印审核"},
+-                    *[
+-                        {"item_id": f"new-{index}", "content": item["content"]}
+-                        for index, item in enumerate(items, start=1)
+-                    ],
+-                ],
+-                "problems": [],
+-                "tomorrow_plan": [],
+-            },
+-            "acknowledged_empty_fields": [],
++            "fields": field_items,
++            "acknowledged_empty_fields": acknowledged,
+         }
+-        self.receipts = (
+-            ToolReceipt(
++        add_receipt = ToolReceipt(
+                 status=ReceiptStatus.SUCCESS,
+                 tool_name="add_daily_items",
+                 changed=True,
+@@ -4652,17 +4951,51 @@ class _CaptureRuntime:
+                     "actual_write": True,
+                     "report_snapshot": snapshot,
+                     "section_states": {
+-                        "today_work": "filled",
+-                        "problems": "missing",
+-                        "tomorrow_plan": "missing",
++                        field: (
++                            "filled"
++                            if field_items[field]
++                            else "acknowledged_empty"
++                            if field in acknowledged
++                            else "missing"
++                        )
++                        for field in (
++                            "today_work",
++                            "problems",
++                            "tomorrow_plan",
++                        )
+                     },
+-                    "missing_sections": ["problems", "tomorrow_plan"],
+-                    "missing_section_labels": ["问题风险", "明日计划"],
+-                    "confirmation_available": False,
++                    "missing_sections": missing,
++                    "missing_section_labels": [
++                        {
++                            "today_work": "今日工作",
++                            "problems": "问题风险",
++                            "tomorrow_plan": "明日计划",
++                        }[field]
++                        for field in missing
++                    ],
++                    "confirmation_available": not missing,
+                     "persisted_draft_available": True,
+                 },
+                 execution_mode=ExecutionMode.CANARY_EXECUTE,
+-            ),
++            )
++        self.receipts = (
++            (
++                ToolReceipt(
++                    status=ReceiptStatus.SUCCESS,
++                    tool_name="delete_daily_items",
++                    changed=True,
++                    target_type="daily_report",
++                    target_id=str(REPORT_ID),
++                    before_version=1,
++                    after_version=2,
++                    affected_item_ids=("prior-1",),
++                    safe_user_facts={"actual_write": True},
++                    execution_mode=ExecutionMode.CANARY_EXECUTE,
++                ),
++                add_receipt,
++            )
++            if replacing
++            else (add_receipt,)
+         )
+         return ProductionRuntimeResult(
+             status="success",
+@@ -4680,14 +5013,128 @@ class _CaptureRuntime:
+             transaction_opened=True,
+             committed_to_outer_transaction=True,
+             handler_call_count=1,
+-            business_write_count=1,
+-            receipt_write_count=1,
++            business_write_count=len(self.receipts),
++            receipt_write_count=len(self.receipts),
+         )
+ 
+     async def rollback_pending(self):
+         self.rollback_count += 1
+ 
+ 
++@pytest.mark.asyncio
++async def test_complete_natural_daily_resend_replaces_an_earlier_partial_draft() -> None:
++    today_quote = (
++        "这是完整日报，今天核对徐州项目调解方案并反馈分公司意见，跟进法官"
++        "与购房者沟通情况；拟定鉴定意见回复初稿并与分公司确认核心要点；"
++        "围绕评估流程启动事项拟定内部方案；核对总部大楼项目付款情况并决定"
++        "暂缓诉讼，同时安排每月持续跟进付款；另外复核授权委托书、主体材料和"
++        "证据目录，更新案件台账，整理会议纪要并向相关负责人同步后续要求"
++    )
++    empty_quote = "目前没有需要上报的问题或风险"
++    tomorrow_quote = (
++        "明天修订并提交鉴定回复，继续跟进诉前调解方案，并为吴昌来案件整理"
++        "证据材料形成书面记录；同时核对合同附件、补充付款凭证并与业务部门"
++        "确认材料提交时间和交接方式"
++    )
++    source = "。".join((today_quote, empty_quote, tomorrow_quote)) + "。"
++    assert len(source) >= 250
++    completion = _CompletionResponse(
++        message={
++            "role": "assistant",
++            "content": json.dumps(
++                {
++                    "decision": "daily_add",
++                    "replace_existing_snapshot": True,
++                    "items": [
++                        {"field": "today_work", "exact_quote": today_quote},
++                        {"field": "tomorrow_plan", "exact_quote": tomorrow_quote},
++                    ],
++                    "empty_fields": [
++                        {"field": "problems", "exact_quote": empty_quote}
++                    ],
++                },
++                ensure_ascii=False,
++            ),
++        },
++        metadata={"finish_reason": "stop"},
++    )
++    calls = 0
++    adapter = DeepSeekToolCallingAdapter(
++        http_client=object(),
++        model="deepseek-v4-flash",
++        timeout_seconds=10,
++        max_tool_loops=4,
++        endpoint="https://example.invalid/chat/completions",
++    )
++
++    async def model(messages, *, tool_schemas, thinking_enabled):
++        nonlocal calls
++        del thinking_enabled
++        calls += 1
++        assert tool_schemas == []
++        if calls == 1:
++            payload = json.loads(messages[1]["content"])
++            assert payload["source"] == source
++            assert payload["existing_daily_report"]["report_id"] == str(REPORT_ID)
++            return completion
++        return _CompletionResponse(
++            message={
++                "role": "assistant",
++                "content": json.dumps(
++                    {
++                        "decision": "empty_fields",
++                        "empty_field_evidence": [
++                            {
++                                "field": "problems",
++                                "source_evidence": {
++                                    "source_message_index": 1,
++                                    "exact_quote": empty_quote,
++                                },
++                            }
++                        ],
++                    },
++                    ensure_ascii=False,
++                ),
++            },
++            metadata={"finish_reason": "stop"},
++        )
++
++    adapter._complete = model
++    runtime = _CaptureRuntime(source)
++    context = _context(report=_existing_report()).model_copy(
++        update={
++            "recent_messages": (),
++            "allowed_tool_names": frozenset(
++                {"add_daily_items", "delete_daily_items"}
++            ),
++            "gate_decisions": {
++                "add_daily_items": True,
++                "delete_daily_items": True,
++            },
++        }
++    )
++
++    await adapter.run_canary_turn(
++        system_prompt="Agent2 full Daily resend test",
++        user_text=source,
++        context=context,
++        runtime_session=runtime,
++        thinking_enabled=True,
++    )
++
++    assert calls == 2
++    assert [call.tool_name for call in runtime.calls] == [
++        "delete_daily_items",
++        "add_daily_items",
++    ]
++    snapshot = runtime.receipts[-1].safe_user_facts["report_snapshot"]
++    assert "prior-1" not in {
++        item["item_id"]
++        for field in snapshot["fields"].values()
++        for item in field
++    }
++
++
+ @pytest.mark.asyncio
+ async def test_processor_reply_draft_satisfies_server_reply_protocol() -> None:
+     source = "沟通海滨项目合同条款并反馈业务部门。"
+@@ -4807,6 +5254,29 @@ async def test_server_completes_missing_label_token_without_another_model_call()
+     assert errors == ()
+ 
+ 
++def test_blocked_daily_write_cannot_keep_a_false_saved_reply() -> None:
++    receipt = ToolReceipt(
++        status=ReceiptStatus.BLOCKED,
++        tool_name="add_daily_items",
++        changed=False,
++        target_type="daily_report",
++        target_id="",
++        before_version=None,
++        after_version=None,
++        affected_item_ids=(),
++        safe_user_facts={"actual_write": False},
++        error_code="DAILY_SOURCE_ANCHOR_MISMATCH",
++        execution_mode=ExecutionMode.CANARY_EXECUTE,
++    )
++
++    reply = complete_verified_daily_reply_draft(
++        "已先记录能够确认的日报内容，其他内容稍后再确认。",
++        (receipt,),
++    )
++
++    assert reply == "这次没有写入日报，内容和状态都没有变化。"
++
++
+ def test_write_reply_retry_explicitly_requires_natural_chinese() -> None:
+     instruction = write_reply_retry_instruction((), ())
+     messages = write_reply_retry_messages(errors=(), receipts=(), retry_number=1)
+
